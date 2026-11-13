@@ -301,7 +301,7 @@ fn mixed_model_unaligned_long_pass_matches_single_rows_and_uneven_chunks() {
         model.prefill(&prefix).unwrap();
     }
     // Start at position 3 and cross the absolute boundaries at 32 and 64.
-    let tokens: Vec<u32> = (0..62).map(|row| (row * 17 + 4) % 128).collect();
+    let tokens: Vec<u32> = (0..73).map(|row| (row * 17 + 4) % 128).collect();
     batched.run_provisional(&tokens).unwrap();
     assert_eq!(batched.position(), prefix.len());
     let expected = bits(batched.row_logits());
@@ -316,7 +316,7 @@ fn mixed_model_unaligned_long_pass_matches_single_rows_and_uneven_chunks() {
     assert_eq!(actual, expected);
     actual.clear();
     let mut start = 0;
-    for count in [1, 31, 2, 27, 1] {
+    for count in [1, 31, 2, 33, 6] {
         chunked.prefill(&tokens[start..start + count]).unwrap();
         actual.extend(bits(chunked.row_logits()));
         start += count;
