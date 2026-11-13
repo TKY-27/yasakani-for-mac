@@ -2,11 +2,13 @@
 use crate::{Engine, Error, MappedModel, Matrix, Result, mapped::MappedEmbeddingTensor};
 use std::{
     path::Path,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 use yskn_ref::{
     ModelDimensions,
     compressed_linear::{PreparedActivation, quantize_activation, restore_projection},
+    gated_deltanet::{GatedDeltaNet, GatedDeltaNetState, round_projection},
     model::{Branch, Layer, LayerState, Weights, load_weights, model_location},
     residual_norm_mlp::{NormalizedInput, gated_product, prepare_normalization, residual_add},
 };
@@ -282,6 +284,57 @@ fn project_rows(
     let inputs: Vec<_> = prepared.iter().map(|p| (p, None)).collect();
     project(engine, linear, &inputs, timing)
 }
+/// The reference's `GatedDeltaNet::step` stages for a pass of rows: rows are
+/// prepared in parallel (they read only earlier rows' rounded projections), then
+/// each value head runs its rows in ascending order on one worker. On error the
+/// state is partly updated; `prefill` discards its state copy.
+fn recurrence(
+    engine: &mut Engine,
+    layer: &GatedDeltaNet,
+    state: &mut GatedDeltaNetState,
+    qkv: &[Vec<f32>],
+    z: &[Vec<f32>],
+    input: &[NormalizedInput],
+) -> Result<Vec<Vec<f32>>> {
+    let rounded: Vec<_> = qkv.iter().map(|row| round_projection(row)).collect();
+    let rows = {
+        let taps: Vec<&[f32]> = state
+            .history_rows()
+            .chain(rounded.iter().map(Vec::as_slice))
+            .collect();
+        let width = taps.len() - rounded.len();
+        engine.map_range(0..qkv.len(), |i| {
+            layer.prepare(
+                &taps[i..i + width],
+                &qkv[i],
+                &z[i],
+                &input[i].weighted_hidden_bf16,
+                input[i].inverse_rms,
+            )
+        })?
+    };
+    let heads: Vec<Mutex<&mut [f32]>> = state.recurrent_heads_mut().map(Mutex::new).collect();
+    let outputs = engine.map_range(0..heads.len(), |head| {
+        let mut head_state = heads[head]
+            .lock()
+            .map_err(|_| Error::InvalidInput("recurrent head lock poisoned".into()))?;
+        rows.iter()
+            .map(|row| layer.recur_head(&mut head_state, row, head))
+            .collect::<Result<Vec<_>>>()
+    })?;
+    drop(heads);
+    for row in &rows {
+        layer.advance_history(state, row)?;
+    }
+    Ok((0..rows.len())
+        .map(|i| {
+            outputs
+                .iter()
+                .flat_map(|head| head[i].iter().copied())
+                .collect()
+        })
+        .collect())
+}
 fn forward(
     engine: &mut Engine,
     layer: &Layer<Linear>,
@@ -301,17 +354,7 @@ fn forward(
             let qkv = project_normalized(engine, &l.query_key_value, &input, timing)?;
             let z = project_normalized(engine, &l.output_gate, &input, timing)?;
             let start = Instant::now();
-            let gated = (0..hidden.len())
-                .map(|i| {
-                    l.recurrence.step(
-                        state,
-                        &qkv[i],
-                        &z[i],
-                        &input[i].weighted_hidden_bf16,
-                        input[i].inverse_rms,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let gated = recurrence(engine, &l.recurrence, state, &qkv, &z, &input)?;
             timing.recurrence += start.elapsed();
             project_rows(engine, &l.output, &gated, timing)?
         }
