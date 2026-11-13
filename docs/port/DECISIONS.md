@@ -448,6 +448,120 @@ output rows could add at most 15% at one row and 34% at 16, and the CPU is
 needed for the recurrent and attention layers, so that split is deferred to
 step 7.
 
+## D14 — Metal projections in the engine and parallel recurrent heads
+
+Decision (2026-11-14): `yskn_engine::Model` runs its compressed projections on
+the Metal kernel by default, and runs the Gated DeltaNet value heads of a pass
+in parallel. Logits are bit-identical to the scalar reference on both
+backends.
+
+**Crate layout.** The `yskn-metal` probe crate is merged into `yskn-engine`
+as the macOS-only module `metal` (`src/metal.rs`, `src/linear.metal`, design
+notes in `crates/yskn-engine/METAL.md`). The project targets Apple Silicon
+only, the probe already depended on the engine, and a backend trait would
+have had a single implementation in a crate that depends back on its user.
+`objc2`/`objc2-metal` are macOS-target dependencies only; other targets build
+without the module, and `Backend::Metal` is an error there. `bench_metal`,
+`synthetic_model` and the kernel tests (`tests/metal.rs`) moved along. D12's
+`-p yskn-metal` commands are now `-p yskn-engine`, for example
+`cargo run --release -p yskn-engine --example bench_metal -- MODEL.yskn`.
+
+**Backend selection.** `Model::with_backend(path, engine, backend,
+rows_per_pass)` takes `Backend::Cpu` (D10 kernel on the pool) or
+`Backend::Metal` (D12 kernel). `Model::load` reads `YSKN_BACKEND` (`cpu` |
+`metal`); unset, it uses Metal when `MTLCreateSystemDefaultDevice` returns a
+device, else CPU. An unknown value is an error, and so is Metal without a
+device: there is no silent fallback. `with_engine` keeps its meaning (CPU) and
+explicit constructors never read the environment. Both backends return the
+same exact row-major M×N i64 sums including padded rows, and the same code
+consumes them from `restore_projection` on, so the backend cannot change a
+bit; the tests check it anyway. The CPU pool runs everything else on either
+backend. With the Metal module, `Model` is not `Send`, because objc2-metal's
+buffer objects are not.
+
+**Dispatch grouping.** Projections that share one prepared input are encoded
+into one command buffer: GDN `qkv`+`z`, attention `q`+`k`+`v`, MLP `gate`+`up`.
+`out`/`o`, `down` and the head are one command buffer each. A 64-layer model
+(48 GDN, 16 attention) therefore makes 4 × 64 + 1 = 257 command buffers per
+pass, not 401. `MetalEngine::weighted_sums_shared` uploads the group's input
+once into a reused activation/scale buffer and reads each matrix's sums back
+from a reused output buffer per group slot. These buffers grow to the largest
+size seen and are never shrunk; with the no-copy mapping buffer and the
+cached lookup tables (D12), no GPU buffer is allocated per call once the
+sizes have been seen. Rows per pass above 16 are split into several
+dispatches inside the same command buffer, as before.
+
+**Recurrence stage split.** `GatedDeltaNet::step` is now three public stages,
+called by `step` itself in its original order:
+
+1. `prepare(history, qkv, z, weighted_hidden, inverse_rms)`: validation, BF16
+   projections, convolution, query/key normalization and both dense gates.
+   It reads the previous `convolution_width - 1` rounded projections, never
+   the recurrent state.
+2. `recur_head(head_state, row, value_head)`: one value head's decay, delta
+   update, output norm and gating on its own `head_dim × head_dim` block.
+3. `advance_history(state, row)`: shift the row's rounded projection into
+   the convolution history.
+
+Because the history holds only rounded projections (`round_projection`), row
+r's convolution input for a pass is the state's history rows followed by the
+rounded projections of rows before r, all known before any recurrence runs.
+The engine therefore prepares all rows of a pass in parallel, then runs each
+value head's chain of M rows, in ascending row order, as one pool task, and
+finally appends the rows to the history in order.
+
+Why parallel heads cannot change bits: a head reads and writes only its own
+state block; its output depends only on that block, the immutable prepared
+row and its own weights. Within a head, every floating operation runs in the
+same code and order as the reference's `step`; nothing is reduced across
+heads or rows; a thread only decides which core executes a chain. The
+D11 digests are unchanged, a reference unit test runs heads in reverse order
+against row-major `step`, and the engine tests cover 1 and 4 workers.
+
+Not separable by head: the chain of rows within a head (each row reads the
+previous row's state), which stays sequential, and the history append, which
+stays sequential in row order (a copy per row). Nothing else had to remain
+sequential. The finite checks of a head's state block and output now run at
+the end of that head rather than after all heads. Whether a row fails is
+unchanged; when several checks fail, the `NonFinite` context reported can
+differ. In the engine, a prepare error of a later row can be reported before
+a head error of an earlier row; the whole pass fails either way and
+`prefill` publishes nothing (D11).
+
+**Related fixes.** `map_range` reports the failing index that comes first,
+as a sequential loop would (panics are caught per index).
+`TrellisStates` validates a trellis descriptor once per tensor instead of once
+per state; `tensor_state` keeps its per-call validation.
+
+### D14 local measurements (synthetic model, 2026-11-14)
+
+`cargo run --release -p yskn-engine --example synthetic_model -- FILE 8`
+(8 layers: 6 GDN with 4 value heads and 2 attention; hidden 5120, FFN 17408,
+4096-row head; 856,300,800 bytes) in a fresh temporary directory, then
+`bench_model FILE --backend B --rows-per-pass R --passes P` (P = 7 for 16
+rows, 15 for 1 row), each run three times. Another CPU-heavy job kept the
+load average near 10, so the numbers are noisy. Values are seconds per pass:
+the minimum over all passes of the three runs / the median of the three run
+medians. "Before" is the CPU engine at merge commit `bf89ad1` plus
+`bench_model`.
+
+| Rows | Configuration | Total | Kernel | Recurrence | Attention | Rest |
+|---:|---|---:|---:|---:|---:|---:|
+| 16 | CPU before | 0.1920 / 0.2460 | 0.1378 / 0.1689 | 0.0152 / 0.0166 | 0.0007 / 0.0016 | 0.0336 / 0.0529 |
+| 16 | CPU after | 0.1704 / 0.2375 | 0.1350 / 0.1762 | 0.0048 / 0.0085 | 0.0008 / 0.0018 | 0.0191 / 0.0452 |
+| 16 | Metal after | 0.0813 / 0.1106 | 0.0602 / 0.0715 | 0.0044 / 0.0064 | 0.0007 / 0.0017 | 0.0154 / 0.0259 |
+| 1 | CPU before | 0.0875 / 0.1086 | 0.0703 / 0.0981 | 0.0009 / 0.0012 | 0.0001 / 0.0002 | 0.0044 / 0.0124 |
+| 1 | CPU after | 0.0821 / 0.1055 | 0.0740 / 0.0991 | 0.0006 / 0.0012 | 0.0001 / 0.0002 | 0.0040 / 0.0106 |
+| 1 | Metal after | 0.0198 / 0.0355 | 0.0154 / 0.0269 | 0.0005 / 0.0009 | 0.0001 / 0.0001 | 0.0034 / 0.0062 |
+
+The synthetic GDN layers have only 4 value heads (the real model has 48), so
+the recurrence gain here (about 3× at 16 rows) is bounded by 4 parallel
+chains and understates the real-model gain. The synthetic file has 33
+command buffers per pass; the real model's 257 add about 46 ms at the
+measured 0.18 ms round trip. The real model was not opened: its numbers
+come from the orchestrator's `verify_model`, `dump_logits` and
+`score_windows` runs (commands in [README.md](README.md)).
+
 ## Scalar-reference sequence API and quality reporting
 
 `prefill(tokens)` commits all supplied input rows. `run_provisional(tokens)`

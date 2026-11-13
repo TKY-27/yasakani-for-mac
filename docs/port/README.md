@@ -1,4 +1,4 @@
-# Rust reference and mapped CPU engine
+# Rust reference and mapped CPU/Metal engine
 
 This workspace implements the documented container and the executable
 mixed Gated DeltaNet/full-attention main-model path. The three historical
@@ -18,15 +18,17 @@ cargo test --workspace --release
 
 The GitHub Actions workflow uses `macos-15` and verifies `uname -m` is
 `arm64` before building. All three crates use edition 2024. `yskn-format`
-and `yskn-ref` forbid unsafe code; `yskn-engine` isolates mapping, CPU intrinsics and scoped pool
-borrows behind documented safety invariants. The engine requires Rust 1.98.
-No CUDA toolchain, GPU, or published weights are needed for the tests.
-All pre-existing upstream files remain unchanged.
+and `yskn-ref` forbid unsafe code; `yskn-engine` isolates mapping, CPU intrinsics, scoped pool
+borrows and Metal buffer access behind documented safety invariants. The engine requires Rust 1.98.
+No CUDA toolchain, published weights or GPU are needed for the tests; with a
+Metal device (CI's macOS runner has one) the Metal tests run, without one they
+print `skipped: no Metal device`. The Metal module is macOS-only; other
+targets build without it. All pre-existing upstream files remain unchanged.
 
 | Crate/module | Source contract |
 |---|---|
 | `yskn-format` | Container layout, signs, vector formats and trellis states in FORMAT.md |
-| `yskn-engine` | Mapped code streams, persistent CPU workers and layer-major main-model inference under D10/D11 |
+| `yskn-engine` | Mapped code streams, persistent CPU workers, the Metal kernel (macOS) and layer-major main-model inference under D10–D12/D14 |
 | `yskn-ref::model` | Chapter 01, loading, layer order and sequence state |
 | `compressed_linear` | Chapter 02, integer compressed projection and coded embedding |
 | `gated_deltanet` | Chapter 03, dense gates, convolution and recurrence |
@@ -74,24 +76,47 @@ slow and is not intended as a competitive inference backend.
 
 `yskn_engine::Model` runs the entire main model in layer-major passes, using
 mapped weights and the reference's scalar operation order. `load` accepts a
-model folder or a `.yskn` path and defaults to 16 rows per pass. Explicit
-configuration uses `Model::with_engine(path, Engine::new(kernel, threads)?,
-rows_per_pass)`. Both constructors are unsafe solely because callers must
-keep the backing weights file unchanged and untruncated until model drop.
-The engine offers `prefill`, `row_logits`, `logits`, `position`, `reset`,
-`context_capacity`, `dimensions`, `rows_per_pass` and measured `pass_timings`.
-It has no provisional, commit, draft or speculation API. See D11 for the
-causal attention and parallelism contract.
+model folder or a `.yskn` path and defaults to 16 rows per pass. Its
+compressed projections run on the backend named by `YSKN_BACKEND` (`cpu` or
+`metal`); unset, it uses Metal when the process has a Metal device and the
+CPU kernel otherwise. Explicit configuration uses
+`Model::with_backend(path, Engine::new(kernel, threads)?, Backend::Metal,
+rows_per_pass)`; `Model::with_engine(path, engine, rows_per_pass)` is the CPU
+backend. Explicit constructors never read the environment, and Metal without
+a device is an error, not a fallback. The CPU pool runs all other work on
+either backend; both backends give identical bits (D14). The constructors
+are unsafe solely because callers must keep the backing weights file
+unchanged and untruncated until model drop. The engine offers `prefill`,
+`row_logits`, `logits`, `position`, `reset`, `context_capacity`,
+`dimensions`, `rows_per_pass`, `backend`, `device` and measured
+`pass_timings`. It has no provisional, commit, draft or speculation API.
+See D11 for the causal attention and parallelism contract and D14 for the
+backends and the parallel recurrent heads.
 
 ```sh
-# Four configurations, first 24 tokens of window 0, all vocabulary logit bits.
+# Six configurations (four CPU, Metal with 16 and 1 rows per pass), first 24
+# tokens of window 0, all vocabulary logit bits.
 cargo run --release -p yskn-engine --example verify_model -- \
   /path/to/model-folder tools/quality/windows_own_thinking.json
 
+# Scalar-reference cross-check of the first ROWS rows (2 or 3; about two
+# minutes per row on the real model, heap-loaded weights; run alone), then the
+# same six configurations plus a comparison with that file.
+cargo run --release -p yskn-ref --example dump_logits -- \
+  /path/to/model-folder tools/quality/windows_own_thinking.json 3 reference-3.json
+cargo run --release -p yskn-engine --example verify_model -- \
+  /path/to/model-folder tools/quality/windows_own_thinking.json --reference reference-3.json
+
 # One window, with bounded logit memory and measured pass-stage timings.
+# The first stderr line names the backend and device.
 /usr/bin/time -l cargo run --release -p yskn-engine --example score_windows -- \
   /path/to/model-folder tools/quality/windows_own_thinking.json \
-  --rows-per-pass 16 --windows 0..1 --json window-0.json
+  --backend metal --rows-per-pass 16 --windows 0..1 --json window-0.json
+
+# Whole-model pass timings (seven 16-row passes after a warm-up), for example
+# on a synthetic file from `--example synthetic_model -- OUT.yskn 8`.
+cargo run --release -p yskn-engine --example bench_model -- \
+  MODEL.yskn --backend cpu --rows-per-pass 16 --passes 7
 
 # Full quality command (long running; run only when authorized by the gate).
 cargo run --release -p yskn-engine --example score_windows -- \
@@ -103,9 +128,11 @@ starts at reset. JSON contains per-window NLL sums/counts, elapsed seconds,
 and aggregate metrics; sum counts and NLLs to combine disjoint partial runs
 in ascending window order, with possible last-bit binary64 rounding differences
 from the full per-position fold. Progress and timing lines go to stderr;
-stdout retains the three scalar-reference summary lines. `YSKN_KERNEL`
-selects `portable`, `neon` or `dotprod`; omission uses the fastest supported
-variant. Real model commands must run serially with no concurrent model
+stdout retains the three scalar-reference summary lines. `--backend` overrides
+`YSKN_BACKEND`. `YSKN_KERNEL` selects the CPU kernel `portable`, `neon` or
+`dotprod`; omission uses the fastest supported variant. The Metal kernel's
+own benchmark is `cargo run --release -p yskn-engine --example bench_metal --
+MODEL.yskn` (design notes in `crates/yskn-engine/METAL.md`). Real model commands must run serially with no concurrent model
 mapping, and no build/test during a timed run.
 
 ## Quality command
