@@ -116,7 +116,9 @@ cargo run --release -p yskn-ref --example score_windows -- \
 ```
 
 The folder's optional `yasakani.json` supplies `files.weights`; otherwise
-the documented `qwen38_27b_e3x.yskn` default is used. The input JSON must have
+the documented `qwen38_27b_e3x.yskn` default is used. `Model::load_folder` (and
+so this command) also accepts a plain `.yskn` file path in place of the folder;
+it then uses the default 262,144-token context capacity. The input JSON must have
 the committed window format: 2,048 token IDs per window and scored positions
 1024 through 2046. Input row p predicts token p+1. The command prints scored
 position count, mean negative log-likelihood and perplexity, and reports

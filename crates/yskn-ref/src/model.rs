@@ -248,6 +248,9 @@ impl Model {
     }
 
     /// Read only the main weights from chapter 10's optional package manifest.
+    ///
+    /// `folder` may also be a plain `.yskn` weights path (any non-directory):
+    /// that file is loaded directly with the default context capacity of 262,144.
     pub fn load_folder(folder: impl AsRef<Path>) -> Result<Self> {
         let (path, capacity) = model_location(folder.as_ref())?;
         let mut model = Self::load(path)?;
