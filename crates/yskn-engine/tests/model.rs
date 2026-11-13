@@ -213,6 +213,49 @@ fn invalid_requests_preserve_logits_position_and_future_sequence_state() {
     );
 }
 #[test]
+fn failure_after_a_completed_pass_preserves_logits_position_and_state() {
+    // Token 100's dense embedding is finite but its squares overflow, so the
+    // first layer norm fails in whichever pass contains it.
+    let mut bytes = support::synthetic_model_with_dense_embeddings(21, &["linear_attention"]);
+    let embedding = Container::from_bytes(bytes.clone())
+        .unwrap()
+        .header()
+        .vectors
+        .iter()
+        .find(|v| v.name == "embed_tokens")
+        .unwrap()
+        .clone();
+    let huge = yskn_format::f32_to_bf16(1.0e38).to_le_bytes();
+    let row = embedding.offset as usize + 100 * 512 * 2;
+    for pair in bytes[row..row + 1024].as_chunks_mut::<2>().0 {
+        *pair = huge;
+    }
+    let fixture = Fixture::new(&bytes);
+    let mut reference = yskn_ref::Model::load_folder(&fixture.0).unwrap();
+    let mut model = fixture.model(Kernel::fastest(), 4, 2);
+    reference.prefill(&[1, 2, 3]).unwrap();
+    model.prefill(&[1, 2, 3]).unwrap();
+    let before = model.row_logits().to_vec();
+    let timings = model.pass_timings().len();
+    // Passes [4, 5] and [6, 7] complete before [8, 100] fails.
+    assert!(matches!(
+        model.prefill(&[4, 5, 6, 7, 8, 100, 9]),
+        Err(yskn_engine::Error::NonFinite(_))
+    ));
+    assert!(reference.prefill(&[4, 5, 6, 7, 8, 100, 9]).is_err());
+    assert_eq!(model.position(), 3);
+    assert_eq!(model.pass_timings().len(), timings);
+    same(model.row_logits(), &before, "failed later pass");
+    // Unchanged recurrent state: continuing equals the reference continuing.
+    model.prefill(&[4, 5, 6, 7, 8]).unwrap();
+    reference.prefill(&[4, 5, 6, 7, 8]).unwrap();
+    same(
+        model.row_logits(),
+        reference.row_logits(),
+        "continuation after a failed later pass",
+    );
+}
+#[test]
 fn persistent_range_pool_preserves_order_borrows_and_recovers_after_errors() {
     let mut engine = Engine::new(Kernel::Portable, 4).unwrap();
     let input: Vec<_> = (0..101).map(|i| i * 3).collect();
@@ -239,6 +282,17 @@ fn persistent_range_pool_preserves_order_borrows_and_recovers_after_errors() {
             })
             .is_err()
     );
+    // Several failures, including a panic after the first: the lowest index wins.
+    for _ in 0..20 {
+        let error = engine
+            .map_range(0..101, |i| match i {
+                97 => panic!("expected range closure panic"),
+                _ if i % 10 == 3 => Err(yskn_engine::Error::InvalidInput(format!("index {i}"))),
+                _ => Ok(i),
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "invalid input: index 3");
+    }
     assert_eq!(engine.map_range(0..101, |i| Ok(input[i])).unwrap(), input);
     assert!(engine.map_range(0..0, |_| Ok(())).unwrap().is_empty());
 }

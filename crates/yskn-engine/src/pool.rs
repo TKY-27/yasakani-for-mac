@@ -146,7 +146,14 @@ impl Engine {
                             break;
                         }
                         let index = first + offset;
-                        results.push((index, function(index)));
+                        // Caught per index so a panic is reported at its own index.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            function(index)
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(Error::InvalidInput("range worker panicked".into()))
+                        });
+                        results.push((index, result));
                     }
                     results
                 }))
@@ -159,27 +166,40 @@ impl Engine {
             // No borrowed result escapes: T retains its original caller-visible lifetime.
             let run: Box<dyn FnOnce() + Send> = unsafe { std::mem::transmute(run) };
             if sender.send(Job::Range(run)).is_err() {
-                failure = Some(Error::InvalidInput("range worker disconnected".into()));
+                failure = Some((
+                    usize::MAX,
+                    Error::InvalidInput("range worker disconnected".into()),
+                ));
                 break;
             }
             sent += 1;
         }
         drop(reply);
+        // Like a sequential loop, report the failing index that comes first;
+        // failures without an index rank after all indexed ones.
+        let mut fail = |index: usize, error: Error| {
+            if failure.as_ref().is_none_or(|(first, _)| index < *first) {
+                failure = Some((index, error));
+            }
+        };
         for _ in 0..sent {
             match receive.recv() {
                 Ok(Ok(results)) => {
                     for (index, result) in results {
                         match result {
                             Ok(value) => output[index - range.start] = Some(value),
-                            Err(error) => failure = Some(error),
+                            Err(error) => fail(index, error),
                         }
                     }
                 }
-                Ok(Err(error)) => failure = Some(error),
-                Err(_) => failure = Some(Error::InvalidInput("range worker failed".into())),
+                Ok(Err(error)) => fail(usize::MAX, error),
+                Err(_) => fail(
+                    usize::MAX,
+                    Error::InvalidInput("range worker failed".into()),
+                ),
             }
         }
-        if let Some(error) = failure {
+        if let Some((_, error)) = failure {
             return Err(error);
         }
         output
