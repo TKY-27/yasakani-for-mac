@@ -208,16 +208,14 @@ impl yskn_ref::compressed_linear::EmbeddingTensor for MappedEmbeddingTensor {
                 "embedding token exceeds vocabulary".into(),
             ));
         }
+        let states = yskn_format::TrellisStates::new(
+            &self.descriptor,
+            &self.mapping[self.code_range.clone()],
+        )?;
         let mut values = Vec::with_capacity(self.descriptor.cols);
         for sequence in 0..self.descriptor.cols / 256 {
             for step in 0..128 {
-                let state = yskn_format::tensor_state(
-                    &self.descriptor,
-                    &self.mapping[self.code_range.clone()],
-                    row,
-                    sequence,
-                    step,
-                )?;
+                let state = states.state(row, sequence, step)?;
                 for component in 0..2 {
                     values.push(self.scales[row] * self.table[usize::from(state) * 2 + component]);
                 }
