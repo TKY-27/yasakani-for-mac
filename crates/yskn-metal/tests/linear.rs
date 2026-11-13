@@ -205,7 +205,19 @@ mod macos {
                     let expected = reference_sums(&reference, &activation, &scales, 64);
                     for splits in [1, 3, 8, 20, 32] {
                         engine.set_splits(splits).unwrap();
-                        let result = engine.weighted_sums(&matrix, &activation, &scales).unwrap();
+                        let result = match engine.weighted_sums(&matrix, &activation, &scales) {
+                            Ok(result) => result,
+                            // Some devices cap a threadgroup below 32 x splits (CI's
+                            // paravirtual GPU allows 448 threads); the default of 4 must work.
+                            Err(error)
+                                if splits > 8
+                                    && error.to_string().contains("threads per threadgroup") =>
+                            {
+                                eprintln!("skipped: splits={splits}: {error}");
+                                continue;
+                            }
+                            Err(error) => panic!("splits={splits}: {error}"),
+                        };
                         assert_sums(
                             &result,
                             &expected,
