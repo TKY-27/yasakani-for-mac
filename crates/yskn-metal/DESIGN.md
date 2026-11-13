@@ -28,8 +28,12 @@ which includes uploading inputs and reading back outputs.
   i64 sums are added in threadgroup memory at the end. This is exact because
   `scale·(d0+d1) = scale·d0 + scale·d1` in integers.
 - **Table.** At threadgroup start the 8 KB signed-byte table is copied into
-  threadgroup memory, widened to 4,096 `short2` (16 KB). The same memory is
-  reused for the final reduction.
+  threadgroup memory, widened to 4,096 `short2` (16 KB). Each entry is
+  written by one thread: the stride is the whole 32 × `splits` threadgroup
+  (`uint2 [[threads_per_threadgroup]]`; a scalar declaration is only the
+  width, 32). The same memory is reused for the final reduction. The host
+  caches one table buffer per (mapping, lookup-table offset), because
+  tensors may share a code stream but not a table.
 - **Decode.** 32 steps of `bits` bits are exactly `bits` 32-bit words. So
   each of a sequence's four 32-step blocks has the same shift pattern. The
   host generates `DECODE_BLOCK4..8` (32 table lookups with literal shifts,

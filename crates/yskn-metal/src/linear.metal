@@ -36,22 +36,25 @@ kernel void weighted_sums(device const uchar *codes [[buffer(0)]],
                           device const int *scales [[buffer(3)]],        // MC x cols/512
                           device long *output [[buffer(4)]],             // MC x rows
                           constant Params &p [[buffer(5)]],
-                          uint tile [[threadgroup_position_in_grid]],
+                          uint2 tile [[threadgroup_position_in_grid]],
                           uint lane [[thread_index_in_simdgroup]],
                           uint split [[simdgroup_index_in_threadgroup]],
                           uint splits [[simdgroups_per_threadgroup]],
                           uint flat [[thread_index_in_threadgroup]],
-                          uint threads [[threads_per_threadgroup]]) {
+                          uint2 size [[threads_per_threadgroup]]) {
     // 16 KB: the table widened to short2 (low byte = first weight), later the reduction.
     threadgroup long shared_memory[2048];
     threadgroup short2 *lut = (threadgroup short2 *)shared_memory;
+    // The threadgroup is 32 x splits; a scalar threads_per_threadgroup would be only
+    // its width, so each entry would be written `splits` times. flat = y * 32 + x.
+    const uint threads = size.x * size.y;
     for (uint i = flat; i < 4096; i += threads) {
         const ushort t = table[i];
         lut[i] = short2(short(as_type<char>(uchar(t & 0xff))), short(as_type<char>(uchar(t >> 8))));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint row = tile * 32 + lane;
+    const uint row = tile.x * 32 + lane;
     const bool live = row < p.rows;
     const uint half_cols = p.cols / 2;
     const uint groups = p.sequences / 2;
