@@ -1,9 +1,12 @@
-# yskn-metal: Metal kernel for the compressed linear operator
+# Metal kernel for the compressed linear operator
 
-Probe for the CPU/GPU backend decision. `MetalEngine::weighted_sums` has the
-contract of `yskn_engine::Engine::weighted_sums`: row-major M×N i64, padded
-physical rows included, prefix variant for head slices. `job` + `run` encode
-any number of matrix calls into one command buffer.
+`yskn_engine::MetalEngine` (macOS only, `src/metal.rs` and `src/linear.metal`;
+until D14 the separate `yskn-metal` probe crate). `MetalEngine::weighted_sums`
+has the contract of `yskn_engine::Engine::weighted_sums`: row-major M×N i64,
+padded physical rows included, prefix variant for head slices. `job` + `run`
+encode any number of matrix calls into one command buffer.
+`weighted_sums_shared` is what `Model` uses: several matrices reading one
+input in one command buffer, with reused input/output buffers (D14).
 
 All numbers below are from an Apple M5 (10-core GPU, 24 GB), on a synthetic
 file written by `examples/synthetic_model.rs` (8 layers, hidden 5120,

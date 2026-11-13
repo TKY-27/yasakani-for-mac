@@ -5,12 +5,17 @@ edition.workspace = true
 rust-version = "1.98"
 license.workspace = true
 repository.workspace = true
-description = "Mapped CPU compressed linear kernels for YASAKANI"
+description = "Mapped CPU and Metal compressed linear kernels and main-model inference for YASAKANI"
 
 [dependencies]
 memmap2 = "0.9"
 yskn-format.workspace = true
 yskn-ref = { path = "../yskn-ref" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
 
 [dev-dependencies]
 sha2.workspace = true
