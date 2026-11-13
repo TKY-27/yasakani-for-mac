@@ -4,7 +4,7 @@ This file is the single resumable record of the port. It is written so the
 orchestrator can continue from it alone. Update it at every merge, decision
 and measurement.
 
-Last updated: 2026-11-14 (step 1 in progress).
+Last updated: 2026-11-14 (step 1 done, step 2 in progress).
 
 ## Goal and release criteria
 
@@ -35,9 +35,11 @@ Release criteria (all must hold):
 
 ## Build order
 
-1. Close gaps D7 to D9; mixed-model tests pass. **In progress.**
+1. Close gaps D7 to D9; mixed-model tests pass. **Done (PR #3).**
 2. Fast CPU path for the compressed linear operator (threaded NEON, run-time
    feature choice, portable fallback), bit-identical, model memory-mapped.
+   **In progress** on branch `feat/02a-linear-kernel` (brief
+   `.work/briefs/02a-linear-kernel.md`, worker GPT-6 Astra).
 3. Validate the main model with `score_windows` (gate for everything later).
 4. Backend decision by measurement (NEON vs Metal at 1, 2, 4, 8, 16 rows).
 5. Draft model, speculation loop, prompt snapshots, long-prompt prefill, KV5.
@@ -74,6 +76,9 @@ Release criteria (all must hold):
   other project process running.
 - Feature branches, pull requests, CI green and a cross-model review before
   each merge to main.
+- Codex workers sometimes cannot write `.git` (sandbox). Briefs ask them to
+  leave work staged; the orchestrator commits after running the proof.
+- Parallel workers get their own git worktree under `.work/wt/`.
 
 ## Decisions
 
@@ -104,6 +109,13 @@ Orchestrator decisions:
 | Date | Step | What | Evidence |
 |---|---|---|---|
 | 2026-11-14 | 0 | PR #2 found already merged; CI green on main at d161397 | `gh pr list --state all`, `gh run list` |
+| 2026-11-14 | 1 | D7 to D9 implemented by Sol (75271d6). Opus review: code correct, tests could not detect a wrong tile schedule. Sol fix round (8ee8520): `prefix_schedule()` tested against hand-written schedules, pinned bits. 61 tests pass, none ignored. | `cargo test --workspace --release`; `! grep -rnE 'todo!\|unimplemented!\|#\[ignore\|SpecGap' crates/` |
+
+## Known debts
+
+- `cargo test --workspace` in debug mode takes about 4 minutes, nearly all in
+  one mixed-model test; CI takes about 11 minutes. Plan: raise the dev
+  profile optimization level while keeping debug assertions (do with step 2).
 
 ## Measurements
 
