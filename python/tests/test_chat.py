@@ -43,7 +43,7 @@ class CleanMessageTests(unittest.TestCase):
         m = clean_messages([{"role": "user", "content": [{"type": "text", "text": "hi"}]}, {"role": "assistant", "content": None}])
         self.assertEqual(m[0]["content"], [{"type": "text", "text": "hi"}])
         self.assertEqual(m[1]["content"], "")
-        for bad in ([], None, [{"role": "tool", "content": "x"}], [{"role": "user", "content": 5}],
+        for bad in ([], None, [{"role": "function", "content": "x"}], [{"role": "user", "content": 5}],
                     [{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}]):
             with self.assertRaises(RequestError):
                 clean_messages(bad)

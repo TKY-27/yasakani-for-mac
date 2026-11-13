@@ -182,7 +182,7 @@ cache has not been measured.
 
 ## Supported environment
 
-This release covers text chat with Qwen3.8-27B on Windows 11 and the RTX 5090. Image input is future work. Tool calling through the API is a preview: it is in the package that comes with the harness, not in the 0.1.0 package.
+This release covers text chat with Qwen3.8-27B on Windows 11 and the RTX 5090. Image input is future work. Tool calling through the API is in the package since 0.1.1; it is not part of the measurements on this page.
 Which configurations and context lengths work on 24 GB and 16 GB GPUs will be checked on each actual card; operation is not promised from
 the file size alone, and the conversation history and working memory are included in that check. The executables are not code-signed, so
 Windows may show a warning.

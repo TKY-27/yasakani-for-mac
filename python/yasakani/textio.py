@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -177,3 +178,153 @@ class OutputStream:
             if tail:
                 events.append(("content", tail))
         return events
+
+
+# ---- tool calls -------------------------------------------------------------------------------------------------------------------
+# The model's chat template asks for tool calls in this form (text inside the answer):
+#
+#     <tool_call>
+#     <function=NAME>
+#     <parameter=KEY>
+#     value (may span several lines)
+#     </parameter>
+#     </function>
+#     </tool_call>
+#
+# ToolCallFilter takes the answer text as it is streamed and splits it into plain text and complete tool calls.
+TOOL_OPEN, TOOL_CLOSE = "<tool_call>", "</tool_call>"
+_FUNCTION = re.compile(r"<function=([^>\n]+)>")
+_PARAMETER = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.S)
+
+
+def tool_schemas(tools: Optional[Sequence[dict]]) -> Dict[str, dict]:
+    """name -> {parameter name: JSON schema} of OpenAI-style tool definitions."""
+    out: Dict[str, dict] = {}
+    for t in tools or ():
+        f = t.get("function") if isinstance(t, dict) and isinstance(t.get("function"), dict) else t
+        if isinstance(f, dict) and isinstance(f.get("name"), str):
+            params = f.get("parameters") if isinstance(f.get("parameters"), dict) else {}
+            props = params.get("properties") if isinstance(params.get("properties"), dict) else {}
+            out[f["name"]] = props
+    return out
+
+
+def _is_string_schema(schema) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    t = schema.get("type")
+    if isinstance(t, str):
+        return t == "string"
+    if isinstance(t, list):
+        return bool(t) and all(x in ("string", "null") for x in t) and "string" in t
+    return False
+
+
+def convert_parameter(value: str, schema) -> object:
+    """The text of one <parameter> block as a JSON value.  A parameter declared as a string stays text; anything else is read as
+    JSON when it is JSON (numbers, booleans, lists, objects) and stays text when it is not."""
+    if _is_string_schema(schema):
+        return value
+    try:
+        v = json.loads(value)
+    except (ValueError, TypeError):
+        return value
+    if isinstance(v, str) and not isinstance(schema, dict):
+        return value                                   # no declaration: keep what the model wrote, quotes included
+    return v
+
+
+def parse_tool_call(block: str, schemas: Dict[str, dict]) -> Optional[dict]:
+    """The inside of one <tool_call> block -> {"name": ..., "arguments": {...}}, or None when it is not a call."""
+    m = _FUNCTION.search(block)
+    if m:
+        name = m.group(1).strip()
+        props = schemas.get(name) or {}
+        args = {}
+        for key, value in _PARAMETER.findall(block[m.end():]):
+            key = key.strip()
+            args[key] = convert_parameter(value, props.get(key))
+        return {"name": name, "arguments": args} if name else None
+    text = block.strip()
+    if text.startswith("{"):                              # the JSON form some models fall back to
+        try:
+            d = json.loads(text)
+        except ValueError:
+            return None
+        if isinstance(d, dict) and isinstance(d.get("name"), str) and d["name"]:
+            args = d.get("arguments", d.get("parameters", {}))
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    return None
+            if args is None:
+                args = {}
+            if isinstance(args, dict):
+                return {"name": d["name"], "arguments": args}
+    return None
+
+
+class ToolCallFilter:
+    """``push(text)`` returns a list of ``("content", text)`` and ``("tool_call", {"name", "arguments"})`` items.  Text that might be
+    the start of a tool call (and white space that might only separate the text from a call) is held back until it is decided.
+    ``flush()`` returns what is left: an unfinished or unreadable call comes back as text, so nothing the model wrote is lost."""
+
+    def __init__(self, tools: Optional[Sequence[dict]]):
+        self.schemas = tool_schemas(tools)
+        self.buf = ""
+        self.inside = False
+        self.gap = ""                    # white space that stood between the text and the <tool_call> being read
+        self.calls = 0
+
+    def _text(self, text: str, out: list) -> None:
+        if text and (text.strip() or not self.calls):
+            out.append(("content", text))
+
+    def push(self, text: str) -> list:
+        out: list = []
+        self.buf += text
+        while True:
+            if self.inside:
+                j = self.buf.find(TOOL_CLOSE)
+                if j < 0:
+                    return out
+                block, self.buf, self.inside = self.buf[:j], self.buf[j + len(TOOL_CLOSE):], False
+                call = parse_tool_call(block, self.schemas)
+                if call is None:
+                    out.append(("content", self.gap + TOOL_OPEN + block + TOOL_CLOSE))
+                else:
+                    self.calls += 1
+                    out.append(("tool_call", call))
+                self.gap = ""
+                continue
+            i = self.buf.find(TOOL_OPEN)
+            if i >= 0:
+                before = self.buf[:i]
+                self._text(before.rstrip(), out)
+                self.gap = before[len(before.rstrip()):]
+                self.buf, self.inside = self.buf[i + len(TOOL_OPEN):], True
+                continue
+            keep = 0                                       # a tail that may be the start of <tool_call> ...
+            for k in range(min(len(TOOL_OPEN) - 1, len(self.buf)), 0, -1):
+                if self.buf.endswith(TOOL_OPEN[:k]):
+                    keep = k
+                    break
+            head = self.buf[:len(self.buf) - keep]
+            cut = len(head.rstrip())                        # ... and the white space before it
+            if cut:
+                self._text(self.buf[:cut], out)
+                self.buf = self.buf[cut:]
+            return out
+
+    def flush(self) -> list:
+        out: list = []
+        rest, self.buf = self.buf, ""
+        if self.inside:
+            self.inside = False
+            out.append(("content", self.gap + TOOL_OPEN + rest))
+            self.gap = ""
+        elif rest.strip() or (rest and not self.calls):
+            out.append(("content", rest))
+        return out
+

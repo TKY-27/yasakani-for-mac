@@ -6,7 +6,7 @@ This package is the part you talk to: a local **OpenAI-compatible server**, a **
 whether your files and your installation are the reference ones. The engine itself is the DLL; the package loads it, applies the
 default settings the published numbers were measured with, handles the chat template and the tokenizer, and streams the answer.
 
-Status: first public release (`0.1.0`). Text only. One request is generated at a time.
+Status: version `0.1.1`. Text only. One request is generated at a time. Tool calling is new in 0.1.1.
 
 ## What you need
 
@@ -82,10 +82,25 @@ curl http://127.0.0.1:8765/v1/chat/completions -H "Content-Type: application/jso
   -d "{\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}],\"chat_template_kwargs\":{\"enable_thinking\":false}}"
 ```
 
-Supported request fields: `messages` (text only), `max_tokens` / `max_completion_tokens`, `temperature` (0-2; 0 is greedy), `top_p`, `top_k` (at most 20),
+Supported request fields: `messages` (text only; the roles `system`, `developer`, `user`, `assistant` and `tool`), `tools` with `tool_choice`
+`auto` or `none`, `max_tokens` / `max_completion_tokens`, `temperature` (0-2; 0 is greedy), `top_p`, `top_k` (at most 20),
 `min_p`, `seed`, `stop` (up to 4 strings), `stream` with `stream_options.include_usage`, `reasoning_effort` (`low`, `medium`, `high`, `xhigh`),
 `chat_template_kwargs` (for example `{"enable_thinking": false}`), `ignore_eos`, `loop_guard`. The defaults are the model's own:
-temperature 1.0, top_p 0.95, top_k 20. Not supported (answered with 400): images, `tools` / `functions`, `n` other than 1, `logprobs`.
+temperature 1.0, top_p 0.95, top_k 20. Not supported (answered with 400): images, the old `functions` / `function_call` fields, a forced `tool_choice`, `n` other than 1, `logprobs`.
+
+Tool calling (new in 0.1.1): send `tools` (functions) with `tool_choice` `"auto"` (the default) or `"none"`. The model's own chat template
+describes the tools to the model. The calls it writes come back as `message.tool_calls`, and `finish_reason` is `tool_calls`; in a stream each
+finished call arrives as one chunk with the whole arguments. Send the results back as messages with the role `tool`. An input that does
+not fit into the context is answered with 400 and the error code `context_length_exceeded` before any text is sent. Also accepted:
+`thinking_budget` (a number of tokens after which the thinking is closed and the answer starts; 0 = no limit) and
+`"thinking": {"type": "enabled"}` / `{"type": "disabled"}`. Tool calling is new and has been tested far less than plain chat.
+
+```python
+tools = [{"type": "function", "function": {"name": "get_weather", "description": "Get the weather of a city.",
+          "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+r = client.chat.completions.create(model="qwen3.8-27b", messages=[{"role": "user", "content": "How is the weather in Osaka?"}], tools=tools)
+print(r.choices[0].message.tool_calls)
+```
 
 * The thinking comes back as `reasoning_content` (and as `delta.reasoning_content` when streaming), the answer as `content`.
 * By default the model thinks first, at its longest thinking setting, and `max_tokens` counts the thinking too. With a small limit a request can

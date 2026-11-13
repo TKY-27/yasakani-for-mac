@@ -3,7 +3,7 @@
 Technical notes by the author, written as a map for people who read the source code in this repository.
 日本語: [TECHNOLOGY.ja.md](TECHNOLOGY.ja.md)
 
-* Scope: version 0.1.0. Windows 11, one NVIDIA GeForce RTX 5090, Qwen3.8-27B.
+* Scope: versions 0.1.0 and 0.1.1 (the engine library is the same in both). Windows 11, one NVIDIA GeForce RTX 5090, Qwen3.8-27B.
 * Unless noted otherwise, the numbers here were measured on 12 November 2026 on the author's computer with the public `yskn.dll` and the
   fastest model (context 16,384, temperature 0, 768 tokens each, four tasks). Comparisons with other engines, and their conditions, are in
   [MEASUREMENTS.md](MEASUREMENTS.md).

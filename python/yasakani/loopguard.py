@@ -20,6 +20,7 @@ DIGITS = 1000              # this many digit ids in a row inside the thinking is
 
 BRIDGE = ("\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n")
 NOTICE = "\n\n[loop guard: the same sequence kept repeating, so the thinking was cut here and the answer follows]\n"
+BUDGET_NOTICE = "\n\n[thinking budget: the thinking reached its limit, so it was cut here and the answer follows]\n"
 
 
 def loop_period(ids: np.ndarray, start: int, n: int, run: int) -> int:
@@ -37,7 +38,7 @@ def loop_period(ids: np.ndarray, start: int, n: int, run: int) -> int:
 @dataclass
 class LoopHit:
     where: str            # "reasoning" | "answer"
-    kind: str             # "repeat" | "digits"
+    kind: str             # "repeat" | "digits" | "budget"
     at: int               # ids produced when it was noticed
     period: int = 0
     run: int = 0
@@ -46,10 +47,12 @@ class LoopHit:
 class LoopWatch:
     """Feed it the growing id array (``check(ids)``); it returns a ``LoopHit`` once, then stays quiet."""
 
-    def __init__(self, think_end_id: int, digit_ids: np.ndarray, in_reasoning: bool, base: int = 0):
+    def __init__(self, think_end_id: int, digit_ids: np.ndarray, in_reasoning: bool, base: int = 0, budget: int = 0, loops: bool = True):
         self.think_end = int(think_end_id)
         self.digits = np.asarray(digit_ids, np.int32)
         self.base = int(base)                           # ids before this index belong to an earlier stage and are not looked at
+        self.budget = int(budget)                       # > 0: the thinking may take this many ids at most (0 = no limit)
+        self.loops = bool(loops)                        # False: only the budget is watched
         self.think_at: Optional[int] = None if in_reasoning else -1
         self.checked = self.base
         self.dig_run = 0
@@ -72,8 +75,10 @@ class LoopWatch:
             p, where = loop_period(ids, self.base, n, RUN_REASONING), "reasoning"
         else:
             p, where = loop_period(ids, max(self.think_at + 1, self.base), n, RUN_ANSWER), "answer"
-        if p:
+        if p and self.loops:
             self.hit = LoopHit(where=where, kind="repeat", at=n, period=p)
-        elif self.think_at is None and self.dig_run >= DIGITS:
+        elif self.loops and self.think_at is None and self.dig_run >= DIGITS:
             self.hit = LoopHit(where="reasoning", kind="digits", at=n, run=self.dig_run)
+        elif self.think_at is None and self.budget > 0 and n - self.base >= self.budget:
+            self.hit = LoopHit(where="reasoning", kind="budget", at=n)
         return self.hit

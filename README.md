@@ -3,7 +3,7 @@
 A local LLM engine for **Windows** and **one NVIDIA RTX 5090**, built for one model: **Qwen3.8-27B**. Open source, Apache License 2.0.
 日本語は [README.ja.md](README.ja.md)。
 
-> **Version 0.1.0 - the first public release (November 13, 2026).** Engine: [release page](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.0). Models on Hugging Face: [quality model](https://huggingface.co/yasakani-dev/Qwen3.8-27B-YASAKANI-quality) and [fastest model](https://huggingface.co/yasakani-dev/Qwen3.8-27B-YASAKANI-speed).
+> **Version 0.1.1 (November 14, 2026).** New in this version: the server accepts requests with `tools` (tool / function calling), so coding agents and other tool-using apps can connect to it; version 0.1.0 refused them. Engine: [release page](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.1). Models on Hugging Face: [quality model](https://huggingface.co/yasakani-dev/Qwen3.8-27B-YASAKANI-quality) and [fastest model](https://huggingface.co/yasakani-dev/Qwen3.8-27B-YASAKANI-speed).
 >
 > **Support the development:** crowdfunding on CAMPFIRE for backers living in Japan, until December 16, 2026 - https://camp-fire.jp/projects/992233/view (outside Japan: see [Support](#support))
 
@@ -151,12 +151,12 @@ generation just becomes several times slower (a warning is printed at start in t
 
 ## Quick start
 
-**The quickest way:** unpack `yasakani-quickstart-0.1.0.zip` from the [release page](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.0) to a plain path such as
+**The quickest way:** unpack `yasakani-quickstart-0.1.1.zip` from the [release page](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.1) to a plain path such as
 `C:\yasakani` and double-click `START.cmd`. It downloads the engine and one model and runs the checks; then you can measure the speed,
 compare look-ahead on and off (the numbers of the technical notes, on your own PC), chat in your browser, or start the server. You only answer its questions with a number (Python 3.10 or newer is needed). What it does is in
 [quickstart/](quickstart/). To install by hand:
 
-1. Download the engine zip (`yskn.dll` and the Python package) from the [release page](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.0) and one model folder from
+1. Download the engine zip (`yskn.dll` and the Python package) from the [release page](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.1) and one model folder from
    Hugging Face ([quality](https://huggingface.co/yasakani-dev/Qwen3.8-27B-YASAKANI-quality) or [fastest](https://huggingface.co/yasakani-dev/Qwen3.8-27B-YASAKANI-speed)). Compare the SHA-256 checksums with the ones on the release page.
 
 ```bat
@@ -197,15 +197,15 @@ To build `yskn.dll` yourself, see [BUILDING.md](BUILDING.md); common questions a
 
 ## Use it as an agent
 
-`yasakani-harness-0.1.0.zip` on the [release page](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.0) opens an agent screen in your browser, run by the model
+`yasakani-harness-0.1.0.zip` on the [release page](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.1) opens an agent screen in your browser, run by the model
 on your PC: the model reads and writes files in a work folder and runs commands (you choose on the screen whether it may change files).
 Run the quickstart above first; then unpack the harness zip into the quickstart folder or next to it and double-click `START_HARNESS.cmd`.
 
 * The screen is [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (open-source software by DeepSeek, MIT license), used
   unchanged. It is installed from npm on first use (about 730 MB; Node.js is fetched too if the PC has none). YASAKANI adds a settings file
   and a Japanese language pack. YASAKANI is not affiliated with DeepSeek, and this combination is not an official product.
-* Tool calling is a preview. The harness brings the next version of the Python package (0.2.0.dev0), in which the server answers requests
-  with `tools`, and starts the server with it. The 0.1.0 package of this release has no tool calling.
+* The harness zip is the one of 0.1.0, unchanged. It starts the server with the copy of the Python package that comes with it (0.2.0.dev0);
+  the tool-calling code of that copy is the code that is in the standard package since 0.1.1.
 * A new session starts with the model's longest thinking setting. One reply may take up to 98,304 tokens; a thinking longer than 49,152
   tokens is closed there and the model goes on to the answer. With both models installed, the screen can switch between them.
 * Everything is kept inside the harness folder. A DeepSeek Harness you already use is not touched.
@@ -231,7 +231,7 @@ part contributes, and the source files that go with each.
 
 ## Limits
 
-* Windows 11 + RTX 5090 + Qwen3.8-27B only. One request at a time. Text only: no images, no `n` above 1, no `logprobs`. Tool / function calling is only in the preview package of the harness (see [Use it as an agent](#use-it-as-an-agent)).
+* Windows 11 + RTX 5090 + Qwen3.8-27B only. One request at a time. Text only: no images, no `n` above 1, no `logprobs`. Tool / function calling: `tools` with `tool_choice` `auto` or `none` (new in 0.1.1; a forced `tool_choice` is not supported). It is new and has been tested far less than plain chat.
 * The release files are not code-signed, so Windows may warn about them (see [SECURITY.md](SECURITY.md)).
 * The answers are not identical to the original model's (see Quality).
 

@@ -3,7 +3,7 @@
 **Windows** と **NVIDIA RTX 5090 1 枚**で、**Qwen3.8-27B** を速く動かすローカル AI エンジンです。オープンソース（Apache License 2.0）。
 English: [README.md](README.md)
 
-> **バージョン 0.1.0（初回公開、2026 年 11 月 13 日）。** エンジン：[公開ページ](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.0)。モデル（Hugging Face）：[品質モデル](https://huggingface.co/yasakani-dev/Qwen3.8-27B-YASAKANI-quality)・[最速モデル](https://huggingface.co/yasakani-dev/Qwen3.8-27B-YASAKANI-speed)。
+> **バージョン 0.1.1（2026 年 11 月 14 日）。** この版から、サーバーが `tools` 付きの依頼（ツール／関数呼び出し）を受け付けます。コーディング用のエージェントなど、ツールを使うアプリをつなげます（0.1.0 は断っていました）。エンジン：[公開ページ](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.1)。モデル（Hugging Face）：[品質モデル](https://huggingface.co/yasakani-dev/Qwen3.8-27B-YASAKANI-quality)・[最速モデル](https://huggingface.co/yasakani-dev/Qwen3.8-27B-YASAKANI-speed)。
 >
 > **開発を応援してください：** CAMPFIRE でクラウドファンディングを行っています（2026 年 12 月 16 日まで）→ https://camp-fire.jp/projects/992233/view
 
@@ -138,11 +138,11 @@ GPU のメモリをたくさん使うほかのプログラム（ゲーム、ほ�
 
 ## 使いはじめ
 
-**いちばん手軽な方法：** [公開ページ](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.0)の `yasakani-quickstart-0.1.0.zip` を、`C:\yasakani` のような英数字だけの場所に展開して、
+**いちばん手軽な方法：** [公開ページ](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.1)の `yasakani-quickstart-0.1.1.zip` を、`C:\yasakani` のような英数字だけの場所に展開して、
 `START.cmd` をダブルクリックします。エンジンとモデルのダウンロードと点検まで自動で進み、そのあと、速さの測定・先読みあり／なしの比較（技術の解説の数字を自分のパソコンで確かめる）・ブラウザーでのチャット・サーバーの起動を選べます。
 画面の質問には、番号で答えるだけです（Python 3.10 以上が必要です）。していることは [quickstart/](quickstart/) にあります。手で入れる場合は、次のとおりです。
 
-1. [公開ページ](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.0)からエンジンの zip（`yskn.dll` と Python のパッケージ）を、Hugging Face からモデルのフォルダーを 1 つ
+1. [公開ページ](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.1)からエンジンの zip（`yskn.dll` と Python のパッケージ）を、Hugging Face からモデルのフォルダーを 1 つ
    （[品質モデル](https://huggingface.co/yasakani-dev/Qwen3.8-27B-YASAKANI-quality) か [最速モデル](https://huggingface.co/yasakani-dev/Qwen3.8-27B-YASAKANI-speed)）ダウンロードします。SHA-256 のチェックサムを、公開ページのものと比べてください。
 
 ```bat
@@ -181,15 +181,15 @@ yasakani serve --model-dir D:\models\qwen38-quality --dll D:\yasakani\yskn.dll
 
 ## エージェントとして使う
 
-[公開ページ](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.0)の `yasakani-harness-0.1.0.zip` は、このパソコンのモデルが動かす「エージェントの画面」をブラウザーで開きます。
+[公開ページ](https://github.com/yasakani-dev/yasakani/releases/tag/v0.1.1)の `yasakani-harness-0.1.0.zip` は、このパソコンのモデルが動かす「エージェントの画面」をブラウザーで開きます。
 モデルが、作業フォルダーのファイルを読み書きし、コマンドを実行します（ファイルを書きかえてよいかどうかは、画面で選べます）。
 先に上のクイックスタートを済ませてから、この zip をクイックスタートのフォルダーの中か、そのとなりに展開して、`START_HARNESS.cmd` をダブルクリックします。
 
 * 画面は [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DeepSeek 社が MIT ライセンスで公開しているソフト）を、書きかえずにそのまま使っています。
   はじめて起動するときに npm から入れます（約 730 MB。Node.js が無ければ、それも取ってきます）。YASAKANI が足しているのは、設定のファイルと日本語の表示だけです。
   YASAKANI は DeepSeek 社とは関係のない個人の開発で、この組み合わせは公式の物ではありません。
-* ツール呼び出しは、まだ試作です。ハーネスには、Python のパッケージの次の版（0.2.0.dev0。サーバーが `tools` つきの依頼に答えます）を同梱していて、
-  それでサーバーを起動します。この版（0.1.0）のパッケージは、ツール呼び出しに対応していません。
+* ハーネスの zip は 0.1.0 の物のままです。同梱している Python のパッケージ（0.2.0.dev0）でサーバーを起動します。
+  そのツール呼び出しの処理は、0.1.1 から通常のパッケージに入っている物と同じです。
 * 最初は、いちばん長く考える設定です。1 回の返事は 98,304 トークンまで。考える量が 49,152 トークンを超えると、そこで切り上げて答えに進みます。
   モデルを 2 つとも入れてあれば、画面のボタンで切り替えられます。
 * 入れたものは、すべてハーネスのフォルダーの中に置きます。すでに使っている DeepSeek Harness には触りません。
@@ -213,7 +213,7 @@ yasakani serve --model-dir D:\models\qwen38-quality --dll D:\yasakani\yskn.dll
 
 ## 限界
 
-* Windows 11 ＋ RTX 5090 ＋ Qwen3.8-27B だけ。1 リクエストずつ。文字だけ（画像、`n` が 2 以上、`logprobs` は非対応）。ツール／関数呼び出しは、ハーネスに同梱した試作パッケージだけが対応しています（[エージェントとして使う](#エージェントとして使う)）。
+* Windows 11 ＋ RTX 5090 ＋ Qwen3.8-27B だけ。1 リクエストずつ。文字だけ（画像、`n` が 2 以上、`logprobs` は非対応）。ツール／関数呼び出しは 0.1.1 から対応しています（`tools` と `tool_choice` の `auto`・`none`。呼び出しを強制する `tool_choice` は非対応）。新しい機能で、通常のチャットほどは試験していません。
 * 配布ファイルにはコード署名がないので、Windows が警告することがあります（[SECURITY.md](SECURITY.md)）。
 * 答えは、元のモデルと同じではありません（品質の項）。
 

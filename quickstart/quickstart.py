@@ -35,10 +35,10 @@ import webbrowser
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-QS_VERSION = "0.1.0"
-ENGINE_ZIP = "yasakani-0.1.0-win-x64.zip"
-ENGINE_URL = "https://github.com/yasakani-dev/yasakani/releases/download/v0.1.0/" + ENGINE_ZIP
-ENGINE_SHA256 = "c1723dd905fd37972416c361c40022fccafb7d8b4517dcce342df8d8b36df7b0"
+QS_VERSION = "0.1.1"
+ENGINE_ZIP = "yasakani-0.1.1-win-x64.zip"
+ENGINE_URL = "https://github.com/yasakani-dev/yasakani/releases/download/v0.1.1/" + ENGINE_ZIP
+ENGINE_SHA256 = "2550f576c252c42bc9884f4e7783d5443ccd722fc53ca34a96d7b6bf545af723"
 REPO_URL = "https://github.com/yasakani-dev/yasakani"
 SUPPORT_URL = "https://camp-fire.jp/projects/992233/view"
 ENGINE_PORT, WEB_PORT = 8765, 8766      # `yasakani serve` and the browser chat; the next free ports are used if these are taken
