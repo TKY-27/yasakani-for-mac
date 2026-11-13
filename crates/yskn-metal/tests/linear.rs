@@ -219,6 +219,46 @@ mod macos {
     }
 
     #[test]
+    fn tensors_sharing_codes_keep_their_own_tables() {
+        let Some(mut engine) = engine() else { return };
+        // Tensor "linear" (A) keeps the fixture's codes; B points at the same codes
+        // but has its own lookup table appended at the end of the file.
+        let mut bytes = synthetic(4, "row", 32, 32, 512, false);
+        let header_length = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header: serde_json::Value =
+            serde_json::from_slice(&bytes[32..32 + header_length]).unwrap();
+        let table_a = header["tensors"][0]["lut_off"].as_u64().unwrap() as usize;
+        let table_b = bytes.len();
+        let one = yskn_format::f32_to_f16(1.0).to_le_bytes();
+        let minus_one = yskn_format::f32_to_f16(-1.0).to_le_bytes();
+        for pair in bytes[table_a..table_a + 16_384].as_chunks_mut::<2>().0 {
+            *pair = one;
+        }
+        for _ in 0..8192 {
+            bytes.extend_from_slice(&minus_one);
+        }
+        let file_bytes = bytes.len() as u64;
+        bytes[24..32].copy_from_slice(&file_bytes.to_le_bytes());
+        let bytes = change_header(&bytes, |header| {
+            let mut b = header["tensors"][0].clone();
+            b["name"] = json!("b");
+            b["lut_off"] = json!(table_b);
+            header["tensors"].as_array_mut().unwrap().push(b);
+        });
+        let file = TempFile::new(&bytes);
+        // SAFETY: the private file is never modified and outlives all mapping owners.
+        let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+        let a = model.matrix("linear").unwrap();
+        let b = model.matrix("b").unwrap();
+        assert_eq!(a.code_range(), b.code_range());
+        // Every weight quantizes to ±127, so each row is ±512 * 127 whatever the codes.
+        let a_sums = engine.weighted_sums(&a, &[1; 512], &[1]).unwrap();
+        let b_sums = engine.weighted_sums(&b, &[1; 512], &[1]).unwrap();
+        assert_eq!(a_sums, vec![65_024; 32]);
+        assert_eq!(b_sums, vec![-65_024; 32]);
+    }
+
+    #[test]
     fn invalid_shapes_are_rejected_before_dispatch() {
         let Some(mut engine) = engine() else { return };
         let bytes = synthetic(6, "warp", 65, 96, 1024, false);

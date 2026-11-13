@@ -227,8 +227,10 @@ pub struct MetalEngine {
     // Keyed by mapping address. The engine keeps every mapping it has wrapped alive
     // until it is dropped, so an address (and a table key) cannot be reused meanwhile.
     mappings: HashMap<usize, Rc<CodeBuffer>>,
-    /// Signed-byte tables keyed by (mapping address, code stream offset).
-    tables: HashMap<(usize, usize), Retained<Buffer>>,
+    /// Signed-byte tables keyed by (mapping address, lookup-table offset): the
+    /// quantized table depends only on the f16 table at that offset, while tensors
+    /// may share a code stream but not a table.
+    tables: HashMap<(usize, u64), Retained<Buffer>>,
     splits: usize,
 }
 
@@ -489,7 +491,7 @@ impl MetalEngine {
                 first_input,
             });
         }
-        let table_key = (matrix.mapping().as_ptr() as usize, range.start);
+        let table_key = (matrix.mapping().as_ptr() as usize, d.table_offset);
         let table = match self.tables.get(&table_key) {
             Some(table) => table.clone(),
             None => {
