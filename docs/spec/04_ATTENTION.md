@@ -305,7 +305,15 @@ The 31/42/4096 constants are engine defaults retained by the shipping environmen
 
 The prefix computation processes 32-key tiles. For numerical fidelity, each group of two query rows (passes of at most two), eight rows (three to eight), or sixteen rows (larger passes) uses a common tile range for a split: take the minimum `first` and maximum `prefix_end` over nonempty prefix ranges in that row group, round the minimum down to a multiple of 32, and visit tiles through the maximum. Each query masks every key outside its own prefix. If no row in the group has a nonempty prefix, visit no prefix tiles. This accounts for the source's shared tile extent without prescribing GPU execution. Sources: `src/q35_atxpk3.cuh:184-195`, `src/q35_atxpk4.cuh:97-108`, `src/q35_atxpk3.cuh:488-502`, `src/q35_atxpk4.cuh:431-434`, `src/q35_atx.cu:379-387`, `src/q35_atx.cu:824-826`.
 
+**Scalar reference:** [D9](../port/DECISIONS.md#d9--per-row-prefix-tiles-and-skipped-masked-values) replaces this upstream behavior with per-row tiles and skipped masked value operations.
+
 ## Prefix score, online softmax, and value accumulation
+
+**Scalar reference note:** [D7](../port/DECISIONS.md#d7--portable-exp2-construction)
+defines portable exp2; [D9](../port/DECISIONS.md#d9--per-row-prefix-tiles-and-skipped-masked-values)
+uses only absolute 32-slot tiles intersecting each row's own prefix, with
+masked scores of negative infinity, probabilities of `+0.0` in the sum,
+and entirely skipped masked value operations (no zero operands).
 
 For this section define `Kbase[position,channel]` and `Vbase[position,channel]` as the BF16 codebook values selected by a packed row, or the exact signed-int8 integer values widened to BF16 for an int8 row. `Kscale`/`Vscale` are the corresponding FP32 row scales. Keep them separate; rounding `Kbase*Kscale` or `Vbase*Vscale` to BF16 before attention would change this path. Sources: `src/q35_atxpk.cu:55-66`, `src/q35_atxpk3.cuh:343-380`, `src/q35_atxpk3.cuh:402-406`, `src/q35_atx.cu:57-61`, `src/q35_atx.cu:478-520`.
 
@@ -354,6 +362,8 @@ for half in 0..1:
 ```
 
 The code skips a numerator multiplication by one when both associated query-row rescale factors are one. The multiply above describes the same finite arithmetic result; a literal execution trace can preserve that conditional. Masked keys have probability zero and a zero scale when outside the shared loaded extent. Sources: `src/q35_atxpk3.cuh:316-319`, `src/q35_atxpk3.cuh:200-227`, `src/q35_atxpk4.cuh:256-258`, `src/q35_atx.cu:396-407`.
+
+**Scalar reference:** [D9](../port/DECISIONS.md#d9--per-row-prefix-tiles-and-skipped-masked-values) replaces this upstream behavior with per-row tiles and skipped masked value operations.
 
 ## Separate self contribution
 

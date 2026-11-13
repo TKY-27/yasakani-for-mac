@@ -28,8 +28,9 @@ zero codes, scales and weighted sum.
 Attention uses each row's own canonical prefix tiles and the documented
 31/42-split schedule, rather than a batch-dependent shared tile extent.
 The prefix and self paths remain distinct, including the BF16 boundary on
-prefix probability/value weights. The unresolved masked operands remain a
-gap; this choice does not supply their missing bit patterns.
+prefix probability/value weights. D9 resolves masked operands by skipping
+their value operations entirely while retaining positive-zero probabilities
+in the denominator reduction.
 
 ## D2 — Explicit portable math
 
@@ -46,9 +47,9 @@ radicand, binary search and an exact midpoint comparison, followed by the
 separately rounded binary32 division. This implements the specified IEEE
 primitive without introducing a platform math dependency.
 
-**There is no exp2 implementation in the permitted source.** It is left as
-`todo!()` under [MATH-01](SPEC_GAPS.md#math-01). In particular, substituting
-`exp(x * ln(2))` would invent an operation sequence.
+**There is no exp2 implementation in the permitted source.** D7 explicitly
+authorizes the portable `exp` of a separately rounded binary32 product with
+ln 2, resolving [MATH-01](SPEC_GAPS.md#math-01).
 
 The port also preserves surprising portable-source behavior. For example,
 `pm_log_d(+0)` and `pm_log_d(-0)` return finite bit patterns
@@ -115,9 +116,10 @@ Hidden and FFN widths still must be positive multiples of the format's
 512-element rotation block. Algorithm block/tile sizes are not model-size
 defaults.
 
-The specification supplies no rotary-width header rule. That is
-[ARCH-01](SPEC_GAPS.md#arch-01), not permission to insert a constant width
-or invent a JSON field. The 32 frequency bit patterns are preserved as
+The specification supplies no rotary-width header rule. D8 resolves
+[ARCH-01](SPEC_GAPS.md#arch-01) with an explicit exception: `model.arch`
+`qwen3_5` uses rotary width 64 and requires `model.head_dim == 256`. No new
+header field is introduced. The 32 frequency bit patterns are preserved as
 specified; `rope_theta` is not used to regenerate them.
 
 ## D6 — Validated input and finite execution
@@ -136,6 +138,42 @@ are checked before a transcendental could turn infinity into a finite zero.
 Signed integer accumulation uses checked addition where its range is not
 intrinsically bounded. Public sequence operations validate token IDs,
 positions and accepted-row counts before publishing any changed state.
+
+## D7 — Portable exp2 construction
+
+`exp2(t)` is `exp(t * f32::from_bits(0x3f31_7218))`, using the existing
+portable binary32 `exp`. The multiplication rounds once to binary32 before
+the call; no FMA or platform transcendental is used. Exceptional inputs
+follow this product and the existing `exp` behavior.
+
+Upstream calls `exp2f(x * log2e)` at these attention sites and supplies no
+portable exp2. This explicit construction resolves
+[MATH-01](SPEC_GAPS.md#math-01) without claiming CUDA bit equivalence.
+
+## D8 — Fixed qwen3_5 rotary width
+
+For `model.arch == "qwen3_5"`, rotary width is the constant 64 and the loader
+requires `model.head_dim == 256`, as upstream hard-codes. This is a stated
+exception to D5's header-derived dimensions, resolving
+[ARCH-01](SPEC_GAPS.md#arch-01). The existing `arch` field is used; no rotary
+field is invented. A model with `full_attention` and any other architecture
+is rejected with `InvalidModel`, rather than guessing a rotary rule. The
+reference already requires `arch=qwen3_5` for recurrent models as well.
+
+## D9 — Per-row prefix tiles and skipped masked values
+
+Each query visits only the absolute 32-slot tiles intersecting its own
+prefix range in each split: tile k covers positions `32k..32k+31`. No other
+row in the pass changes that tile range. A masked slot has score negative
+infinity and probability `+0.0`; it still enters the existing probability
+sum as `+0.0`.
+
+Masked slots take no part in value accumulation: their scale lookup, weight
+multiplication, value lookup, and multiply/add are skipped entirely. No zero
+operand is substituted. This resolves [ATT-MASK-01](SPEC_GAPS.md#att-mask-01),
+whose unspecified masked operand bits could otherwise change signed-zero
+arithmetic under D3. Every row's result is independent of the other rows
+sharing its pass.
 
 ## Sequence API and quality reporting
 
@@ -180,6 +218,7 @@ quality value has been reproduced.
   compressed operator.
 - The portable log zero behavior above differs from the native-math
   discussion in SMP-03. It is preserved and tested under D2.
-- The three blocking ambiguities, their exact `todo!()` sites, and affected
-  acceptance tests are listed in [SPEC_GAPS.md](SPEC_GAPS.md). Existing
-  specification files have not been silently corrected.
+- The three former blocking ambiguities and their historical implementation
+  boundaries are retained in [SPEC_GAPS.md](SPEC_GAPS.md), resolved by D7–D9.
+  The upstream specification is preserved, with short notes linking these
+  reference decisions.

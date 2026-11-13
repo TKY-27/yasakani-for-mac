@@ -277,6 +277,7 @@ impl Model {
     pub fn from_container<R: Read + Seek>(mut container: Container<R>) -> Result<Self> {
         let header = container.header().model.clone();
         let dimensions = ModelDimensions::read(&header)?;
+        let rotary_dim = rotary_width_from_header(&header)?;
         let layer_types = header
             .get("layer_types")
             .and_then(Value::as_array)
@@ -288,13 +289,6 @@ impl Model {
                 "layer_types must contain one string per layer".into(),
             ));
         }
-        if layer_types
-            .iter()
-            .any(|kind| kind.as_str() == Some("full_attention"))
-        {
-            require_rotary_width_spec()?;
-        }
-
         let embeddings = if container
             .header()
             .tensors
@@ -329,7 +323,7 @@ impl Model {
                         query_heads: dimensions.query_heads,
                         kv_heads: dimensions.kv_heads,
                         head_dim: dimensions.attention_head_width,
-                        rotary_dim: rotary_width_from_header(&header),
+                        rotary_dim,
                     },
                     load_vector(
                         &mut container,
@@ -767,12 +761,45 @@ fn product(left: usize, right: usize) -> Result<usize> {
         .ok_or_else(|| Error::InvalidModel("model dimension product overflow".into()))
 }
 
-fn require_rotary_width_spec() -> Result<()> {
-    Err(Error::SpecGap("ARCH-01"))
+fn rotary_width_from_header(header: &Value) -> Result<usize> {
+    if header.get("arch").and_then(Value::as_str) != Some("qwen3_5") {
+        return Err(Error::InvalidModel(
+            "main reference requires arch=qwen3_5".into(),
+        ));
+    }
+    // D8 is an explicit exception to D5's header-derived dimensions.
+    if header.get("head_dim").and_then(Value::as_u64) != Some(256) {
+        return Err(Error::InvalidModel(
+            "qwen3_5 requires model.head_dim=256 (D8)".into(),
+        ));
+    }
+    Ok(64)
 }
 
-fn rotary_width_from_header(_header: &Value) -> usize {
-    todo!(
-        "docs/port/SPEC_GAPS.md#arch-01: the header field or derivation for rotary width is unspecified"
-    )
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rotary_width_checks_architecture_and_head_width_itself() {
+        assert_eq!(
+            rotary_width_from_header(&json!({"arch": "qwen3_5", "head_dim": 256})).unwrap(),
+            64
+        );
+        for (header, expected) in [
+            (
+                json!({"arch": "other", "head_dim": 256}),
+                "main reference requires arch=qwen3_5",
+            ),
+            (
+                json!({"arch": "qwen3_5", "head_dim": 128}),
+                "qwen3_5 requires model.head_dim=256 (D8)",
+            ),
+        ] {
+            assert!(
+                matches!(rotary_width_from_header(&header), Err(Error::InvalidModel(message)) if message == expected)
+            );
+        }
+    }
 }

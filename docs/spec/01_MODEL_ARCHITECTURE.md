@@ -43,6 +43,10 @@ alone does **not** identify which 16-bit format is stored. Sources:
 | Normalization epsilon | Header `model.eps`, read as FP32; the member initializer `1e-6f` is overwritten | `src/format.hpp:36`, `src/engine35.cpp:218`, `src/engine35.hpp:315` |
 | Context capacity | Requested capacity rounded upward to a multiple of 64; Python model-folder default is 262,144 | `src/engine35.cpp:219`, `python/yasakani/runtime.py:136-138` |
 
+**Scalar reference note:** [D8](../port/DECISIONS.md#d8--fixed-qwen3_5-rotary-width)
+uses rotary width 64 for `model.arch=qwen3_5`, requires `head_dim=256`, and
+rejects unsupported architectures; this is an explicit exception to D5.
+
 **UNCERTAIN [ARCH-01]:** The released main `.yskn` header is not included in
 the checkout. The executable does not hard-code 64 layers, 17,408 feed-forward
 width, the complete layer-type sequence, or the released epsilon. The table

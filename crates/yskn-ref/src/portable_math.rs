@@ -184,14 +184,10 @@ pub fn softplus(value: f32) -> f32 {
     }
 }
 
-/// No portable `exp2` algorithm is present in the permitted upstream file.
-pub fn exp2(_value: f32) -> f32 {
-    todo!("MATH-01: docs/port/SPEC_GAPS.md — pm_math.cuh does not define exp2")
-}
-
-/// Reject an attention pass before it mutates state or reaches the missing primitive.
-pub fn require_exp2() -> Result<()> {
-    Err(Error::SpecGap("MATH-01"))
+/// D7: round the product with binary32 ln(2), then use the portable exp.
+pub fn exp2(value: f32) -> f32 {
+    let argument = value * f32::from_bits(0x3f31_7218);
+    exp(argument)
 }
 
 pub fn exp_d(value: f64) -> f64 {
@@ -408,6 +404,35 @@ pub fn sincos(angle: f32) -> Result<(f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exp2_pins_output_bits() {
+        // Captured from the current D7 implementation, including subnormal rounding.
+        for (value, expected) in [
+            (1.0, 0x4000_0000),
+            (-1.0, 0x3f00_0000),
+            (0.5, 0x3fb5_04f3),
+            (-30.0, 0x3080_0008),
+            (-126.0, 0x007f_ffe6),
+            (-150.0, 0x0000_0001),
+            (-1.44e30, 0x0000_0000),
+            (f32::NEG_INFINITY, 0x0000_0000),
+        ] {
+            assert_eq!(exp2(value).to_bits(), expected, "input {value}");
+        }
+        assert!(exp2(f32::NAN).is_nan());
+    }
+
+    #[test]
+    fn exp2_uses_d7_binary32_product_and_portable_exp() {
+        for value in [
+            0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 1.0e-7, -1.0e-7, 30.0, -30.0, -100.0,
+        ] {
+            let expected = exp(value * f32::from_bits(0x3f31_7218));
+            assert_eq!(exp2(value).to_bits(), expected.to_bits(), "input {value}");
+        }
+        assert_eq!(exp2(0.0).to_bits(), 1.0_f32.to_bits());
+    }
 
     #[test]
     fn square_root_handles_normal_subnormal_and_rounding_boundaries() {
