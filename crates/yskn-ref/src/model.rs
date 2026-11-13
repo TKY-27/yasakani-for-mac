@@ -2,14 +2,14 @@
 
 use std::fs;
 use std::io::{Read, Seek};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
 use serde_json::Value;
 use yskn_format::{Container, VectorType};
 
 use crate::attention::{Attention, AttentionDimensions, AttentionState};
-use crate::compressed_linear::{CompressedLinear, Embedding, quantize_activation};
+use crate::compressed_linear::{CompressedLinear, Embedding, EmbeddingTensor, quantize_activation};
 use crate::gated_deltanet::{
     GatedDeltaNet, GatedDeltaNetDimensions, GatedDeltaNetState, GatedDeltaNetWeights,
 };
@@ -74,72 +74,84 @@ impl ModelDimensions {
     }
 }
 
-enum Embeddings {
-    Coded(Box<Embedding>),
+pub enum Embeddings<T = yskn_format::Tensor> {
+    Coded(Box<Embedding<T>>),
     Plain {
         values: Vec<f32>,
         hidden_width: usize,
     },
 }
 
-impl Embeddings {
-    fn row(&self, token: u32) -> Result<Vec<f32>> {
+impl<T: EmbeddingTensor> Embeddings<T> {
+    pub fn row(&self, token: u32) -> Result<Vec<f32>> {
         match self {
             Self::Coded(embedding) => embedding.row(token as usize),
             Self::Plain {
                 values,
                 hidden_width,
             } => {
-                let start = token as usize * hidden_width;
-                Ok(values[start..start + hidden_width].to_vec())
+                let start = (token as usize)
+                    .checked_mul(*hidden_width)
+                    .ok_or_else(|| Error::InvalidInput("embedding token offset overflow".into()))?;
+                let end = start
+                    .checked_add(*hidden_width)
+                    .ok_or_else(|| Error::InvalidInput("embedding token extent overflow".into()))?;
+                Ok(values
+                    .get(start..end)
+                    .ok_or_else(|| {
+                        Error::InvalidInput("embedding token is outside the vocabulary".into())
+                    })?
+                    .to_vec())
             }
         }
     }
 }
 
-struct AttentionLayer {
-    query_gate: CompressedLinear,
-    key: CompressedLinear,
-    value: CompressedLinear,
-    output: CompressedLinear,
-    attention: Attention,
+pub struct AttentionLayer<L = CompressedLinear> {
+    pub query_gate: L,
+    pub key: L,
+    pub value: L,
+    pub output: L,
+    pub attention: Attention,
 }
 
-struct RecurrentLayer {
-    query_key_value: CompressedLinear,
-    output_gate: CompressedLinear,
-    output: CompressedLinear,
-    recurrence: GatedDeltaNet,
+pub struct RecurrentLayer<L = CompressedLinear> {
+    pub query_key_value: L,
+    pub output_gate: L,
+    pub output: L,
+    pub recurrence: GatedDeltaNet,
 }
 
-enum Branch {
-    Attention(Box<AttentionLayer>),
-    Recurrent(Box<RecurrentLayer>),
+pub enum Branch<L = CompressedLinear> {
+    Attention(Box<AttentionLayer<L>>),
+    Recurrent(Box<RecurrentLayer<L>>),
 }
 
-struct Layer {
-    branch: Branch,
-    input_norm: Vec<f32>,
-    post_attention_norm: Vec<f32>,
-    gate: CompressedLinear,
-    up: CompressedLinear,
-    down: CompressedLinear,
+pub struct Layer<L = CompressedLinear> {
+    pub branch: Branch<L>,
+    pub input_norm: Vec<f32>,
+    pub post_attention_norm: Vec<f32>,
+    pub gate: L,
+    pub up: L,
+    pub down: L,
 }
 
 #[derive(Clone)]
-enum LayerState {
+pub enum LayerState {
     Attention(AttentionState),
     Recurrent(GatedDeltaNetState),
 }
 
-impl Layer {
-    fn new_state(&self) -> Result<LayerState> {
+impl<L> Layer<L> {
+    pub fn new_state(&self) -> Result<LayerState> {
         match &self.branch {
             Branch::Attention(layer) => Ok(LayerState::Attention(layer.attention.new_state()?)),
             Branch::Recurrent(layer) => Ok(LayerState::Recurrent(layer.recurrence.new_state()?)),
         }
     }
+}
 
+impl Layer {
     fn forward(
         &self,
         hidden: &[f32],
@@ -211,12 +223,12 @@ impl Layer {
     }
 }
 
-struct Weights {
-    dimensions: ModelDimensions,
-    embeddings: Embeddings,
-    layers: Vec<Layer>,
-    final_norm: Vec<f32>,
-    head: CompressedLinear,
+pub struct Weights<L = CompressedLinear, T = yskn_format::Tensor> {
+    pub dimensions: ModelDimensions,
+    pub embeddings: Embeddings<T>,
+    pub layers: Vec<Layer<L>>,
+    pub final_norm: Vec<f32>,
+    pub head: L,
 }
 
 /// A single sequence. Immutable weights are shared only through a single-threaded Rc.
@@ -237,188 +249,22 @@ impl Model {
 
     /// Read only the main weights from chapter 10's optional package manifest.
     pub fn load_folder(folder: impl AsRef<Path>) -> Result<Self> {
-        let folder = folder.as_ref();
-        let manifest_path = folder.join("yasakani.json");
-        let manifest: Value = match fs::read(manifest_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Null,
-            Err(error) => return Err(error.into()),
-        };
-        let filename = match manifest.pointer("/files/weights") {
-            Some(Value::String(filename)) => filename.as_str(),
-            None => "qwen38_27b_e3x.yskn",
-            _ => return Err(Error::InvalidModel("files.weights must be a string".into())),
-        };
-        if Path::new(filename)
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
-        {
-            return Err(Error::InvalidModel(
-                "files.weights must be relative to the model folder".into(),
-            ));
-        }
-        let mut model = Self::load(folder.join(filename))?;
-        if let Some(capacity) = manifest.get("max_ctx") {
-            let capacity = capacity
-                .as_u64()
-                .and_then(|value| usize::try_from(value).ok())
-                .filter(|&value| value > 0)
-                .ok_or_else(|| {
-                    Error::InvalidModel("max_ctx must be a positive addressable integer".into())
-                })?;
-            model.context_capacity = capacity
-                .checked_add(63)
-                .map(|rounded| rounded / 64 * 64)
-                .ok_or_else(|| Error::InvalidModel("rounded context capacity overflows".into()))?;
-        }
+        let (path, capacity) = model_location(folder.as_ref())?;
+        let mut model = Self::load(path)?;
+        model.context_capacity = capacity;
         Ok(model)
     }
 
     pub fn from_container<R: Read + Seek>(mut container: Container<R>) -> Result<Self> {
-        let header = container.header().model.clone();
-        let dimensions = ModelDimensions::read(&header)?;
-        let rotary_dim = rotary_width_from_header(&header)?;
-        let layer_types = header
-            .get("layer_types")
-            .and_then(Value::as_array)
-            .ok_or_else(|| Error::InvalidModel("model.layer_types must be an array".into()))?;
-        if layer_types.len() != dimensions.layer_count
-            || layer_types.iter().any(|value| !value.is_string())
-        {
-            return Err(Error::InvalidModel(
-                "layer_types must contain one string per layer".into(),
-            ));
-        }
-        let embeddings = if container
-            .header()
-            .tensors
-            .iter()
-            .any(|tensor| tensor.name == "embed_tokens")
-        {
-            let main = container.load_tensor("embed_tokens")?;
-            if main.rows() != dimensions.vocabulary_size || main.cols() != dimensions.hidden_width {
-                return Err(Error::InvalidModel(
-                    "embedding dimensions do not match model header".into(),
-                ));
-            }
-            let residual = load_optional_tensor(&mut container, "embed_tokens.res")?;
-            let residual2 = load_optional_tensor(&mut container, "embed_tokens.res2")?;
-            Embeddings::Coded(Box::new(Embedding::new(main, residual, residual2)?))
-        } else {
-            let count = product(dimensions.vocabulary_size, dimensions.hidden_width)?;
-            Embeddings::Plain {
-                values: load_vector(&mut container, "embed_tokens", count)?,
-                hidden_width: dimensions.hidden_width,
-            }
-        };
-
-        let mut layers = Vec::new();
-        for (index, kind) in layer_types.iter().enumerate() {
-            let prefix = format!("layers.{index}");
-            let branch = if kind.as_str() == Some("full_attention") {
-                let query_width = product(dimensions.query_heads, dimensions.attention_head_width)?;
-                let key_width = product(dimensions.kv_heads, dimensions.attention_head_width)?;
-                let attention = Attention::new(
-                    AttentionDimensions {
-                        query_heads: dimensions.query_heads,
-                        kv_heads: dimensions.kv_heads,
-                        head_dim: dimensions.attention_head_width,
-                        rotary_dim,
-                    },
-                    load_vector(
-                        &mut container,
-                        &format!("{prefix}.self_attn.q_norm"),
-                        dimensions.attention_head_width,
-                    )?,
-                    load_vector(
-                        &mut container,
-                        &format!("{prefix}.self_attn.k_norm"),
-                        dimensions.attention_head_width,
-                    )?,
-                    dimensions.epsilon,
-                )?;
-                Branch::Attention(Box::new(AttentionLayer {
-                    query_gate: load_linear(
-                        &mut container,
-                        &format!("{prefix}.self_attn.q_proj"),
-                        product(2, query_width)?,
-                        dimensions.hidden_width,
-                        true,
-                    )?,
-                    key: load_linear(
-                        &mut container,
-                        &format!("{prefix}.self_attn.k_proj"),
-                        key_width,
-                        dimensions.hidden_width,
-                        true,
-                    )?,
-                    value: load_linear(
-                        &mut container,
-                        &format!("{prefix}.self_attn.v_proj"),
-                        key_width,
-                        dimensions.hidden_width,
-                        true,
-                    )?,
-                    output: load_linear(
-                        &mut container,
-                        &format!("{prefix}.self_attn.o_proj"),
-                        dimensions.hidden_width,
-                        query_width,
-                        true,
-                    )?,
-                    attention,
-                }))
-            } else {
-                // The upstream dispatch treats every other layer-type string as GDN.
-                Branch::Recurrent(Box::new(load_recurrent_layer(
-                    &mut container,
-                    &prefix,
-                    &dimensions,
-                )?))
-            };
-            layers.push(Layer {
-                branch,
-                input_norm: load_vector(
-                    &mut container,
-                    &format!("{prefix}.input_layernorm"),
-                    dimensions.hidden_width,
-                )?,
-                post_attention_norm: load_vector(
-                    &mut container,
-                    &format!("{prefix}.post_attention_layernorm"),
-                    dimensions.hidden_width,
-                )?,
-                gate: load_linear(
-                    &mut container,
-                    &format!("{prefix}.mlp.gate_proj"),
-                    dimensions.feed_forward_width,
-                    dimensions.hidden_width,
-                    true,
-                )?,
-                up: load_linear(
-                    &mut container,
-                    &format!("{prefix}.mlp.up_proj"),
-                    dimensions.feed_forward_width,
-                    dimensions.hidden_width,
-                    true,
-                )?,
-                down: load_linear(
-                    &mut container,
-                    &format!("{prefix}.mlp.down_proj"),
-                    dimensions.hidden_width,
-                    dimensions.feed_forward_width,
-                    true,
-                )?,
-            });
-        }
-        let final_norm = load_vector(&mut container, "norm", dimensions.hidden_width)?;
-        let head = load_linear(
-            &mut container,
-            "lm_head",
-            dimensions.vocabulary_size,
-            dimensions.hidden_width,
-            false,
-        )?;
+        let Weights {
+            dimensions,
+            embeddings,
+            layers,
+            final_norm,
+            head,
+        } = load_weights(&mut container, load_linear, |c, name| {
+            Ok(c.load_tensor(name)?)
+        })?;
         let layer_states = layers.iter().map(Layer::new_state).collect::<Result<_>>()?;
         Ok(Self {
             weights: Rc::new(Weights {
@@ -601,11 +447,172 @@ impl Model {
     }
 }
 
-fn load_recurrent_layer<R: Read + Seek>(
+/// Shared architecture validation/loading; backends choose storage for each tensor.
+pub fn load_weights<R: Read + Seek, L, T: EmbeddingTensor>(
+    container: &mut Container<R>,
+    mut linear: impl FnMut(&mut Container<R>, &str, usize, usize, bool) -> Result<L>,
+    mut tensor: impl FnMut(&mut Container<R>, &str) -> Result<T>,
+) -> Result<Weights<L, T>> {
+    let header = container.header().model.clone();
+    let dimensions = ModelDimensions::read(&header)?;
+    let rotary_dim = rotary_width_from_header(&header)?;
+    let layer_types = header
+        .get("layer_types")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::InvalidModel("model.layer_types must be an array".into()))?;
+    if layer_types.len() != dimensions.layer_count
+        || layer_types.iter().any(|value| !value.is_string())
+    {
+        return Err(Error::InvalidModel(
+            "layer_types must contain one string per layer".into(),
+        ));
+    }
+    let embeddings = if container
+        .header()
+        .tensors
+        .iter()
+        .any(|tensor| tensor.name == "embed_tokens")
+    {
+        let main = tensor(container, "embed_tokens")?;
+        if main.rows() != dimensions.vocabulary_size || main.cols() != dimensions.hidden_width {
+            return Err(Error::InvalidModel(
+                "embedding dimensions do not match model header".into(),
+            ));
+        }
+        let residual = optional_tensor(container, "embed_tokens.res", &mut tensor)?;
+        let residual2 = optional_tensor(container, "embed_tokens.res2", &mut tensor)?;
+        Embeddings::Coded(Box::new(Embedding::new(main, residual, residual2)?))
+    } else {
+        let count = product(dimensions.vocabulary_size, dimensions.hidden_width)?;
+        Embeddings::Plain {
+            values: load_vector(container, "embed_tokens", count)?,
+            hidden_width: dimensions.hidden_width,
+        }
+    };
+
+    let mut layers = Vec::new();
+    for (index, kind) in layer_types.iter().enumerate() {
+        let prefix = format!("layers.{index}");
+        let branch = if kind.as_str() == Some("full_attention") {
+            let query_width = product(dimensions.query_heads, dimensions.attention_head_width)?;
+            let key_width = product(dimensions.kv_heads, dimensions.attention_head_width)?;
+            let attention = Attention::new(
+                AttentionDimensions {
+                    query_heads: dimensions.query_heads,
+                    kv_heads: dimensions.kv_heads,
+                    head_dim: dimensions.attention_head_width,
+                    rotary_dim,
+                },
+                load_vector(
+                    container,
+                    &format!("{prefix}.self_attn.q_norm"),
+                    dimensions.attention_head_width,
+                )?,
+                load_vector(
+                    container,
+                    &format!("{prefix}.self_attn.k_norm"),
+                    dimensions.attention_head_width,
+                )?,
+                dimensions.epsilon,
+            )?;
+            Branch::Attention(Box::new(AttentionLayer {
+                query_gate: linear(
+                    container,
+                    &format!("{prefix}.self_attn.q_proj"),
+                    product(2, query_width)?,
+                    dimensions.hidden_width,
+                    true,
+                )?,
+                key: linear(
+                    container,
+                    &format!("{prefix}.self_attn.k_proj"),
+                    key_width,
+                    dimensions.hidden_width,
+                    true,
+                )?,
+                value: linear(
+                    container,
+                    &format!("{prefix}.self_attn.v_proj"),
+                    key_width,
+                    dimensions.hidden_width,
+                    true,
+                )?,
+                output: linear(
+                    container,
+                    &format!("{prefix}.self_attn.o_proj"),
+                    dimensions.hidden_width,
+                    query_width,
+                    true,
+                )?,
+                attention,
+            }))
+        } else {
+            // The upstream dispatch treats every other layer-type string as GDN.
+            Branch::Recurrent(Box::new(load_recurrent_layer(
+                container,
+                &prefix,
+                &dimensions,
+                &mut linear,
+            )?))
+        };
+        layers.push(Layer {
+            branch,
+            input_norm: load_vector(
+                container,
+                &format!("{prefix}.input_layernorm"),
+                dimensions.hidden_width,
+            )?,
+            post_attention_norm: load_vector(
+                container,
+                &format!("{prefix}.post_attention_layernorm"),
+                dimensions.hidden_width,
+            )?,
+            gate: linear(
+                container,
+                &format!("{prefix}.mlp.gate_proj"),
+                dimensions.feed_forward_width,
+                dimensions.hidden_width,
+                true,
+            )?,
+            up: linear(
+                container,
+                &format!("{prefix}.mlp.up_proj"),
+                dimensions.feed_forward_width,
+                dimensions.hidden_width,
+                true,
+            )?,
+            down: linear(
+                container,
+                &format!("{prefix}.mlp.down_proj"),
+                dimensions.hidden_width,
+                dimensions.feed_forward_width,
+                true,
+            )?,
+        });
+    }
+    let final_norm = load_vector(container, "norm", dimensions.hidden_width)?;
+    let head = linear(
+        container,
+        "lm_head",
+        dimensions.vocabulary_size,
+        dimensions.hidden_width,
+        false,
+    )?;
+    Ok(Weights {
+        dimensions,
+        embeddings,
+        layers,
+        final_norm,
+        head,
+    })
+}
+
+fn load_recurrent_layer<R: Read + Seek, L>(
     container: &mut Container<R>,
     prefix: &str,
     model: &ModelDimensions,
-) -> Result<RecurrentLayer> {
+    linear: &mut impl FnMut(&mut Container<R>, &str, usize, usize, bool) -> Result<L>,
+) -> Result<RecurrentLayer<L>> {
     let name = |suffix: &str| format!("{prefix}.linear_attn.{suffix}");
     let head_dim = vector_length(container, &name("norm"))?;
     let value_heads = vector_length(container, &name("A_log"))?;
@@ -654,21 +661,21 @@ fn load_recurrent_layer<R: Read + Seek>(
         model.epsilon,
     )?;
     Ok(RecurrentLayer {
-        query_key_value: load_linear(
+        query_key_value: linear(
             container,
             &name("in_proj_qkv"),
             qkv_rows,
             model.hidden_width,
             true,
         )?,
-        output_gate: load_linear(
+        output_gate: linear(
             container,
             &name("in_proj_z"),
             output_width,
             model.hidden_width,
             true,
         )?,
-        output: load_linear(
+        output: linear(
             container,
             &name("out_proj"),
             model.hidden_width,
@@ -695,17 +702,18 @@ fn load_linear<R: Read + Seek>(
     CompressedLinear::new(tensor, output_rotation)
 }
 
-fn load_optional_tensor<R: Read + Seek>(
+fn optional_tensor<R: Read + Seek, T>(
     container: &mut Container<R>,
     name: &str,
-) -> Result<Option<yskn_format::Tensor>> {
+    tensor: &mut impl FnMut(&mut Container<R>, &str) -> Result<T>,
+) -> Result<Option<T>> {
     if container
         .header()
         .tensors
         .iter()
         .any(|tensor| tensor.name == name)
     {
-        Ok(Some(container.load_tensor(name)?))
+        Ok(Some(tensor(container, name)?))
     } else {
         Ok(None)
     }
@@ -774,6 +782,47 @@ fn rotary_width_from_header(header: &Value) -> Result<usize> {
         ));
     }
     Ok(64)
+}
+
+/// Resolve a folder manifest (or a direct weights path) without opening model weights.
+pub fn model_location(folder: &Path) -> Result<(PathBuf, usize)> {
+    if !folder.is_dir() {
+        return Ok((folder.to_path_buf(), 262_144));
+    }
+    let manifest_path = folder.join("yasakani.json");
+    let manifest: Value = match fs::read(manifest_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Null,
+        Err(error) => return Err(error.into()),
+    };
+    let filename = match manifest.pointer("/files/weights") {
+        Some(Value::String(filename)) => filename.as_str(),
+        None => "qwen38_27b_e3x.yskn",
+        _ => return Err(Error::InvalidModel("files.weights must be a string".into())),
+    };
+    if Path::new(filename)
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(Error::InvalidModel(
+            "files.weights must be relative to the model folder".into(),
+        ));
+    }
+    let mut context_capacity = 262_144;
+    if let Some(capacity) = manifest.get("max_ctx") {
+        let capacity = capacity
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|&value| value > 0)
+            .ok_or_else(|| {
+                Error::InvalidModel("max_ctx must be a positive addressable integer".into())
+            })?;
+        context_capacity = capacity
+            .checked_add(63)
+            .map(|rounded| rounded / 64 * 64)
+            .ok_or_else(|| Error::InvalidModel("rounded context capacity overflows".into()))?;
+    }
+    Ok((folder.join(filename), context_capacity))
 }
 
 #[cfg(test)]

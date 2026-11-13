@@ -7,6 +7,7 @@ pub mod gated_deltanet;
 pub mod model;
 pub mod output_head_sampler;
 pub mod portable_math;
+pub mod quality;
 pub mod residual_norm_mlp;
 
 use std::fmt;
