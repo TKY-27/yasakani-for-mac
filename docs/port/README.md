@@ -188,9 +188,14 @@ keeps arbitrary-precision integers. `NaN` and `Infinity` are rejected as JSON
 input, while Python's `json.loads` accepts them and `json.dumps` emits `NaN`
 and `Infinity` by default.
 
-The environment preserves JSON key order, uses Python string methods and a
-Python-format `tojson` filter (including indentation, separators, ASCII
-escaping and sorted-key options). Template errors expose the message passed
+The environment preserves JSON key order. Its `trim` filter matches Python's
+whitespace set; `.strip()`, `.lstrip()` and `.rstrip()` come from
+`minijinja-contrib` and use Rust's whitespace set, which differs for U+001C to
+U+001F. The model's template uses only `|trim`. A Python-format `tojson` filter
+is also provided (including indentation, separators, ASCII escaping and
+sorted-key options). Floats joined with `~` or printed inside lists use Rust's
+float format; this only affects an error message if a caller passes a
+non-string `reasoning_effort`. Template errors expose the message passed
 to `raise_exception`. Nonempty string tool arguments are rejected by upstream's
 `ChatFormatter` template; request-level normalization belongs to the caller
 (upstream does that in `chat.py`). `strftime_now` is intentionally absent:

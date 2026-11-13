@@ -157,6 +157,8 @@ def main():
             case['hidden_ids'] = hidden
         data['output'].append(case)
 
+    emoji_ids = fmt.encode('A 👩🏿‍💻').tolist()
+    partial = next(emoji_ids[:end] for end in range(len(emoji_ids) - 1, 0, -1) if fmt.decode(emoji_ids[:end]).endswith('�'))
     normal = fmt.encode('Hello 日本語.').tolist()
     unknown = [248077, 248100, 248319]
     mixed_ids = normal[:1] + unknown[:1] + normal[1:2] + unknown[1:] + normal[2:]
@@ -165,6 +167,16 @@ def main():
     output_case('review-3-unknown-content', mixed_ids, False)
     output_case('review-3-unknown-reasoning', mixed_ids + [fmt.think_end] + normal, True)
     output_case('review-3-unknown-hidden', mixed_ids, False, unknown + [248046, 248044])
+    unknown_first = [248077] + normal
+    unknown_inside_emoji = partial[:2] + [248077] + partial[2:]
+    unknown_last = normal + [248319]
+    for name, ids in (
+        ('review-3-unknown-first', unknown_first),
+        ('review-3-unknown-inside-emoji', unknown_inside_emoji),
+        ('review-3-unknown-last', unknown_last),
+    ):
+        stream_case(name, ids)
+        output_case(name + '-content', ids, False)
     scalars = [1e20, 1e-7, 1.0, 0.1, 51.248178375505404,
                18446744073709551615, -9223372036854775808, True, False, None]
     rendered('chat', 'review-4-scalars', [{'role': 'user', 'content': [{'type': 'text', 'text': value} for value in scalars]}])
@@ -193,8 +205,6 @@ def main():
     rendered('tools', 'review-6-multiple-calls', user + [{'role': 'assistant', 'content': 'Checking.', 'tool_calls': calls}])
     rendered('tools', 'review-6-empty-content', user + [{'role': 'assistant', 'content': '', 'tool_calls': calls[:1]}])
     rendered('tools', 'review-6-flat-call', user + [{'role': 'assistant', 'content': '', 'tool_calls': [calls[0]['function']]}])
-    emoji_ids = fmt.encode('A 👩🏿‍💻').tolist()
-    partial = next(emoji_ids[:end] for end in range(len(emoji_ids) - 1, 0, -1) if fmt.decode(emoji_ids[:end]).endswith('�'))
     stream_case('review-6-partial-utf8', partial)
     output_case('review-6-hidden-middle', normal[:1] + [248046] + normal[1:], False)
     output_case('review-6-second-think-end', normal + [fmt.think_end] + normal + [fmt.think_end] + normal, True)
@@ -204,6 +214,7 @@ def main():
         ('cjk-extension-i', '\U0002ebf0'), ('ol-onal-letter', '\U0001e5d0'),
         ('ol-onal-mark', '\U0001e5ee'), ('garay-digit', '\U00010d40'),
         ('cyrillic', '\u1c89'), ('unassigned', '\u0378\U00010ffff'),
+        ('max-unicode-scalar', '\U0010ffff'),
         ('private-use', '\ue000\U000f0000'), ('combining', '\u0301\u20dd'),
     ]
     # Exclude only independently confirmed regex-engine differences; retain exact

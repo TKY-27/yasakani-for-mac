@@ -17943,6 +17943,47 @@
       "decoded": "a͸𐿿fb A͸𐿿fB ͸𐿿fabc123͸𐿿f45!͸𐿿f\n"
     },
     {
+      "name": "review-7-max-unicode-scalar",
+      "text": "a􏿿b A􏿿B 􏿿abc123􏿿45!􏿿\n",
+      "rendered": "a􏿿b A􏿿B 􏿿abc123􏿿45!􏿿\n",
+      "ids": [
+        64,
+        176,
+        237,
+        123,
+        123,
+        65,
+        357,
+        176,
+        237,
+        123,
+        123,
+        33,
+        220,
+        176,
+        237,
+        123,
+        123,
+        13290,
+        16,
+        17,
+        18,
+        176,
+        237,
+        123,
+        123,
+        19,
+        20,
+        0,
+        176,
+        237,
+        123,
+        123,
+        198
+      ],
+      "decoded": "a􏿿b A􏿿B 􏿿abc123􏿿45!􏿿\n"
+    },
+    {
       "name": "review-7-private-use",
       "text": "a󰀀b A󰀀B 󰀀abc123󰀀45!󰀀\n",
       "rendered": "a󰀀b A󰀀B 󰀀abc123󰀀45!󰀀\n",
@@ -46197,6 +46238,73 @@
       "decoded": "Hello 日本語."
     },
     {
+      "name": "review-3-unknown-first",
+      "ids": [
+        248077,
+        9419,
+        220,
+        247359,
+        13
+      ],
+      "pieces": [
+        "",
+        "Hello",
+        " ",
+        "日本語",
+        "."
+      ],
+      "tail": "",
+      "decoded": "Hello 日本語."
+    },
+    {
+      "name": "review-3-unknown-inside-emoji",
+      "ids": [
+        32,
+        59720,
+        248077,
+        102,
+        9008,
+        237,
+        123,
+        373,
+        235,
+        88995
+      ],
+      "pieces": [
+        "A",
+        "",
+        "",
+        " 👩",
+        "",
+        "",
+        "🏿",
+        "",
+        "‍",
+        ""
+      ],
+      "tail": "�",
+      "decoded": "A 👩🏿‍�"
+    },
+    {
+      "name": "review-3-unknown-last",
+      "ids": [
+        9419,
+        220,
+        247359,
+        13,
+        248319
+      ],
+      "pieces": [
+        "Hello",
+        " ",
+        "日本語",
+        ".",
+        ""
+      ],
+      "tail": "",
+      "decoded": "Hello 日本語."
+    },
+    {
       "name": "review-6-partial-utf8",
       "ids": [
         32,
@@ -46562,6 +46670,141 @@
         248046,
         248044
       ]
+    },
+    {
+      "name": "review-3-unknown-first-content",
+      "ids": [
+        248077,
+        9419,
+        220,
+        247359,
+        13
+      ],
+      "in_reasoning": false,
+      "pieces": [
+        [],
+        [
+          [
+            "content",
+            "Hello"
+          ]
+        ],
+        [
+          [
+            "content",
+            " "
+          ]
+        ],
+        [
+          [
+            "content",
+            "日本語"
+          ]
+        ],
+        [
+          [
+            "content",
+            "."
+          ]
+        ]
+      ],
+      "tail": [],
+      "think_end_at": null
+    },
+    {
+      "name": "review-3-unknown-inside-emoji-content",
+      "ids": [
+        32,
+        59720,
+        248077,
+        102,
+        9008,
+        237,
+        123,
+        373,
+        235,
+        88995
+      ],
+      "in_reasoning": false,
+      "pieces": [
+        [
+          [
+            "content",
+            "A"
+          ]
+        ],
+        [],
+        [],
+        [
+          [
+            "content",
+            " 👩"
+          ]
+        ],
+        [],
+        [],
+        [
+          [
+            "content",
+            "🏿"
+          ]
+        ],
+        [],
+        [
+          [
+            "content",
+            "‍"
+          ]
+        ],
+        []
+      ],
+      "tail": [
+        [
+          "content",
+          "�"
+        ]
+      ],
+      "think_end_at": null
+    },
+    {
+      "name": "review-3-unknown-last-content",
+      "ids": [
+        9419,
+        220,
+        247359,
+        13,
+        248319
+      ],
+      "in_reasoning": false,
+      "pieces": [
+        [
+          [
+            "content",
+            "Hello"
+          ]
+        ],
+        [
+          [
+            "content",
+            " "
+          ]
+        ],
+        [
+          [
+            "content",
+            "日本語"
+          ]
+        ],
+        [
+          [
+            "content",
+            "."
+          ]
+        ],
+        []
+      ],
+      "tail": [],
+      "think_end_at": null
     },
     {
       "name": "review-6-hidden-middle",
