@@ -406,6 +406,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exp2_pins_output_bits() {
+        // Captured from the current D7 implementation, including subnormal rounding.
+        for (value, expected) in [
+            (1.0, 0x4000_0000),
+            (-1.0, 0x3f00_0000),
+            (0.5, 0x3fb5_04f3),
+            (-30.0, 0x3080_0008),
+            (-126.0, 0x007f_ffe6),
+            (-150.0, 0x0000_0001),
+            (-1.44e30, 0x0000_0000),
+            (f32::NEG_INFINITY, 0x0000_0000),
+        ] {
+            assert_eq!(exp2(value).to_bits(), expected, "input {value}");
+        }
+        assert!(exp2(f32::NAN).is_nan());
+    }
+
+    #[test]
     fn exp2_uses_d7_binary32_product_and_portable_exp() {
         for value in [
             0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 1.0e-7, -1.0e-7, 30.0, -30.0, -100.0,

@@ -762,11 +762,44 @@ fn product(left: usize, right: usize) -> Result<usize> {
 }
 
 fn rotary_width_from_header(header: &Value) -> Result<usize> {
-    // ModelDimensions::read requires arch=qwen3_5; D8 is an explicit D5 exception.
+    if header.get("arch").and_then(Value::as_str) != Some("qwen3_5") {
+        return Err(Error::InvalidModel(
+            "main reference requires arch=qwen3_5".into(),
+        ));
+    }
+    // D8 is an explicit exception to D5's header-derived dimensions.
     if header.get("head_dim").and_then(Value::as_u64) != Some(256) {
         return Err(Error::InvalidModel(
             "qwen3_5 requires model.head_dim=256 (D8)".into(),
         ));
     }
     Ok(64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rotary_width_checks_architecture_and_head_width_itself() {
+        assert_eq!(
+            rotary_width_from_header(&json!({"arch": "qwen3_5", "head_dim": 256})).unwrap(),
+            64
+        );
+        for (header, expected) in [
+            (
+                json!({"arch": "other", "head_dim": 256}),
+                "main reference requires arch=qwen3_5",
+            ),
+            (
+                json!({"arch": "qwen3_5", "head_dim": 128}),
+                "qwen3_5 requires model.head_dim=256 (D8)",
+            ),
+        ] {
+            assert!(
+                matches!(rotary_width_from_header(&header), Err(Error::InvalidModel(message)) if message == expected)
+            );
+        }
+    }
 }

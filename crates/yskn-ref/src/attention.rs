@@ -100,6 +100,41 @@ struct AttentionSplit {
     numerator: Vec<f32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SplitPlan {
+    tiles: Vec<(usize, std::ops::Range<usize>)>,
+    include_self: bool,
+}
+
+/// Chapter 04's 31/42 splits with D9's absolute, per-row prefix tiles.
+/// `length` includes self and is therefore positive.
+fn prefix_schedule(length: usize) -> Vec<SplitPlan> {
+    let split_count = if length < 4096 { 31 } else { 42 };
+    let per_split = length.div_ceil(split_count);
+    (0..split_count)
+        .map(|split_index| {
+            let first = split_index * per_split;
+            let last = first.saturating_add(per_split).min(length);
+            let prefix_end = first.max(last.min(length - 1));
+            let mut tiles = Vec::new();
+            if first < prefix_end {
+                let mut tile_start = first / 32 * 32;
+                while tile_start < prefix_end {
+                    tiles.push((
+                        tile_start,
+                        first.max(tile_start)..prefix_end.min(tile_start + 32),
+                    ));
+                    tile_start += 32;
+                }
+            }
+            SplitPlan {
+                tiles,
+                include_self: first < length && length - 1 < first.saturating_add(per_split),
+            }
+        })
+        .collect()
+}
+
 impl Attention {
     pub fn new(
         dimensions: AttentionDimensions,
@@ -341,47 +376,33 @@ impl Attention {
             .checked_add(1)
             .ok_or_else(|| Error::InvalidModel("attention context length overflow".into()))?;
         let kv_head = query_head / (self.dimensions.query_heads / self.dimensions.kv_heads);
-        // These are the chapter's split policy, not model dimensions.
-        let split_count = if length < 4096 { 31 } else { 42 };
-        let per_split = length.div_ceil(split_count);
-        let padded_count = if split_count <= 32 { 32 } else { 64 };
+        let schedule = prefix_schedule(length);
+        let padded_count = schedule.len().next_power_of_two();
         let mut splits = Vec::with_capacity(padded_count);
-        for split_index in 0..padded_count {
+        for plan in schedule {
             let mut split = AttentionSplit {
                 maximum: EMPTY_MAXIMUM,
                 denominator: 0.0,
                 numerator: vec![0.0; self.dimensions.head_dim],
             };
-            if split_index < split_count {
-                let first = split_index * per_split;
-                let last = first.saturating_add(per_split).min(length);
-                let prefix_end = first.max(last.min(length - 1));
-                // D9: visit only absolute 32-slot tiles intersecting this row's prefix.
-                if first < prefix_end {
-                    let mut tile_start = first / 32 * 32;
-                    while tile_start < prefix_end {
-                        self.prefix_tile(
-                            &mut split,
-                            query,
-                            kv_head,
-                            prefix,
-                            tile_start,
-                            first..prefix_end,
-                        )?;
-                        tile_start += 32;
-                    }
-                }
-                if first < length && length - 1 < first.saturating_add(per_split) {
-                    self.add_self(
-                        &mut split,
-                        query,
-                        &current.keys[kv_head],
-                        &current.values[kv_head],
-                    )?;
-                }
+            for (tile_start, visible) in plan.tiles {
+                self.prefix_tile(&mut split, query, kv_head, prefix, tile_start, visible)?;
+            }
+            if plan.include_self {
+                self.add_self(
+                    &mut split,
+                    query,
+                    &current.keys[kv_head],
+                    &current.values[kv_head],
+                )?;
             }
             splits.push(split);
         }
+        splits.resize_with(padded_count, || AttentionSplit {
+            maximum: EMPTY_MAXIMUM,
+            denominator: 0.0,
+            numerator: vec![0.0; self.dimensions.head_dim],
+        });
         let largest_maximum = splits
             .iter()
             .map(|split| split.maximum)
@@ -650,6 +671,205 @@ mod tests {
             1.0e-6,
         )
         .unwrap()
+    }
+
+    fn plan(tiles: &[(usize, std::ops::Range<usize>)], include_self: bool) -> SplitPlan {
+        SplitPlan {
+            tiles: tiles.to_vec(),
+            include_self,
+        }
+    }
+
+    #[test]
+    fn prefix_schedule_empty_and_short_prefixes() {
+        // Chapter 04 assigns one slot per split at these lengths; D9 aligns tiles to zero.
+        let only_self = prefix_schedule(1);
+        assert_eq!(only_self.len(), 31);
+        assert_eq!(only_self[0], plan(&[], true));
+        assert_eq!(only_self[1..], vec![plan(&[], false); 30]);
+
+        let short = prefix_schedule(5);
+        assert_eq!(short.len(), 31);
+        assert_eq!(
+            short[..5],
+            [
+                plan(&[(0, 0..1)], false),
+                plan(&[(0, 1..2)], false),
+                plan(&[(0, 2..3)], false),
+                plan(&[(0, 3..4)], false),
+                plan(&[], true),
+            ]
+        );
+        assert_eq!(short[5..], vec![plan(&[], false); 26]);
+    }
+
+    #[test]
+    fn prefix_schedule_33_stops_before_the_self_tile() {
+        let schedule = prefix_schedule(33);
+        assert_eq!(schedule.len(), 31);
+        assert_eq!(
+            schedule[..17],
+            [
+                plan(&[(0, 0..2)], false),
+                plan(&[(0, 2..4)], false),
+                plan(&[(0, 4..6)], false),
+                plan(&[(0, 6..8)], false),
+                plan(&[(0, 8..10)], false),
+                plan(&[(0, 10..12)], false),
+                plan(&[(0, 12..14)], false),
+                plan(&[(0, 14..16)], false),
+                plan(&[(0, 16..18)], false),
+                plan(&[(0, 18..20)], false),
+                plan(&[(0, 20..22)], false),
+                plan(&[(0, 22..24)], false),
+                plan(&[(0, 24..26)], false),
+                plan(&[(0, 26..28)], false),
+                plan(&[(0, 28..30)], false),
+                plan(&[(0, 30..32)], false),
+                plan(&[], true),
+            ]
+        );
+        assert_eq!(schedule[17..], vec![plan(&[], false); 14]);
+    }
+
+    #[test]
+    fn prefix_schedule_76_splits_across_absolute_tile_boundaries() {
+        // From chapter 04: 31 splits, three slots each; self is slot 75 in split 25.
+        let schedule = prefix_schedule(76);
+        assert_eq!(schedule.len(), 31);
+        assert_eq!(
+            schedule[..26],
+            [
+                plan(&[(0, 0..3)], false),
+                plan(&[(0, 3..6)], false),
+                plan(&[(0, 6..9)], false),
+                plan(&[(0, 9..12)], false),
+                plan(&[(0, 12..15)], false),
+                plan(&[(0, 15..18)], false),
+                plan(&[(0, 18..21)], false),
+                plan(&[(0, 21..24)], false),
+                plan(&[(0, 24..27)], false),
+                plan(&[(0, 27..30)], false),
+                plan(&[(0, 30..32), (32, 32..33)], false),
+                plan(&[(32, 33..36)], false),
+                plan(&[(32, 36..39)], false),
+                plan(&[(32, 39..42)], false),
+                plan(&[(32, 42..45)], false),
+                plan(&[(32, 45..48)], false),
+                plan(&[(32, 48..51)], false),
+                plan(&[(32, 51..54)], false),
+                plan(&[(32, 54..57)], false),
+                plan(&[(32, 57..60)], false),
+                plan(&[(32, 60..63)], false),
+                plan(&[(32, 63..64), (64, 64..66)], false),
+                plan(&[(64, 66..69)], false),
+                plan(&[(64, 69..72)], false),
+                plan(&[(64, 72..75)], false),
+                plan(&[], true),
+            ]
+        );
+        assert_eq!(schedule[26..], vec![plan(&[], false); 5]);
+    }
+
+    #[test]
+    fn prefix_schedule_4096_uses_42_splits_and_covers_each_prefix_slot_once() {
+        let schedule = prefix_schedule(4096);
+        assert_eq!(schedule.len(), 42);
+        assert_eq!(
+            schedule[0],
+            plan(
+                &[(0, 0..32), (32, 32..64), (64, 64..96), (96, 96..98)],
+                false
+            )
+        );
+        assert_eq!(
+            schedule[41],
+            plan(
+                &[(4000, 4018..4032), (4032, 4032..4064), (4064, 4064..4095)],
+                true
+            )
+        );
+        let mut visits = [0; 4095];
+        for split in &schedule {
+            for (tile_start, visible) in &split.tiles {
+                assert_eq!(tile_start % 32, 0);
+                assert!(!visible.is_empty());
+                assert!(visible.start >= *tile_start && visible.end <= tile_start + 32);
+                for slot in visible.clone() {
+                    visits[slot] += 1;
+                }
+            }
+        }
+        assert_eq!(visits, [1; 4095]);
+        assert_eq!(
+            schedule.iter().filter(|split| split.include_self).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn length_76_attention_pins_absolute_tile_output_bits() {
+        let layer = layer();
+        let query: Vec<f32> = (0..256)
+            .map(|channel| ((channel * 7 % 29) as f32 - 14.0) * 0.03125)
+            .collect();
+        let rows: Vec<CacheToken> = (0..76)
+            .map(|position| CacheToken {
+                keys: vec![
+                    Int8CacheRow {
+                        integers: (0..256)
+                            .map(
+                                |channel| (((position * 13 + channel * 7) % 255) as i16 - 127)
+                                    as i8
+                            )
+                            .collect(),
+                        scale: (position % 7 + 1) as f32 * 0.0078125,
+                    };
+                    2
+                ],
+                values: vec![
+                    Int8CacheRow {
+                        integers: (0..256)
+                            .map(
+                                |channel| (((position * 19 + (channel % 16) * 11) % 255) as i16
+                                    - 127) as i8
+                            )
+                            .collect(),
+                        scale: (position % 11 + 1) as f32 * 0.015625,
+                    };
+                    2
+                ],
+            })
+            .collect();
+        let output = layer
+            .attend_head(&query, 0, &rows[..75], &rows[75])
+            .unwrap();
+        // Captured from the pre-extraction D9 implementation; values repeat every 16 channels.
+        let expected = [
+            0xbede_440b,
+            0xbeac_aee9,
+            0x3ce1_ab7d,
+            0xbdb7_14de,
+            0xbd93_8526,
+            0x3ef5_474a,
+            0x3e3f_be6c,
+            0x3f4c_2f7e,
+            0x3f26_e245,
+            0x3f81_1d5b,
+            0x3f09_e0ce,
+            0x3f0e_8ea2,
+            0xbde6_e0e7,
+            0xbeb1_494b,
+            0xbccd_e3de,
+            0xbf2b_79d6,
+        ];
+        assert_eq!(
+            output
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected.repeat(16)
+        );
     }
 
     #[test]
