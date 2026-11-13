@@ -14,11 +14,38 @@ pub fn synthetic_model_with_dimensions(
     feed_forward: usize,
     vocabulary: usize,
 ) -> Vec<u8> {
-    build_model(seed, layer_types, hidden, feed_forward, vocabulary, false)
+    build_model(
+        seed,
+        layer_types,
+        hidden,
+        feed_forward,
+        vocabulary,
+        false,
+        false,
+    )
+}
+
+/// Like the released files (FORMAT.md §6): `warp` matrices, 6-bit body, 8-bit head.
+pub fn synthetic_model_released_layout(
+    seed: u64,
+    layer_types: &[&str],
+    hidden: usize,
+    feed_forward: usize,
+    vocabulary: usize,
+) -> Vec<u8> {
+    build_model(
+        seed,
+        layer_types,
+        hidden,
+        feed_forward,
+        vocabulary,
+        false,
+        true,
+    )
 }
 
 pub fn synthetic_model_with_dense_embeddings(seed: u64, layer_types: &[&str]) -> Vec<u8> {
-    build_model(seed, layer_types, 512, 512, 128, true)
+    build_model(seed, layer_types, 512, 512, 128, true, false)
 }
 
 fn build_model(
@@ -28,11 +55,12 @@ fn build_model(
     feed_forward: usize,
     vocabulary: usize,
     dense_embeddings: bool,
+    released_layout: bool,
 ) -> Vec<u8> {
     assert!(hidden > 0 && hidden % 512 == 0);
     assert!(feed_forward > 0 && feed_forward % 512 == 0);
     assert!(vocabulary > 0);
-    let mut writer = Writer::new(seed);
+    let mut writer = Writer::new(seed, released_layout);
     if dense_embeddings {
         writer.vector("embed_tokens", vocabulary * hidden, 0.0, 0.25);
     } else {
@@ -123,15 +151,17 @@ fn build_model(
 
 struct Writer {
     random_state: u64,
+    released_layout: bool,
     payload: Vec<u8>,
     tensors: Vec<Value>,
     vectors: Vec<Value>,
 }
 
 impl Writer {
-    fn new(seed: u64) -> Self {
+    fn new(seed: u64, released_layout: bool) -> Self {
         Self {
             random_state: seed,
+            released_layout,
             payload: Vec::new(),
             tensors: Vec::new(),
             vectors: Vec::new(),
@@ -159,8 +189,13 @@ impl Writer {
 
     fn tensor(&mut self, name: &str, role: &str, rows: usize, cols: usize, scale: f32) {
         let ordinal = self.tensors.len();
-        let bits = if ordinal % 2 == 0 { 6 } else { 8 };
-        let layout = if role == "embedding" || ordinal % 3 == 0 {
+        let bits = match (self.released_layout, role) {
+            (true, "head") => 8,
+            (true, _) => 6,
+            _ if ordinal % 2 == 0 => 6,
+            _ => 8,
+        };
+        let layout = if role == "embedding" || (!self.released_layout && ordinal % 3 == 0) {
             "row"
         } else {
             "warp"
@@ -324,4 +359,24 @@ fn synthetic_writer_supports_other_dimensions_and_plain_embeddings() {
     assert_eq!(embedding.values.len(), 128 * 512);
     assert_eq!(embedding.descriptor.dtype, yskn_format::VectorType::Bf16);
     assert!(container.load_tensor("embed_tokens").is_err());
+}
+
+#[test]
+fn synthetic_writer_released_layout_uses_warp_and_released_bit_widths() {
+    let bytes =
+        synthetic_model_released_layout(23, &["linear_attention", "full_attention"], 512, 512, 65);
+    let container = yskn_format::Container::from_bytes(bytes).unwrap();
+    for tensor in &container.header().tensors {
+        let (layout, bits) = match tensor.role {
+            yskn_format::Role::Embedding => (yskn_format::Layout::Row, tensor.bits),
+            yskn_format::Role::Head => (yskn_format::Layout::Warp, 8),
+            _ => (yskn_format::Layout::Warp, 6),
+        };
+        assert_eq!(
+            (tensor.layout, tensor.bits),
+            (layout, bits),
+            "{}",
+            tensor.name
+        );
+    }
 }

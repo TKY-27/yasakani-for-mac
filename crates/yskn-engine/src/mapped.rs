@@ -158,6 +158,14 @@ impl Matrix {
     pub fn code_words(&self) -> &[u8] {
         &self.0.mapping[self.0.code_range.clone()]
     }
+    /// The whole read-only file mapping that holds this matrix (page-aligned start),
+    /// and the code stream's byte range within it. Used to wrap the mapping for a GPU.
+    pub fn mapping(&self) -> &[u8] {
+        &self.0.mapping
+    }
+    pub fn code_range(&self) -> Range<usize> {
+        self.0.code_range.clone()
+    }
     pub fn weight_table8(&self) -> &[i8; 8192] {
         &self.0.table
     }

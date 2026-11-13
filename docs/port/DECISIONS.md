@@ -410,6 +410,40 @@ are deliberately absent from the engine. Full twenty-window quality
 validation remains the orchestrator's next gate; one-window scoring and
 configuration agreement do not establish the published full-set quality.
 
+## D12 — Metal backend for the compressed linear operator
+
+Decision (2026-11-14): the compressed linear operator's exact signed-64
+weighted sums run on the GPU through `crates/yskn-metal`. The CPU kernel
+(D10) remains the fallback and the test oracle for real tensors. Design,
+bounds and rejected variants: `crates/yskn-metal/DESIGN.md`.
+
+Measurement (M2 in `docs/port/STATE.md`), with no scoring run, build or test
+running:
+`cargo run --release -p yskn-metal --example bench_metal -- ~/models/qwen38-speed/qwen38_27b_speed.yskn`
+Apple M5, threadgroup 32x4, the whole 10,311,344,128-byte mapping as one
+no-copy buffer, 401 matrices, 9,758,310,400 code bytes per pass, 7 passes
+after a warm-up, measured at the pre-rebase probe commit 4e5fe32. Before
+timing, Metal equalled the CPU kernel on four real tensors (M=3). Median ms
+per whole pass, including activation upload and result readback:
+
+| Rows (M) | Metal, one command buffer per pass | CPU dotprod, 10 threads (M1) |
+|---:|---:|---:|
+| 1 | 111.2 | 645.8 |
+| 2 | 127.7 | 671.5 |
+| 4 | 186.9 | 757.7 |
+| 8 | 330.5 | 924.0 |
+| 16 | 634.1 | 1247.6 |
+
+Reason: Metal wins at every row count, 5.8 times at one row and 2.0 times
+at 16. The GPU removes the decode cost (the CPU does one scalar table
+lookup per weight pair), while each added row costs about the same on both
+(about 35 ms on the GPU, 40 ms on the CPU). Command-buffer granularity
+matters: one buffer per matrix costs about 72 ms more per pass than one per
+pass, one per layer about 12 ms more. A CPU/GPU split of one matrix's
+output rows could add at most 15% at one row and 34% at 16, and the CPU is
+needed for the recurrent and attention layers, so that split is deferred to
+step 7.
+
 ## Scalar-reference sequence API and quality reporting
 
 `prefill(tokens)` commits all supplied input rows. `run_provisional(tokens)`
