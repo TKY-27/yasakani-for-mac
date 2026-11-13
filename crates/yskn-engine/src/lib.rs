@@ -3,9 +3,11 @@
 
 mod kernel;
 mod mapped;
+mod model;
 mod pool;
 
 pub use kernel::Kernel;
 pub use mapped::{MappedModel, Matrix};
+pub use model::{Model, PassTiming};
 pub use pool::Engine;
 pub use yskn_ref::{Error, Result};

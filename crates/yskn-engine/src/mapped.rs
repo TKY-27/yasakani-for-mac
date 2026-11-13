@@ -34,6 +34,42 @@ impl MappedModel {
         &self.header
     }
 
+    /// A validated reader borrowing the same mapping; loading vectors never copies code streams.
+    pub fn reader(&self) -> Result<Container<Cursor<&[u8]>>> {
+        Ok(Container::new(Cursor::new(&self.mapping[..]))?)
+    }
+
+    pub fn embedding_tensor(&self, name: &str) -> Result<MappedEmbeddingTensor> {
+        let descriptor = self
+            .header
+            .tensors
+            .iter()
+            .find(|d| d.name == name)
+            .ok_or_else(|| Error::InvalidModel(format!("missing tensor {name}")))?
+            .clone();
+        let code_range = region(
+            &self.mapping,
+            descriptor.stream_offset,
+            descriptor.stream_bytes,
+        )?;
+        let table = floats(&self.mapping, descriptor.table_offset, 8192)?;
+        let scales = floats(
+            &self.mapping,
+            descriptor.scale_offset,
+            descriptor.physical_rows,
+        )?;
+        let r = &descriptor.input_rotation;
+        let input_signs = signs(r.rule, r.sign_seed, r.sign_offset, descriptor.cols)?;
+        Ok(MappedEmbeddingTensor {
+            mapping: Arc::clone(&self.mapping),
+            descriptor,
+            code_range,
+            table,
+            scales,
+            input_signs,
+        })
+    }
+
     pub fn matrix(&self, name: &str) -> Result<Matrix> {
         let descriptor = self
             .header
@@ -133,5 +169,52 @@ impl Matrix {
     }
     pub fn output_signs(&self) -> Option<&[i8]> {
         self.0.output_signs.as_deref()
+    }
+}
+
+/// Floating embedding tables/scales are owned; the code stream remains mapped.
+pub struct MappedEmbeddingTensor {
+    mapping: Arc<Mmap>,
+    descriptor: TensorDescriptor,
+    code_range: Range<usize>,
+    table: Vec<f32>,
+    scales: Vec<f32>,
+    input_signs: Vec<i8>,
+}
+impl yskn_ref::compressed_linear::EmbeddingTensor for MappedEmbeddingTensor {
+    fn descriptor(&self) -> &TensorDescriptor {
+        &self.descriptor
+    }
+    fn table(&self) -> &[f32] {
+        &self.table
+    }
+    fn scales(&self) -> &[f32] {
+        &self.scales
+    }
+    fn input_signs(&self) -> &[i8] {
+        &self.input_signs
+    }
+    fn rotated_row(&self, row: usize) -> Result<Vec<f32>> {
+        if row >= self.descriptor.rows {
+            return Err(Error::InvalidInput(
+                "embedding token exceeds vocabulary".into(),
+            ));
+        }
+        let mut values = Vec::with_capacity(self.descriptor.cols);
+        for sequence in 0..self.descriptor.cols / 256 {
+            for step in 0..128 {
+                let state = yskn_format::tensor_state(
+                    &self.descriptor,
+                    &self.mapping[self.code_range.clone()],
+                    row,
+                    sequence,
+                    step,
+                )?;
+                for component in 0..2 {
+                    values.push(self.scales[row] * self.table[usize::from(state) * 2 + component]);
+                }
+            }
+        }
+        Ok(values)
     }
 }
