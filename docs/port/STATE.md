@@ -4,7 +4,7 @@ This file is the single resumable record of the port. It is written so the
 orchestrator can continue from it alone. Update it at every merge, decision
 and measurement.
 
-Last updated: 2026-11-14 (steps 1 and 2 merged; step 3 engine model in progress; Metal probe for step 4 started early).
+Last updated: 2026-11-14 (steps 1 and 2 merged; step 3 full score running; step 4 measured: Metal wins, integration waits for the step 3 gate).
 
 ## Goal and release criteria
 
@@ -40,17 +40,19 @@ Release criteria (all must hold):
    feature choice, portable fallback), bit-identical, model memory-mapped.
    **Done (PR #4).** Crate `crates/yskn-engine`; design in DECISIONS D10.
 3. Validate the main model with `score_windows` (gate for everything later).
-   **In progress.** Brief `.work/briefs/02b-engine-model.md` (Sol), worktree
-   `.work/wt/02b`, branch `feat/02b-engine-model`: layer-major engine model
-   that reuses the reference's scalar functions, bit-identity tests, and
-   `score_windows` / `verify_model` examples in `yskn-engine`. When it is
-   verified, the orchestrator runs the full 20-window score (over an hour,
-   nothing else running on the model).
+   **Running.** PR #6 (`feat/02b-engine-model`, Sol, under Opus review) adds
+   the layer-major engine model and `score_windows` / `verify_model`.
+   `verify_model` passes on the real model (four configurations agree bit
+   for bit over 24 rows). The full 20-window run was started 2026-11-14
+   07:46 JST from `.work/runs/` (binary built at 09266e0, the pre-rebase
+   id of b9bd460); output in `.work/runs/score_int8_09266e0.{out,err,json,exit}`.
+   Expected duration about 2.4 hours. Window 0 alone: NLL sum
+   508.71858607572784, perplexity 1.644245 (worker's run).
 4. Backend decision by measurement (NEON vs Metal at 1, 2, 4, 8, 16 rows).
-   **Probe started early** (it does not depend on the main model): brief
-   `.work/briefs/04a-metal-probe.md` (Astra), worktree `.work/wt/04a`,
-   branch `feat/04a-metal-probe`, synthetic data only. The orchestrator
-   runs `bench_metal` on the real model on a quiet machine afterwards.
+   **Measured; decision D12 below: Metal for the compressed linear
+   operator.** Branch `feat/04a-metal-probe` (Opus 5.5, crate
+   `crates/yskn-metal`), under Sol review. It merges after PR #6, and the
+   engine switches to it only after step 3 passes.
 5. Draft model, speculation loop, prompt snapshots, long-prompt prefill, KV5.
 6. Product binary: terminal chat, OpenAI-compatible server, benchmark.
 7. Optimization to the machine limit (stop after five attempts under 2%).
@@ -60,8 +62,16 @@ Release criteria (all must hold):
 
 ## Environment (observed 2026-11-14)
 
-- Machine: Apple M5 family, 10 cores (4 performance, 6 efficiency), 24 GB
+- Machine: MacBook Pro `Mac17,2`, chip **Apple M5** (the base M5, not an
+  M5 Pro: `system_profiler SPHardwareDataType` reports "Apple M5", 10 cores,
+  4 Super and 6 Efficiency; GPU 10 cores, Metal 4), 24 GB
   (`sysctl hw.memsize` = 25769803776), macOS 27.2.1, rustc 1.100.0.
+  Metal `maxBufferLength` is 14,302,248,960 bytes.
+- **Bandwidth ceiling.** The owner's brief gives 307 GB/s nominal, which is
+  the M5 Pro figure. This chip is the base M5; its nominal figure is about
+  153 GB/s (recalled from Apple's M5 announcement, not verified here). The
+  highest read rate observed so far is 87.7 GB/s (Metal kernel, M=1). The
+  achievable ceiling must be measured before step 7 compares against it.
 - Model folder (never commit, never copy): `~/models/qwen38-speed/`.
   Contains `qwen38_27b_speed.yskn` (10,311,344,128 bytes), `bdraft2_k8.yskn`,
   `bdraft2_k8.shead`, `kvq_u5.bin`, `tokenizer.json`, `chat_template.jinja`,
@@ -114,6 +124,21 @@ Orchestrator decisions:
   build output was showing as untracked; briefs and worker reports are
   transient.
 
+- **D12 (2026-11-14) Backend: Metal for the compressed linear operator.**
+  Measured on the real model (M2 below), whole pass, median ms, Metal vs
+  CPU dotprod with 10 threads: 111 vs 646 at 1 row, 128 vs 671 at 2,
+  187 vs 758 at 4, 331 vs 924 at 8, 634 vs 1,248 at 16. Metal wins at every
+  row count: 5.8 times at 1 row, 2.0 times at 16. Reason for the shape: the
+  GPU removes the decode cost (the CPU does one scalar table lookup per
+  weight pair), while the cost of each added row is similar on both (about
+  35 ms on the GPU, 40 ms on the CPU) because neither has a cheap int8
+  product at this scale. Command-buffer granularity matters: one buffer per
+  matrix costs about 72 ms more per pass than one per pass, one per layer
+  about 12 ms more. The CPU kernel stays as the fallback and the test
+  oracle for real tensors. A CPU/GPU split of one matrix's output rows
+  could add at most 15% at 1 row and 34% at 16 by rate addition, and the
+  CPU is needed for the recurrent and attention layers, so it is deferred
+  to step 7. To record in DECISIONS.md when the Metal crate merges.
 - **O3 (2026-11-14)** Commits that change only this file go through a pull
   request and CI but need no cross-model review. Reason: the file is the
   orchestrator's own record, not code; a review would add nothing.
@@ -122,6 +147,12 @@ Orchestrator decisions:
   about 15 GB/s, far from the 307 GB/s ceiling, so the backend choice is
   the largest open question and does not depend on the main-model gate.
   Nothing is built on it until step 3 passes.
+- **O6 (2026-11-14)** GPU work goes to Opus 5.5 subagents, not through the
+  Codex plugin. Reason: the plugin runs Codex in a sandbox where
+  `MTLCreateSystemDefaultDevice()` returns nil and the network is blocked.
+  Astra's attempt at the Metal probe wrote no code for that reason. Codex
+  models still review GPU code by reading it. New crates are fetched by
+  the orchestrator before a Codex task needs them.
 - **O5 (2026-11-14)** The engine's main model reuses the reference's scalar
   functions for everything except the compressed linear kernel, and only
   changes the loop order to layer-major. Reason: least new code, and
@@ -167,7 +198,37 @@ matrices, 9,758,310,400 code bytes per pass, 7 passes after one warm-up.
 | 8 | 924.0 | 908.8 | 10.6 |
 | 16 | 1247.6 | 1234.1 | 7.8 |
 
-Reading: the ideal at 307 GB/s is about 32 ms, so the kernel is
+### M2: Metal kernel, full pass of the compressed linear operator (2026-11-14)
+
+Command (scoring run stopped first, no build or test running):
+`cargo run --release -p yskn-metal --example bench_metal -- ~/models/qwen38-speed/qwen38_27b_speed.yskn`
+
+Commit 4e5fe32 (branch `feat/04a-metal-probe`). Device Apple M5,
+threadgroup 32x4, whole 10,311,344,128-byte mapping as one no-copy buffer,
+401 matrices, 9,758,310,400 code bytes per pass, 7 passes after a warm-up.
+Before timing, Metal equalled the CPU kernel on four real tensors (M=3).
+Empty dispatch round trip: median 0.18 ms. No swap in use afterwards.
+
+| Rows (M) | (a) one buffer per pass, median ms | (b) one per matrix | (c) one per layer | Read rate GB/s (a) |
+|---:|---:|---:|---:|---:|
+| 1 | 111.2 | 183.7 | 122.6 | 87.7 |
+| 2 | 127.7 | 203.1 | 139.6 | 76.4 |
+| 4 | 186.9 | 264.3 | 199.3 | 52.2 |
+| 8 | 330.5 | 410.4 | 344.9 | 29.5 |
+| 16 | 634.1 | 713.8 | 647.5 | 15.4 |
+
+Times include uploading activations and reading results back.
+
+### M3: where a 16-row pass of the whole model goes, CPU path (2026-11-14)
+
+From the scoring run's stderr (`score_windows`, commit 09266e0, rows per
+pass 16, 10 threads), seconds per pass at context about 190: total 2.86,
+kernel 1.20, recurrence 1.39, attention 0.14, rest 0.12. The worker's
+window-0 run reported 3.73 late in the window (attention 1.04 at context
+about 2,000). The recurrent layers and attention are the reference's
+scalar code and are now the largest costs.
+
+Reading of M1: the ideal at 307 GB/s is about 32 ms, so the kernel is
 compute-bound by a factor of about 20. The decode is scalar (one table
 lookup per pair of weights, bounds-checked) and each added row costs about
 40 ms. CPU features present: NEON, dotprod, i8mm, SME, SME2
