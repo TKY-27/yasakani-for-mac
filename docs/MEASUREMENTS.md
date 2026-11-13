@@ -14,7 +14,8 @@ records themselves are in [`bench/`](../bench/).
 * The quality table evaluates the same two models with an FP16 key-value (KV) cache. That is not the KV condition of the speed tables, which
   use KV5. YASAKANI's two rows of that table were measured with a research build of the engine, which can use an FP16 KV cache and return
   the distribution over the whole vocabulary; the weights are the same data as in the released model files. The `yskn.dll` of this
-  release was not used for the quality table.
+  release was not used for the quality table. It was measured with the released `yskn.dll` afterwards (November 14, 2026): see
+  "The released engine" at the end of the section on quality.
 * "16.78 GiB" comes from the long-context test of the fastest model.
 * The code-edit demonstration (the uncut screen recording) was made with the fastest model on November 8: 5.56 s from sending the input to the
   arrival of the last output.
@@ -162,7 +163,26 @@ auxiliary layers; the whole file is 13.15 GB. For UD-IQ3_XXS the whole file, 10.
 
 The score of every configuration, the logs, the scoring scripts and how the distribution of each engine was obtained are in
 [`bench/20261108/quality/`](../bench/20261108/quality/), together with two more Unsloth files that are not in the table above. The twenty
-transcripts and the reference are not published, so the table cannot be measured again from the records alone.
+transcripts are in [`tools/quality/`](../tools/quality/) (added on November 14, 2026), together with a program that makes the reference from
+the original model and a program that measures a released model with the released engine. The reference file of this table itself (about
+10 GB) is not published; a reference made with that program from the original model gives the same distributions (KL divergence between
+the two: less than 0.000001).
+
+### The released engine (added November 14, 2026)
+
+The two YASAKANI rows above were measured with a research build and an FP16 KV cache. The released `yskn.dll` is built for its 8-bit KV
+cache only, and the published source builds only this configuration, so those rows cannot be repeated with the released engine. On the
+same 20 windows and against the same reference, the engine of release 0.1.1 gives:
+
+| Model | KV cache | KL on thinking text↓ | Top-1 agreement↑ |
+|---|---|---|---|
+| quality model | KV5 (the engine as the package starts it) | 0.0126 | 95.35% |
+| quality model | 8-bit, without the KV5 compression | 0.0125 | 95.23% |
+| fastest model | KV5 (the engine as the package starts it) | 0.0309 | 92.98% |
+| fastest model | 8-bit, without the KV5 compression | 0.0307 | 93.06% |
+
+Against a reference made from the original model with Hugging Face transformers (`tools/quality/make_reference.py`), the two KV5 rows
+are 0.0126 / 95.35% and 0.0309 / 92.98%. How to repeat this: [`tools/quality/README.md`](../tools/quality/README.md).
 
 ## KV5 (the compressed key-value cache) with the fastest model
 

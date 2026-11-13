@@ -114,6 +114,14 @@ result covers thinking text only: on general web text an additional evaluation s
 than for our earlier conversion of the same size. The full table, including the configurations for which only a lower bound of the KL
 divergence could be measured, is in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
 
+**Checking it yourself.** The numbers above were measured with a research build of the engine and an FP16 key-value cache. The released
+`yskn.dll` works with its 8-bit cache only. Measured again with the released engine as the package starts it (KV5 cache, November 14,
+2026), the quality model gives a KL divergence of 0.0126 and a top-1 agreement of 95.35%, the fastest model 0.0309 and 92.98%. The
+20 texts, a program that makes the reference from the original model with Hugging Face transformers, and the program that measures a
+released model are in [tools/quality/](tools/quality/). The file format is specified in [docs/FORMAT.md](docs/FORMAT.md), and
+[tools/yskn_decode.py](tools/yskn_decode.py) reads a model file without the engine and compares the stored weights with the original
+ones. The conversion tool is not public, so the model files cannot be rebuilt from the original weights.
+
 Speculative decoding only keeps tokens that the main model agrees with, so it is built not to change what is written. Whether a repeated
 request gives exactly the same tokens depended, in our checks of November 10, 2026, on whether other programs were using the GPU at the same
 time. With the GPU otherwise idle, all 240 repeated runs were identical. While other programs were using the GPU (the desktop was drawing),
