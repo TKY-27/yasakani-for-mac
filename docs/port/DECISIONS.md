@@ -294,10 +294,123 @@ ownership are also tested. Real verification covers GDN qkv, MLP down,
 attention q, and the first 4096 head rows for M=3. No new specification
 error was found; the previously documented bits 4/5 negative-start wording
 and the distinction between logical and physical output rows remain
-important. This crate implements the integer operator, not a complete
-floating-point inference backend.
+important. At D10 this crate implemented the integer operator only; D11 adds the complete
+floating-point main-model path.
 
-## Sequence API and quality reporting
+## D11 — Layer-major mapped main model
+
+`yskn_engine::Model` resolves the same folder manifest and header-derived
+architecture as the reference, or accepts a direct `.yskn` path. Both paths
+call the shared `model_location` and `load_weights`; scalar and mapped
+embedding tensors use the same `Embedding` implementation. All tensor code
+streams, including embedding residuals, stay in a single shared mapping.
+Only vectors, tables, scales, signs and sequence scratch are owned. Opening
+is unsafe for the same external-file stability invariant as D10; callers
+must prevent modification/truncation through model drop.
+
+`prefill` validates every token and the complete context extent before doing
+work. It computes on a copy of sequence state and publishes the new state,
+position and all requested row logits only when the entire call succeeds.
+An empty call is a no-op. Pass width is configurable and positive (default
+16); widths above 16 still make one kernel API call per projection, with the
+existing kernel's internal 16-row decode groups. Within a pass, embeddings
+are followed by every layer, then final norm/head. GDN qkv/z share qkv's
+prepared signs; attention q/k/v share q's, exactly as in the reference.
+
+The existing persistent pool now also runs index-range closures. Independent
+embedding rows, normalization/activation preparation, projection restoration
+and rotation, residuals and MLP gating run in parallel. Attention rows are
+prepared independently, their cache entries are appended in ascending
+position, then query rows and heads run in parallel. Each query explicitly
+reads only `cache[..position]` and its separately prepared self entry. Later
+rows cannot change its prefix tiles, split plan, masked values or arithmetic.
+GDN `step` calls stay in ascending row order on each layer's state.
+
+There are no parallel floating reductions: each row/head executes the shared
+reference scalar primitives in their original operation order. The integer
+kernel is exact. `CompressedLinear::project` and the engine both call
+`restore_projection`; attention `step` calls the same prepared-row,
+per-head output and cache append pieces as the engine. The reference still
+forbids unsafe code. The pool's one lifetime-erasure block permits borrowed
+closures on persistent threads: all dispatched jobs are drained before the
+borrow ends, including numeric errors, dispatch failures and caught panics.
+Results are owned by workers and collected in index order.
+
+The shared `quality` module fixes window validation, next-token targets,
+ordered binary64 NLL addition and portable `exp_d`. Both scoring examples
+use it. Engine scoring processes batches and exposes half-open window ranges
+and JSON window sums/counts. A full run adds individual losses in ascending
+window/position order; combining only per-window sums can differ in the last
+binary64 rounding bits from that full fold. `PassTiming` records nonoverlapping
+wall times for kernel calls, attention preparation/cache/output, complete
+GDN steps and remaining pass work. Scoring reports early/late pass timings
+and aggregate stage times on stderr; scoring/NLL overhead is outside passes.
+
+Synthetic model comparisons cover all host kernels, one/four workers, widths
+1/2/5/16/17/40, uneven input chunks, reset with different tokens and rejected
+requests without state changes. The mixed fixture runs 73 rows from position
+3 across attention tiles 32 and 64. Four fixed SHA-256 logit digests were
+obtained by executing the original pre-D11 `604aecd` sources separately on the
+same synthetic writer; they also guard the reference's unchanged bits.
+The shared scorer has an independent deterministic sequence test for target
+positions, reset, range selection, counts and ordered addition.
+
+### D11 local proof and measurements (2026-11-14)
+
+All six brief proof commands succeeded on this worktree: fmt, clippy with
+`-D warnings`, debug and release workspace tests (76 passing in each),
+real `verify_model` (all 24 rows/all vocabulary bits in all four requested
+configurations), and `score_windows --windows 0..1`. The real scalar model
+was never loaded. Runs were serial, with no build/test alongside timing.
+
+Window 0 consumes 2,047 input rows in 128 passes and scores 1,023 positions:
+```text
+window=0 scored_positions=1023 nll_sum=5.0871858607572784e2
+scored_positions: 1023
+mean_negative_log_likelihood: 0.497281120309
+perplexity: 1.644244684328
+```
+
+The completed measurement uses default dotprod, ten workers and 16 rows per
+pass (`YSKN_KERNEL` unset). All stage entries below are elapsed wall seconds,
+not CPU-time sums. Early is the mean of 13 full passes at positions 0..192;
+late is the mean of three full passes at 1984/2000/2016. The final 15-row
+pass is included only in the whole-window totals.
+
+| Scope | Total pass time | Integer kernel | Attention | GDN step | Rest |
+|---|---:|---:|---:|---:|---:|
+| Early 16-row mean | 2.764065 | 1.206741 | 0.103914 | 1.334633 | 0.118777 |
+| Late 16-row mean | 3.731764 | 1.206684 | 1.042580 | 1.362127 | 0.120373 |
+| All 128 passes | 427.336007 | 158.660025 | 71.930404 | 180.898005 | 15.847574 |
+
+Shared scoring elapsed: 429.062166 s; whole command:
+429.584103 s. The 1.726159 s outside passes covers reset,
+state cloning, ordered NLL evaluation and reporting. Linear extrapolation
+of the scored window gives 8581.2 s (about 2 h 23 min) for all twenty
+windows; this is an estimate, not a completed full-set run.
+
+Peak resident memory including mappings was **10,569,367,552 bytes**
+(10.569 GB; 9.843 GiB), measured by Darwin `wait4` rusage.
+**Measurement limitation:** the requested `/usr/bin/time -l` completed its
+first scoring run (421.09 s real, score time 420.559641 s), then failed
+with `time: sysctl kern.clockrate: Operation not permitted` before printing
+resident memory. Its wrapper returned 1. No permissions or system settings
+were changed. The same one-window cargo command was therefore repeated
+under a small Python `os.posix_spawnp`/`os.wait4` observer; cargo returned 0,
+and its peak RSS is the number above. This is not represented as a successful
+`time -l` RSS reading. Both runs produced exactly the same printed 17-digit
+window NLL sum and final perplexity. Their score times differ by about 2%.
+
+No new specification/reference error was identified. D2 portable math, D3
+provisional attention dot order and D9 masking are preserved; these CPU
+comparisons do not prove CUDA bit equivalence or the published full-set score.
+
+Provisional execution, commit/replay, speculation and draft-model loading
+are deliberately absent from the engine. Full twenty-window quality
+validation remains the orchestrator's next gate; one-window scoring and
+configuration agreement do not establish the published full-set quality.
+
+## Scalar-reference sequence API and quality reporting
 
 `prefill(tokens)` commits all supplied input rows. `run_provisional(tokens)`
 computes a straight causal chain on a copy of committed state. `commit(K)`
