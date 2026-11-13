@@ -187,10 +187,5 @@ impl ChatFormatter {
 }
 
 fn decode(tokenizer: &Tokenizer, ids: &[u32]) -> Result<String> {
-    for &id in ids {
-        if tokenizer.id_to_token(id).is_none() {
-            return Err(error(format!("the tokenizer has no token id {id}")));
-        }
-    }
     tokenizer.decode(ids, false).map_err(error)
 }

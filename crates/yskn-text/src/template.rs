@@ -1,6 +1,6 @@
 use minijinja::{
     Environment, Error, ErrorKind, Value as JValue,
-    value::{Kwargs, Rest, ValueOrKwargs, from_args},
+    value::{Kwargs, Rest, StringInput, ValueOrKwargs, from_args},
 };
 use serde_json::Value;
 
@@ -22,6 +22,32 @@ pub(crate) fn environment() -> Environment<'static> {
             .expect("default delimiters are valid"),
     );
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.set_formatter(|out, state, value| {
+        if value.kind() == minijinja::value::ValueKind::Number && !value.is_integer() {
+            let number = serde_json::to_value(value).map_err(|e| invalid(e.to_string()))?;
+            minijinja::escape_formatter(
+                out,
+                state,
+                &JValue::from(python_float(&number.to_string())),
+            )
+        } else {
+            minijinja::escape_formatter(out, state, value)
+        }
+    });
+    env.add_filter("trim", |value: StringInput<'_>, chars: Option<String>| {
+        let trimmed = if let Some(chars) = chars {
+            value
+                .as_str()
+                .trim_matches(|c| chars.contains(c))
+                .to_owned()
+        } else {
+            value
+                .as_str()
+                .trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+                .to_owned()
+        };
+        value.preserve_safety(trimmed)
+    });
     env.add_filter("tojson", tojson);
     env.add_filter("items", |v: JValue| {
         if !v.is_undefined() && v.kind() != minijinja::value::ValueKind::Map {

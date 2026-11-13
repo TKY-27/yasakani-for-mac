@@ -19,12 +19,6 @@ impl<'a> StreamDecoder<'a> {
     }
 
     pub fn push(&mut self, ids: &[u32]) -> Result<String> {
-        // Reject unknown ids before mutating the window.
-        for &id in ids {
-            if self.tokenizer.id_to_token(id).is_none() {
-                return Err(error(format!("the tokenizer has no token id {id}")));
-            }
-        }
         self.ids.extend_from_slice(ids);
         if self.ids.len() == self.read {
             return Ok(String::new());
@@ -99,11 +93,6 @@ impl<'a> OutputStream<'a> {
     pub fn feed(&mut self, ids: &[u32], final_: bool) -> Result<Vec<(String, String)>> {
         if ids.len() < self.seen {
             return Err(error("generation ids must be a growing array"));
-        }
-        for &id in &ids[self.seen..] {
-            if self.reason.tokenizer.id_to_token(id).is_none() {
-                return Err(error(format!("the tokenizer has no token id {id}")));
-            }
         }
         let mut events = Vec::new();
         for (index, &id) in ids.iter().enumerate().skip(self.seen) {

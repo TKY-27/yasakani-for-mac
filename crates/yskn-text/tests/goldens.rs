@@ -1,6 +1,8 @@
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use yskn_text::{ChatFormatter, OutputStream, StreamDecoder, ToolCallFilter};
+use yskn_text::{
+    ChatFormatter, OutputStream, StreamDecoder, ToolCallFilter, parse_tool_call, tool_schemas,
+};
 
 fn ids(case: &Value) -> Vec<u32> {
     serde_json::from_value(case["ids"].clone()).unwrap()
@@ -70,6 +72,14 @@ fn upstream_python_goldens() {
         eprintln!("goldens {category}: {}/{} passed", cases.len(), cases.len());
         total += cases.len();
     }
+    for case in data["decode"].as_array().unwrap() {
+        assert_eq!(
+            fmt.decode(&ids(case)).unwrap(),
+            case["decoded"].as_str().unwrap(),
+            "decode {}",
+            case["name"]
+        );
+    }
     for case in data["stream"].as_array().unwrap() {
         let all = ids(case);
         let mut stream = StreamDecoder::new(fmt.tokenizer());
@@ -95,7 +105,17 @@ fn upstream_python_goldens() {
     }
     for case in data["output"].as_array().unwrap() {
         let all = ids(case);
-        let mut output = OutputStream::new(&fmt, case["in_reasoning"].as_bool().unwrap());
+        let hidden: Option<Vec<u32>> = case
+            .get("hidden_ids")
+            .map(|v| serde_json::from_value(v.clone()).unwrap());
+        let make_output = || {
+            let inside = case["in_reasoning"].as_bool().unwrap();
+            match &hidden {
+                Some(ids) => OutputStream::with_hidden_ids(&fmt, inside, ids),
+                None => OutputStream::new(&fmt, inside),
+            }
+        };
+        let mut output = make_output();
         let mut expected_events = Vec::new();
         for (i, expected) in case["pieces"].as_array().unwrap().iter().enumerate() {
             let events = output.feed(&all[..i + 1], false).unwrap();
@@ -112,7 +132,7 @@ fn upstream_python_goldens() {
         expected_events.extend(tail);
         assert_eq!(json!(output.think_end_at), case["think_end_at"]);
         for chunk in [3, 1000] {
-            let mut output = OutputStream::new(&fmt, case["in_reasoning"].as_bool().unwrap());
+            let mut output = make_output();
             let mut events = Vec::new();
             for end in (chunk..all.len()).step_by(chunk) {
                 events.extend(output.feed(&all[..end], false).unwrap());
@@ -122,7 +142,7 @@ fn upstream_python_goldens() {
             assert_eq!(json!(output.think_end_at), case["think_end_at"]);
         }
     }
-    for category in ["stream", "output"] {
+    for category in ["decode", "stream", "output"] {
         let count = data[category].as_array().unwrap().len();
         eprintln!("goldens {category}: {count}/{count} passed");
         total += count;
@@ -157,4 +177,20 @@ fn upstream_tool_filter_goldens_without_model() {
         cases.len(),
         cases.len()
     );
+}
+
+#[test]
+fn upstream_parse_goldens_without_model() {
+    let data: Value = serde_json::from_str(include_str!("data/goldens.json")).unwrap();
+    let cases = data["parse"].as_array().unwrap();
+    for case in cases {
+        let schemas = tool_schemas(Some(&case["tools"]));
+        assert_eq!(
+            json!(parse_tool_call(case["block"].as_str().unwrap(), &schemas)),
+            case["result"],
+            "{}",
+            case["name"]
+        );
+    }
+    eprintln!("goldens parse: {}/{} passed", cases.len(), cases.len());
 }

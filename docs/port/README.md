@@ -177,9 +177,16 @@ Jinja template. `render(&messages, tools.as_ref(), &options)` accepts JSON
 values; `prompt` returns `(Vec<u32>, starts_inside_thinking)` and always adds
 the generation prompt, as upstream does. `render` supports
 `add_generation_prompt: false`. `encode` adds no special tokens; `decode`
-keeps them and rejects unknown ids. Token ids, including the ten digit ids,
+keeps them and silently skips unmapped ids. Token ids, including the ten digit ids,
 are available to the future sampler and chat layers. This crate forbids unsafe
 code and has no Python runtime dependency.
+
+JSON numbers have limits relative to Python: JSON `-0` becomes a float and
+prints `-0.0`, while Python parses it as integer `0` and prints `0`. Integers
+beyond `u64` (or below `i64`) become floats and can lose precision, while Python
+keeps arbitrary-precision integers. `NaN` and `Infinity` are rejected as JSON
+input, while Python's `json.loads` accepts them and `json.dumps` emits `NaN`
+and `Infinity` by default.
 
 The environment preserves JSON key order, uses Python string methods and a
 Python-format `tojson` filter (including indentation, separators, ASCII
@@ -202,11 +209,12 @@ text helpers in `python/yasakani/textio.py`; NumPy array types are replaced by
 Rust vectors and arrays. Request validation and generation remain outside this
 crate.
 
-Regenerate independent oracle vectors from the worktree root (Python is only
-needed here, not for the Rust runtime):
+Regenerate independent oracle vectors from the worktree root. Set `$PYTHON` to
+a Python with `tokenizers`, `jinja2` and `numpy`; these are needed only to
+regenerate goldens, never at run time:
 
 ```sh
-PYTHONPATH=python /Users/anag2bgod/Projects/yasakani-for-mac/.work/venv/bin/python \
+PYTHONPATH=python "$PYTHON" \
   tools/text/make_goldens.py "$HOME/models/qwen38-speed" \
   crates/yskn-text/tests/data/goldens.json
 CARGO_NET_OFFLINE=true cargo test -p yskn-text

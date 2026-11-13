@@ -41,9 +41,8 @@ struct Folder(PathBuf);
 impl Folder {
     fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::current_dir()
-            .unwrap()
-            .join("target/text-fixtures")
+        let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join("text-fixtures")
             .join(format!(
                 "{}-{}",
                 std::process::id(),
@@ -174,12 +173,9 @@ fn template_fallback_file_precedence_tokens_and_unknown_ids() {
             .to_string()
             .contains("missing")
     );
-    assert_eq!(
-        fmt.decode(&[999]).unwrap_err().to_string(),
-        "the tokenizer has no token id 999"
-    );
+    assert_eq!(fmt.decode(&[999]).unwrap(), "");
     let mut stream = StreamDecoder::new(fmt.tokenizer());
-    assert!(stream.push(&[999]).is_err());
+    assert_eq!(stream.push(&[999]).unwrap(), "");
     assert_eq!(stream.push(&[8]).unwrap(), "A");
     assert!(fmt.render(&json!({}), None, &json!({})).is_err());
     assert!(fmt.render(&json!([]), None, &json!(null)).is_err());
@@ -187,7 +183,7 @@ fn template_fallback_file_precedence_tokens_and_unknown_ids() {
     let mut output = OutputStream::new(&fmt, false);
     output.feed(&[8], false).unwrap();
     assert!(output.feed(&[], false).is_err());
-    assert!(output.feed(&[8, 999], false).is_err());
+    assert!(output.feed(&[8, 999], false).unwrap().is_empty());
     let mut tokenizer: Value =
         serde_json::from_str(&fs::read_to_string(folder.0.join("tokenizer.json")).unwrap())
             .unwrap();

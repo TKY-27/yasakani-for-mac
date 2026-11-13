@@ -5,7 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from yasakani.textio import ChatFormatter, OutputStream, StreamDecoder, ToolCallFilter
+from yasakani.textio import ChatFormatter, OutputStream, StreamDecoder, ToolCallFilter, parse_tool_call, tool_schemas
 
 
 def main():
@@ -14,7 +14,7 @@ def main():
     parser.add_argument('output', type=Path)
     args = parser.parse_args()
     fmt = ChatFormatter(args.model_folder)
-    data = {k: [] for k in ('selfcheck', 'chat', 'tools', 'errors', 'raw', 'stream', 'output', 'tool_filter')}
+    data = {k: [] for k in ('selfcheck', 'chat', 'tools', 'errors', 'raw', 'stream', 'output', 'tool_filter', 'decode', 'parse')}
 
     def rendered(category, name, messages, options=None, tools=None, prompt_sha256=None):
         options = options or {}
@@ -129,6 +129,93 @@ def main():
             pieces = [filt.push(c) for c in chunks]
             tail = filt.flush()
             data['tool_filter'].append(dict(name=f'{name}-{step}', tools=tools, chunks=chunks, pieces=pieces, tail=tail, calls=filt.calls))
+    # Review regressions: every expected result below is produced by upstream.
+    whitespace = '\u001c\u001d\u001e\u001f\u00a0\u3000\u2028\t\n'
+    for index, char in enumerate(whitespace):
+        rendered('chat', f'review-1-content-{index}', [{'role': 'user', 'content': char + 'Hello' + char}])
+        rendered('chat', f'review-1-reasoning-{index}', user + [{'role': 'assistant', 'content': 'answer', 'reasoning_content': char + 'reason' + char}], {'preserve_thinking': True})
+    rendered('chat', 'review-1-mixed', [{'role': 'user', 'content': whitespace + 'Hello' + whitespace}])
+    values = {'rounded': 51.248178375505404, 'one': 1.0, 'large_float': 1e20,
+              'small_float': 1e-7, 'tenth': 0.1, 'large_int': 18446744073709551615,
+              'negative_int': -9223372036854775808, 'yes': True, 'no': False,
+              'nil': None, 'escaped': '"\\\n\u0000\u001f/\u2028日本語'}
+    rendered('tools', 'review-2-schema-values', user, tools=[{'type': 'function', 'function': {'name': 'values', 'parameters': values}}])
+    rendered('tools', 'review-2-argument-values', user + [{'role': 'assistant', 'content': '', 'tool_calls': [{'function': {'name': 'values', 'arguments': values}}]}])
+
+    def stream_case(name, ids):
+        stream = StreamDecoder(fmt.tok)
+        pieces = [stream.push([i]) for i in ids]
+        tail = stream.flush()
+        data['stream'].append(dict(name=name, ids=ids, pieces=pieces, tail=tail, decoded=fmt.decode(ids)))
+
+    def output_case(name, ids, inside, hidden=None):
+        stream = OutputStream(fmt, inside) if hidden is None else OutputStream(fmt, inside, hidden)
+        pieces = [stream.feed(ids[:i]) for i in range(1, len(ids) + 1)]
+        tail = stream.feed(ids, final=True)
+        case = dict(name=name, ids=ids, in_reasoning=inside, pieces=pieces, tail=tail, think_end_at=stream.think_end_at)
+        if hidden is not None:
+            case['hidden_ids'] = hidden
+        data['output'].append(case)
+
+    normal = fmt.encode('Hello 日本語.').tolist()
+    unknown = [248077, 248100, 248319]
+    mixed_ids = normal[:1] + unknown[:1] + normal[1:2] + unknown[1:] + normal[2:]
+    data['decode'].append(dict(name='review-3-unknown', ids=mixed_ids, decoded=fmt.decode(mixed_ids)))
+    stream_case('review-3-unknown', mixed_ids)
+    output_case('review-3-unknown-content', mixed_ids, False)
+    output_case('review-3-unknown-reasoning', mixed_ids + [fmt.think_end] + normal, True)
+    output_case('review-3-unknown-hidden', mixed_ids, False, unknown + [248046, 248044])
+    scalars = [1e20, 1e-7, 1.0, 0.1, 51.248178375505404,
+               18446744073709551615, -9223372036854775808, True, False, None]
+    rendered('chat', 'review-4-scalars', [{'role': 'user', 'content': [{'type': 'text', 'text': value} for value in scalars]}])
+    malformed = [
+        ('function-newline', '<function=bad\nname><parameter=x>1</parameter>'),
+        ('parameter-newline', '<function=f><parameter=bad\nname>1</parameter><parameter=ok>2</parameter>'),
+        ('unterminated-newline', '<function=\n<function=valid><parameter=\n<parameter=ok>3</parameter>'),
+        ('adversarial', '<function=\n' * 10000 + '<function=valid><parameter=\n' * 10000 + '<parameter=ok>3</parameter>'),
+    ]
+    for name, block in malformed:
+        name = 'review-5-' + name
+        data['parse'].append(dict(name=name, block=block, tools=tools, result=parse_tool_call(block, tool_schemas(tools))))
+        text = '<tool_call>' + block + '</tool_call>'
+        chunks = [text]  # Exercise the entire long tag scan without quadratic chunk construction.
+        filt = ToolCallFilter(tools)
+        pieces = [filt.push(c) for c in chunks]
+        data['tool_filter'].append(dict(name=name, tools=tools, chunks=chunks, pieces=pieces, tail=filt.flush(), calls=filt.calls))
+
+    for effort in (None, 'xhigh', 'medium', 'low', 'high'):
+        category = 'errors' if effort in (None, 'high') else 'chat'
+        rendered(category, f'review-6-effort-{effort}', user, {'reasoning_effort': effort})
+    for value in (1, 0, 'yes', None):
+        rendered('chat', f'review-6-thinking-{value}', user, {'enable_thinking': value})
+    rendered('chat', 'review-6-system-parts', [{'role': 'system', 'content': [{'type': 'text', 'text': ' Be '}, {'type': 'text', 'text': 'brief. '}]}] + user)
+    calls = [{'function': {'name': 'first', 'arguments': {'x': 1}}}, {'function': {'name': 'second', 'arguments': {'y': False}}}]
+    rendered('tools', 'review-6-multiple-calls', user + [{'role': 'assistant', 'content': 'Checking.', 'tool_calls': calls}])
+    rendered('tools', 'review-6-empty-content', user + [{'role': 'assistant', 'content': '', 'tool_calls': calls[:1]}])
+    rendered('tools', 'review-6-flat-call', user + [{'role': 'assistant', 'content': '', 'tool_calls': [calls[0]['function']]}])
+    emoji_ids = fmt.encode('A 👩🏿‍💻').tolist()
+    partial = next(emoji_ids[:end] for end in range(len(emoji_ids) - 1, 0, -1) if fmt.decode(emoji_ids[:end]).endswith('�'))
+    stream_case('review-6-partial-utf8', partial)
+    output_case('review-6-hidden-middle', normal[:1] + [248046] + normal[1:], False)
+    output_case('review-6-second-think-end', normal + [fmt.think_end] + normal + [fmt.think_end] + normal, True)
+    output_case('review-6-first-think-end', [fmt.think_end] + fmt.encode('\n\nAnswer').tolist(), True)
+
+    unicode_inputs = [
+        ('cjk-extension-i', '\U0002ebf0'), ('ol-onal-letter', '\U0001e5d0'),
+        ('ol-onal-mark', '\U0001e5ee'), ('garay-digit', '\U00010d40'),
+        ('cyrillic', '\u1c89'), ('unassigned', '\u0378\U00010ffff'),
+        ('private-use', '\ue000\U000f0000'), ('combining', '\u0301\u20dd'),
+    ]
+    # Exclude only independently confirmed regex-engine differences; retain exact
+    # inputs, both id sequences and library versions here if any are found.
+    known_divergences = []
+    for name, char in unicode_inputs:
+        text = f'a{char}b A{char}B {char}abc123{char}45!{char}\n'
+        if name not in {case['name'] for case in known_divergences}:
+            raw('raw', 'review-7-' + name, text)
+    for size in (1, 2, 3, 100, 10000):
+        raw('raw', f'review-7-spaces-{size}', 'a' + ' ' * size + 'b')
+        raw('raw', f'review-7-mixed-whitespace-{size}', 'a' + ' \t\n' * size + 'b')
     assert all('error' in c for c in data['errors'])
     assert all('error' not in c for c in data['chat'])
     args.output.parent.mkdir(parents=True, exist_ok=True)
