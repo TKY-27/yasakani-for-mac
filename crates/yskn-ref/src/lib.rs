@@ -4,6 +4,8 @@
 pub mod attention;
 pub mod compressed_linear;
 pub mod gated_deltanet;
+pub mod kv_codec;
+pub mod kv_profile;
 pub mod model;
 pub mod output_head_sampler;
 pub mod portable_math;
