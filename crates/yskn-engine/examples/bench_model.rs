@@ -1,32 +1,43 @@
-//! `bench_model MODEL [--rows-per-pass 16] [--passes 7]`
+//! `bench_model MODEL [--backend cpu|metal] [--rows-per-pass 16] [--passes 7]`
 //!
 //! Times whole-model passes from position 0 after one untimed warm-up pass and
 //! prints the minimum and median seconds of each `PassTiming` stage.
 use std::time::Duration;
-use yskn_engine::{Engine, Error, Model, PassTiming, Result};
+use yskn_engine::{Backend, Engine, Error, Model, PassTiming, Result};
 
 fn usage() -> Error {
-    Error::InvalidInput("usage: bench_model MODEL [--rows-per-pass N] [--passes N]".into())
+    Error::InvalidInput(
+        "usage: bench_model MODEL [--backend cpu|metal] [--rows-per-pass N] [--passes N]".into(),
+    )
 }
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let path = args.next().ok_or_else(usage)?;
-    let (mut rows, mut passes) = (16, 7);
+    let (mut rows, mut passes, mut backend) = (16, 7, Backend::from_env()?);
     while let Some(option) = args.next() {
-        let value: usize = args
-            .next()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v| v > 0)
-            .ok_or_else(usage)?;
+        let value = args.next().ok_or_else(usage)?;
+        let number = || {
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|&v| v > 0)
+                .ok_or_else(usage)
+        };
         match option.as_str() {
-            "--rows-per-pass" => rows = value,
-            "--passes" => passes = value,
+            "--backend" => backend = value.parse()?,
+            "--rows-per-pass" => rows = number()?,
+            "--passes" => passes = number()?,
             _ => return Err(usage()),
         }
     }
     // SAFETY: this read-only benchmark requires the weights to stay unchanged until exit.
-    let mut model = unsafe { Model::with_engine(&path, Engine::from_env()?, rows)? };
+    let mut model = unsafe { Model::with_backend(&path, Engine::from_env()?, backend, rows)? };
+    println!(
+        "backend={} device={}",
+        model.backend().name(),
+        model.device()
+    );
     let vocabulary = model.dimensions().vocabulary_size;
     let tokens: Vec<u32> = (0..rows * passes)
         .map(|i| ((i * 7 + 11) % vocabulary) as u32)
