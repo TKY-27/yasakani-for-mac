@@ -118,15 +118,25 @@ FP16-rounded row scale, see [04](04_ATTENTION.md). The file contains the
 **profile**; the encoder produces payloads in memory. Source distinction:
 `src/kvq_fast.cuh:197-234`, `src/engine35.cpp:242-251`.
 
-**UNCERTAIN [AUX-02]:** The actual `kvq_u5.bin` payload is not in this
-checkout. Therefore the numerical table entries, multiplier list, means,
-which layer/kind remains int8, and whether its groups select the optimized
-encoder cannot be established from its filename. `TECHNOLOGY.md` reports
-16 packed key streams and 13 packed value streams, but the loader computes
-that from the file; it is not hard-coded. Checked:
-`python/yasakani/runtime.py:116`, `src/engine35.cpp:38-53`,
-`src/engine35.cpp:242-251`, `src/kvq_atxpk.hpp:60-83`,
-`docs/TECHNOLOGY.md:231-237`.
+**RESOLVED [AUX-02] (brief 05a, local artifact inspection):** The read-only
+17,432-byte `kvq_u5.bin` has 16 attention layers, four KV heads and 128 groups.
+Every group has mode 0 / five bits; even groups reference table 0, odd groups
+table 1. Both 256-entry tables span [-886,874], with gains 1.0015934 and 1.0.
+The nine multipliers are 0.9, 0.93, 0.96, 0.98, 1.0, 1.02, 1.04, 1.07, 1.1.
+VIT2 is eligible under `src/kvq_fast.hpp:51-66`. The predicate in
+`src/kvq_atxpk.hpp:60-83` yields all 16 packed key sides and 13 value sides;
+value ordinals 10, 14, 15 are unpackable. Group 83 has guard 1, groups
+115/123/125 have one basis, and 121/127 have two. Means are present in groups
+3, 5, 7, 13, 63, 71, 77, 95, 98, 99, 103, 106, 109, 113, 115, 117, 119,
+121, 123, 125, 127. These are artifact facts, not hardcoded format rules;
+`kv_profile_info` prints them and the optional real-profile test asserts them.
+Neither table contents nor profile bytes are copied into the repository.
+
+The scalar port derives group count as attention layers × KV heads × 2,
+checks it against offset 28, and validates all referenced ranges. This
+intentionally generalizes the shipping loader's fixed 16/4/128 dimensions
+(`src/engine35.cpp:41`) for synthetic models; it does not reinterpret unknown
+header bytes. See [D13](../port/DECISIONS.md#d13--profile-quantized-kv-row-codec).
 
 **UNCERTAIN [AUX-03]:** The KVQP reader performs some length checks but does
 not validate every offset before dereferencing it. For example, the table

@@ -196,7 +196,17 @@ trellis_chain(target[64], integer_codebook[256], bits):
 
 `argmin(value,tie)` minimizes the value and then the integer tie argument. The per-step comparison is signed integer; the final general-program comparison converts the stored cost to unsigned before combining it with the state index. The source uses 32-bit integer arithmetic. Sources: `src/kvq_fast.cuh:112-135`.
 
-**UNCERTAIN [ATT-04]:** The general trellis path has signed 32-bit squared-error costs without an overflow check. The profile format permits signed int16 codebook entries, while the target is clamped only to `[-2048,2048]`; such representable inputs can make `difference*difference + predecessor_cost` exceed signed 32-bit range. The VIT2 eligibility check applies the narrower `[-1100,1100]` table bound, but rejecting VIT2 falls back to the unchecked general path. It is unknown whether the absent shipping profile can reach overflow; no wraparound behavior is asserted as a portable contract. Checked: `src/kvq_fast.cuh:108-123`, `src/kvq_fast.cuh:162-168`, `src/kvq_fast.cuh:240-246`, `src/kvq_fast.hpp:59-66`.
+**RESOLVED FOR THE INSPECTED PROFILE [ATT-04]:** Upstream still has
+unchecked signed i32 arithmetic (`src/kvq_fast.cuh:108-123`,
+`src/kvq_vit2.cuh:64-88,143-172`). Arbitrary int16 tables can overflow;
+the scalar codec checks the source's intermediate products/adds/subtracts
+and returns an error. For this artifact's [-886,874] tables and the source's
+[-2048,2048] target clamp (`src/kvq_fast.cuh:167-168`), tests prove general
+costs are at most 1,624,676,608 including finite infinity. VIT2's normalized
+cost spread gives intermediate absolute bounds 474,879,999 / 923,638,527
+for 4/5 bits. Overflow is therefore unreachable for these table values and
+any clamped target sequence; this does not define upstream wraparound for
+other profiles. See D13 and `kv_real_profile_facts_quality_and_overflow`.
 
 Shipping enables VIT2. It is selected for 4/5-bit groups only when all such groups pass the table checks, including every int16 entry being within `[-1100,1100]`; it is not unconditionally selected just because the environment enables it. Its compressed recurrence removes a common cost every step and encodes the predecessor tie in low bits. The following is the source's actual recurrence, rather than assuming it is interchangeable under every integer overflow condition with the general program. Sources: `src/kvq_fast.hpp:46-66`, `src/kvq_fast.cuh:237-246`, `src/kvq_vit2.cuh:64-90`, `src/kvq_vit2.cuh:143-192`, `python/yasakani/runtime.py:27-43`.
 
@@ -278,7 +288,16 @@ For attention, build `attention_codebook[state] = bf(mul(mul(float32(ci[state]),
 
 For an unpackable side, mode 0 still performs profile quantization, restores the optional basis contributions in order and then the mean, and quantizes the result a second time with `encode_int8`. Mode 1 instead uses residual scale `max(abs(residual))/7` (zero replaced by one), nearest-even integer rounding clamped to `[-7,7]`, then restores basis/mean and performs that second int8 encoding. Before a group's guard position, or for a missing group, profile alteration is bypassed but the selector still sends the dequantized row through the final int8 store. Sources: `src/kvq_fast.cuh:187-218`, `src/kvq_fast.cuh:233-234`.
 
-**UNCERTAIN [ATT-03]:** The checked-in source does not contain the shipping `kvq_u5.bin`. Therefore the codebook values, candidate multipliers, means, group modes, guard positions, VIT2 eligibility, and actual packed-key/packed-value layer list cannot be enumerated from source alone. The author's statement that all 16 key sides and 13 value sides are packed is an artifact-specific claim, not a hardcoded engine rule. Checked: `src/kvq_atxpk.hpp:60-83`, `src/kvq_fast.hpp:46-66`, `src/engine35.cpp:242-251`, `docs/TECHNOLOGY.md:231-231`.
+**RESOLVED [ATT-03] (brief 05a):** Inspection of the read-only local
+17,432-byte profile establishes all 128 groups as mode 0 / five bits,
+nine scale multipliers, table bounds [-886,874], and VIT2 eligibility.
+All 16 key sides and value ordinals 0–9, 11–13 pack. Value ordinal 10 has
+head-1 guard 1 (group 83); ordinal 14 has a head-1 basis (group 115);
+ordinal 15 has basis counts 2/1/1/2. Means are permitted and occur in 21
+groups, including two key groups. See chapter 10 AUX-02 for the full list.
+These facts follow the consumed fields and predicates in
+`src/kvq_fast.cuh:54-62`, `src/kvq_fast.hpp:51-66`, and
+`src/kvq_atxpk.hpp:60-83`; they are artifact-specific, not filename promises.
 
 ## Attention selection and logical row visibility
 

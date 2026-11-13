@@ -3,7 +3,8 @@
 Baseline: merged specification PR #1, commit
 `157e33eac8d5ddd0e031b1826fe28e67f57f3787`. Implementation sources are
 `docs/FORMAT.md`, `docs/spec/`, and the explicitly permitted
-`src/pm_math.cuh`. No other upstream implementation file was opened.
+`src/pm_math.cuh`. No other upstream implementation file was opened in that baseline round.
+D13 explicitly ports the upstream KV codec source under brief 05a.
 
 ## D1 — Internal bit consistency
 
@@ -75,6 +76,9 @@ stages, XOR reductions, the GDN four-part folds, integer dots, and sampler
 prefix sums retain their documented order.
 
 ## D4 — Int8 KV cache only
+
+Historical plain `Int8` baseline. [D13](#d13--profile-quantized-kv-row-codec)
+adds the profile codec as separate modules; attention wiring follows later.
 
 Attention stores signed byte key/value codes and one binary32 scale per head
 and token, with the chapter 04 signed cache rotation. Query operands retain
@@ -491,3 +495,108 @@ quality value has been reproduced.
   boundaries are retained in [SPEC_GAPS.md](SPEC_GAPS.md), resolved by D7–D9.
   The upstream specification is preserved, with short notes linking these
   reference decisions.
+
+
+## D13 — Profile-quantized KV row codec
+
+Three cache modes have distinct numeric contracts:
+
+| Mode | Contract |
+|---|---|
+| `Int8` | D4's plain rotated row, signed int8 plus FP32 scale; no profile |
+| `Int8Profile` | Initial int8 encode, dequantize, profile fake-quantize, then final int8 encode; upstream's published “int8” record |
+| `Kv5` | Same initial int8 and profile selection; pack eligible layer/sides into the common 4/5-bit width plus scale; otherwise use `Int8Profile`; upstream's default |
+
+The shipping build defines mode 3 (`CMakeLists.txt:46`) and runs profile
+requantization even with packed capacity disabled (`src/engine35.cpp:688-704`).
+Its published perplexities 2.075900 and 2.0759369 differ by much less than the
+quality gate's 0.001 tolerance. Perplexity therefore cannot prove codec
+correctness. D4 remains available; the row codec is implemented separately
+in `kv_profile.rs` and `kv_codec.rs`, without changing attention or model
+loading in this brief.
+
+The reader checks every referenced region before indexing or allocation,
+including directories, table indices, consumed means/bases, finite numeric
+values, size arithmetic, and partial region overlaps. Exact record aliases
+are allowed. Unknown header and record bytes stay uninterpreted (AUX-01).
+It accepts positive header-derived attention-layer/KV-head counts with
+`groups = layers * heads * 2` and checks model compatibility explicitly;
+upstream's loader fixes these to 16/4/128 (`src/engine35.cpp:40-43`).
+Only 256-channel rows and the source's 8-state-bit/64-chain/8-fraction-bit
+code tables are supported. At most two basis vectors are consumed even if
+the declared count is larger (`src/kvq_fast.cuh:90-91`).
+
+The codec ports the source operation for operation, preserving separate RN
+binary32 operations, correctly rounded `sqrt_rn`, nearest-even integer and
+binary16 rounding, descending warp XOR reductions followed by eight ordered
+warp additions, initial int8 dequantization, mean subtraction, sequential
+basis projection/restoration, and the first strictly smaller scale error.
+There is no explicit FMA in these encoder expressions and none is introduced.
+Sources: `src/kvx_codec.cuh:50-69`, `src/kvq_fast.cuh:33-41,78-95,139-168,189-234`,
+`src/kvq_gpu.cuh:53-146`.
+
+General trellis and VIT2 are separate implementations. The general search
+starts state zero at zero cost, other states at `0x40000000`, breaks
+predecessor ties by lowest j, and final ties by unsigned cost then state
+(`src/kvq_fast.cuh:108-135`). VIT2 retains the source's normalized cost keys,
+low-bit predecessor ties, paired emission minimum *before* cost addition for
+5-bit searches, and final signed cost/state tie
+(`src/kvq_vit2.cuh:64-88,143-192`). Its global eligibility check follows
+`src/kvq_fast.hpp:51-66`, including the [-1100,1100] bound on all referenced
+4/5-bit tables. Three-bit groups still use the general search.
+
+All potentially overflowing i32 products, additions and subtractions return
+an error instead of asserting CUDA signed-overflow behavior (ATT-04).
+Using the actual profile bounds [-886,874] and targets clamped to
+[-2048,2048], the tests bound **all** general costs including the finite
+infinity by 1,624,676,608. A reduced-cost spread invariant bounds every VIT2
+intermediate in magnitude by 474,879,999 (4-bit) or 923,638,527 (5-bit).
+Thus overflow is unreachable for this artifact's clamped targets, while
+synthetic int16-extreme tables demonstrably return an overflow error.
+The independent i64 forward-edge DP also checks selected path costs at both
+clamp limits and on seeded targets, for both search implementations.
+
+The read-only local `kvq_u5.bin` (17,432 bytes) resolves ATT-03/AUX-02:
+128 groups all use mode 0 and five bits; even groups use table 0 and odd
+groups table 1. Both tables have bounds [-886,874]; gains are 1.0015934
+and 1.0 respectively. There are nine multipliers in file order:
+0.9, 0.93, 0.96, 0.98, 1.0, 1.02, 1.04, 1.07, 1.1.
+VIT2 is eligible. All 16 key sides and 13 value sides pack; value ordinals
+10, 14, 15 fall back. Group 83 has guard 1; groups 115/123/125 have one
+basis and 121/127 have two. Means occur in groups
+3, 5, 7, 13, 63, 71, 77, 95, 98, 99, 103, 106, 109, 113, 115, 117,
+119, 121, 123, 125, 127. No artifact payload is stored in the repository;
+CI uses synthesized profiles, with optional real-file assertions only when
+`YSKN_MODEL_DIR` is set (an unusable set path fails).
+
+`CacheRow::{Int8,Packed}` owns the row bytes/words and scale. `key_base` and
+`value_base` return the unscaled attention operand; `decode_packed` returns
+all 256 base operands for reuse. Packed decode selects a BF16-rounded
+codebook entry, **not** the encoder's unrounded reconstruction, and leaves
+scale and mean separate (`src/kvq_atxpk.hpp:39-42`, `src/q35_atxpk.cu:69-74`).
+For the next attention brief: retain BF16 query operands, use the BF16 table
+operand for packed keys/values, and retain the existing BF16 rounding on
+prefix `probability * value_scale`; self weights remain FP32. Key means
+are ignored; add `split_denominator * value_mean[channel]` to each packed
+value split numerator after the self contribution and before split
+combination (`docs/spec/04_ATTENTION.md`, “Packing, decoding, and the int8
+fallback”; `src/q35_atxpk3.cuh:343-380,412-468`,
+`src/q35_atxpk4.cuh:354-410`). `value_mean` returns zero for int8 rows, whose
+means/bases were already restored before their final int8 encoding.
+
+With nine multipliers and four chains, VIT2 examines
+`9 * 4 * 64 * 256 = 589,824` emission candidates per side-row, or
+75,497,472 per token (128 side-rows). Each candidate needs an integer
+multiply and add; paired minima, shared cost adds, final minima and
+normalization bring the dominant recurrence to roughly 2.06 million
+integer operations/comparisons per row, or 264 million per token, plus
+coefficient setup, checked-arithmetic branches, about 30,000 floating
+arithmetic/reduction operations per row, and packing. This is a count,
+not a throughput measurement. It intentionally remains a scalar reference.
+
+Proofs also cover malformed files, independent DP optimality and path
+legality, explicit tie rules, 4/5-bit word packing and BF16 decode boundaries,
+guard/mean/basis/mode-1 behavior, row independence and frozen SHA-256
+synthetic output digests. Digests freeze the source port, not a CUDA golden
+capture. Native CUDA execution/equality and end-to-end perplexity are not
+verified by this codec-only brief.
