@@ -123,10 +123,10 @@ struct Plan {
 
 /// Widen the activation rows to i16 and copy the integer scales into shared buffers.
 ///
-/// Callers own both buffers exclusively (a `Job` or the engine's scratch, reached
-/// only through `&mut`), and every submission waits for completion, so no GPU
-/// work reads them during this write.
-fn upload(
+/// # Safety
+/// No GPU work and no other CPU reference may access either buffer's contents
+/// during the call.
+unsafe fn upload(
     activation_buffer: &Buffer,
     scales_buffer: &Buffer,
     activation: &[i8],
@@ -138,8 +138,8 @@ fn upload(
         return Err(metal_error("upload", "input buffer too small"));
     }
     // SAFETY: the lengths were just checked against the buffers, whose shared
-    // contents are page-aligned and CPU-visible. Nothing else accesses them now
-    // (see above), so the mutable slice is not aliased.
+    // contents are page-aligned and CPU-visible; the caller guarantees exclusive
+    // access, so the mutable slice is not aliased.
     unsafe {
         let wide = std::slice::from_raw_parts_mut(
             activation_buffer.contents().as_ptr().cast::<i16>(),
@@ -157,15 +157,17 @@ fn upload(
     Ok(())
 }
 
-/// Copy `len` i64 sums out of a shared output buffer after its command buffer completed.
-fn download(output: &Buffer, len: usize) -> Result<Vec<i64>> {
+/// Copy `len` i64 sums out of a shared output buffer.
+///
+/// # Safety
+/// No GPU work may be writing the buffer during the call.
+unsafe fn download(output: &Buffer, len: usize) -> Result<Vec<i64>> {
     if output.length() < len * 8 {
         return Err(metal_error("readback", "output buffer too small"));
     }
     let mut values = vec![0_i64; len];
     // SAFETY: the buffer holds at least `len` i64 values (checked above; shared
-    // contents are page-aligned). GPU writes finished: every submission waits for
-    // completion, and the buffer's owner is borrowed here, so none is executing.
+    // contents are page-aligned), and the caller guarantees no concurrent GPU write.
     unsafe {
         std::ptr::copy_nonoverlapping(
             output.contents().as_ptr().cast::<i64>(),
@@ -203,8 +205,11 @@ pub struct Job {
 impl Job {
     /// Row-major M×N sums of the last completed [`MetalEngine::run`] containing this job.
     pub fn output(&self) -> Vec<i64> {
-        // The buffer was allocated for exactly this length in `MetalEngine::job`.
-        download(&self.output, self.plan.output_len()).expect("job output buffer")
+        // SAFETY: `run` waits for completion and takes jobs mutably, so no GPU work
+        // writes this job's buffer while it is borrowed here.
+        unsafe { download(&self.output, self.plan.output_len()) }
+            // The buffer was allocated for exactly this length in `MetalEngine::job`.
+            .expect("job output buffer")
     }
 
     /// Replace this job's activation rows and integer scales (same M) before a rerun.
@@ -214,7 +219,9 @@ impl Job {
         {
             return Err(invalid("inputs must keep the job's M, K and K/512"));
         }
-        upload(&self.activation, &self.scales, activation, scales)
+        // SAFETY: the job's private buffers are borrowed exclusively here, and `run`
+        // waits for completion, so no GPU work reads them now.
+        unsafe { upload(&self.activation, &self.scales, activation, scales) }
     }
 
     /// Bytes of compressed code this job reads (once per pass, independent of M).
@@ -658,7 +665,10 @@ impl MetalEngine {
             .zip(&mut self.scratch_outputs)
             .map(|(plan, slot)| reserve(&self.device, slot, plan.output_len() * 8))
             .collect::<Result<Vec<_>>>()?;
-        upload(&activation_buffer, &scales_buffer, activation, scales)?;
+        // SAFETY: the scratch buffers are distinct objects owned by this engine,
+        // which is borrowed mutably here, and every submission waits for
+        // completion, so no GPU work or other reference touches them meanwhile.
+        unsafe { upload(&activation_buffer, &scales_buffer, activation, scales) }?;
         self.submit(|encoder| {
             for (plan, output) in plans.iter().zip(&outputs) {
                 plan.encode(encoder, &activation_buffer, &scales_buffer, output);
@@ -667,7 +677,11 @@ impl MetalEngine {
         plans
             .iter()
             .zip(&outputs)
-            .map(|(plan, output)| download(output, plan.output_len()))
+            .map(|(plan, output)| {
+                // SAFETY: `submit` returned, so the command buffer has completed and
+                // nothing writes these engine-owned buffers any more.
+                unsafe { download(output, plan.output_len()) }
+            })
             .collect()
     }
 
