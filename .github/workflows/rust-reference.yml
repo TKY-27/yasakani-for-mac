@@ -1,0 +1,31 @@
+name: Rust scalar reference
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scalar-reference:
+    name: Apple Silicon / stable
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify Apple Silicon host
+        run: test "$(uname -m)" = arm64
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+      - name: Release tests
+        run: cargo test --workspace --release
