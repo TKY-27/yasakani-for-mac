@@ -310,38 +310,7 @@ impl Tensor {
 
     /// Read one state, including zero extension before the sequence begins.
     pub fn state(&self, row: usize, sequence: usize, step: usize) -> Result<u16> {
-        if row >= self.physical_rows() || sequence >= self.cols() / 256 || step >= 128 {
-            return Err(invalid("trellis coordinate out of range"));
-        }
-        let end = self.bits() * (step + 1);
-        let mut state = 0_u16;
-        for state_bit in 0..12 {
-            let position = end as isize - 12 + state_bit as isize;
-            if position >= 0 {
-                let position = position as usize;
-                let word = self.sequence_word(row, sequence, position / 32);
-                state |= (((word >> (position % 32)) & 1) as u16) << state_bit;
-            }
-        }
-        Ok(state)
-    }
-
-    fn sequence_word(&self, row: usize, sequence: usize, word: usize) -> u32 {
-        let descriptor = &self.descriptor;
-        let word_index = match descriptor.layout {
-            Layout::Row => {
-                (row * (descriptor.cols / 256) + sequence) * (4 * descriptor.bits) + word
-            }
-            Layout::Warp => {
-                let sequence_index = sequence * descriptor.physical_rows + row;
-                let group = sequence_index / 32;
-                let lane = sequence_index % 32;
-                ((group * descriptor.bits + word / 4) * 32 + lane) * 4 + word % 4
-            }
-        };
-        let start = word_index * 4;
-        // The immutable descriptor and stream were range-checked together on load.
-        u32::from_le_bytes(self.stream[start..start + 4].try_into().unwrap())
+        tensor_state(&self.descriptor, &self.stream, row, sequence, step)
     }
 
     pub fn row_states(&self, row: usize) -> Result<Vec<u16>> {
@@ -369,4 +338,65 @@ impl Tensor {
         }
         Ok(values)
     }
+}
+
+/// Decode one state from a stored little-endian code stream, without owning it.
+pub fn tensor_state(
+    descriptor: &TensorDescriptor,
+    stream: &[u8],
+    row: usize,
+    sequence: usize,
+    step: usize,
+) -> Result<u16> {
+    if !(4..=8).contains(&descriptor.bits)
+        || descriptor.cols == 0
+        || descriptor.cols % 512 != 0
+        || descriptor
+            .physical_rows
+            .checked_mul(descriptor.cols / 256)
+            .and_then(|n| n.checked_mul(16 * descriptor.bits))
+            .is_none()
+    {
+        return Err(invalid("invalid trellis descriptor dimensions"));
+    }
+    if row >= descriptor.physical_rows || sequence >= descriptor.cols / 256 || step >= 128 {
+        return Err(invalid("trellis coordinate out of range"));
+    }
+    let end = descriptor.bits * (step + 1);
+    let mut state = 0_u16;
+    for state_bit in 0..12 {
+        let position = end as isize - 12 + state_bit as isize;
+        if position >= 0 {
+            let position = position as usize;
+            let word = sequence_word(descriptor, stream, row, sequence, position / 32)?;
+            state |= (((word >> (position % 32)) & 1) as u16) << state_bit;
+        }
+    }
+    Ok(state)
+}
+fn sequence_word(
+    descriptor: &TensorDescriptor,
+    stream: &[u8],
+    row: usize,
+    sequence: usize,
+    word: usize,
+) -> Result<u32> {
+    let word_index = match descriptor.layout {
+        Layout::Row => (row * (descriptor.cols / 256) + sequence) * (4 * descriptor.bits) + word,
+        Layout::Warp => {
+            let sequence_index = sequence * descriptor.physical_rows + row;
+            let group = sequence_index / 32;
+            let lane = sequence_index % 32;
+            ((group * descriptor.bits + word / 4) * 32 + lane) * 4 + word % 4
+        }
+    };
+    let start = word_index * 4;
+    // The immutable descriptor and stream were range-checked together on load.
+    Ok(u32::from_le_bytes(
+        stream
+            .get(start..start + 4)
+            .ok_or_else(|| invalid("trellis stream truncated"))?
+            .try_into()
+            .map_err(|_| invalid("trellis word truncated"))?,
+    ))
 }

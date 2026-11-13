@@ -88,7 +88,9 @@ impl AttentionState {
     }
 }
 
-struct PreparedRow {
+pub struct PreparedRow {
+    dimensions: AttentionDimensions,
+    position: usize,
     queries: Vec<f32>,
     gates: Vec<f32>,
     cache: CacheToken,
@@ -216,13 +218,76 @@ impl Attention {
             projected_key,
             projected_value,
         )?;
+        let output = self.output_row(state, position, &prepared)?;
+        self.append_prepared(state, position, &prepared)?;
+        Ok(output)
+    }
+
+    /// Append cache rows in ascending position before running independent attention queries.
+    pub fn append_prepared(
+        &self,
+        state: &mut AttentionState,
+        position: usize,
+        prepared: &PreparedRow,
+    ) -> Result<()> {
+        if state.dimensions != self.dimensions
+            || state.rows.len() != position
+            || prepared.dimensions != self.dimensions
+            || prepared.position != position
+        {
+            return Err(Error::InvalidInput("invalid attention cache append".into()));
+        }
+        state
+            .rows
+            .try_reserve(1)
+            .map_err(|_| Error::InvalidModel("attention cache exceeds available memory".into()))?;
+        state.rows.push(prepared.cache.clone());
+        Ok(())
+    }
+
+    pub fn query_heads(&self) -> usize {
+        self.dimensions.query_heads
+    }
+
+    pub fn output_row(
+        &self,
+        state: &AttentionState,
+        position: usize,
+        prepared: &PreparedRow,
+    ) -> Result<Vec<f32>> {
         let mut output = Vec::with_capacity(self.query_width);
         for query_head in 0..self.dimensions.query_heads {
+            output.extend(self.output_head(state, position, prepared, query_head)?);
+        }
+        finite(&output, "attention gated output")?;
+        Ok(output)
+    }
+
+    /// Attend one head using only this row's causal prefix, even if later cache rows exist.
+    pub fn output_head(
+        &self,
+        state: &AttentionState,
+        position: usize,
+        prepared: &PreparedRow,
+        query_head: usize,
+    ) -> Result<Vec<f32>> {
+        if state.dimensions != self.dimensions
+            || position > state.rows.len()
+            || query_head >= self.dimensions.query_heads
+            || prepared.dimensions != self.dimensions
+            || prepared.position != position
+        {
+            return Err(Error::InvalidInput(
+                "invalid attention prefix or head".into(),
+            ));
+        }
+        let mut output = Vec::with_capacity(self.dimensions.head_dim);
+        {
             let start = query_head * self.dimensions.head_dim;
             let attended = self.attend_head(
                 &prepared.queries[start..start + self.dimensions.head_dim],
                 query_head,
-                &state.rows,
+                &state.rows[..position],
                 &prepared.cache,
             )?;
             let unrotated = inverse_rotate_cache(&attended);
@@ -235,11 +300,6 @@ impl Attention {
             }
         }
         finite(&output, "attention gated output")?;
-        state
-            .rows
-            .try_reserve(1)
-            .map_err(|_| Error::InvalidModel("attention cache exceeds available memory".into()))?;
-        state.rows.push(prepared.cache);
         Ok(output)
     }
 
@@ -262,7 +322,7 @@ impl Attention {
         finite(projected_value, "attention value projection")
     }
 
-    fn prepare_row(
+    pub fn prepare_row(
         &self,
         position: usize,
         projected_query_gate: &[f32],
@@ -313,6 +373,8 @@ impl Attention {
         finite(&queries, "attention rounded rotated query")?;
         finite(&gates, "attention rounded gate")?;
         Ok(PreparedRow {
+            dimensions: self.dimensions,
+            position,
             queries,
             gates,
             cache: CacheToken { keys, values },

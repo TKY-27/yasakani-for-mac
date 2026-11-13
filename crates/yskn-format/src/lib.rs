@@ -10,6 +10,7 @@ pub use floats::{bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16};
 pub use signs::{SignRule, signs};
 pub use tensor::{
     Layout, Role, Rotation, Tensor, TensorDescriptor, Vector, VectorDescriptor, VectorType,
+    tensor_state,
 };
 
 use serde_json::{Map, Value};

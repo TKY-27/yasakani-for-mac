@@ -9,7 +9,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-struct Job {
+struct KernelJob {
     matrix: Matrix,
     activation: Arc<[i8]>,
     scales: Arc<[i32]>,
@@ -18,6 +18,11 @@ struct Job {
     task_rows: usize,
     kernel: Kernel,
     reply: mpsc::Sender<(Range<usize>, Result<Vec<i64>>)>,
+}
+
+enum Job {
+    Kernel(KernelJob),
+    Range(Box<dyn FnOnce() + Send>),
 }
 
 /// Persistent workers. Calls borrow mutably so one engine executes one call at a time.
@@ -65,6 +70,13 @@ impl Engine {
                 .name(format!("yskn-{index}"))
                 .spawn(move || {
                     while let Ok(job) = receiver.recv() {
+                        let job = match job {
+                            Job::Range(run) => {
+                                run();
+                                continue;
+                            }
+                            Job::Kernel(job) => job,
+                        };
                         loop {
                             let start = job.next.fetch_add(job.task_rows, Ordering::Relaxed);
                             if start >= job.rows {
@@ -94,6 +106,86 @@ impl Engine {
     }
     pub fn threads(&self) -> usize {
         self.workers.len()
+    }
+
+    /// Run independent indices on the same persistent workers, returning index order.
+    /// Each worker owns its results; the caller's closure may borrow immutable data.
+    pub fn map_range<T: Send, F: Fn(usize) -> Result<T> + Sync>(
+        &mut self,
+        range: Range<usize>,
+        function: F,
+    ) -> Result<Vec<T>> {
+        if range.start > range.end {
+            return Err(Error::InvalidInput("reversed index range".into()));
+        }
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut output: Vec<Option<T>> = Vec::new();
+        output
+            .try_reserve_exact(range.len())
+            .map_err(|_| Error::InvalidInput("range output allocation failed".into()))?;
+        output.resize_with(range.len(), || None);
+        let count = self.threads().min(range.len());
+        let next = AtomicUsize::new(0);
+        let (reply, receive) = mpsc::channel();
+        let mut sent = 0;
+        let mut failure = None;
+        for sender in self.senders.iter().take(count) {
+            let function = &function;
+            let next = &next;
+            let reply = reply.clone();
+            let length = range.len();
+            let first = range.start;
+            let run: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut results = Vec::new();
+                    loop {
+                        let offset = next.fetch_add(1, Ordering::Relaxed);
+                        if offset >= length {
+                            break;
+                        }
+                        let index = first + offset;
+                        results.push((index, function(index)));
+                    }
+                    results
+                }))
+                .map_err(|_| Error::InvalidInput("range worker panicked".into()));
+                let _ = reply.send(result);
+            });
+            // SAFETY: function and next stay alive until all `sent` jobs reply below,
+            // including on dispatch/numeric errors or closure panic. Each job catches
+            // unwinding and sends owned results after its last use of the borrows.
+            // No borrowed result escapes: T retains its original caller-visible lifetime.
+            let run: Box<dyn FnOnce() + Send> = unsafe { std::mem::transmute(run) };
+            if sender.send(Job::Range(run)).is_err() {
+                failure = Some(Error::InvalidInput("range worker disconnected".into()));
+                break;
+            }
+            sent += 1;
+        }
+        drop(reply);
+        for _ in 0..sent {
+            match receive.recv() {
+                Ok(Ok(results)) => {
+                    for (index, result) in results {
+                        match result {
+                            Ok(value) => output[index - range.start] = Some(value),
+                            Err(error) => failure = Some(error),
+                        }
+                    }
+                }
+                Ok(Err(error)) => failure = Some(error),
+                Err(_) => failure = Some(Error::InvalidInput("range worker failed".into())),
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        output
+            .into_iter()
+            .map(|v| v.ok_or_else(|| Error::InvalidInput("range result missing".into())))
+            .collect()
     }
 
     /// Row-major M×N sums, including padded physical output rows by default.
@@ -154,7 +246,7 @@ impl Engine {
         let next = Arc::new(AtomicUsize::new(0));
         for worker in 0..count {
             self.senders[worker]
-                .send(Job {
+                .send(Job::Kernel(KernelJob {
                     matrix: matrix.clone(),
                     activation: Arc::clone(&activation),
                     scales: Arc::clone(&scales),
@@ -163,7 +255,7 @@ impl Engine {
                     task_rows,
                     kernel: self.kernel,
                     reply: reply.clone(),
-                })
+                }))
                 .map_err(|_| Error::InvalidInput("kernel worker disconnected".into()))?;
         }
         drop(reply);

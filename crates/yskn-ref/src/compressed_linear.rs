@@ -253,27 +253,61 @@ impl CompressedLinear {
             &prepared.integer_scale,
             self.tensor.physical_rows(),
         )?;
-        let mut output = vec![0.0; self.tensor.physical_rows()];
-        for (row, linear) in output.iter_mut().enumerate() {
-            // There is exactly one i64->f32 conversion. Restore scales in the
-            // specified order; neither reassociation nor an FMA is equivalent.
-            *linear = weighted_sums[row] as f32 * prepared.row_quantum;
-            if let Some(inverse_rms) = inverse_rms {
-                *linear *= inverse_rms;
-            }
-            *linear *= self.effective_row_scale[row];
-        }
-        require_finite(&output, "scaled compressed projection")?;
-        if self.output_rotation {
-            let signs = self
-                .tensor
-                .output_signs()
-                .ok_or_else(|| Error::InvalidModel("missing output rotation signs".into()))?;
-            inverse_rotation(&mut output, signs)?;
-        }
-        output.truncate(self.rows());
-        Ok(output)
+        restore_projection(
+            &weighted_sums,
+            prepared,
+            inverse_rms,
+            &self.effective_row_scale,
+            if self.output_rotation {
+                self.tensor.output_signs()
+            } else {
+                None
+            },
+            self.rows(),
+        )
     }
+}
+
+/// Restore a projection's integer sums using the canonical per-row scale/rotation order.
+pub fn restore_projection(
+    weighted_sums: &[i64],
+    prepared: &PreparedActivation,
+    inverse_rms: Option<f32>,
+    effective_row_scale: &[f32],
+    output_signs: Option<&[i8]>,
+    rows: usize,
+) -> Result<Vec<f32>> {
+    if weighted_sums.len() != effective_row_scale.len()
+        || rows > weighted_sums.len()
+        || output_signs.is_some_and(|s| {
+            s.len() != weighted_sums.len()
+                || s.len() % ROTATION_BLOCK != 0
+                || s.iter().any(|&x| x != -1 && x != 1)
+        })
+    {
+        return Err(Error::InvalidInput(
+            "invalid projection restore dimensions or signs".into(),
+        ));
+    }
+    if inverse_rms.is_some_and(|x| !x.is_finite()) {
+        return Err(Error::NonFinite("deferred inverse RMS"));
+    }
+    let mut output = vec![0.0; weighted_sums.len()];
+    for (row, linear) in output.iter_mut().enumerate() {
+        // There is exactly one i64->f32 conversion. Restore scales in the
+        // specified order; neither reassociation nor an FMA is equivalent.
+        *linear = weighted_sums[row] as f32 * prepared.row_quantum();
+        if let Some(inverse_rms) = inverse_rms {
+            *linear *= inverse_rms;
+        }
+        *linear *= effective_row_scale[row];
+    }
+    require_finite(&output, "scaled compressed projection")?;
+    if let Some(signs) = output_signs {
+        inverse_rotation(&mut output, signs)?;
+    }
+    output.truncate(rows);
+    Ok(output)
 }
 
 fn inverse_rotation(values: &mut [f32], signs: &[i8]) -> Result<()> {
@@ -290,15 +324,48 @@ fn inverse_rotation(values: &mut [f32], signs: &[i8]) -> Result<()> {
     require_finite(values, "inverse-rotated projection")
 }
 
-#[derive(Debug)]
-pub struct Embedding {
-    main: Tensor,
-    residual: Option<Tensor>,
-    residual2: Option<Tensor>,
+/// Stored floating embedding components, including mapped code streams.
+pub trait EmbeddingTensor {
+    fn descriptor(&self) -> &yskn_format::TensorDescriptor;
+    fn table(&self) -> &[f32];
+    fn scales(&self) -> &[f32];
+    fn input_signs(&self) -> &[i8];
+    fn rotated_row(&self, row: usize) -> Result<Vec<f32>>;
+    fn rows(&self) -> usize {
+        self.descriptor().rows
+    }
+    fn cols(&self) -> usize {
+        self.descriptor().cols
+    }
 }
 
-impl Embedding {
-    pub fn new(main: Tensor, residual: Option<Tensor>, residual2: Option<Tensor>) -> Result<Self> {
+impl EmbeddingTensor for Tensor {
+    fn descriptor(&self) -> &yskn_format::TensorDescriptor {
+        self.descriptor()
+    }
+    fn table(&self) -> &[f32] {
+        self.table()
+    }
+    fn scales(&self) -> &[f32] {
+        self.scales()
+    }
+    fn input_signs(&self) -> &[i8] {
+        self.input_signs()
+    }
+    fn rotated_row(&self, row: usize) -> Result<Vec<f32>> {
+        Ok(self.rotated_row(row)?)
+    }
+}
+
+#[derive(Debug)]
+pub struct Embedding<T = Tensor> {
+    main: T,
+    residual: Option<T>,
+    residual2: Option<T>,
+}
+
+impl<T: EmbeddingTensor> Embedding<T> {
+    pub fn new(main: T, residual: Option<T>, residual2: Option<T>) -> Result<Self> {
         if residual2.is_some() && residual.is_none() {
             return Err(Error::InvalidModel(
                 "a third embedding component requires the second".into(),
@@ -310,7 +377,7 @@ impl Embedding {
         {
             if component.rows() != main.rows()
                 || component.cols() != main.cols()
-                || component.output_signs().is_some()
+                || component.descriptor().output_rotation.is_some()
                 || component.descriptor().input_rotation.sign_offset
                     != main.descriptor().input_rotation.sign_offset
             {

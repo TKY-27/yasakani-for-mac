@@ -1,0 +1,97 @@
+use std::{path::PathBuf, time::Duration};
+use yskn_engine::{Engine, Error, Model, Result};
+use yskn_ref::quality::{TokenWindows, score};
+
+fn main() -> Result<()> {
+    let mut arguments = std::env::args_os().skip(1);
+    let folder = arguments.next().ok_or_else(|| {
+        Error::InvalidInput(
+            "expected MODEL_FOLDER WINDOWS.json [--rows-per-pass N] [--windows A..B] [--json OUT]"
+                .into(),
+        )
+    })?;
+    if folder == "--help" || folder == "-h" {
+        println!(
+            "Usage: score_windows MODEL_FOLDER WINDOWS.json [--rows-per-pass N] [--windows A..B] [--json OUT]"
+        );
+        return Ok(());
+    }
+    let path = arguments
+        .next()
+        .ok_or_else(|| Error::InvalidInput("missing WINDOWS.json".into()))?;
+    let windows = TokenWindows::load(path)?;
+    let mut rows = 16;
+    let mut range = 0..windows.windows.len();
+    let mut json = None;
+    while let Some(option) = arguments.next() {
+        let value = arguments
+            .next()
+            .ok_or_else(|| Error::InvalidInput("option requires a value".into()))?;
+        match option.to_str() {
+            Some("--rows-per-pass") => {
+                rows = value
+                    .to_str()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| Error::InvalidInput("invalid rows per pass".into()))?
+            }
+            Some("--windows") => {
+                let (first, last) =
+                    value
+                        .to_str()
+                        .and_then(|s| s.split_once(".."))
+                        .ok_or_else(|| {
+                            Error::InvalidInput("expected half-open A..B window range".into())
+                        })?;
+                range = first
+                    .parse()
+                    .map_err(|_| Error::InvalidInput("invalid first window".into()))?
+                    ..last
+                        .parse()
+                        .map_err(|_| Error::InvalidInput("invalid last window".into()))?;
+            }
+            Some("--json") => json = Some(PathBuf::from(value)),
+            _ => return Err(Error::InvalidInput("unknown score option".into())),
+        }
+    }
+    // SAFETY: this read-only scoring command requires stable input weights until exit.
+    let mut model = unsafe { Model::with_engine(folder, Engine::from_env()?, rows)? };
+    let mut totals = [Duration::ZERO; 5];
+    let mut passes = 0;
+    let result = score(&mut model, &windows, range, rows, |model| {
+        for timing in model.pass_timings() {
+            totals[0] += timing.total;
+            totals[1] += timing.kernel;
+            totals[2] += timing.attention;
+            totals[3] += timing.recurrence;
+            totals[4] += timing.rest();
+            passes += 1;
+            if timing.position < 200 || timing.position >= 1984 {
+                eprintln!(
+                    "pass position={} rows={} total={:.6} kernel={:.6} attention={:.6} recurrence={:.6} rest={:.6}",
+                    timing.position,
+                    timing.rows,
+                    timing.total.as_secs_f64(),
+                    timing.kernel.as_secs_f64(),
+                    timing.attention.as_secs_f64(),
+                    timing.recurrence.as_secs_f64(),
+                    timing.rest().as_secs_f64()
+                );
+            }
+        }
+    })?;
+    result.print();
+    eprintln!(
+        "profile passes={passes} total={:.6} kernel={:.6} attention={:.6} recurrence={:.6} rest={:.6} score_seconds={:.6}",
+        totals[0].as_secs_f64(),
+        totals[1].as_secs_f64(),
+        totals[2].as_secs_f64(),
+        totals[3].as_secs_f64(),
+        totals[4].as_secs_f64(),
+        result.elapsed_seconds
+    );
+    if let Some(path) = json {
+        result.write_json(path)?;
+    }
+    Ok(())
+}

@@ -1,4 +1,4 @@
-# Rust scalar reference
+# Rust reference and mapped CPU engine
 
 This workspace implements the documented container and the executable
 mixed Gated DeltaNet/full-attention main-model path. The three historical
@@ -17,13 +17,16 @@ cargo test --workspace --release
 ```
 
 The GitHub Actions workflow uses `macos-15` and verifies `uname -m` is
-`arm64` before building. Both crates use edition 2024 and forbid unsafe
-code. No CUDA toolchain, GPU, or published weights are needed for the tests.
+`arm64` before building. All three crates use edition 2024. `yskn-format`
+and `yskn-ref` forbid unsafe code; `yskn-engine` isolates mapping, CPU intrinsics and scoped pool
+borrows behind documented safety invariants. The engine requires Rust 1.98.
+No CUDA toolchain, GPU, or published weights are needed for the tests.
 All pre-existing upstream files remain unchanged.
 
 | Crate/module | Source contract |
 |---|---|
 | `yskn-format` | Container layout, signs, vector formats and trellis states in FORMAT.md |
+| `yskn-engine` | Mapped code streams, persistent CPU workers and layer-major main-model inference under D10/D11 |
 | `yskn-ref::model` | Chapter 01, loading, layer order and sequence state |
 | `compressed_linear` | Chapter 02, integer compressed projection and coded embedding |
 | `gated_deltanet` | Chapter 03, dense gates, convolution and recurrence |
@@ -63,9 +66,47 @@ be committed or discarded before another pass. Commit replay is intentional:
 this implementation prioritizes one readable scalar operation order.
 
 Container payloads are loaded into ordinary vectors, while matrices retain
-their compressed codes. There is no memory mapping, dense model-weight
-expansion, threading or architecture-specific code. Execution is deliberately
+their compressed codes. The reference uses no memory mapping, dense
+model-weight expansion, threading or architecture-specific code. Execution is deliberately
 slow and is not intended as a competitive inference backend.
+
+## Mapped engine API and commands
+
+`yskn_engine::Model` runs the entire main model in layer-major passes, using
+mapped weights and the reference's scalar operation order. `load` accepts a
+model folder or a `.yskn` path and defaults to 16 rows per pass. Explicit
+configuration uses `Model::with_engine(path, Engine::new(kernel, threads)?,
+rows_per_pass)`. Both constructors are unsafe solely because callers must
+keep the backing weights file unchanged and untruncated until model drop.
+The engine offers `prefill`, `row_logits`, `logits`, `position`, `reset`,
+`context_capacity`, `dimensions`, `rows_per_pass` and measured `pass_timings`.
+It has no provisional, commit, draft or speculation API. See D11 for the
+causal attention and parallelism contract.
+
+```sh
+# Four configurations, first 24 tokens of window 0, all vocabulary logit bits.
+cargo run --release -p yskn-engine --example verify_model -- \
+  /path/to/model-folder tools/quality/windows_own_thinking.json
+
+# One window, with bounded logit memory and measured pass-stage timings.
+/usr/bin/time -l cargo run --release -p yskn-engine --example score_windows -- \
+  /path/to/model-folder tools/quality/windows_own_thinking.json \
+  --rows-per-pass 16 --windows 0..1 --json window-0.json
+
+# Full quality command (long running; run only when authorized by the gate).
+cargo run --release -p yskn-engine --example score_windows -- \
+  /path/to/model-folder tools/quality/windows_own_thinking.json --json all-windows.json
+```
+
+`--windows A..B` selects zero-based window indices, end excluded. Each window
+starts at reset. JSON contains per-window NLL sums/counts, elapsed seconds,
+and aggregate metrics; sum counts and NLLs to combine disjoint partial runs
+in ascending window order, with possible last-bit binary64 rounding differences
+from the full per-position fold. Progress and timing lines go to stderr;
+stdout retains the three scalar-reference summary lines. `YSKN_KERNEL`
+selects `portable`, `neon` or `dotprod`; omission uses the fastest supported
+variant. Real model commands must run serially with no concurrent model
+mapping, and no build/test during a timed run.
 
 ## Quality command
 
@@ -81,9 +122,23 @@ the committed window format: 2,048 token IDs per window and scored positions
 position count, mean negative log-likelihood and perplexity, and reports
 per-window progress on stderr.
 
-Full attention is executable under D7–D9. No released model was loaded for
-this validation: neither a published quality number nor CUDA mixed-model
-bit equivalence has been reproduced.
+Full attention is executable under D7–D9. The original scalar-reference
+validation did not load released weights.
+Neither a published full-set quality number nor CUDA mixed-model bit
+equivalence has been established. D11 records the mapped-engine contract;
+its real-model checks compare CPU configurations, without loading the
+heap-copying scalar model.
+
+The D11 local gate passed the six proof commands specified in Brief 02b
+(76 debug and 76 release tests), including all four real-model verification
+configurations. Window 0 scored
+1,023 positions with NLL sum `508.71858607572784` and perplexity
+`1.644244684328`. The measured run took 429.06 s for scoring and peaked at
+10.57 GB resident including mappings. `/usr/bin/time -l` could not read
+`kern.clockrate` in the sandbox; RSS came from Darwin `wait4` on a repeat
+run. See D11 for stage timings and that measurement boundary. All twenty
+windows are estimated at about 2 h 23 min; their complete quality gate is
+still pending.
 
 ## Verification evidence
 
