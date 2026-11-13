@@ -1,0 +1,152 @@
+(APIServer pid=357) INFO 11-08 15:19:59 [api_utils.py:347] 
+(APIServer pid=357) INFO 11-08 15:19:59 [api_utils.py:347]        █     █     █▄   ▄█
+(APIServer pid=357) INFO 11-08 15:19:59 [api_utils.py:347]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.31.0
+(APIServer pid=357) INFO 11-08 15:19:59 [api_utils.py:347]   █▄█▀ █     █     █     █  model   <model_dir>/gittensor_NVFP4_LMHead4
+(APIServer pid=357) INFO 11-08 15:19:59 [api_utils.py:347]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+(APIServer pid=357) INFO 11-08 15:19:59 [api_utils.py:347] 
+(APIServer pid=357) INFO 11-08 15:19:59 [api_utils.py:286] non-default args: {'model_tag': '<model_dir>/gittensor_NVFP4_LMHead4', 'host': '127.0.0.1', 'port': 30000, 'model': '<model_dir>/gittensor_NVFP4_LMHead4', 'max_model_len': 4096, 'enforce_eager': True, 'max_logprobs': 100, 'served_model_name': ['qwen3.8-27b'], 'kv_cache_dtype': 'fp8', 'enable_prefix_caching': False, 'language_model_only': True, 'max_num_seqs': 1}
+(APIServer pid=357) INFO 11-08 15:19:59 [model.py:699] Resolved architecture: Qwen3_5ForConditionalGeneration
+(APIServer pid=357) INFO 11-08 15:19:59 [model.py:2109] Using max model len 4096
+(APIServer pid=357) INFO 11-08 15:20:01 [model.py:917] All limits of multimodal modalities supported by the model are set to 0, running in text-only mode.
+(APIServer pid=357) INFO 11-08 15:20:01 [model.py:974] Disabled mm_prefix attention mode because multimodal inputs are configuration-disabled. Attention backends without mm_prefix support may now be selected.
+(APIServer pid=357) INFO 11-08 15:20:01 [cache.py:363] Using fp8 data type to store kv cache. It reduces the GPU memory footprint and boosts the performance. Meanwhile, it may cause accuracy drop without a proper scaling factor
+(APIServer pid=357) WARNING 11-08 15:20:01 [vllm.py:1706] Enforce eager set, disabling torch.compile, CUDAGraphs, and JIT kernel warmup. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none and --kernel_config.enable_jit_warmup=False
+(APIServer pid=357) WARNING 11-08 15:20:01 [vllm.py:1750] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+(APIServer pid=357) INFO 11-08 15:20:01 [kernel.py:408] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'], gelu_and_mul_sparse=['triton', 'native'])
+(APIServer pid=357) INFO 11-08 15:20:01 [vllm.py:1968] Cudagraph is disabled under eager mode
+(APIServer pid=357) INFO 11-08 15:20:01 [compilation.py:331] Enabled custom fusions: norm_quant, act_quant
+(EngineCore pid=448) INFO 11-08 15:20:07 [core.py:129] Initializing a V1 LLM engine (v0.31.0) with config: model='<model_dir>/gittensor_NVFP4_LMHead4', speculative_config=None, tokenizer='<model_dir>/gittensor_NVFP4_LMHead4', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=4096, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=modelopt_fp4, quantization_config=None, enforce_eager=True, aux_output_config=AuxOutputConfig(enable_return_routed_experts=False, max_bytes=None), kv_cache_dtype=fp8, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, per_request_spec_decode_metrics='none', kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=qwen3.8-27b, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [2048], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'], gelu_and_mul_sparse=['triton', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=False, moe_backend='auto', sparse_indexer_topk_backend='auto', linear_backend='auto', linear_backend_per_quant=None)
+(EngineCore pid=448) INFO 11-08 15:20:07 [parallel_state.py:1825] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/vllm_dist_96cd374ce298480b86c182d9172ee033 backend=nccl
+(EngineCore pid=448) INFO 11-08 15:20:07 [parallel_state.py:2269] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank N/A, EPLB rank N/A
+(EngineCore pid=448) INFO 11-08 15:20:07 [gpu_worker.py:479] Using V2 Model Runner
+(EngineCore pid=448) WARNING 11-08 15:20:07 [buffer_utils.py:47] Pinned memory is not available on this platform; falling back to device memory for UVA buffers.
+(EngineCore pid=448) INFO 11-08 15:20:08 [model_runner.py:375] Loading model from scratch...
+(EngineCore pid=448) INFO 11-08 15:20:09 [cuda.py:585] Using backend AttentionBackendEnum.FLASH_ATTN for vit attention
+(EngineCore pid=448) INFO 11-08 15:20:09 [mm_encoder_attention.py:372] Using AttentionBackendEnum.FLASH_ATTN for MMEncoderAttention.
+(EngineCore pid=448) INFO 11-08 15:20:09 [__init__.py:1186] Using FlashInferCutlassNvFp4LinearKernel for NVFP4 GEMM
+(EngineCore pid=448) INFO 11-08 15:20:09 [qwen_gdn_linear_attn.py:177] Using FlashInfer GDN prefill kernel (requested=auto, head_k_dim=128).
+(EngineCore pid=448) INFO 11-08 15:20:09 [qwen_gdn_linear_attn.py:533] GDN decode kernel: cuda
+(EngineCore pid=448) INFO 11-08 15:20:13 [cuda.py:526] Using FLASHINFER attention backend out of potential backends: ['FLASHINFER', 'TRITON_ATTN'].
+(EngineCore pid=448) INFO 11-08 15:20:14 [weight_utils.py:1063] Filesystem type for checkpoints: 9P. Checkpoint size: 17.48 GiB. Available RAM: 75.11 GiB.
+(EngineCore pid=448) INFO 11-08 15:20:14 [weight_utils.py:1086] Auto-prefetch is disabled because the filesystem (9P) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+Loading safetensors checkpoint shards:   0% Completed | 0/3 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:  33% Completed | 1/3 [00:48<01:37, 48.74s/it]
+Loading safetensors checkpoint shards:  67% Completed | 2/3 [01:33<00:46, 46.36s/it]
+Loading safetensors checkpoint shards: 100% Completed | 3/3 [01:33<00:00, 31.15s/it]
+
+(EngineCore pid=448) INFO 11-08 15:21:48 [default_loader.py:484] Loading weights took 95.77 seconds
+(EngineCore pid=448) WARNING 11-08 15:21:51 [kv_cache.py:146] Checkpoint does not provide a q scaling factor. Setting it to k_scale. This only matters for FP8 Attention backends (flash-attn or flashinfer).
+(EngineCore pid=448) WARNING 11-08 15:21:51 [kv_cache.py:163] Using KV cache scaling factor 1.0 for fp8_e4m3. If this is unintended, verify that k/v_scale scaling factors are properly set in the checkpoint.
+(EngineCore pid=448) WARNING 11-08 15:21:51 [kv_cache.py:201] Using uncalibrated q_scale 1.0 and/or prob_scale 1.0 with fp8 attention. This may cause accuracy issues. Please make sure q/prob scaling factors are available in the fp8 checkpoint.
+(EngineCore pid=448) INFO 11-08 15:21:52 [model_runner.py:407] Model loading took 16.19 GiB memory and 106.398073 seconds
+(EngineCore pid=448) INFO 11-08 15:21:52 [topk_topp_sampler.py:124] Using FlashInfer for top-p & top-k sampling.
+(EngineCore pid=448) INFO 11-08 15:21:52 [torch_utils.py:286] Reducing Torch threads from 8 to 1 for serving. Set OMP_NUM_THREADS in the external environment to override.
+(EngineCore pid=448) INFO 11-08 15:21:52 [interface.py:989] Setting attention block size to 1568 tokens to ensure that attention page size is >= mamba page size.
+(EngineCore pid=448) INFO 11-08 15:21:52 [interface.py:1013] Padding mamba page size by 0.13% to ensure that mamba page size and attention page size are exactly equal.
+(EngineCore pid=448) INFO 11-08 15:21:52 [utils.py:343] Using LBNHC KV cache layout.
+(EngineCore pid=448) INFO 11-08 15:22:07 [gpu_worker.py:692] Available KV cache memory: 12.4 GiB
+(EngineCore pid=448) INFO 11-08 15:22:07 [kv_cache_utils.py:2464] GPU KV cache size: 176,810 tokens, Maximum concurrency for 4,096 tokens per request: 43.17x
+(EngineCore pid=448) INFO 11-08 15:22:07 [flashinfer.py:903] FlashInfer resolved query dtypes: prefill=torch.bfloat16, decode=torch.bfloat16, decode_backend=xqa, kv_cache_dtype=torch.float8_e4m3fn, arch=sm120
+(EngineCore pid=448) INFO 11-08 15:22:08 [qwen_triton_warmup.py:294] Warming up Qwen GDN Triton kernels for model_type=qwen3_5_text.
+(EngineCore pid=448) INFO 11-08 15:22:09 [qwen_vl_triton_warmup.py:98] Warmed M-RoPE Triton kernels.
+(EngineCore pid=448) INFO 11-08 15:22:09 [mamba_triton_warmup.py:42] Warmed Mamba batch_memcpy_kernel.
+(EngineCore pid=448) INFO 11-08 15:22:09 [kernel_warmup.py:437] Using FlashInfer autotune cache file: /root/.cache/vllm/flashinfer_autotune_cache/0.7.0.post1/120f/bab8eaab881cae95d3eef0480da44008d21518b3dc74494251b8b2384c3105fd/autotune_configs.json
+2026-11-08 15:22:09,381 - INFO - autotuner.py:1046 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+(EngineCore pid=448) INFO 11-08 15:22:09 [kernel_warmup.py:359] Running FlashInfer autotune with 2048 tokens and token buckets (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536, 1792, 2048).
+[AutoTuner]: Tuning fp4_gemm:   0%|          | 0/16 [00:00<?, ?profile/s][AutoTuner]: Tuning fp4_gemm:   6%|▋         | 1/16 [00:00<00:09,  1.59profile/s][AutoTuner]: Tuning fp4_gemm:  12%|█▎        | 2/16 [00:01<00:06,  2.03profile/s][AutoTuner]: Tuning fp4_gemm:  19%|█▉        | 3/16 [00:01<00:05,  2.27profile/s][AutoTuner]: Tuning fp4_gemm:  25%|██▌       | 4/16 [00:01<00:04,  2.43profile/s][AutoTuner]: Tuning fp4_gemm:  31%|███▏      | 5/16 [00:02<00:04,  2.57profile/s][AutoTuner]: Tuning fp4_gemm:  38%|███▊      | 6/16 [00:03<00:05,  1.70profile/s][AutoTuner]: Tuning fp4_gemm:  44%|████▍     | 7/16 [00:03<00:04,  1.98profile/s][AutoTuner]: Tuning fp4_gemm:  50%|█████     | 8/16 [00:03<00:03,  2.22profile/s][AutoTuner]: Tuning fp4_gemm:  56%|█████▋    | 9/16 [00:04<00:02,  2.41profile/s][AutoTuner]: Tuning fp4_gemm:  62%|██████▎   | 10/16 [00:04<00:02,  2.18profile/s][AutoTuner]: Tuning fp4_gemm:  69%|██████▉   | 11/16 [00:05<00:02,  1.71profile/s][AutoTuner]: Tuning fp4_gemm:  75%|███████▌  | 12/16 [00:06<00:02,  1.46profile/s][AutoTuner]: Tuning fp4_gemm:  81%|████████▏ | 13/16 [00:07<00:02,  1.40profile/s][AutoTuner]: Tuning fp4_gemm:  88%|████████▊ | 14/16 [00:07<00:01,  1.40profile/s][AutoTuner]: Tuning fp4_gemm:  94%|█████████▍| 15/16 [00:08<00:00,  1.30profile/s][AutoTuner]: Tuning fp4_gemm: 100%|██████████| 16/16 [00:09<00:00,  1.20profile/s][AutoTuner]: Tuning fp4_gemm: 100%|██████████| 16/16 [00:09<00:00,  1.63profile/s]
+[AutoTuner]: Tuning fp4_gemm:   0%|          | 0/16 [00:00<?, ?profile/s][AutoTuner]: Tuning fp4_gemm:   6%|▋         | 1/16 [00:00<00:03,  4.63profile/s][AutoTuner]: Tuning fp4_gemm:  12%|█▎        | 2/16 [00:00<00:02,  4.74profile/s][AutoTuner]: Tuning fp4_gemm:  19%|█▉        | 3/16 [00:00<00:02,  4.69profile/s][AutoTuner]: Tuning fp4_gemm:  25%|██▌       | 4/16 [00:00<00:02,  4.79profile/s][AutoTuner]: Tuning fp4_gemm:  31%|███▏      | 5/16 [00:01<00:02,  4.71profile/s][AutoTuner]: Tuning fp4_gemm:  38%|███▊      | 6/16 [00:01<00:02,  4.78profile/s][AutoTuner]: Tuning fp4_gemm:  44%|████▍     | 7/16 [00:01<00:01,  4.84profile/s][AutoTuner]: Tuning fp4_gemm:  50%|█████     | 8/16 [00:01<00:01,  4.89profile/s][AutoTuner]: Tuning fp4_gemm:  56%|█████▋    | 9/16 [00:01<00:01,  4.56profile/s][AutoTuner]: Tuning fp4_gemm:  62%|██████▎   | 10/16 [00:02<00:01,  4.06profile/s][AutoTuner]: Tuning fp4_gemm:  69%|██████▉   | 11/16 [00:02<00:01,  4.03profile/s][AutoTuner]: Tuning fp4_gemm:  75%|███████▌  | 12/16 [00:02<00:01,  3.60profile/s][AutoTuner]: Tuning fp4_gemm:  81%|████████▏ | 13/16 [00:03<00:00,  3.08profile/s][AutoTuner]: Tuning fp4_gemm:  88%|████████▊ | 14/16 [00:03<00:00,  2.70profile/s][AutoTuner]: Tuning fp4_gemm:  94%|█████████▍| 15/16 [00:04<00:00,  2.44profile/s][AutoTuner]: Tuning fp4_gemm: 100%|██████████| 16/16 [00:04<00:00,  2.19profile/s][AutoTuner]: Tuning fp4_gemm: 100%|██████████| 16/16 [00:04<00:00,  3.34profile/s]
+[AutoTuner]: Tuning fp4_gemm:   0%|          | 0/16 [00:00<?, ?profile/s][AutoTuner]: Tuning fp4_gemm:   6%|▋         | 1/16 [00:00<00:05,  2.66profile/s][AutoTuner]: Tuning fp4_gemm:  12%|█▎        | 2/16 [00:00<00:05,  2.65profile/s][AutoTuner]: Tuning fp4_gemm:  19%|█▉        | 3/16 [00:01<00:04,  2.63profile/s][AutoTuner]: Tuning fp4_gemm:  25%|██▌       | 4/16 [00:01<00:04,  2.63profile/s][AutoTuner]: Tuning fp4_gemm:  31%|███▏      | 5/16 [00:01<00:04,  2.64profile/s][AutoTuner]: Tuning fp4_gemm:  38%|███▊      | 6/16 [00:02<00:03,  2.65profile/s][AutoTuner]: Tuning fp4_gemm:  44%|████▍     | 7/16 [00:02<00:03,  2.68profile/s][AutoTuner]: Tuning fp4_gemm:  50%|█████     | 8/16 [00:02<00:02,  2.71profile/s][AutoTuner]: Tuning fp4_gemm:  62%|██████▎   | 10/16 [00:03<00:01,  3.26profile/s][AutoTuner]: Tuning fp4_gemm:  69%|██████▉   | 11/16 [00:04<00:02,  2.40profile/s][AutoTuner]: Tuning fp4_gemm:  75%|███████▌  | 12/16 [00:05<00:02,  1.75profile/s][AutoTuner]: Tuning fp4_gemm:  81%|████████▏ | 13/16 [00:06<00:02,  1.45profile/s][AutoTuner]: Tuning fp4_gemm:  88%|████████▊ | 14/16 [00:07<00:01,  1.25profile/s][AutoTuner]: Tuning fp4_gemm:  94%|█████████▍| 15/16 [00:08<00:00,  1.04profile/s][AutoTuner]: Tuning fp4_gemm: 100%|██████████| 16/16 [00:09<00:00,  1.06s/profile][AutoTuner]: Tuning fp4_gemm: 100%|██████████| 16/16 [00:09<00:00,  1.61profile/s]
+[AutoTuner]: Tuning fp4_gemm:   0%|          | 0/16 [00:00<?, ?profile/s][AutoTuner]: Tuning fp4_gemm:   6%|▋         | 1/16 [00:00<00:04,  3.14profile/s][AutoTuner]: Tuning fp4_gemm:  12%|█▎        | 2/16 [00:00<00:04,  3.16profile/s][AutoTuner]: Tuning fp4_gemm:  19%|█▉        | 3/16 [00:00<00:04,  3.17profile/s][AutoTuner]: Tuning fp4_gemm:  25%|██▌       | 4/16 [00:01<00:03,  3.20profile/s][AutoTuner]: Tuning fp4_gemm:  31%|███▏      | 5/16 [00:01<00:03,  3.19profile/s][AutoTuner]: Tuning fp4_gemm:  38%|███▊      | 6/16 [00:01<00:03,  3.24profile/s][AutoTuner]: Tuning fp4_gemm:  44%|████▍     | 7/16 [00:02<00:02,  3.28profile/s][AutoTuner]: Tuning fp4_gemm:  50%|█████     | 8/16 [00:02<00:02,  3.27profile/s][AutoTuner]: Tuning fp4_gemm:  56%|█████▋    | 9/16 [00:02<00:02,  3.17profile/s][AutoTuner]: Tuning fp4_gemm:  62%|██████▎   | 10/16 [00:03<00:02,  2.89profile/s][AutoTuner]: Tuning fp4_gemm:  69%|██████▉   | 11/16 [00:03<00:01,  2.67profile/s][AutoTuner]: Tuning fp4_gemm:  75%|███████▌  | 12/16 [00:04<00:01,  2.22profile/s][AutoTuner]: Tuning fp4_gemm:  81%|████████▏ | 13/16 [00:05<00:01,  1.82profile/s][AutoTuner]: Tuning fp4_gemm:  88%|████████▊ | 14/16 [00:05<00:01,  1.53profile/s][AutoTuner]: Tuning fp4_gemm:  94%|█████████▍| 15/16 [00:06<00:00,  1.33profile/s][AutoTuner]: Tuning fp4_gemm: 100%|██████████| 16/16 [00:08<00:00,  1.16profile/s][AutoTuner]: Tuning fp4_gemm: 100%|██████████| 16/16 [00:08<00:00,  1.99profile/s]
+[AutoTuner]: Tuning fp4_gemm:   0%|          | 0/16 [00:00<?, ?profile/s][AutoTuner]: Tuning fp4_gemm:   6%|▋         | 1/16 [00:00<00:03,  4.01profile/s][AutoTuner]: Tuning fp4_gemm:  12%|█▎        | 2/16 [00:00<00:03,  4.08profile/s][AutoTuner]: Tuning fp4_gemm:  19%|█▉        | 3/16 [00:00<00:03,  4.07profile/s][AutoTuner]: Tuning fp4_gemm:  25%|██▌       | 4/16 [00:00<00:02,  4.09profile/s][AutoTuner]: Tuning fp4_gemm:  31%|███▏      | 5/16 [00:01<00:02,  4.09profile/s][AutoTuner]: Tuning fp4_gemm:  38%|███▊      | 6/16 [00:01<00:02,  4.11profile/s][AutoTuner]: Tuning fp4_gemm:  44%|████▍     | 7/16 [00:01<00:02,  4.12profile/s][AutoTuner]: Tuning fp4_gemm:  50%|█████     | 8/16 [00:01<00:01,  4.15profile/s][AutoTuner]: Tuning fp4_gemm:  56%|█████▋    | 9/16 [00:02<00:01,  4.24profile/s][AutoTuner]: Tuning fp4_gemm:  62%|██████▎   | 10/16 [00:02<00:01,  3.39profile/s][AutoTuner]: Tuning fp4_gemm:  69%|██████▉   | 11/16 [00:03<00:01,  2.71profile/s][AutoTuner]: Tuning fp4_gemm:  75%|███████▌  | 12/16 [00:03<00:01,  2.29profile/s][AutoTuner]: Tuning fp4_gemm:  81%|████████▏ | 13/16 [00:04<00:01,  1.87profile/s][AutoTuner]: Tuning fp4_gemm:  88%|████████▊ | 14/16 [00:05<00:01,  1.74profile/s][AutoTuner]: Tuning fp4_gemm:  94%|█████████▍| 15/16 [00:05<00:00,  1.61profile/s][AutoTuner]: Tuning fp4_gemm: 100%|██████████| 16/16 [00:06<00:00,  1.43profile/s][AutoTuner]: Tuning fp4_gemm: 100%|██████████| 16/16 [00:06<00:00,  2.36profile/s]
+2026-11-08 15:22:49,462 - INFO - autotuner.py:1069 - flashinfer.jit: [Autotuner]: Autotuning process ends
+2026-11-08 15:22:49,511 - INFO - autotuner.py:3554 - flashinfer.jit: [Autotuner]: Saved 80 configs to /root/.cache/vllm/flashinfer_autotune_cache/0.7.0.post1/120f/bab8eaab881cae95d3eef0480da44008d21518b3dc74494251b8b2384c3105fd/autotune_configs.json (80 new, 0 from previous config)
+(EngineCore pid=448) INFO 11-08 15:22:49 [gpu_worker.py:955] Free memory on device (30.2/31.82 GiB) on startup. Desired GPU memory utilization is (0.92, 29.27 GiB). Actual usage is 16.55 GiB for consumed memory (weights + non-torch), 0.32 GiB for peak activation, and 0.0 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=13154339308` (12.25 GiB) to fit into requested memory, or `--kv-cache-memory=14154594304` (13.18 GiB) to fully utilize gpu memory. Current kv cache memory in use is 12.4 GiB.
+(EngineCore pid=448) INFO 11-08 15:22:49 [core.py:380] init engine (profile, create kv cache, warmup model) took 57.36 s
+(EngineCore pid=448) INFO 11-08 15:22:49 [kv_cache_utils.py:772] kv cache group sizes [4096, 4096, 4096, 1568]
+(EngineCore pid=448) INFO 11-08 15:22:49 [kv_cache_utils.py:773] kv lcm block sizes 200704
+(EngineCore pid=448) WARNING 11-08 15:22:49 [vllm.py:1706] Enforce eager set, disabling torch.compile, CUDAGraphs, and JIT kernel warmup. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none and --kernel_config.enable_jit_warmup=False
+(EngineCore pid=448) WARNING 11-08 15:22:49 [vllm.py:1750] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+(EngineCore pid=448) INFO 11-08 15:22:49 [kernel.py:408] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'], gelu_and_mul_sparse=['triton', 'native'])
+(EngineCore pid=448) INFO 11-08 15:22:49 [vllm.py:1968] Cudagraph is disabled under eager mode
+(EngineCore pid=448) INFO 11-08 15:22:49 [compilation.py:331] Enabled custom fusions: norm_quant, act_quant
+(APIServer pid=357) INFO 11-08 15:22:49 [entry.py:132] Supported tasks: ['generate']
+(APIServer pid=357) INFO 11-08 15:22:49 [factories.py:76] Scale-out endpoints are disabled. Set --enable-scale-out to enable them.
+(APIServer pid=357) INFO 11-08 15:22:50 [hf.py:646] Detected the chat template content format to be 'openai'. You can set `--chat-template-content-format` to override this.
+(APIServer pid=357) WARNING 11-08 15:22:50 [model.py:1850] Default vLLM sampling parameters have been overridden by the model's `generation_config.json`: `{'temperature': 1.0, 'top_k': 20, 'top_p': 0.95}`. If this is not intended, please relaunch vLLM instance with `--generation-config vllm`.
+(APIServer pid=357) INFO 11-08 15:22:50 [entry.py:136] Starting vLLM server on http://127.0.0.1:30000
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:60] Available routes are:
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /openapi.json, Methods: GET, HEAD
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /docs, Methods: GET, HEAD
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /docs/oauth2-redirect, Methods: GET, HEAD
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /redoc, Methods: GET, HEAD
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /load, Methods: GET
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /version, Methods: GET
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /kv_event_sources, Methods: GET
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /health, Methods: GET
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /metrics, Methods: GET
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /tokenize, Methods: POST
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /detokenize, Methods: POST
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /v1/models, Methods: GET
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /ping, Methods: GET
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /ping, Methods: POST
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /invocations, Methods: POST
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /v1/chat/completions, Methods: POST
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /v1/chat/completions/batch, Methods: POST
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /v1/responses, Methods: POST
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /v1/responses/{response_id}, Methods: GET
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /v1/responses/{response_id}/cancel, Methods: POST
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /v1/completions, Methods: POST
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /v1/messages, Methods: POST
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /v1/messages/count_tokens, Methods: POST
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /generative_scoring, Methods: POST
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /scale_elastic_ep, Methods: POST
+(APIServer pid=357) INFO 11-08 15:22:50 [launcher.py:69] Route: /is_scaling_elastic_ep, Methods: POST
+INFO:     Started server process [357]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     127.0.0.1:46288 - "GET /v1/models HTTP/1.1" 200 OK
+2026-11-08 15:22:55,991 - WARNING - autotuner.py:2271 - flashinfer.jit: [AutoTuner]: No tuned config covers fp4_gemm input_shapes=((1, 2560), (2560, 248320), (128, 320), (320, 248320), (), (0,), (1, 248320), (0,), (0,), (41943040,)); falling back to runner=CutlassFp4GemmRunner tactic=-1.  This shape is outside the tuning bucket range -- expand tuning_buckets / max_num_tokens during the next tuning pass to avoid this perf cliff.
+2026-11-08 15:22:56,038 - WARNING - autotuner.py:2271 - flashinfer.jit: [AutoTuner]: No tuned config covers fp4_gemm input_shapes=((1024, 2560), (2560, 248320), (1024, 320), (320, 248320), (), (0,), (1024, 248320), (0,), (0,), (41943040,)); falling back to runner=CutlassFp4GemmRunner tactic=-1.  This shape is outside the tuning bucket range -- expand tuning_buckets / max_num_tokens during the next tuning pass to avoid this perf cliff.
+INFO:     127.0.0.1:46298 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36702 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36714 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=357) INFO 11-08 15:23:00 [loggers.py:320] Engine 000: Avg prompt throughput: 691.5 tokens/s, Avg generation throughput: 0.3 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%
+INFO:     127.0.0.1:36716 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36732 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36744 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36746 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36756 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55540 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55556 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55568 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=357) INFO 11-08 15:23:11 [loggers.py:320] Engine 000: Avg prompt throughput: 1544.5 tokens/s, Avg generation throughput: 0.8 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%
+INFO:     127.0.0.1:55576 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55592 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55594 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55610 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:41992 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:42002 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:42018 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:42028 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=357) INFO 11-08 15:23:21 [loggers.py:320] Engine 000: Avg prompt throughput: 1584.1 tokens/s, Avg generation throughput: 0.8 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%
+INFO:     127.0.0.1:42030 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=357) INFO 11-08 15:23:22 [launcher.py:128] [shutdown] API server: shutdown triggered
+(APIServer pid=357) INFO 11-08 15:23:22 [launcher.py:144] [shutdown] API server: stopping engine client mode=abort timeout=0s
+(APIServer pid=357) INFO 11-08 15:23:22 [core_client.py:762] [shutdown] MPClient: start timeout=0s
+(APIServer pid=357) INFO 11-08 15:23:22 [core_client.py:764] [shutdown] MPClient: stopping engine manager
+(APIServer pid=357) INFO 11-08 15:23:22 [utils.py:638] [shutdown] Process manager: send sigterm to process EngineCore
+(APIServer pid=357) WARNING 11-08 15:23:22 [utils.py:658] [shutdown] Process manager: force killing remaining processes count=1
+(APIServer pid=357) WARNING 11-08 15:23:22 [utils.py:663] [shutdown] Process manager: force killing remaining process EngineCore pid 448
+(EngineCore pid=448) INFO 11-08 15:23:22 [core.py:1409] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=448) INFO 11-08 15:23:22 [core.py:1558] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=448) INFO 11-08 15:23:22 [core.py:1589] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=448) INFO 11-08 15:23:22 [core.py:1422] [shutdown] EngineCore: exiting busy loop
+(APIServer pid=357) INFO 11-08 15:23:22 [core_client.py:766] [shutdown] MPClient: engine manager stopped
+(APIServer pid=357) INFO 11-08 15:23:22 [core_client.py:767] [shutdown] MPClient: cleaning up background resources
+(APIServer pid=357) INFO 11-08 15:23:22 [core_client.py:769] [shutdown] MPClient: complete
+(APIServer pid=357) INFO 11-08 15:23:22 [launcher.py:153] [shutdown] API server: engine client stopped
+(APIServer pid=357) INFO 11-08 15:23:22 [launcher.py:156] [shutdown] API server: signalling HTTP server shutdown
+(APIServer pid=357) INFO 11-08 15:23:22 [launcher.py:178] [shutdown] API server: shutting down FastAPI HTTP server
+INFO:     Shutting down
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

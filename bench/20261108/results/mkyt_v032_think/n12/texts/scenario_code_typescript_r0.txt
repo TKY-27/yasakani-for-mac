@@ -1,0 +1,263 @@
+The user is asking for a complete TypeScript 5 service that does the following:
+
+1. Consumes newline-delimited request metrics (NDJSON input)
+2. Validates without third-party schema libraries (hand-crafted validation)
+3. Groups records by model and fixture
+4. Computes mean / median / sample standard deviation
+5. Exposes `/health`, `/summary`, and `/runs/:id` endpoints
+6. Includes strict types, incremental parsing, bounded memory, errors for malformed input
+7. Unit tests
+8. package.json, tsconfig.json, concise operational guide
+9. No placeholders, complete executable code
+
+Architecture design:
+
+**Data model:**
+- Each NDJSON line is a request-metrics record: `{ runId, model, fixture, latencyMs, tokensIn?, tokensOut?, status, timestamp, ... }`
+- Define strict types: `MetricsRecord`, `ParsedRecord`, `GroupStats`, etc.
+
+**Validation (no third-party schema library):**
+- Hand-crafted validator: check JSON parse, check types, check ranges (latencyMs > 0, timestamp valid, strings non-empty, etc.)
+- Custom `ValidationError` type with field paths
+
+**Incremental parsing:**
+- Stream-based NDJSON parser: buffer partial lines, split on `\n`, handle trailing incomplete lines, handle CRLF, enforce max line length (bounded memory), enforce max records / max payload size
+- Use Node streams: `readable-stream` / `Readable.from`, transform stream that emits per-line
+
+**Bounded memory:**
+- Max records in memory (e.g., 100,000)
+- Max line length (e.g., 64 KB)
+- When exceeded: reject with 413 / report in summary
+- Since we're grouping by (model, fixture), memory for stats is bounded by number of groups — but each group stores all values for median computation... median needs the full dataset or a streaming median algorithm. Bounded memory: store values in a bounded structure. Options:
+  - Store all values per group up to cap, then switch to reservoir sampling? That's getting complex.
+  - Simpler: cap total record count; per group keep an array of latency values; memory is bounded by total record cap. This is defensible: total records are bounded → memory is bounded.
+  - Also track count and reject ingestion once cap reached (or drop-and-count). My policy: reject with 422/409 when cap is exceeded and expose `dropped` count. Actually the requirement is "bounded memory" — reject with 413 Payload Too Large if records exceed cap. That's clean and testable.
+
+**Statistics:**
+- Mean: sum / n (use Kahan summation for precision — nice touch)
+- Median: sort a copy of the values
+- Sample standard deviation: sqrt( sum((x - mean)^2) / (n - 1) ), n ≥ 2, otherwise null/undefined
+
+**HTTP service:**
+- Use Node's built-in `http` module (no express dependency — "no third-party schema libraries" refers to validation, but to make it executable without a network install of express, it's safest to use zero-dependency Node http). Dependencies should be minimal: devDependencies only typescript, @types/node, a test runner. For unit tests without a framework... the user said "unit tests". Options: use Node's built-in `node:test` module (Node 18/20+). Zero dependencies and works with TS 5 via tsx? Or compile and test. Use `node:test` + `ts-node`? Simpler: write tests in TS and compile with tsc, run with `node --test`? But node --test on compiled JS works: run `tsc` then `node --test dist/test/`. Works with zero runtime deps. Let's use Node's built-in test runner.
+
+Actually to keep it robust and simple:
+- `package.json`: scripts: build (tsc), start (node dist/src/index.js), test (tsc && node --test dist/test/)
+- devDependencies: typescript, @types/node. No runtime deps → truly executable with just `npm i` (dev only) and offline? TypeScript needs to be downloaded but that's standard.
+
+Hmm, should I use `tsx` for dev? Adds a dependency. Let's keep it zero-deps with just tsc + node --test. Node version >= 18.17 or 20. Node built-in test runner requires Node 18.13+ / stable on 19.4+/20. Let's state `"engines": { "node": ">=18.17" }`.
+
+**Endpoints:**
+- `GET /health` → `{ status: "ok", uptimeSec, version, records: { accepted, rejected, dropped } , capacity: { maxRecords, usedRecords } }`
+- `POST /runs` → accepts NDJSON body (newline-delimited metrics records) → validates + ingests → returns summary of accepted/rejected rows with per-line error list (bounded error list). That's the ingestion endpoint. User said "consumes newline-delimited request metrics" and exposes `/health`, `/summary`, `/runs/:id`. Ingestion needs an endpoint; add `POST /runs` (batch ingest), possibly also `POST /runs/:id/records`? Keep it simple: `POST /ingest`? Since the user listed the three endpoints they want, ingestion is implicit — add `POST /runs` as the ingest endpoint that creates/extends a run. Each NDJSON record should carry its own `runId`? Or the endpoint path carries the run id?
+
+Design: NDJSON records are self-describing: each record has `runId`, `model`, `fixture`, `latencyMs`, optional `tokensIn`, `tokensOut`, `status` (success|error), `ts` (ISO 8601 or epoch ms). `POST /runs` consumes the body and groups. `GET /runs/:id` returns stats grouped by model+fixture for that run. `GET /summary` returns cross-run global groups (or per-run?). "Groups records by model and fixture" → `/summary` returns groups across all ingested records (global), each group: model, fixture, n, mean, median, sampleStdDev, min, max, errorRate. `/runs/:id` returns the same shape scoped to that runId (including list of fixture/model combinations within that run). 404 if unknown run.
+
+**Malformed input errors:**
+- Per line: JSON parse error, validation errors → collected with 1-based line numbers, reported in response (`errors: [{ line, code, message, raw? }]`). If no valid lines → 400. If some valid → 200 with partial acceptance and errors (documented). Whole-body level: too big → 413; empty → 400.
+- Also enforce max body size in stream (bounded).
+
+**Incremental parsing:**
+- Implement an `NdjsonParser` class that consumes a stream of chunks: maintain a `buffer`, split on `\n` (also handle `\r\n`), enforce max line bytes, emit per line via callback, and handle trailing partial line at end-of-stream (error: truncated last line → report as malformed line).
+- Line length is a rolling counter in bytes (not storing? we need the line string anyway to parse).
+
+**Bounded memory details:**
+- `MAX_BODY_BYTES` (e.g., 8 MiB) — reject with 413 mid-stream if exceeded, abort.
+- `MAX_LINE_BYTES` (e.g., 64 KiB) — malformed line error, skip line.
+- `MAX_LINE_ERRORS` (e.g., 50) — cap reported errors, report total.
+- `MAX_RECORDS` (e.g., 250_000) — service-wide cap on stored records; once reached, further ingests get 409 or per-line rejection with code `capacity_exceeded`. Per-line rejection keeps the pipeline consistent; but if all records hit the cap, response is 400/409. Let's do this: each capacity-exceeding record produces an error entry `capacity_exceeded`; if valid records are zero and errors all capacity → 409.
+
+Also cap on group count: `MAX_GROUPS` (e.g., 10_000) to prevent unbounded cardinality explosion. If a new group would exceed it → error `group_capacity_exceeded`. Good for "bounded memory".
+
+**Storage:**
+- `RecordStore` class:
+  - `groups: Map<string, Group>` keyed by `${model}\u0000${fixture}`
+  - For each group: arrays for latency, tokensIn, tokensOut, counts, errors. Keep arrays for latency/tokensIn/tokensOut for median. Use Kahan sum for mean.
+  - `runs: Map<runId, { groupKeys: Set<string>, accepted, rejected, firstSeen, lastSeen }>`
+  - Global counter.
+
+Actually simpler: since total records is bounded, group arrays are also bounded. Fine.
+
+**Median:** sort a copy of the array → O(n log n) per call. For bounded n it's fine. Document complexity.
+
+**Sample std dev:** n ≥ 2 → sqrt(Σ(x−mean)²/(n−1)); n < 2 → null.
+
+**Types (strict):**
+- `tsconfig` with `strict: true`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `noImplicitAny`, `noFallthroughCasesInSwitch`, etc.
+- Discriminated union for validation results: `{ ok: true, value } | { ok: false, errors: FieldError[] }` — hand-rolled Result type.
+- Validator: `validateRecord(obj: unknown): Result<MetricsRecord>` with per-field checks, using `typeof` narrowing, number checks (finite, range), string checks (non-empty, max length), allowlist for status enum, `isIso8601` / epoch timestamp.
+
+Define record shape:
+
+```ts
+interface MetricsRecord {
+  runId: string;      // 1..64 chars, [A-Za-z0-9._-]
+  model: string;      // 1..64
+  fixture: string;    // 1..128
+  latencyMs: number;  // finite, 0 < x <= 1e9? use range [0, 3_600_000]? allow >= 0? require > 0? allow >= 0 and finite, up to 86_400_000 (24h in ms).
+  tokensIn: number;   // integer >= 0, max 1e9
+  tokensOut: number;
+  status: "success" | "error" | "timeout";
+  ts: string;         // ISO 8601 with Z, or numeric epoch ms? Let's keep string ISO. Validate via Date parse + regex.
+}
+```
+
+Required fields: runId, model, fixture, latencyMs, status, ts. Optional: tokensIn, tokensOut. Unknown fields → error `unknown_field` (strict). That demonstrates a hand-crafted strict validator.
+
+ISO 8601 validation without a library: regex for `YYYY-MM-DDTHH:mm:ss(.sss)?(Z|±HH:MM)` plus `Date.parse` finite + round-trip? A full round-trip is complex; let's keep regex + parseable + range year 2000–2100. Reasonable.
+
+**Server:**
+- `createServer(config)` returns a started `http.Server`; `index.ts` wires config from env vars, starts it, prints readiness line.
+- Router: hand-crafted:
+  - `GET /health`
+  - `GET /summary`
+  - `GET /runs/:id` (validate id against charset, URL-decoded)
+  - `POST /runs` (ingest NDJSON)
+  - 404 otherwise; 405 for known paths with wrong method.
+- Response is JSON, `Content-Type: application/json`.
+- Ingestion: read request stream through `NdjsonParser` transform; enforce body cap; aggregate results; write response at end.
+- Graceful shutdown on SIGINT/SIGTERM.
+
+**Test (node:test):**
+1. Validator tests: valid record; missing field; wrong type; unknown field; bad status; bad ts; non-finite number; out of range; numeric string → invalid (strict).
+2. NdjsonParser tests: multi-line, CRLF, partial chunk (incremental), over-long line, trailing partial line at EOF (error), empty lines (skipped? decision: empty/whitespace-only lines are silently skipped — document; but final partial line is an error), BOM handling? Strip UTF-8 BOM on first line.
+3. Stats tests: mean/median/std on known data (e.g., [1,2,3,4,5] mean 3, median 3, sample std sqrt(2.5)≈1.58113883), even-count median, single value std = null, empty.
+4. Store tests: group aggregation, run membership, capacity cap → error code, group cap.
+5. HTTP integration tests: start server on ephemeral port; POST NDJSON; GET /summary shape; GET /runs/:id; malformed batch → partial accept + errors with line numbers; unknown run → 404; bad content-type? (accept any but parse as NDJSON; document). Oversized body → 413 (using a small limit in test config).
+6. Health endpoint shape.
+
+**File layout:**
+
+```
+package.json
+tsconfig.json
+README.md (ops guide)
+src/
+  types.ts         — domain types, config, results
+  validate.ts      — hand-rolled validators
+  ndjson.ts        — incremental parser (chunk-based)
+  stats.ts         — mean/median/sample std, running aggregation
+  store.ts         — RecordStore with caps
+  api.ts           — createApi handlers, router, server factory
+  index.ts         — bootstrap
+  errors.ts        — error classes/codes
+test/
+  validate.test.ts
+  ndjson.test.ts
+  stats.test.ts
+  store.test.ts
+  api.test.ts
+```
+
+Let's carefully write out the code.
+
+**types.ts**
+
+```ts
+export type RequestStatus = "success" | "error" | "timeout";
+
+export interface MetricsRecord {
+  runId: string;
+  model: string;
+  fixture: string;
+  latencyMs: number;
+  tokensIn?: number;
+  tokensOut?: number;
+  status: RequestStatus;
+  ts: string; // ISO 8601
+}
+
+export interface LineResult {
+  line: number; // 1-based
+  ok: MetricsRecord | null;
+  error?: { code: ErrorCode; message: string; field?: string };
+}
+
+export type ErrorCode =
+  | "invalid_json"
+  | "not_an_object"
+  | "missing_field"
+  | "wrong_type"
+  | "invalid_value"
+  | "unknown_field"
+  | "line_too_long"
+  | "line_truncated"
+  | "capacity_exceeded"
+  | "group_capacity_exceeded";
+
+export interface ServiceConfig {
+  maxBodyBytes: number;
+  maxLineBytes: number;
+  maxLineErrors: number;
+  maxRecords: number;
+  maxGroups: number;
+  port?: number;
+  host?: string;
+}
+
+export const DEFAULT_CONFIG: ServiceConfig = {
+  maxBodyBytes: 8 * 1024 * 1024,
+  maxLineBytes: 64 * 1024,
+  maxLineErrors: 50,
+  maxRecords: 250_000,
+  maxGroups: 10_000,
+  port: 8080,
+  host: "0.0.0.0",
+};
+
+export function resolveConfig(env: NodeJS.ProcessEnv = process.env): ServiceConfig { ... }
+```
+
+Env resolution with parseInt safe fallbacks.
+
+**errors.ts**
+
+```ts
+export class ApiError extends Error {
+  constructor(public readonly status: number, public readonly code: string, message: string) { super(message); }
+}
+```
+
+**validate.ts**
+
+Write `Result<T>`:
+
+```ts
+export type Result<T> = { ok: true; value: T } | { ok: false; errors: FieldError[] };
+export interface FieldError { code: ErrorCode; field?: string; message: string; }
+```
+
+Constraints object:
+
+```ts
+export const CONSTRAINTS = {
+  runId: { max: 64, pattern: /^[A-Za-z0-9][A-Za-z0-9._-]*$/ },
+  model: { max: 64 },
+  fixture: { max: 128 },
+  latency: { min: 0, max: 86_400_000 },
+  tokens: { min: 0, max: 1_000_000_000 },
+} as const;
+```
+
+Wait, latency min: allow 0? A latency of 0 ms could be valid for a cached response. Let's allow ≥ 0. Hmm, mean of zeros... it's fine.
+
+String validation: `typeof v === "string" && v.length >= 1 && v.length <= max` plus pattern for runId.
+
+`validateRecord(input: unknown): Result<MetricsRecord>`:
+
+```ts
+if (typeof input !== "object" || input === null || Array.isArray(input)) → not_an_object
+```
+
+Check required fields; build errors array; allow up to several errors (collect all, cap? no need for cap; fields are finite → max ~9 errors).
+
+Unknown field detection: `Object.keys(obj)` compared to allowed set → emit unknown_field for each (cap at 5 to avoid huge lines? bounded anyway since we enforce maxLineBytes 64k → number of keys is bounded, fine, but cap at 10 reported and continue counting).
+
+TS strictness: narrowing from `unknown` with helper functions:
+
+```ts
+function isString(v: unknown): v is string
+function isNumber(v: unknown): v is number  // typeof === 'number' (excludes NaN? NaN is number; check Number.isFinite separately)
+```
+
+Status allowlist: `const STATUS_VALUES: ReadonlySet<string> = new Set(["success","error","timeout"])` then `typeof v === "string" && STATUS_VALUES.has(v)` → cast

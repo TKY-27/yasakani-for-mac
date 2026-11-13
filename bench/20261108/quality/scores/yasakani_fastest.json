@@ -1,0 +1,72 @@
+{
+ "configuration": "YASAKANI fastest model",
+ "engine": "YASAKANI, a research build of the engine (not the yskn.dll of this release)",
+ "model": "the weights of the released fastest model, in the container format of the research build",
+ "kv_cache": "FP16",
+ "size_bytes": 10311344128,
+ "size_note": "the model file",
+ "band": "10 GB",
+ "band_reference": true,
+ "kl": 0.030430692160046863,
+ "kl_kind": "whole vocabulary",
+ "top1_agreement_pct": 93.01075268817203,
+ "ppl": 2.0749008762301315,
+ "in_table": true,
+ "in_documents_table": true,
+ "how": "A research build of the engine, which can use an FP16 KV cache and return the logits of the whole vocabulary, read every window 16 positions at a time on its verification path. The yskn.dll of this release was not used.",
+ "record": {
+  "count": 20460,
+  "ppl": 2.0749008762301315,
+  "ppl_base": 2.065188190523882,
+  "ln_ppl_ratio": 0.004692026363906088,
+  "kld_mean": 0.030430692160046863,
+  "kld_median": 0.00863923853610318,
+  "kld_p99": 0.2466651686333872,
+  "kld_p999": 0.7240663706294741,
+  "kld_max": 3.7571146468211842,
+  "rms_dp_pct": 6.027297566273448,
+  "same_top_pct": 93.01075268817203,
+  "kld_per_window": [
+   0.013404854236215904,
+   0.02005479212481108,
+   0.02392316852101107,
+   0.030910053227490925,
+   0.059997942453925285,
+   0.05574442979343077,
+   0.042946685426708146,
+   0.04245724067355458,
+   0.033103682794939034,
+   0.023819500765019267,
+   0.03217115126005012,
+   0.011886184396785779,
+   0.01934153380965594,
+   0.025392480422717877,
+   0.023106166269868028,
+   0.023457103086373277,
+   0.04272214371801146,
+   0.026597900734641643,
+   0.027183207759527976,
+   0.030393621726199097
+  ],
+  "kld_lower_bound_from_top_k": {
+   "20": 0.028372568484027763,
+   "100": 0.029984960584902298
+  },
+  "ppl_from_engine_nll": 2.0749008884704674,
+  "rows_where_argmax_of_logits_differs_from_engine": 0,
+  "max_abs_nll_difference_logits_vs_engine": 1.5003424849169278e-06,
+  "reference_bytes": 10161581940,
+  "seconds": 236.1,
+  "gpu_before": {
+   "memory_used_mib": 332,
+   "temperature_c": 33,
+   "power_w": 69.37
+  },
+  "gpu_after": {
+   "memory_used_mib": 11813,
+   "temperature_c": 36,
+   "power_w": 74.46
+  },
+  "finished": "2026-11-08 15:32:51 +09:00"
+ }
+}

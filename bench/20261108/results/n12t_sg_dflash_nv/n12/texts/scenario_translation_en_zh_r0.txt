@@ -1,0 +1,149 @@
+我们需要回答用户：将完整英文文档翻译成准确自然的简体中文，保留六个章节标题和所有技术边界。译文之后附上至少二十项英中术语表。
+
+需要仔细理解原文，保证翻译准确自然。保留六个章节标题：Section One — Ownership 等。应该翻译标题吗？用户说保留六个章节标题，可能指保留原有六个章节标题的对应中文？可译为“第一节 —— 所有权”等，或保留英文标题？“保留六个章节标题”可能要求不删减章节标题，翻译中文即可。为了自然，保留结构：“第一节——所有权”等。也可以保留英文标题加中文？但要求翻译成简体中文，可能标题也译成中文，且保留六个章节标题（即六个章节）。我会用“第一节 —— 所有权”等。
+
+所有技术边界：需要保留术语如 mutable frontier, kernels, speculative drafts, prefix restoration, loading time, prompt preparation, prefill, decode, network transport, benchmark, generated token, token counts, frozen inputs, request body, resolved sampling parameters, model identity, context capacity, cache format, raw timing fields, warm-up requests, measured repetitions, maximum cache capacity, maximum-length prompt, 262,144-token allocation, prepared prompt, visible context, memory plan, workload dependent, code, prose, translation, structured records, local predictability, accepted-draft percentage, output tokens per round, throughput, user-visible result, acceptance statistics, complete configuration, repeated measurements, variation, material limitations, valid slow run, internal timer, client-observed latency, clear boundaries.
+
+需要至少二十项英中术语表。可以列表：Section One — Ownership / 第一节——所有权，但术语表至少二十项，可能不包括章节。最好提供至少20个术语。
+
+翻译草案：
+第一节 —— 所有权。可靠的推理服务为每一个可变边界分配唯一的所有者。程序可以将数学运算委托给内核，但内核不会悄悄推进请求状态。这种分离使得成功轮次、被拒绝的推测草稿、取消以及前缀恢复都能作为完整的状态转移被观察到。
+
+这里 mutable frontier 怎么译？在推理服务/程序状态里 frontier 可能“前端/边界”。结合“owner”可能“可变前沿”？“frontier”在编译器/状态管理可能“边界”。技术边界保留？用户说所有技术边界，可能指技术术语边界，不是物理边界。 “mutable frontier” 译为“可变边界”较自然。 single owner “唯一所有者”。 kernels “内核”或“执行核/算子内核”。数学运算委托给 kernels：GPU 内核？ 推理引擎中的 kernels 是“内核”（计算内核）。不要静默推进 request state：请求状态。 successful rounds, rejected speculative drafts, cancellation, prefix restoration observable as complete transitions：成功轮次、被拒绝的推测草稿、取消和前缀恢复可被观测为完整转移/状态变迁。 “round” 在 speculation 中是“轮次”。
+
+第二节 —— 测量。加载时间、提示词准备、预填充、解码和网络传输回答的是不同问题。基准测试应为每个报告的速率标明其对应的区间。在本引擎中，首个生成 token 属于预填充阶段，其余生成 token 属于解码阶段，因此 token 计数必须遵循同一边界。
+
+“prompt preparation” 可译“提示准备/提示词准备”。 prefill 预填充/预填充阶段。 decode 解码/解码阶段。 network transport 网络传输。 benchmark 基准测试/评测。 name the interval behind every reported rate：为每个报告速率标出其背后的区间/对应时间区间。 first generated token belongs to prefill in this engine：本引擎中首个生成 token 归属于预填充。 token counts must follow the same boundary：token 计数必须遵循相同边界。
+
+第三节 —— 可复现性。正式运行前，输入被冻结。请求体、解析后的采样参数、模型标识、上下文容量、缓存格式和原始计时字段均被保留。预热请求会被标注并排除，而不是混入被测重复运行中。
+
+“official run” 正式运行/官方运行。 “resolved sampling parameters” 已解析的采样参数。 “model identity” 模型标识。 “context capacity” 上下文容量。 “cache format” 缓存格式。 “raw timing fields” 原始计时字段。 “measured repetitions” 被测量的重复次数/重复运行。 “Warm-up requests are labeled and excluded instead of being mixed into the measured repetitions.” 预热请求被标记并排除，而非混入被测量的重复样本/重复测试中。 自然：“被测量重复”。
+
+第四节 —— 长上下文。分配最大缓存容量并不等同于呈现最大长度的提示词。引擎可以维持 262,144 个 token 的分配，同时测试改变实际准备好的提示词。这在不改变不同案例之间内存计划的情况下，隔离了可见上下文的成本。
+
+“Allocating the maximum cache capacity” 分配最大缓存容量。 “presenting a maximum-length prompt” 呈现最大长度提示词/提交最长提示词。 “keep a 262,144-token allocation” 维持 262,144 token 的分配/保留 262,144 个 token 的分配。 “test varies the actual prepared prompt” 测试改变实际已准备提示词。 “isolates the cost of visible context without changing the memory plan between cases” 在不改变各案例间内存计划的前提下，隔离可见上下文的成本。 “cases” 案例/用例。
+
+第五节 —— 推测。草稿接受率取决于工作负载。代码、散文、翻译和结构化记录具有不同的局部可预测性，因此既需要草稿接受百分比，也需要每轮输出 token 数。吞吐量仍是用户可见的结果；接受率统计只是解释它，而不是取代它。
+
+“Draft acceptance is workload dependent” 草稿接受情况取决于工作负载。 “local predictability” 局部可预测性。 “accepted-draft percentage” 草稿接受率/已接受草稿百分比。 “output tokens per round” 每轮输出 token 数。 “Throughput remains the user-visible result” 吞吐量仍为用户可见结果。 “acceptance statistics explain rather than replace it” 接受统计用于解释而非取代吞吐量。
+
+第六节 —— 报告。公开完整配置、重复测量、变化幅度以及实质性限制。不要丢弃一次有效的慢速运行，也不要将内部计时器描述为客户可观察到的延迟。清晰的边界会让卓越结果更容易获得信任。
+
+“Publish” 发布/公开。 “complete configuration” 完整配置。 “repeated measurements” 重复测量。 “variation” 差异/波动/变化幅度。 “material limitations” 实质性限制/重要限制。 “valid slow run” 有效的慢速运行。 “internal timer” 内部计时器。 “client-observed latency” 客户端观测延迟/客户端可见延迟。 “Clear boundaries make an excellent result easier to trust.” 清晰的边界让优秀的结果更易被信任。
+
+术语表至少二十项。可给 25+ 项，确保不少于20。格式：
+1. Ownership — 所有权
+2. mutable frontier — 可变边界
+3. single owner — 唯一所有者
+4. kernels — 内核（计算内核）
+5. request state — 请求状态
+6. successful round — 成功轮次
+7. rejected speculative draft — 被拒绝的推测草稿
+8. cancellation — 取消
+9. prefix restoration — 前缀恢复
+10. complete transition — 完整转移 / 完整状态转移
+11. loading time — 加载时间
+12. prompt preparation — 提示准备 / 提示词准备
+13. prefill — 预填充
+14. decode — 解码
+15. network transport — 网络传输
+16. benchmark — 基准测试
+17. interval — 区间
+18. reported rate — 报告速率
+19. first generated token — 首个生成 token
+20. token count — token 计数
+21. reproducibility — 可复现性
+22. frozen — 冻结
+23. official run — 正式运行
+24. request body — 请求体
+25. resolved sampling parameters — 已解析采样参数
+26. model identity — 模型标识
+27. context capacity — 上下文容量
+28. cache format — 缓存格式
+29. raw timing fields — 原始计时字段
+30. warm-up requests — 预热请求
+31. measured repetitions — 被测量的重复运行/样本
+32. long context — 长上下文
+33. maximum cache capacity — 最大缓存容量
+34. maximum-length prompt — 最大长度提示词
+35. allocation — 分配
+36. prepared prompt — 已准备提示词
+37. visible context — 可见上下文
+38. memory plan — 内存计划
+39. speculation — 推测（解码）/推测执行
+40. draft acceptance — 草稿接受
+41. workload dependent — 取决于工作负载
+42. local predictability — 局部可预测性
+43. accepted-draft percentage — 草稿接受率
+44. output tokens per round — 每轮输出 token 数
+45. throughput — 吞吐量
+46. user-visible result — 用户可见结果
+47. acceptance statistics — 接受率统计
+48. reporting — 报告
+49. complete configuration — 完整配置
+50. repeated measurements — 重复测量
+51. variation — 波动/差异
+52. material limitations — 实质性限制
+53. valid slow run — 有效的慢速运行
+54. internal timer — 内部计时器
+55. client-observed latency — 客户端观测延迟
+56. clear boundaries — 清晰边界
+
+可以只提供 20 项，但要求至少二十项。最好提供 24 或 25 项，避免冗长但可多。用户要求“至少二十项英中术语表”，可给 25 项，编号。要确保术语表准确。可以包括章节术语和核心术语。
+
+需要注意翻译“technical boundaries”：可能要求保留技术边界，即翻译中不要模糊概念边界，如 first generated token belongs to prefill, token counts same boundary. 译文保留。也可在译文中保留“boundary”等词？ “same boundary” 译“同一边界”。
+
+“complete transitions” 可译“完整状态转移”比“完整转移”更自然，但原文没有 state? request state earlier. “observable as complete transitions” = 可观测为完整转移。 可译“可被观察为完整的状态变迁”。
+
+“kernels do not silently advance request state” 在 GPU 上下文 kernels 是“内核”。“silent” 悄悄/静默。 “advance” 推进。 Good.
+
+“rounds” 在 speculative decoding 中是“轮次”（每次 spec decode round）。 Good.
+
+“prefix restoration” 前缀恢复。 Good.
+
+“Loading time, prompt preparation, prefill, decode, and network transport answer different questions.” 这里 “loading time” 模型加载时间？ “prompt preparation” 提示准备（tokenizer等）。 “network transport” 网络传输。 Good.
+
+“name the interval behind every reported rate” 基准测试应给每个报告速率标注其所对应的时间区间。 “behind” = 背后/对应。 Good.
+
+“first generated token belongs to prefill in this engine” 可能有些引擎首 token 延迟在 prefill。 “生成 token” 可保留 token 英文？ 中文技术翻译常用 token。 用户要求技术边界，可保留 token 小写。 也可以译“词元”，但 LLM 中文社区 token 更常见。 术语表可列 token—词元/token。 为自然，保留 token。 但“准确自然简体中文” 可保留 token 作为技术术语。 术语表可写 token — token（词元）。 若完全中文可译“词元”，但 LLM 中 token 也常用。 用户要求技术边界，保留 token 有助于清晰。 译文中使用 token。 标题“262,144-token allocation” 译“262,144 个 token 的分配”。
+
+“cache capacity” 可能 KV cache capacity? “缓存容量”。
+
+“context capacity” 上下文容量。 Good.
+
+“raw timing fields” 原始计时字段。 Good.
+
+“frozen before the official run” 在正式运行前冻结输入。 Good.
+
+“excluded instead of being mixed into the measured repetitions” 排除而不是混入被测量的重复。 可译“预热请求会被标注并剔除，而不是混入受测的重复样本。” 更自然。 “repetitions” 是重复运行。 “measured repetitions” = 被测量的重复运行。 “受测重复样本” 可能改变。 我倾向“被测量的重复运行”。
+
+“maximum-length prompt” 最大长度提示词。 “presenting” 呈现/提交。 更自然：“分配最大缓存容量并不等同于提交最大长度提示词。” “presenting” 可以“呈现”。 技术文档可“呈现”。 “引擎可以维持 262,144 个 token 的分配，同时让测试改变实际准备好的提示词。” 原 “while the test varies the actual prepared prompt” = 同时测试会变化实际已准备的提示词。 可“同时测试改变实际准备好的提示词”。 Good.
+
+“isolates the cost of visible context without changing the memory plan between cases” = 在不改变不同用例之间内存计划的情况下，将可见上下文的成本隔离出来。 更自然：“这能在不改变各用例之间内存计划的情况下，分离出可见上下文的成本。” “isolates” 分离/隔离。 Good.
+
+“Draft acceptance is workload dependent.” “草稿接受取决于工作负载。” 但 “draft acceptance” 可“草稿接受率/接受情况”。 “代码、散文、翻译和结构化记录具有不同的局部可预测性，所以草稿接受率和每轮输出 token 数都是必要的。” Good.
+
+“Throughput remains the user-visible result; acceptance statistics explain rather than replace it.” “吞吐量仍然是用户可见的结果；接受统计只用于解释它，而不是取代它。” Good.
+
+“Publish the complete configuration, repeated measurements, variation, and material limitations.” “应公开完整配置、重复测量、波动以及实质性限制。” variation 可能是“变化/差异/波动”。 在测量中“variation”指差异/离散度。 用“波动”自然。 但“repeated measurements, variation” 并列：重复测量及其变化。 可译“重复测量及其波动”。 为了准确：“重复测量、波动以及实质性限制”。 Good.
+
+“Do not discard a valid slow run” “不要丢弃有效的慢速运行”。 Good. “do not describe an internal timer as client-observed latency” “不要将内部计时器描述为客户端观测延迟”。 可“客户端观察到的延迟”。 “client-observed latency” 术语表：客户端观测延迟。 Good.
+
+“Clear boundaries make an excellent result easier to trust.” “清晰的边界让卓越结果更容易被信任。” Good.
+
+需要最终输出：先译文，然后术语表。 用户要求“译文之后附上至少二十项英中术语表。” 可以标题“译文”和“英中术语表”。 确保至少 20 项。 可以 24 项。 但为避免争议，给 30 项。 可编号。
+
+考虑是否要保留英文标题？ “保留六个章节标题” 可能希望翻译后仍然有六个章节标题，如 Section One — Ownership 等。 我可以译标题为“第一节 —— 所有权”等，这保留章节标题。 但“Section One — Ownership” 原格式破折号，我用“第一节 —— 所有权”。 如果要求“保留”也许保留英文原标题？ 但翻译成中文文档，标题也应中文。 我可以同时写：“第一节（Section One — Ownership）—— 所有权”？ 这有点冗但确保保留。 用户说“将下面完整英文文档翻译成...简体中文，保留六个章节标题” 可能指翻译时保留章节结构，不是必须保留英文。 我可以用中文标题。 为了保险，可标题行：“第一节 —— 所有权（Section One — Ownership）”？ 但“保留六个章节标题”也许要求原文六个标题存在，翻译中可保留英文标题，更明确。 但中文文档自然性可接受附英文？ 可能不必。 用户是中文，要求中文译文。 如果每个标题加英文，会不自然但满足保留。 我觉得可以用中文标题并保留编号，足以。 如果想更保险：标题写“第一节 —— 所有权（Section One — Ownership）”，六个都保留英文原标题。 但“完整英文文档翻译成简体中文”中保留英文标题可能允许。 术语表也可包含 Section One — Ownership. “保留六个章节标题”可能要求不删除六个章节标题，翻译标题为中文即可。 我倾向不附英文，简洁自然。 但为了“保留”可保留“Section One — Ownership” 作为标题？ 例如：
+Section One — Ownership（第一节：所有权）
+这样英文和中文都有，但用户要简体中文，可能不希望英文。 不过术语表会英文。 最终可译为：
+第一节 —— 所有权
+第二节 —— 测量
+第三节 —— 可复现性
+第四节 —— 长上下文
+第五节 —— 推测
+第六节 —— 报告
+这自然。
+
+术语表至少 20：可给 26 项，包含关键。 需要确保术语表不是简单同义？ 准确。 可能“Ownership” 译“所有权”也可“所有关系”。 在系统里 ownership 指所有权限/归属。 “ownership” 可译“所有权/归属”。 标题“Ownership” 更自然“所有权”。 术语表“Ownership — 所有权（归属）”。
+
+“mutable frontier” 可能“可变前沿”比“可变边界”更技术？ 什么是 frontier？ 在状态管理/执行中“frontier”常指当前推进边界，如编译器的 worklist frontier, mutable frontier maybe “可变前沿”。 “所有技术边界” 用户强调边界，可能“frontier” 应保留“前沿”而非“边界”。 但 “frontier” 中文可“前沿”。 “mutable frontier” = 可变前沿。 “single owner” 唯一所有者。 “frontier” 如果是执行中的 frontier，译“前沿”更贴近技术术语。 但“边界”也可。 原文后面有 “clear boundaries” 边界。 为避免混淆，保留 frontier 为“前沿”？ 例如“每个可变前沿都有单一所有者”。 在推理服务中，frontier 可能指“请求前沿/状态前沿”？ 不太常见。 “mutable frontier” 可能是自定义术语。 “frontier” 可译“前端/前沿”。 “owner” 所有权。 “This separation makes ... observable as complete transitions.” “frontier” 可能是一个抽象对象，拥有者负责变化。 “可变前沿

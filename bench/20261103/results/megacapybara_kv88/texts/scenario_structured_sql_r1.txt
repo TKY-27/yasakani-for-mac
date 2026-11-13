@@ -1,0 +1,228 @@
+-- 1. Schema Definition
+DROP VIEW IF EXISTS v_model_performance_summary;
+DROP VIEW IF EXISTS v_fixture_latency_breakdown;
+DROP FUNCTION IF EXISTS upsert_request_metrics;
+
+DROP TABLE IF EXISTS request_metrics;
+DROP TABLE IF EXISTS runs;
+DROP TABLE IF EXISTS fixtures;
+DROP TABLE IF EXISTS models;
+
+CREATE TABLE models (
+    model_id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    architecture VARCHAR(100) NOT NULL,
+    context_length INT NOT NULL CHECK (context_length > 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE fixtures (
+    fixture_id SERIAL PRIMARY KEY,
+    kind VARCHAR(50) NOT NULL CHECK (kind IN ('short', 'medium', 'long', 'code')),
+    description TEXT,
+    token_count INT NOT NULL CHECK (token_count > 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE runs (
+    run_id SERIAL PRIMARY KEY,
+    model_id INT NOT NULL REFERENCES models(model_id) ON DELETE CASCADE,
+    fixture_id INT NOT NULL REFERENCES fixtures(fixture_id) ON DELETE CASCADE,
+    started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at TIMESTAMP,
+    status VARCHAR(20) NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed')),
+    UNIQUE (model_id, fixture_id, started_at)
+);
+
+CREATE TABLE request_metrics (
+    metric_id SERIAL PRIMARY KEY,
+    run_id INT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    request_index INT NOT NULL CHECK (request_index >= 0),
+    input_tokens INT NOT NULL CHECK (input_tokens > 0),
+    output_tokens INT NOT NULL CHECK (output_tokens >= 0),
+    latency_ms DECIMAL(10, 2) NOT NULL CHECK (latency_ms >= 0),
+    mtp_accepted BOOLEAN NOT NULL DEFAULT FALSE,
+    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (run_id, request_index)
+);
+
+CREATE INDEX idx_runs_model ON runs(model_id);
+CREATE INDEX idx_runs_fixture ON runs(fixture_id);
+CREATE INDEX idx_metrics_run ON request_metrics(run_id);
+CREATE INDEX idx_metrics_mtp ON request_metrics(mtp_accepted);
+CREATE INDEX idx_metrics_latency ON request_metrics(latency_ms);
+
+-- 2. Views
+CREATE VIEW v_model_performance_summary AS
+SELECT 
+    m.name AS model_name,
+    COUNT(DISTINCT r.run_id) AS total_runs,
+    AVG(rm.latency_ms) AS avg_latency_ms,
+    MAX(rm.latency_ms) AS max_latency_ms,
+    MIN(rm.latency_ms) AS min_latency_ms,
+    SUM(CASE WHEN rm.mtp_accepted THEN 1 ELSE 0 END)::FLOAT / COUNT(*) * 100 AS mtp_acceptance_rate_pct
+FROM models m
+JOIN runs r ON m.model_id = r.model_id
+JOIN request_metrics rm ON r.run_id = rm.run_id
+GROUP BY m.name;
+
+CREATE VIEW v_fixture_latency_breakdown AS
+SELECT 
+    f.kind AS fixture_kind,
+    f.token_count AS avg_input_tokens,
+    COUNT(rm.metric_id) AS total_requests,
+    AVG(rm.latency_ms) AS avg_latency_ms,
+    STDDEV_POP(rm.latency_ms) AS latency_stddev
+FROM fixtures f
+JOIN runs r ON f.fixture_id = r.fixture_id
+JOIN request_metrics rm ON r.run_id = rm.run_id
+GROUP BY f.kind, f.token_count;
+
+-- 3. Transaction-Safe Upsert Function
+CREATE OR REPLACE FUNCTION upsert_request_metrics(
+    p_run_id INT,
+    p_request_index INT,
+    p_input_tokens INT,
+    p_output_tokens INT,
+    p_latency_ms DECIMAL(10, 2),
+    p_mtp_accepted BOOLEAN
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO request_metrics (run_id, request_index, input_tokens, output_tokens, latency_ms, mtp_accepted)
+    VALUES (p_run_id, p_request_index, p_input_tokens, p_output_tokens, p_latency_ms, p_mtp_accepted)
+    ON CONFLICT (run_id, request_index) DO UPDATE SET
+        input_tokens = EXCLUDED.input_tokens,
+        output_tokens = EXCLUDED.output_tokens,
+        latency_ms = EXCLUDED.latency_ms,
+        mtp_accepted = EXCLUDED.mtp_accepted,
+        timestamp = CURRENT_TIMESTAMP;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 4. Data Insertion
+INSERT INTO models (name, architecture, context_length) VALUES
+('Llama-3-8B-Instruct', 'llama', 8192),
+('Mistral-7B-v0.3', 'mistral', 32768);
+
+INSERT INTO fixtures (kind, description, token_count) VALUES
+('short', 'Simple Q&A prompt', 50),
+('medium', 'Summarization task', 500),
+('long', 'Document analysis', 4000),
+('code', 'Code generation snippet', 200);
+
+-- Generate Runs for Model 1 (Llama-3-8B-Instruct)
+INSERT INTO runs (model_id, fixture_id, started_at, finished_at, status) VALUES
+(1, 1, '2023-10-01 10:00:00', '2023-10-01 10:05:00', 'completed'),
+(1, 2, '2023-10-01 10:10:00', '2023-10-01 10:15:00', 'completed'),
+(1, 3, '2023-10-01 10:20:00', '2023-10-01 10:25:00', 'completed'),
+(1, 4, '2023-10-01 10:30:00', '2023-10-01 10:35:00', 'completed');
+
+-- Generate Runs for Model 2 (Mistral-7B-v0.3)
+INSERT INTO runs (model_id, fixture_id, started_at, finished_at, status) VALUES
+(2, 1, '2023-10-01 11:00:00', '2023-10-01 11:05:00', 'completed'),
+(2, 2, '2023-10-01 11:10:00', '2023-10-01 11:15:00', 'completed'),
+(2, 3, '2023-10-01 11:20:00', '2023-10-01 11:25:00', 'completed'),
+(2, 4, '2023-10-01 11:30:00', '2023-10-01 11:35:00', 'completed');
+
+-- Insert Metrics for Run 1 (Model 1, Fixture 1 - Short)
+INSERT INTO request_metrics (run_id, request_index, input_tokens, output_tokens, latency_ms, mtp_accepted) VALUES
+(1, 0, 50, 100, 120.50, TRUE),
+(1, 1, 50, 105, 118.20, TRUE),
+(1, 2, 50, 98, 122.10, FALSE),
+(1, 3, 50, 102, 119.80, TRUE),
+(1, 4, 50, 101, 121.30, TRUE),
+(1, 5, 50, 99, 120.10, TRUE),
+(1, 6, 50, 103, 117.90, FALSE),
+(1, 7, 50, 100, 120.70, TRUE),
+(1, 8, 50, 104, 118.50, TRUE),
+(1, 9, 50, 97, 123.40, TRUE);
+
+-- Insert Metrics for Run 2 (Model 1, Fixture 2 - Medium)
+INSERT INTO request_metrics (run_id, request_index, input_tokens, output_tokens, latency_ms, mtp_accepted) VALUES
+(2, 0, 500, 200, 450.20, TRUE),
+(2, 1, 500, 205, 448.10, TRUE),
+(2, 2, 500, 198, 452.30, FALSE),
+(2, 3, 500, 202, 449.50, TRUE),
+(2, 4, 500, 201, 451.20, TRUE),
+(2, 5, 500, 199, 450.80, TRUE),
+(2, 6, 500, 203, 447.90, FALSE),
+(2, 7, 500, 200, 450.10, TRUE),
+(2, 8, 500, 204, 448.70, TRUE),
+(2, 9, 500, 197, 453.20, TRUE);
+
+-- Insert Metrics for Run 3 (Model 1, Fixture 3 - Long)
+INSERT INTO request_metrics (run_id, request_index, input_tokens, output_tokens, latency_ms, mtp_accepted) VALUES
+(3, 0, 4000, 500, 2500.50, TRUE),
+(3, 1, 4000, 505, 2498.20, TRUE),
+(3, 2, 4000, 498, 2502.10, FALSE),
+(3, 3, 4000, 502, 2499.80, TRUE),
+(3, 4, 4000, 501, 2501.30, TRUE),
+(3, 5, 4000, 499, 2500.10, TRUE),
+(3, 6, 4000, 503, 2497.90, FALSE),
+(3, 7, 4000, 500, 2500.70, TRUE),
+(3, 8, 4000, 504, 2498.50, TRUE),
+(3, 9, 4000, 497, 2503.40, TRUE);
+
+-- Insert Metrics for Run 4 (Model 1, Fixture 4 - Code)
+INSERT INTO request_metrics (run_id, request_index, input_tokens, output_tokens, latency_ms, mtp_accepted) VALUES
+(4, 0, 200, 300, 350.20, TRUE),
+(4, 1, 200, 305, 348.10, TRUE),
+(4, 2, 200, 298, 352.30, FALSE),
+(4, 3, 200, 302, 349.50, TRUE),
+(4, 4, 200, 301, 351.20, TRUE),
+(4, 5, 200, 299, 350.80, TRUE),
+(4, 6, 200, 303, 347.90, FALSE),
+(4, 7, 200, 300, 350.10, TRUE),
+(4, 8, 200, 304, 348.70, TRUE),
+(4, 9, 200, 297, 353.20, TRUE);
+
+-- Insert Metrics for Run 5 (Model 2, Fixture 1 - Short)
+INSERT INTO request_metrics (run_id, request_index, input_tokens, output_tokens, latency_ms, mtp_accepted) VALUES
+(5, 0, 50, 100, 110.50, TRUE),
+(5, 1, 50, 105, 108.20, TRUE),
+(5, 2, 50, 98, 112.10, FALSE),
+(5, 3, 50, 102, 109.80, TRUE),
+(5, 4, 50, 101, 111.30, TRUE),
+(5, 5, 50, 99, 110.10, TRUE),
+(5, 6, 50, 103, 107.90, FALSE),
+(5, 7, 50, 100, 110.70, TRUE),
+(5, 8, 50, 104, 108.50, TRUE),
+(5, 9, 50, 97, 113.40, TRUE);
+
+-- Insert Metrics for Run 6 (Model 2, Fixture 2 - Medium)
+INSERT INTO request_metrics (run_id, request_index, input_tokens, output_tokens, latency_ms, mtp_accepted) VALUES
+(6, 0, 500, 200, 420.20, TRUE),
+(6, 1, 500, 205, 418.10, TRUE),
+(6, 2, 500, 198, 422.30, FALSE),
+(6, 3, 500, 202, 419.50, TRUE),
+(6, 4, 500, 201, 421.20, TRUE),
+(6, 5, 500, 199, 420.80, TRUE),
+(6, 6, 500, 203, 417.90, FALSE),
+(6, 7, 500, 200, 420.10, TRUE),
+(6, 8, 500, 204, 418.70, TRUE),
+(6, 9, 500, 197, 423.20, TRUE);
+
+-- Insert Metrics for Run 7 (Model 2, Fixture 3 - Long)
+INSERT INTO request_metrics (run_id, request_index, input_tokens, output_tokens, latency_ms, mtp_accepted) VALUES
+(7, 0, 4000, 500, 2300.50, TRUE),
+(7, 1, 4000, 505, 2298.20, TRUE),
+(7, 2, 4000, 498, 2302.10, FALSE),
+(7, 3, 4000, 502, 2299.80, TRUE),
+(7, 4, 4000, 501, 2301.30, TRUE),
+(7, 5, 4000, 499, 2300.10, TRUE),
+(7, 6, 4000, 503, 2297.90, FALSE),
+(7, 7, 4000, 500, 2300.70, TRUE),
+(7, 8, 4000, 504, 2298.50, TRUE),
+(7, 9, 4000, 497, 2303.40, TRUE);
+
+-- Insert Metrics for Run 8 (Model 2, Fixture 4 - Code)
+INSERT INTO request_metrics (run_id, request_index, input_tokens, output_tokens, latency_ms, mtp_accepted) VALUES
+(8, 0, 200, 300, 320.20, TRUE),
+(8, 1, 200, 305, 318.10, TRUE),
+(8, 2, 200, 298, 322.30, FALSE),
+(8, 3, 200, 302, 319.50, TRUE),
+(8, 4, 200, 301, 321.20, TRUE),
+(8, 5, 200, 299, 320.80, TRUE),
+(8, 6, 200, 303, 317.90, FALSE),
+(8, 7, 200, 300, 320.10, TRUE),
+(8, 8, 200, 304, 318.70

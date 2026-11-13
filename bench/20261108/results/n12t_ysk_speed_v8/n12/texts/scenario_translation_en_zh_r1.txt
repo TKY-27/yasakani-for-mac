@@ -1,0 +1,183 @@
+We need answer in Chinese. User asks: "将下面完整英文文档翻译成准确、自然的简体中文，保留六个章节标题和所有技术边界。译文之后附上至少二十项英中术语表。" Need translate given six sections into Simplified Chinese, retain six section titles and all technical boundaries. Then glossary at least 20 EN-ZH terms. Need likely output translation only? Need produce final with translation and glossary. Need ensure six chapter titles? Original headings: "Section One — Ownership." etc. Need preserve six section titles. Could translate titles? "保留六个章节标题" likely keep six section titles, maybe English or Chinese? "保留六个章节标题" means preserve the six section headings. Could use "第一节 — 所有权。" etc. Need all technical boundaries: mutable frontier, single owner, kernels, request state, successful rounds, rejected speculative drafts, cancellation, prefix restoration, loading time, prompt preparation, prefill, decode, network transport, first generated token, remaining generated tokens, token counts, inputs frozen, request body, resolved sampling parameters, model identity, context capacity, cache format, raw timing fields, warm-up requests, measured repetitions, maximum cache capacity, maximum-length prompt, 262,144-token allocation, actual prepared prompt, visible context, memory plan, draft acceptance, workload dependent, code/prose/translation/structured records, local predictability, accepted-draft percentage, output tokens per round, throughput, user-visible result, acceptance statistics, complete configuration, repeated measurements, variation, material limitations, valid slow run, internal timer, client-observed latency, clear boundaries. Need translate accurately natural. Need glossary at least 20 terms. Could include table. Need not mention analysis.
+
+Need decide if "mutable frontier" in inference service? It might be "可变前沿" (frontier as boundary of mutable state?). In inference, "mutable frontier" maybe point in program where state changes. "single owner" 单一所有者/唯一负责人. "A reliable inference service gives every mutable frontier a single owner." Translate: "可靠的推理服务为每个可变前沿指定单一所有者。" Could be natural: "为每个可变状态前沿指定唯一负责人". Technical boundary: frontier maybe "边界". "mutable frontier" as "可变前沿". Need preserve. "The program may delegate mathematical operations to kernels, but kernels do not silently advance request state." kernels here likely CUDA kernels? "内核/计算内核". In GPU context, kernel. Use "内核". "程序可以把数学运算委托给内核，但内核不会静默推进请求状态。" "request state" 请求状态. "This separation makes successful rounds, rejected speculative drafts, cancellation, and prefix restoration observable as complete transitions." rounds? In speculative decoding round. "轮次". "speculative drafts" 投机草稿? "draft" in speculative decoding = draft tokens. "rejected speculative drafts" = 被拒绝的投机草稿（或草稿生成）. "prefix restoration" 前缀恢复. "observable as complete transitions" 可观察为完整状态转移. Could say "使成功轮次、被拒的投机草稿、取消以及前缀恢复都能作为完整转移被观察到。"
+
+Section Two: "Loading time, prompt preparation, prefill, decode, and network transport answer different questions." loading time 加载时间; prompt preparation 提示准备/提示词准备; prefill 预填充; decode 解码; network transport 网络传输. "A benchmark should name the interval behind every reported rate." 基准测试应标明每项所报告速率对应的区间/时段. "The first generated token belongs to prefill in this engine, while the remaining generated tokens belong to decode, so the token counts must follow the same boundary." 在本引擎中，首个生成 token 属于预填充阶段，其余生成 token 属于解码阶段，因此 token 计数必须遵循同一边界。 Need token maybe "令牌/词元". In LLM Chinese often "token" retained or "词元". Need accurate natural. Could use "token" in technical context. But glossary term. Maybe "生成 token". To be natural Simplified Chinese, can keep "token" or translate "词元". Need technical boundaries. I can use "词元" but many Chinese developers say "token". Since user asks English-Chinese glossary, can use "token / 词元". In translation, perhaps "token（词元）". But natural? "首个生成的 token". Could use "词元" to be pure Chinese. But technical boundaries: "token counts". I'd use "token" to avoid ambiguity? The request says 简体中文, accurate natural; technical terms can be borrowed. Glossary can include Token. Maybe use "词元" and note? Let's decide. In modern Chinese ML docs, "token" widely used, but "词元" also accepted. "token counts" -> "token 计数" maybe natural. If using "词元" might be less familiar but clear. Need glossary at least 20 terms: include "token" as "词元/令牌". If translation uses "token", glossary can have "Token — 词元/令牌". But user wants 英中术语表, maybe English term: Chinese translation. We can list English -> Chinese. Use "Token — 词元/令牌". In translation, maybe "token" retained. But if term glossary, okay.
+
+Need "all technical boundaries" perhaps don't alter technical terms. Keep boundaries: first generated token in prefill, remaining decode; token counts same boundary; max cache capacity vs maximum-length prompt; 262,144-token allocation; visible context; memory plan. Need keep numbers.
+
+Section Four: "Allocating the maximum cache capacity is not the same as presenting a maximum-length prompt." 分配最大缓存容量并不等于呈现最大长度提示词/提示. "The engine can keep a 262,144-token allocation while the test varies the actual prepared prompt." 引擎可以保持 262,144-token 分配，同时测试改变实际准备好的提示。 "This isolates the cost of visible context without changing the memory plan between cases." 这样可单独考察可见上下文的成本，且在不同用例之间不改变内存计划。
+
+Section Five: "Draft acceptance is workload dependent." 草稿接受率取决于工作负载/任务类型. "Code, prose, translation, and structured records have different local predictability" 代码、散文、翻译和结构化记录具有不同的局部可预测性. "so both accepted-draft percentage and output tokens per round are necessary." 因此既需要接受草稿百分比，也需要每轮输出 token 数. "Throughput remains the user-visible result; acceptance statistics explain rather than replace it." 吞吐量仍是面向用户可见的结果；接受统计用于解释而非替代它。
+
+Section Six: "Publish the complete configuration, repeated measurements, variation, and material limitations." 发布完整配置、重复测量、变异/波动以及实质性限制。 Variation: "差异/波动". "Do not discard a valid slow run, and do not describe an internal timer as client-observed latency." 不要丢弃有效的慢速运行，也不要将内部计时器描述为客户端观察到的延迟。 "Clear boundaries make an excellent result easier to trust." 清晰的边界让优异结果更易可信。
+
+Need produce six section titles. Could be:
+第一节 — 所有权
+第二节 — 测量
+第三节 — 可复现性
+第四节 — 长上下文
+第五节 — 投机
+第六节 — 报告
+
+Need preserve "Section One — Ownership." Maybe if preserving English titles? "保留六个章节标题" could mean keep six section headings, not necessarily translate? But user wants translate complete English doc into Chinese, preserve six chapter titles and all technical boundaries. I think translate titles to Chinese but preserve their role. Could include original English in parentheses? "第一节 — 所有权（Ownership）"? That may be more preserving. But "保留六个章节标题" maybe from original doc, need not omit. I can use bilingual titles: "第一节 — 所有权（Ownership）" etc. That preserves original and natural. But user asked translate; adding English may be okay? It says retain six section titles; maybe exactly retain the six section titles as headings. Could be either English or translated. To be safe, use Chinese headings but maybe include original English in parentheses? That adds not pure translation. But likely acceptable. They ask 完整英文文档翻译成简体中文, retain six chapter titles. If I include English, not fully Chinese? It says 简体中文, but technical terms can English. Six section titles could be "第一节 — 所有权". That is a translated title. It retains six chapter titles (as Chinese). I think use only Chinese headings: 第一节 — 所有权 etc. But "Section One — Ownership" if preserving maybe should keep "Section One"? In Chinese docs, "第一节" enough. Need all six.
+
+Need glossary at least twenty items. Need count. Let's list possible terms:
+1. inference service — 推理服务
+2. mutable frontier — 可变前沿
+3. owner — 所有者/负责人
+4. kernel — 内核/计算内核
+5. request state — 请求状态
+6. round — 轮次
+7. speculative draft — 投机草稿
+8. cancellation — 取消
+9. prefix restoration — 前缀恢复
+10. transition — 状态转移
+11. loading time — 加载时间
+12. prompt preparation — 提示准备
+13. prefill — 预填充
+14. decode — 解码
+15. network transport — 网络传输
+16. token — 词元/令牌
+17. benchmark — 基准测试
+18. interval — 区间/阶段
+19. rate — 速率
+20. input — 输入
+21. official run — 正式运行
+22. request body — 请求体
+23. sampling parameters — 采样参数
+24. model identity — 模型标识
+25. context capacity — 上下文容量
+26. cache format — 缓存格式
+27. raw timing fields — 原始计时间字段
+28. warm-up request — 预热请求
+29. measured repetitions — 被计量的重复测试/测量重复
+30. maximum cache capacity — 最大缓存容量
+31. maximum-length prompt — 最大长度提示
+32. allocation — 分配
+33. visible context — 可见上下文
+34. memory plan — 内存计划
+35. draft acceptance — 草稿接受（率）
+36. workload — 工作负载
+37. local predictability — 局部可预测性
+38. accepted-draft percentage — 接受草稿百分比
+39. output tokens per round — 每轮输出词元数
+40. throughput — 吞吐量
+41. user-visible result — 用户可见结果
+42. acceptance statistics — 接受统计
+43. configuration — 配置
+44. repeated measurements — 重复测量
+45. variation — 波动/变异
+46. material limitations — 实质性限制
+47. slow run — 慢速运行
+48. internal timer — 内部计时器
+49. client-observed latency — 客户端观察到的延迟
+50. boundary — 边界
+
+Need at least 20. Could choose 30. Need format. "英中术语表" English-Chinese glossary. Could table: English | Chinese. Ensure at least 20 rows. Could include "Token" row. Need maybe "speculative decoding" not explicit but speculative. Include "speculative draft".
+
+Need final: translation first, then glossary. Need maybe no extra commentary. Ensure translation accurate. Let's craft carefully.
+
+Potential translation:
+
+第一节 — 所有权
+可靠的推理服务为每个可变前沿指定单一所有者。程序可以把数学运算委托给内核，但内核不会静默推进请求状态。这一分离使成功轮次、被拒绝的投机草稿、取消以及前缀恢复都能作为完整状态转移被观察到。
+
+第二节 — 测量
+加载时间、提示准备、预填充、解码和网络传输回答的是不同的问题。基准测试应当指明每一项所报告速率背后的区间。在本引擎中，首个生成的 token 属于预填充，而其余生成的 token 属于解码，因此 token 计数必须遵循同一边界。
+
+第三节 — 可复现性
+输入在正式运行前被冻结。请求体、已解析的采样参数、模型标识、上下文容量、缓存格式以及原始计时间字段均被保留。预热请求会被标注并排除，而不是混入被测重复样本中。
+
+第四节 — 长上下文
+分配最大缓存容量并不等于呈现最大长度提示。引擎可以保持 262,144-token 分配，同时测试改变实际准备好的提示。这样可单独考察可见上下文的成本，且在不同用例之间不改变内存计划。
+
+第五节 — 投机
+草稿接受情况取决于工作负载。代码、散文、翻译和结构化记录具有不同的局部可预测性，因此既需要接受草稿百分比，也需要每轮输出 token 数。吞吐量仍然是面向用户可见的结果；接受统计用于解释它，而不是替代它。
+
+第六节 — 报告
+发布完整配置、重复测量、波动以及实质性限制。不要丢弃有效的慢速运行，也不要将内部计时器描述为客户端观察到的延迟。清晰的边界会让优异结果更容易被信任。
+
+Need check "technical boundaries" maybe "prompt preparation" vs "提示准备" ok. "preparation" maybe "提示预处理"? "prompt preparation" is stage before prefill, could be "提示准备". "raw timing fields" -> "原始计时间字段" maybe "原始计时字段". Use "原始计时字段". "resolved sampling parameters" -> "已解析的采样参数" natural? "解析后的采样参数". "request body" 请求体. "official run" 正式运行. "measured repetitions" "被测量的重复测试". "mixed into measured repetitions" "混入被测重复样本". Good.
+
+"Draft acceptance is workload dependent." "草稿接受情况取决于工作负载" maybe "接受率" but original doesn't say rate? It says Draft acceptance. Then next says accepted-draft percentage. Use "草稿接受情况". Good.
+
+Need glossary terms at least 20. Need maybe include all terms in translation. Let's make 30 rows.
+
+Could format:
+
+英中术语表（不少于 20 项）
+| English | Chinese |
+| --- | --- |
+| inference service | 推理服务 |
+... 
+
+Need ensure at least 20. Let's count 30:
+1 inference service 推理服务
+2 mutable frontier 可变前沿
+3 owner 所有者
+4 kernel 计算内核
+5 request state 请求状态
+6 round 轮次
+7 speculative draft 投机草稿
+8 cancellation 取消
+9 prefix restoration 前缀恢复
+10 transition 状态转移
+11 loading time 加载时间
+12 prompt preparation 提示准备
+13 prefill 预填充
+14 decode 解码
+15 network transport 网络传输
+16 benchmark 基准测试
+17 interval 区间/阶段
+18 rate 速率
+19 token 词元/令牌
+20 official run 正式运行
+21 request body 请求体
+22 sampling parameters 采样参数
+23 model identity 模型标识
+24 context capacity 上下文容量
+25 cache format 缓存格式
+26 raw timing fields 原始计时字段
+27 warm-up request 预热请求
+28 measured repetitions 被测重复样本
+29 maximum cache capacity 最大缓存容量
+30 maximum-length prompt 最大长度提示
+31 allocation 分配
+32 visible context 可见上下文
+33 memory plan 内存计划
+34 workload 工作负载
+35 local predictability 局部可预测性
+36 accepted-draft percentage 接受草稿百分比
+37 output tokens per round 每轮输出词元数
+38 throughput 吞吐量
+39 user-visible result 用户可见结果
+40 acceptance statistics 接受统计
+41 configuration 配置
+42 repeated measurements 重复测量
+43 variation 波动
+44 material limitations 实质性限制
+45 slow run 慢速运行
+46 internal timer 内部计时器
+47 client-observed latency 客户端观察到的延迟
+48 boundary 边界
+
+More than 20. Need perhaps "technical boundary" itself. Good.
+
+Need ensure "保留六个章节标题" maybe if we use only Chinese headings, does it "retain"? Could include original English in glossary? Maybe headings: "第一节 — 所有权（Ownership）" etc. That would retain original title? But final all Simplified Chinese? It says translate into accurate natural Simplified Chinese. Including English parenthetical maybe not ideal but can preserve titles. Let's consider. If the original doc has six sections with titles: "Section One — Ownership." The instruction "保留六个章节标题和所有技术边界" likely means don't lose headings or technical distinctions. It doesn't say preserve English titles. So Chinese headings are fine.
+
+Need maybe use em dash exactly. "第一节 — 所有权" etc.
+
+Need think about "ownership" in state management: "单一所有者". Good.
+
+Potential issue: "kernels do not silently advance request state" In GPU programming, kernel can update memory, but service owns state transitions. Translation ok.
+
+"prefix restoration" maybe "前缀恢复" in speculative decoding if restoring accepted prefix. Good.
+
+"complete transitions" maybe "完整转移" or "完整状态转移". Add state to clarify. Technical boundary: "transition" glossary. Good.
+
+"Loading time, prompt preparation, prefill, decode, and network transport answer different questions." Could translate "加载时间、提示准备、预填充、解码与网络传输分别回答不同的问题。" More natural: "回答不同的问题" ok. Maybe "分别回答不同的问题".
+
+"A benchmark should name the interval behind every reported rate." "基准测试应指出每项已报告速率所对应的区间。" Better: "基准测试应标明每一个所报告速率背后的测量区间。" Use "测量区间". "name" = specify. "The first generated token belongs to prefill in this engine" = "在本引擎中，第一个生成词元归属于预填充阶段". Add 阶段? Technical boundary. Could say "属于预填充". Add "阶段" for natural. But original says belongs to prefill, not stage. Use "属于预填充阶段". Then token counts must follow same boundary. Good.
+
+Should we use "词元" consistently? I used token in translation. Maybe if use token, glossary includes token. But user asked natural Chinese, perhaps "token" accepted. If use "词元", translation more Chinese: "首个生成词元". Let's decide. In Chinese LLM docs, "token" common, but "词元" can be clear. The glossary asks English-Chinese, so "Token — 词元/令牌". If translation uses "词元", good. Need "262,144-token allocation" -> "262,144 词元的分配" or "262,144-token 分配". To preserve technical boundary, maybe "262

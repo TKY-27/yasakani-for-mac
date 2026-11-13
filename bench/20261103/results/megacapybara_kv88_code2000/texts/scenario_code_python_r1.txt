@@ -1,0 +1,281 @@
+Below is a complete, runnable Python 3.11 package named `deterministic_job_runner`.
+
+Design notes (so the code makes sense):
+- **Determinism**: jobs are processed in manifest order; each job's output is derived purely from its inputs via a pure function (`sha256` of canonical JSON), so re-running yields identical results.
+- **One active GPU job**: a single worker coroutine + an `asyncio.Lock` guarantee at most one job runs at a time.
+- **Atomic state persistence**: state is written to a temp file then `os.replace`'d into place (atomic on POSIX).
+- **Resume**: completed/failed/cancelled jobs are skipped on restart; only pending ones run.
+- **JSONL events**: structured events streamed to stdout and appended to `events.jsonl`.
+- **SIGINT**: first signal cancels the current job (marks it cancelled) and stops scheduling new ones; second signal exits immediately.
+- **Secret redaction**: configured secret values are replaced with `[REDACTED]` in all emitted text.
+
+---
+
+### pyproject.toml
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deterministic-job-runner"
+version = "0.1.0"
+description = "A deterministic asynchronous job runner with atomic state, resume, JSONL events, SIGINT handling, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Example Author", email = "author@example.com" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pytest-asyncio>=0.21"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["deterministic_job_runner*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+---
+
+### README.md
+
+```markdown
+# deterministic-job-runner
+
+A deterministic asynchronous job runner.
+
+## Usage
+
+    python -m deterministic_job_runner --manifest manifest.json --state-dir ./state
+
+The runner reads a JSON manifest, enforces a single active GPU job, persists
+atomic state, resumes completed work, streams structured JSONL events, handles
+SIGINT gracefully, and redacts configured secrets.
+
+## Manifest format
+
+    {
+      "jobs": [
+        {"id": "job-1", "kind": "train", "params": {"epochs": 3}},
+        {"id": "job-2", "kind": "eval", "params": {"split": "val"}}
+      ]
+    }
+
+Each job must have a unique `id` and a `kind`. `params` is optional.
+
+## State layout
+
+    <state-dir>/
+      state.json          # atomic snapshot of job statuses
+      events.jsonl        # append-only structured event log
+```
+
+---
+
+### deterministic_job_runner/__init__.py
+
+```python
+"""Deterministic asynchronous job runner."""
+
+from .runner import JobRunner, RunnerConfig
+from .manifest import load_manifest, Manifest
+from .state import StateStore, JobStatus
+from .events import EventStream, EventType
+from .redact import Redactor
+
+__all__ = [
+    "JobRunner",
+    "RunnerConfig",
+    "load_manifest",
+    "Manifest",
+    "StateStore",
+    "JobStatus",
+    "EventStream",
+    "EventType",
+    "Redactor",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+### deterministic_job_runner/manifest.py
+
+```python
+"""Manifest loading and validation."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class Job:
+    """A single job definition from the manifest."""
+
+    id: str
+    kind: str
+    params: dict[str, Any] = field(default_factory=dict)
+
+    def canonical(self) -> str:
+        """Return a canonical JSON string for deterministic hashing."""
+        return json.dumps(
+            {"id": self.id, "kind": self.kind, "params": self.params},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+
+@dataclass(frozen=True)
+class Manifest:
+    """Collection of jobs loaded from a manifest file."""
+
+    jobs: list[Job]
+
+    @property
+    def job_ids(self) -> list[str]:
+        return [j.id for j in self.jobs]
+
+
+def _validate_jobs(raw: Any) -> list[Job]:
+    if not isinstance(raw, list):
+        raise ValueError("manifest 'jobs' must be a list")
+
+    seen: set[str] = set()
+    jobs: list[Job] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(f"job at index {i} must be an object")
+
+        job_id = entry.get("id")
+        kind = entry.get("kind")
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError(f"job at index {i} missing valid 'id'")
+        if not isinstance(kind, str) or not kind:
+            raise ValueError(f"job '{job_id}' missing valid 'kind'")
+        if job_id in seen:
+            raise ValueError(f"duplicate job id: {job_id!r}")
+        seen.add(job_id)
+
+        params = entry.get("params", {})
+        if not isinstance(params, dict):
+            raise ValueError(f"job '{job_id}' params must be an object")
+
+        jobs.append(Job(id=job_id, kind=kind, params=params))
+
+    return jobs
+
+
+def load_manifest(path: str | Path) -> Manifest:
+    """Load and validate a JSON manifest file."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"manifest not found: {p}")
+
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("manifest root must be a JSON object")
+
+    jobs_raw = raw.get("jobs")
+    if jobs_raw is None:
+        raise ValueError("manifest must contain a 'jobs' key")
+
+    jobs = _validate_jobs(jobs_raw)
+    return Manifest(jobs=jobs)
+```
+
+---
+
+### deterministic_job_runner/state.py
+
+```python
+"""Atomic persistent state store."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+TERMINAL_STATUSES = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
+
+
+@dataclass
+class JobRecord:
+    id: str
+    status: JobStatus = JobStatus.PENDING
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    attempts: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "id": self.id,
+            "status": self.status.value,
+            "attempts": self.attempts,
+        }
+        if self.result is not None:
+            d["result"] = self.result
+        if self.error is not None:
+            d["error"] = self.error
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "JobRecord":
+        return cls(
+            id=d["id"],
+            status=JobStatus(d.get("status", "pending")),
+            result=d.get("result"),
+            error=d.get("error"),
+            attempts=d.get("attempts", 0),
+        )
+
+
+@dataclass
+class State:
+    version: int = 1
+    jobs: dict[str, JobRecord] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "jobs": {jid: rec.to_dict() for jid, rec in self.jobs.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "State":
+        jobs = {
+            jid: JobRecord.from_dict(jd)
+            for jid, jd in d.get("jobs", {}).items()
+        }
+        return cls(version=d.get("version", 1), jobs=jobs)
+
+
+class StateStore:
+    """Persists state atomically using write-to-temp + os.replace."""
+
+    def __init__(self, state_dir: str | Path) -> None:
+        self.state_dir = Path(state_dir)
+        self.state_path = self.state_dir /

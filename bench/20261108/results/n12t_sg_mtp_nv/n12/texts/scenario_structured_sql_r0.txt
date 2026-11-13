@@ -1,0 +1,118 @@
+We need answer user's request. Need produce one PostgreSQL script no Markdown fences. Must run in dependency order. Need define normalized tables models, fixtures, runs, request_metrics; include PK/FK, checks, useful indexes, two views, one transaction-safe upsert function, at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Need likely no markdown fences, just SQL. Need ensure dependencies: tables then constraints? Could use CREATE TABLE IF NOT EXISTS with FKs to previously created tables. Insert models, fixtures, runs, request_metrics. Views after tables and data? Views can be before data, but okay after. Function after views? Need transaction-safe upsert function. It likely inserts/updates run and maybe request metrics? Transaction-safe maybe wraps in single transaction and uses ON CONFLICT, or function with security definer, atomic. Need at least 80 realistic INSERT rows spanning two models and four fixture kinds. What rows? likely request_metrics rows? The phrase "at least 80 realistic INSERT rows" could be total INSERT statements/rows? Need at least 80 rows of data. We can make 80 request_metrics rows, each referencing run, model, fixture. But runs need at least 2 models * 4 fixtures = 8 runs maybe. Each run multiple metrics. Need realistic fields. Let's design normalized:
+
+models (model_id serial, model_name text not null unique, provider text, created_at timestamp timestamptz)
+check provider? maybe.
+fixtures (fixture_id serial, fixture_name text not null unique, fixture_kind text not null, description text)
+check fixture_kind in ('short_qa','long_context','reasoning','code').
+runs (run_id serial, model_id int FK, fixture_id int FK, started_at timestamptz, completed_at timestamptz, status text check in ('completed','failed','running'), gpu_type text, concurrency int check >0, seed int, unique (model_id, fixture_id, started_at?) but upsert maybe natural key (model_id, fixture_id, run_label) or (model_id, fixture_id, started_at). Need upsert function. Could define runs with run_label text not null, unique (model_id, fixture_id, run_label). Function upsert_run(p_model_id, p_fixture_id, p_run_label, p_status...) uses ON CONFLICT UPDATE. Also insert request_metrics? Maybe transaction-safe upsert function for request_metrics? The requirement: one transaction-safe upsert function. Could be upsert_request_metric(run_id, timestamp, ...) using ON CONFLICT. But transaction-safe may mean function executes in a single transaction, uses atomic updates. Maybe better function upsert_run_and_metrics(run_id, metrics) but PG can't easy dynamic array? Could create function upsert_request_metric(run_id, ts, metric_name, value_num, unit, token_count, latency_ms, error_text) with ON CONFLICT on unique (run_id, timestamp, metric_name) update. Need PK and unique constraints.
+
+request_metrics normalized: Could be metric observations per run and metric type. But if we need throughput, variability, long-context retention, MTP acceptance, perhaps request_metrics table with columns: metric_id serial, run_id FK, recorded_at timestamptz, metric_type text check ('throughput_tps','p99_latency_ms','p50_latency_ms','token_completion_ratio','mtp_acceptance_rate','error_rate'), value numeric, unit text? Unique(run_id, recorded_at, metric_type). Or event table with request-level metrics? For analytical queries maybe need request-level rows: request_id, run_id, request_time, prompt_tokens, completion_tokens, latency_ms, mtp_tokens, accepted_mtp_tokens, status. But "request_metrics" suggests metrics per request. Throughput: completion_tokens / latency or tokens/sec aggregated; variability: stddev of latency/throughput; long-context retention: token_completion_ratio or accuracy for long context? MTP acceptance: accepted_mtp_tokens/mtp_tokens. Need realistic INSERT rows 80. Could insert 80 request_metrics rows as event/request-level rows: request_id auto, run_id, model? FK run. Include fixture? We can join. But to compute long-context retention maybe need fixture_kind from runs/fixtures. If request_metrics includes request-level prompt_tokens, completion_tokens, latency_ms, expected_completion_tokens? Retention maybe completion_tokens/expected_completion_tokens or retrieval score. Could have retention_score numeric. MTP acceptance: mtp_candidates integer, mtp_accepted integer. Need 80 rows. Maybe easier: request_metrics table with request_id, run_id, request_seq, prompt_tokens, completion_tokens, latency_ms, first_token_ms, mtp_candidates, mtp_accepted, retrieval_score, status, timestamp. Unique(run_id, request_seq). This yields 80 rows across 8 runs (10 each). It covers throughput (completion_tokens/latency), variability (stddev latency), long-context retention (retrieval_score), MTP acceptance (mtp_accepted/candidates). But is "request_metrics" singular? Yes.
+
+Normalized tables: models, fixtures, runs, request_metrics. Need foreign keys: runs.model_id -> models, runs.fixture_id -> fixtures, request_metrics.run_id -> runs. Checks: models.provider length? fixtures.fixture_kind check. runs.status check, concurrency check, completed_at >= started_at. request_metrics: latency_ms >=0, first_token_ms >=0, prompt_tokens >=0, completion_tokens >=0, mtp_candidates >=0, mtp_accepted >=0, mtp_accepted <= mtp_candidates, retrieval_score between 0 and 1, status check. Maybe unique(run_id, request_seq).
+
+Useful indexes: models(model_name), fixtures(fixture_name, fixture_kind), runs(model_id, fixture_id, started_at), runs(status), request_metrics(run_id, recorded_at), request_metrics(metric_type?) If using request-level, index request_metrics(run_id, latency_ms), request_metrics(run_id, completion_tokens), request_metrics(mtp_candidates). Also maybe include partial index for failed.
+
+Two views: v_run_summary maybe aggregates throughput, p50/p99 latency, average MTP acceptance, long-context retention. v_long_context_mtp maybe long-context fixture rows. Or v_model_fixture_benchmark. Need views useful.
+
+One transaction-safe upsert function: Could be function upsert_request_metric(run_id int, request_seq int, prompt_tokens int, completion_tokens int, latency_ms numeric, first_token_ms numeric, mtp_candidates int, mtp_accepted int, retrieval_score numeric, status text) returns request_metrics, using INSERT ... ON CONFLICT (run_id, request_seq) DO UPDATE. Transaction-safe because function executes atomic by default. But maybe they want a transaction around upsert: function begin; savepoint? In PostgreSQL, function body in single transaction unless nested. Could create function that uses explicit transaction? Functions can't have BEGIN TRANSACTION? Actually PL/pgSQL can't explicitly start a transaction? It can use DECLARE BEGIN ... but not start new transaction? It can use nested subtransaction via SAVEPOINT. But function body executes in caller's transaction; atomic if no errors. "transaction-safe upsert" likely means use ON CONFLICT DO UPDATE to avoid unique violation and safe under concurrent calls. We can mention in comment? The script can include comments. Need no Markdown. Could include SQL comments.
+
+Need script run dependency order. Need use CREATE TABLE IF NOT EXISTS? If rerun, INSERT duplicates. Could use ON CONFLICT for models/fixtures, but at least 80 INSERT rows. Could use TRUNCATE? But dependency order? We can use DROP TABLE IF EXISTS in dependency reverse? But user says script run in dependency order. Could use CREATE TABLE IF NOT EXISTS, and INSERT ON CONFLICT DO NOTHING for dimensions, and request_metrics ON CONFLICT DO UPDATE to be idempotent. But if at least 80 INSERT rows, using ON CONFLICT DO UPDATE is still insert statements. Could do 80 individual INSERTs with ON CONFLICT. However writing 80 INSERT rows manually is long. We can use a single multi-row INSERT with 80 rows; that's one INSERT statement but 80 rows? User says at least 80 realistic INSERT rows, likely rows not statements. We can provide multi-row INSERT with 80 rows. But if we use sequence for request_metrics.request_id, need specify run_id, request_seq. Could use 80 rows in one INSERT. Need ensure no duplicates. To make idempotent, ON CONFLICT (run_id, request_seq) DO UPDATE SET ... But if request_metrics has request_id serial and not part of conflict, okay. However multi-row ON CONFLICT with DO UPDATE is allowed. Need ensure generated request_id default nextval.
+
+Need insert models: 2. fixtures: 4. runs: 8 (2*4) maybe each run has 10 request metrics => 80. Could add run_label e.g. 'r1'. Need unique (model_id, fixture_id, run_label). For request_metrics, unique(run_id, request_seq). Need realistic values. Need compute plausible throughput: prompt tokens maybe 100-400 for short; long context 8k-32k; completion 50-500; latency_ms for completion tokens maybe 1000-10000; mtp candidates and accepted. Retention_score for long context high for model1 maybe 0.92, model2 0.85, degraded for longer. MTP acceptance rates maybe 0.75-0.85. Need 80 rows: 8 runs * 10 rows. We can generate manually. Need ensure realistic and varied.
+
+Need six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Six queries. They should finish script. They can reference views/tables. Need maybe:
+1. Throughput by model and fixture kind: average tokens/sec = completion_tokens/latency*1000.
+2. Throughput over time? Maybe p50/p99 latency and tokens per second by model, fixture.
+3. Variability: stddev of latency_ms, coefficient of variation, stddev of throughput by model/fixture.
+4. Long-context retention: average retrieval_score by model, fixture_kind, bucket prompt_tokens.
+5. MTP acceptance: average accepted/candidates by model, fixture_kind.
+6. Long-context MTP acceptance combined: MTP acceptance vs prompt_tokens bucket for long_context fixture.
+Need ensure queries not too complex but analytical. Could use views.
+
+Need include "long-context retention" maybe retrieval_score is proxy. Could call metric "context_retention" rather than retrieval. Need define request_metrics.context_retention numeric 0..1. For non-long contexts can be 1.0. MTP acceptance: mtp_candidates, mtp_accepted. Need ensure accepted <= candidates. Need at least 80 rows with varied values. Let's design table names and columns:
+
+models:
+model_id integer generated by default as identity? PostgreSQL supports identity. Or serial. Use integer primary key. We can use GENERATED ALWAYS AS IDENTITY. But inserts need no model_id if using explicit? For dependencies, easier to insert models with ON CONFLICT DO NOTHING and get IDs using subselect. But if we use explicit model_id 1,2? Could define fixed IDs. But better use generated by default identity and insert with explicit? If generated by default, can insert explicit IDs. But idempotent maybe. Use model_id integer primary key not null, model_name text not null unique. Insert with explicit ids 1,2? But if rerun, ON CONFLICT DO NOTHING. Runs need model_id. Use subselect from models where model_name.
+
+fixtures fixture_id integer pk, fixture_name unique, fixture_kind check.
+runs: run_id integer pk, model_id int not null references, fixture_id int not null references, run_label text not null default 'default', started_at timestamptz not null, completed_at timestamptz, status text not null default 'completed' check in ('completed','running','failed'), concurrency int not null default 4 check between 1 and 512, seed int, unique (model_id, fixture_id, run_label). Also check completed_at >= started_at when not null. Use CHECK (completed_at IS NULL OR completed_at >= started_at).
+request_metrics: request_id integer pk generated by default as identity or sequence. Use request_id integer generated by default as identity, run_id int not null references runs, request_seq int not null check >0, recorded_at timestamptz not null default now(), prompt_tokens int not null check >=0, completion_tokens int not null check >=0, latency_ms numeric not null check >=0, first_token_ms numeric not null check >=0, mtp_candidates int not null default 0 check >=0, mtp_accepted int not null default 0 check >=0, context_retention numeric not null default 1.0 check between 0 and 1, status text not null default 'success' check in ('success','error'), unique(run_id, request_seq). Check first_token_ms <= latency_ms? Could be. Add CHECK (latency_ms >= 0 AND first_token_ms <= latency_ms). Check mtp_accepted <= mtp_candidates.
+
+Need useful indexes:
+CREATE INDEX IF NOT EXISTS idx_runs_model_fixture ON runs (model_id, fixture_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_status ON runs (status) WHERE status <> 'completed';
+CREATE INDEX IF NOT EXISTS idx_request_metrics_run_time ON request_metrics (run_id, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_request_metrics_run_seq ON request_metrics (run_id, request_seq); -- unique already creates index, but can not duplicate. Unique creates index. Could create other: idx_request_metrics_latency ON request_metrics (run_id, latency_ms); idx_request_metrics_mtp ON request_metrics(run_id, mtp_candidates, mtp_accepted); idx_request_metrics_retention ON request_metrics(run_id, context_retention) WHERE context_retention < 1.
+Maybe index on fixtures(kind).
+
+Two views:
+CREATE VIEW v_benchmark_summary AS
+SELECT m.model_name, f.fixture_name, f.fixture_kind, r.run_id, r.status,
+count(qm.request_id) AS requests,
+avg(qm.completion_tokens / nullif(qm.latency_ms,0) * 1000) AS avg_completion_tps,
+percentile_cont(0.5) within group (order by qm.latency_ms) AS p50_latency_ms,
+percentile_cont(0.99) within group (order by qm.latency_ms) AS p99_latency_ms,
+avg(qm.mtp_accepted::numeric / nullif(qm.mtp_candidates,0)) AS avg_mtp_acceptance_rate,
+avg(qm.context_retention) AS avg_context_retention
+FROM runs r JOIN models m ON ... JOIN fixtures f ... JOIN request_metrics qm ON qm.run_id=r.run_id
+GROUP BY ...;
+
+CREATE VIEW v_long_context_mtp AS
+SELECT m.model_name, f.fixture_kind, qm.run_id, qm.prompt_tokens,
+CASE WHEN qm.prompt_tokens < 8000 THEN '8k_or_less' ... END context_bucket,
+qm.context_retention,
+qm.mtp_accepted::numeric / nullif(qm.mtp_candidates,0) AS mtp_acceptance_rate
+FROM request_metrics qm JOIN runs ... JOIN fixtures ... WHERE f.fixture_kind='long_context' OR qm.prompt_tokens >= 8000? Since fixture kind long_context.
+
+Function:
+CREATE OR REPLACE FUNCTION upsert_request_metric(
+ p_run_id integer,
+ p_request_seq integer,
+ p_prompt_tokens integer,
+ p_completion_tokens integer,
+ p_latency_ms numeric,
+ p_first_token_ms numeric,
+ p_mtp_candidates integer DEFAULT 0,
+ p_mtp_accepted integer DEFAULT 0,
+ p_context_retention numeric DEFAULT 1.0,
+ p_status text DEFAULT 'success',
+ p_recorded_at timestamptz DEFAULT now()
+) RETURNS request_metrics
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_row request_metrics;
+BEGIN
+  IF p_run_id IS NULL OR p_request_seq <= 0 THEN
+    RAISE EXCEPTION 'p_run_id and p_request_seq must be positive';
+  END IF;
+  IF p_mtp_accepted > p_mtp_candidates THEN ...
+  INSERT INTO request_metrics (...)
+  VALUES (...)
+  ON CONFLICT (run_id, request_seq) DO UPDATE SET
+     prompt_tokens = excluded.prompt_tokens,
+     ...
+  RETURNING * INTO v_row;
+  RETURN v_row;
+END;
+$$;
+This is transaction-safe. But if called inside transaction, atomic. Could add SAVEPOINT? Maybe no. If want "transaction-safe" maybe use lock? But upsert handles concurrency. Could add explicit advisory lock? Not necessary. Could create function that uses a CTE and ON CONFLICT, returns affected. Good.
+
+Need ensure script runs: create tables, constraints, indexes, views, function, insert data, queries. If views before inserts okay. Function before inserts. But function uses table. Good.
+
+Need insert runs: use CTE? To make dependency order, insert models/fixtures then runs using explicit IDs. Could use ON CONFLICT DO NOTHING. For runs, ON CONFLICT (model_id, fixture_id, run_label) DO UPDATE SET started_at=excluded.started_at, etc. Need get model/fixture IDs: use subselect. But ON CONFLICT with subselect in VALUES? Can do:
+INSERT INTO runs (model_id, fixture_id, run_label, started_at, completed_at, status, concurrency, seed)
+SELECT m.model_id, f.fixture_id, 'r1', ...
+FROM models m CROSS JOIN fixtures f
+WHERE m.model_name='llama-3.1-8b-instruct' AND f.fixture_name='hotpot_qa_short';
+ON CONFLICT ...
+But multiple rows in one statement? Could do eight separate inserts, or one multi-row using SELECT. Need dependency order and idempotent. Could use:
+INSERT INTO runs (model_id, fixture_id, run_label, started_at, completed_at, status, concurrency, seed)
+SELECT m.model_id, f.fixture_id, 'baseline' || row_number() OVER (ORDER BY m.model_name, f.fixture_name),
+...
+FROM models m JOIN fixtures f ON true
+ORDER BY m.model_name, f.fixture_name
+ON CONFLICT (model_id, fixture_id, run_label) DO UPDATE ...
+But run_label generated? If using expression, on conflict target requires stable? For ON CONFLICT with SELECT, run_label expression can be row_number but not stable? It is stable within statement? Maybe okay but conflict detection uses values from subquery. Better use explicit run_label per fixture/model. Could use VALUES with subselect? Maybe simpler: 8 INSERT statements with subselect and ON CONFLICT. That's okay.
+
+Need insert request_metrics 80 rows. We can use multi-row INSERT with subselect for run_id? If run_id identity, need select run_id. Could insert 80 rows using SELECT join from runs to avoid hardcoding run_ids. But each row needs request_seq, prompt_tokens etc. We can create a temporary table

@@ -1,0 +1,522 @@
+# `metrics-service` — a complete, runnable TypeScript 5 service
+
+Below is a full, self-contained implementation. It uses **only Node built-ins** (no third-party runtime dependencies) for the service, and **only `typescript` + `@types/node`** as dev dependencies. Tests use Node's built-in `node:test` runner.
+
+---
+
+## 1. `package.json`
+
+```json
+{
+  "name": "metrics-service",
+  "version": "1.0.0",
+  "description": "Newline-delimited request-metrics ingestion, validation, and aggregation service.",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "main": "dist/index.js",
+  "bin": {
+    "metrics-service": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsc -p tsconfig.json --watch & node --watch dist/index.js",
+    "test": "tsc -p tsconfig.json && node --test dist/test/",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "keywords": [
+    "metrics",
+    "ingestion",
+    "aggregation",
+    "typescript"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
+```
+
+---
+
+## 2. `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
+```
+
+> `exactOptionalPropertyTypes` + `noUncheckedIndexedAccess` keep the strict types honest. `NodeNext` matches the `"type": "module"` package.
+
+---
+
+## 3. `src/types.ts` — strict domain types
+
+```ts
+/**
+ * Core domain types for the metrics service.
+ *
+ * Design notes:
+ *  - `RunRecord` is the *validated* shape. Raw input is `unknown` until it
+ *    passes `validateRunRecord`, so we never trust the wire format.
+ *  - `GroupKey` is a stable, serializable identity for a (model, fixture)
+ *    pair. We keep it as a plain object (not a Map key) so it can be
+ *    serialized to JSON for the API.
+ *  - `Aggregation` holds only the *sufficient statistics* needed to compute
+ *    mean, median, and sample standard deviation. Median requires the full
+ *    sorted sample, so we store the sorted values (bounded by the per-group
+ *    cap). This is the "bounded memory" trade-off: memory is O(cap) per
+ *    group, not O(total records).
+ */
+
+/** A single validated request-metrics record. */
+export interface RunRecord {
+  /** Unique run identifier (string). */
+  id: string;
+  /** Model name (string). */
+  model: string;
+  /** Fixture name (string). */
+  fixture: string;
+  /** Latency in milliseconds (finite number, >= 0). */
+  latencyMs: number;
+  /** HTTP status code (integer 100..599). */
+  status: number;
+  /** Unix epoch milliseconds (finite number, >= 0). */
+  timestampMs: number;
+  /** Optional free-form error message (string). */
+  error?: string;
+}
+
+/** Stable identity for a (model, fixture) group. */
+export interface GroupKey {
+  model: string;
+  fixture: string;
+}
+
+/** Sufficient statistics for a group. */
+export interface Aggregation {
+  key: GroupKey;
+  /** Number of records in the group. */
+  count: number;
+  /** Sum of latencyMs (for mean). */
+  sum: number;
+  /** Sum of latencyMs^2 (for variance). */
+  sumSq: number;
+  /** Sorted latency values (for median). Bounded by per-group cap. */
+  sorted: number[];
+  /** Minimum latency observed. */
+  min: number;
+  /** Maximum latency observed. */
+  max: number;
+  /** Number of records with status >= 400. */
+  errorCount: number;
+  /** Number of records with status >= 500. */
+  serverErrorCount: number;
+  /** First timestamp seen (for "first seen" reporting). */
+  firstSeenMs: number;
+  /** Last timestamp seen (for "last seen" reporting). */
+  lastSeenMs: number;
+}
+
+/** A fully computed summary for one group. */
+export interface GroupSummary {
+  model: string;
+  fixture: string;
+  count: number;
+  meanMs: number;
+  medianMs: number;
+  /** Sample standard deviation (n-1 denominator). 0 when count < 2. */
+  sampleStdDevMs: number;
+  minMs: number;
+  maxMs: number;
+  errorRate: number;
+  serverErrorRate: number;
+  firstSeenMs: number;
+  lastSeenMs: number;
+}
+
+/** The full /summary response body. */
+export interface SummaryResponse {
+  generatedAtMs: number;
+  totalRecords: number;
+  totalGroups: number;
+  groups: GroupSummary[];
+}
+
+/** The /runs/:id response body. */
+export interface RunResponse {
+  id: string;
+  model: string;
+  fixture: string;
+  latencyMs: number;
+  status: number;
+  timestampMs: number;
+  error?: string;
+}
+
+/** The /health response body. */
+export interface HealthResponse {
+  status: 'ok' | 'degraded';
+  uptimeMs: number;
+  receivedRecords: number;
+  rejectedRecords: number;
+  groupCount: number;
+  memoryUsedBytes: number;
+  memoryLimitBytes: number;
+  memoryUsedPct: number;
+}
+
+/** A validation error with a machine-readable code and human message. */
+export class ValidationError extends Error {
+  readonly code: string;
+  readonly field?: string;
+  readonly line?: number;
+
+  constructor(code: string, message: string, field?: string, line?: number) {
+    super(message);
+    this.name = 'ValidationError';
+    this.code = code;
+    this.field = field;
+    this.line = line;
+  }
+}
+
+/** A batch of validation errors (one per malformed line). */
+export interface MalformedLine {
+  line: number;
+  raw: string;
+  code: string;
+  message: string;
+  field?: string;
+}
+
+/** Result of parsing a batch of NDJSON lines. */
+export interface ParseResult {
+  records: RunRecord[];
+  malformed: MalformedLine[];
+}
+```
+
+---
+
+## 4. `src/validate.ts` — schema validation without third-party libraries
+
+```ts
+/**
+ * Hand-rolled schema validation for RunRecord.
+ *
+ * We deliberately avoid ajv/zod/etc. The schema is small and fixed, so a
+ * direct, explicit validator is clearer, faster, and dependency-free.
+ *
+ * Every check returns a ValidationError with a stable `code` so callers
+ * (and tests) can assert on specific failure modes.
+ */
+
+import type { RunRecord } from './types.js';
+import { ValidationError } from './types.js';
+
+/** Maximum allowed length for string fields. */
+const MAX_STRING_LEN = 512;
+/** Maximum allowed magnitude for numeric fields. */
+const MAX_NUMBER = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Validate a single raw record (of type `unknown`) into a RunRecord.
+ * Throws ValidationError on the first problem found.
+ *
+ * @param raw - The raw parsed JSON value.
+ * @param line - 1-based line number for error reporting.
+ */
+export function validateRunRecord(raw: unknown, line: number): RunRecord {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new ValidationError(
+      'NOT_OBJECT',
+      `Line ${line}: record must be a JSON object`,
+      undefined,
+      line,
+    );
+  }
+
+  const obj = raw as Record<string, unknown>;
+
+  // --- id ---
+  const id = obj['id'];
+  if (typeof id !== 'string' || id.length === 0) {
+    throw new ValidationError(
+      'ID_INVALID',
+      `Line ${line}: "id" must be a non-empty string`,
+      'id',
+      line,
+    );
+  }
+  if (id.length > MAX_STRING_LEN) {
+    throw new ValidationError(
+      'ID_TOO_LONG',
+      `Line ${line}: "id" exceeds ${MAX_STRING_LEN} characters`,
+      'id',
+      line,
+    );
+  }
+
+  // --- model ---
+  const model = obj['model'];
+  if (typeof model !== 'string' || model.length === 0) {
+    throw new ValidationError(
+      'MODEL_INVALID',
+      `Line ${line}: "model" must be a non-empty string`,
+      'model',
+      line,
+    );
+  }
+  if (model.length > MAX_STRING_LEN) {
+    throw new ValidationError(
+      'MODEL_TOO_LONG',
+      `Line ${line}: "model" exceeds ${MAX_STRING_LEN} characters`,
+      'model',
+      line,
+    );
+  }
+
+  // --- fixture ---
+  const fixture = obj['fixture'];
+  if (typeof fixture !== 'string' || fixture.length === 0) {
+    throw new ValidationError(
+      'FIXTURE_INVALID',
+      `Line ${line}: "fixture" must be a non-empty string`,
+      'fixture',
+      line,
+    );
+  }
+  if (fixture.length > MAX_STRING_LEN) {
+    throw new ValidationError(
+      'FIXTURE_TOO_LONG',
+      `Line ${line}: "fixture" exceeds ${MAX_STRING_LEN} characters`,
+      'fixture',
+      line,
+    );
+  }
+
+  // --- latencyMs ---
+  const latencyMs = obj['latencyMs'];
+  if (typeof latencyMs !== 'number' || !Number.isFinite(latencyMs)) {
+    throw new ValidationError(
+      'LATENCY_INVALID',
+      `Line ${line}: "latencyMs" must be a finite number`,
+      'latencyMs',
+      line,
+    );
+  }
+  if (latencyMs < 0) {
+    throw new ValidationError(
+      'LATENCY_NEGATIVE',
+      `Line ${line}: "latencyMs" must be >= 0`,
+      'latencyMs',
+      line,
+    );
+  }
+  if (latencyMs > MAX_NUMBER) {
+    throw new ValidationError(
+      'LATENCY_TOO_LARGE',
+      `Line ${line}: "latencyMs" exceeds maximum allowed value`,
+      'latencyMs',
+      line,
+    );
+  }
+
+  // --- status ---
+  const status = obj['status'];
+  if (typeof status !== 'number' || !Number.isInteger(status)) {
+    throw new ValidationError(
+      'STATUS_INVALID',
+      `Line ${line}: "status" must be an integer`,
+      'status',
+      line,
+    );
+  }
+  if (status < 100 || status > 599) {
+    throw new ValidationError(
+      'STATUS_OUT_OF_RANGE',
+      `Line ${line}: "status" must be in [100, 599]`,
+      'status',
+      line,
+    );
+  }
+
+  // --- timestampMs ---
+  const timestampMs = obj['timestampMs'];
+  if (typeof timestampMs !== 'number' || !Number.isFinite(timestampMs)) {
+    throw new ValidationError(
+      'TIMESTAMP_INVALID',
+      `Line ${line}: "timestampMs" must be a finite number`,
+      'timestampMs',
+      line,
+    );
+  }
+  if (timestampMs < 0) {
+    throw new ValidationError(
+      'TIMESTAMP_NEGATIVE',
+      `Line ${line}: "timestampMs" must be >= 0`,
+      'timestampMs',
+      line,
+    );
+  }
+
+  // --- error (optional) ---
+  let error: string | undefined;
+  if (obj['error'] !== undefined) {
+    if (typeof obj['error'] !== 'string') {
+      throw new ValidationError(
+        'ERROR_INVALID',
+        `Line ${line}: "error" must be a string when present`,
+        'error',
+        line,
+      );
+    }
+    if ((obj['error'] as string).length > MAX_STRING_LEN) {
+      throw new ValidationError(
+        'ERROR_TOO_LONG',
+        `Line ${line}: "error" exceeds ${MAX_STRING_LEN} characters`,
+        'error',
+        line,
+      );
+    }
+    error = obj['error'] as string;
+  }
+
+  return { id, model, fixture, latencyMs, status, timestampMs, error };
+}
+```
+
+---
+
+## 5. `src/parser.ts` — incremental NDJSON parsing with bounded memory
+
+```ts
+/**
+ * Incremental, streaming NDJSON parser.
+ *
+ * "Incremental" means the parser can be fed arbitrary chunks of bytes/text
+ * at any time (e.g., from a socket or a file stream) and will emit complete
+ * records as soon as a full line is available. It buffers only the current
+ * partial line, so memory is O(longest line), not O(total input).
+ *
+ * "Bounded memory" is enforced by a per-line byte cap: any line longer than
+ * `maxLineBytes` is rejected (and counted as malformed) rather than buffered
+ * unboundedly.
+ */
+
+import type { ParseResult, RunRecord } from './types.js';
+import { validateRunRecord } from './validate.js';
+
+export interface ParserOptions {
+  /** Maximum bytes per line before it is rejected. Default 64 KiB. */
+  maxLineBytes?: number;
+}
+
+export class NdjsonParser {
+  private readonly maxLineBytes: number;
+  private buffer: string = '';
+  private lineCounter: number = 0;
+
+  constructor(options: ParserOptions = {}) {
+    this.maxLineBytes = options.maxLineBytes ?? 64 * 1024;
+  }
+
+  /**
+   * Feed a chunk of text into the parser. Returns any complete records
+   * parsed from this chunk (plus any previously buffered partial line).
+   *
+   * @param chunk - A chunk of NDJSON text (may or may not end in a newline).
+   */
+  feed(chunk: string): ParseResult {
+    const records: RunRecord[] = [];
+    const malformed: ParseResult['malformed'] = [];
+
+    // Append the new chunk to any leftover partial line.
+    this.buffer += chunk;
+
+    // Process complete lines.
+    let nl: number;
+    while ((nl = this.buffer.indexOf('\n')) !== -1) {
+      const rawLine = this.buffer.slice(0, nl);
+      this.buffer = this.buffer.slice(nl + 1);
+      this.lineCounter += 1;
+
+      const line = rawLine.trim();
+      if (line.length === 0) {
+        // Skip blank lines (common in NDJSON).
+        continue;
+      }
+
+      // Bounded memory: reject over-long lines.
+      if (Buffer.byteLength(line, 'utf8') > this.maxLineBytes) {
+        malformed.push({
+          line: this.lineCounter,
+          raw: line.slice(0, 128) + '…',
+          code: 'LINE_TOO_LONG',
+          message: `Line ${this.lineCounter}: exceeds ${this.maxLineBytes} bytes`,
+        });
+        continue;
+      }
+
+      // Parse JSON.
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        malformed.push({
+          line: this.lineCounter,
+          raw: line.slice(0, 128),
+          code: 'JSON_PARSE_ERROR',
+          message: `Line ${this.lineCounter}: invalid JSON`,
+        });
+        continue;
+      }
+
+      // Validate schema.
+      try {
+        records.push(validateRunRecord(parsed, this.lineCounter));
+      } catch (err) {
+        if (err instanceof Error && 'code' in err) {
+          const ve = err as { code: string; message: string; field?: string };
+          malformed.push({
+            line: this.lineCounter,
+            raw: line.slice(0, 128),
+            code: ve.code,
+            message: ve.message,
+            field: ve.field,
+          });
+        } else {
+          malformed.push({
+            line: this.lineCounter,
+            raw: line.slice(0, 128),
+            code: 'VALIDATION_ERROR',
+            message: `Line ${this.lineCounter}: ${String(err)}`,
+          });

@@ -1,0 +1,284 @@
+Let me carefully analyze the requirements:
+
+1. A **TypeScript 5 service** that does the following:
+   - Consumes **newline-delimited request metrics** (NDJSON format)
+   - **Validates** them without any third-party schema libraries (no zod, no ajv, etc.)
+   - **Groups** records by model and fixture
+   - **Computes** mean / median / sample standard deviation
+   - Exposes `/health`, `/summary`, `/runs/:id` endpoints
+   - **Strict typing**
+   - **Incremental parsing** (streaming NDJSON processing)
+   - **Bounded memory** (bounded buffers, caps on in-memory state, etc.)
+   - **Malformed-input errors** (clear error reporting)
+   - **Unit tests**
+   - `package.json`, `tsconfig.json`
+   - **Short operational guide**
+   - **No placeholders** — fully runnable code
+
+The user wants complete, executable code. So we need to write a complete project. Let me think about the architecture.
+
+**Inferred domain:** "request metrics" — records describing benchmark requests: model (e.g., "gpt-4"), fixture (test fixture name), run ID, latency, token count, error flag, etc. NDJSON lines like:
+
+```json
+{"runId":"run-001","model":"gpt-4","fixture":"chat-1k","latencyMs":123.4,"tokens":512,"ts":1700000000000,"ok":true}
+```
+
+Endpoints:
+- `GET /health` → liveness/readiness, memory usage, counts
+- `GET /summary` → grouped stats per (model, fixture): count, mean, median, sample stddev (of latency, or possibly tokens too)
+- `GET /runs/:id` → details of a single run: all its records (within bounds), stats per fixture, errors
+
+**Input consumption:** "consume newline-delimited request metrics" — the service has to receive NDJSON. Best approach: an `POST /ingest` endpoint that accepts NDJSON body with streaming parsing (incremental parsing). Plus, for convenience, we might also support file tailing via CLI. Let me implement:
+
+- HTTP server on Node (node:http), no Express (to keep dependencies minimal — "no third-party schema libraries" specifically refers to schema libraries, but we can also avoid Express. Node's built-in http is safer and dependency-free).
+- `POST /ingest`: stream the request body, split on newlines incrementally (handling lines spanning chunks, CRLF, oversized lines), validate each line, and update the aggregator.
+- Also a CLI mode: `node dist/main.js --tail <file>` that reads a file/stdin line by line using readline — incremental parsing. This also demonstrates bounded memory.
+
+Actually, for completeness, I'll implement both: the HTTP service plus a standalone ingest mode for files/stdin. Both share the core "pipeline" (splitter → validator → aggregator).
+
+**Bounded memory:**
+- Line buffer: cap the max line length (e.g., 64 KB). If exceeded → malformed error (line too long), reset the buffer.
+- Aggregator: cap total number of tracked groups (model×fixture), cap records per run, cap number of runs. Use LRU eviction or reject with a clear error. Let's do: max runs (e.g., 1024), max records per run (e.g., 10_000), max groups (e.g., 4_096). When exceeded, reject the record with a `LIMIT_EXCEEDED` error, keep per-run/group error counters, and don't corrupt the state.
+- Per-record retention: to make `/runs/:id` useful without unbounded memory, we retain per-record summaries? Hmm. "Bounded memory" — retain per-run per-record records up to a cap (e.g., 10k per run), and after the cap keep only stats and error counts, marking `truncated: true`.
+
+**Statistics:** mean, median, sample standard deviation.
+- For median, we need a sorted list → keep an array of latencies per group, but that's unbounded per group. Options: keep a bounded reservoir? But the median is computed from the retained sample. Simpler: keep a per-group array capped at `maxSamplesPerGroup` (e.g., 100k); if exceeded, do reservoir sampling? A median computed from a reservoir sample is an estimate. To be honest and simple: cap retained samples per group (e.g., 100_000); if exceeded, continue updating count/mean/stddev (Welford's online algorithm) but mark `statsApprox: true` and note that median is based on the retained subsample. That's honest and bounded.
+
+Actually, let me reconsider: mean and sample stddev can be computed exactly with Welford's online algorithm (bounded memory: sum, m2, count). The median needs ordering; a bounded per-group array capped at N with a flag. I'll do:
+
+```ts
+interface GroupStats {
+  count: number;
+  mean: number | null;
+  median: number | null; // exact if retainedCount === count, else sample median
+  stddev: number | null; // sample stddev (n-1), null if count < 2
+  min: number; max: number;
+  retained: number; // number of samples kept for median
+  complete: boolean; // retained === count
+}
+```
+
+Welford for mean and variance (sample variance = m2/(n-1)).
+
+**Validation** (no third-party): a hand-rolled validator that:
+- Parses the JSON line (try/catch JSON.parse) → error `INVALID_JSON`
+- Must be a plain object → `NOT_OBJECT`
+- Required fields:
+  - `runId`: non-empty string, max 128 chars, pattern `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`? Let me make it simpler: string, length 1..128.
+  - `model`: string 1..64
+  - `fixture`: string 1..64
+  - `latencyMs`: finite number >= 0, maybe cap <= 1e7? Use Number.isFinite and >=0.
+  - `tokens`: integer number >= 0 (optional? Let me make it required for completeness — required integer 0..1e9).
+  - `ts`: epoch millis integer number (required) — range sanity: 0 <= ts <= Date.now()+60s? Clock-skew check could cause test failures; allow ts in [0, now + 5 min]. For deterministic tests we should be careful. Alternatively, validate range [1970..year 3000] without depending on now. Safer: ts is an integer in [0, 4102444800000] (year 3000). Deterministic.
+  - `ok`: boolean (required) — success flag; if ok is false, `error` string is required? Let me add optional `error` string 0..256, required when ok=false.
+  - Unknown fields: allowed but ignored? For strictness: reject unknown fields with `UNKNOWN_FIELD`? Strict validation is nice, and it demonstrates strict typing. But real metrics pipelines tolerate extras. I'll make unknown-field rejection configurable, default to strict (reject). Hmm, that's a good "strict" flag. Default strict = true, configurable.
+- Type checks with hand-rolled predicates: `isString`, `isFiniteNumber`, `isInteger`, `isBoolean`.
+- Error shape: `{ line: number, code, message, field? }`. Line number is 1-based within the ingest payload (or overall stream offset? Per-payload is clearer).
+
+Ingest response: `{ accepted, rejected, errors: [...] }`, with the error list capped (e.g., first 20) plus `errorCount`.
+
+**Incremental parsing:** implement an NDJSON splitter that consumes chunks, retains a partial line (with a size cap), and emits complete lines. Handle `\n` and `\r\n`. Also a final line without a trailing newline at the end of the stream.
+
+**HTTP server:** node:http. Routes:
+- `GET /health` → 200 JSON: `{ status: "ok", uptimeMs, memory: { rss, heapUsed }, metrics: { totalAccepted, totalRejected, activeRuns, groups, ingestErrors } }`. If memory bounds are nearly exhausted, 503? Health is usually 200 even under stress, but let me include `degraded: boolean` if any bound is at capacity.
+- `GET /summary` → grouped stats:
+```json
+{
+  "generatedAt": ...,
+  "totals": { "accepted": N, "rejected": M },
+  "groups": [ { "model": "m", "fixture": "f", "records": n, "latencyMs": { "mean": ..., "median": ..., "stddev": ... }, "tokens": { ... } } ]
+}
+```
+Compute stats for latencyMs (and tokens too? median/stddev for tokens is also possible). Let me compute stats on both `latencyMs` and `tokens` per group. Also a success rate per group: `okCount/records`.
+
+- `GET /runs/:id` → 404 if unknown; details:
+```json
+{
+  "runId": ...,
+  "records": n,
+  "accepted": n, "rejected": r,
+  "truncated": bool,
+  "models": {...}, // per fixture?
+  "fixtures": [ { fixture, count, latencyMs: {...}, } ],
+  "firstSeenTs": ..., "lastSeenTs": ...,
+  "recentErrors": [ ... ] // capped
+}
+```
+
+Route matching: parse URL, simple pattern for `/runs/` prefix, decodeURIComponent, validate runId characters (if invalid, 400). 404 JSON error for unknown paths.
+
+**Request body limits:** cap ingest body at, say, 8 MB total per request (`maxBodyBytes`); when exceeded, respond with 413 and stop. Also cap line length at 64 KB.
+
+**Concurrency:** Node is single-threaded; aggregation is synchronous per line — no issue.
+
+**CLI mode:** `ingest-file` mode: `node dist/cli.js --file path` or stdin. Uses the same pipeline with `fs.createReadStream`. Also good for the operational guide: `cat metrics.ndjson | node dist/cli.js --stdin`. Output: a summary JSON at the end. This demonstrates incremental parsing with bounded memory. The HTTP server is the primary "service"; the CLI is a bonus that reuses the core. Let's include it — it strengthens "consume newline-delimited request metrics."
+
+Hmm, but scope: the user asked for a "service" that "consumes newline-delimited request metrics." A POST /ingest with streaming NDJSON is the consumption path. The file/CLI mode is a nice addition; let me include it as a second entry point (main.ts serves HTTP; cli.ts handles file/stdin). Both share `src/core`.
+
+**Tests:** use Node's built-in test runner? Node 18+/20 with `node:test` and `assert` — zero dependencies. But the requirement says TypeScript 5; run tests with `tsx`? To keep deps minimal, compile with tsc and run `node --test dist/test/`. Actually, Node's test runner can run JS test files in dist. Plan:
+
+- devDependencies: `typescript@^5.x`, `@types/node@^20.x`.
+- scripts: `build` (tsc -p tsconfig.json), `test` (npm run build && node --test dist/test/), `start` (node dist/main.js), `ingest` (node dist/cli.js).
+
+Unit tests (node:test):
+1. NDJSON splitter: lines spanning chunks, CRLF, oversized line, no trailing newline.
+2. Validator: valid line passes; each invalid case yields the right code (bad json, not object, missing field, wrong type, negative latency, non-integer tokens, unknown field when strict, bad runId length).
+3. Statistics: mean/median/stddev on known datasets; sample stddev uses n-1 (e.g., [2,4,4,4,5,5,7,9] mean 5, stddev sqrt(32/7)≈2.13809); n<2 → stddev null; median even/odd; Welford numeric stability.
+4. Aggregator bounds: exceeding per-run records cap → rejection with LIMIT code; group cap; run cap.
+5. Endpoints: spin up the server on a random port, POST NDJSON (including bad lines) → expect accept/reject counts; GET /summary reflects stats; GET /runs/:id; unknown run 404; unknown path 404; oversized body 413.
+6. Health endpoint shape.
+
+Use `fetch` (Node 18+ global fetch) in tests.
+
+**tsconfig.json:**
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "forceConsistentCasingInFileNames": true,
+    "verbatimModuleSyntax": true,
+    "declaration": true,
+    "sourceMap": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "lib": ["ES2022"]
+  },
+  "include": ["src/**/*.ts"]
+}
+```
+
+If using NodeNext modules, imports in TS files need `import ... from "./x.js"` style. That's the modern correct way. With `verbatimModuleSyntax`, must use `import type` for types. I'll be careful.
+
+Alternatively `module: CommonJS` to avoid the .js extension requirement. But NodeNext is the 2024 best practice; I'll use ESM with `"type": "module"` in package.json. Tests in dist/test will work with `node --test dist/test/`.
+
+`exactOptionalPropertyTypes` — need to be careful with optional properties; write code that complies (don't assign `undefined` to optional properties). I'll be careful.
+
+**Code structure:**
+
+```
+src/
+  types.ts        // shared types: RequestMetric, ValidationError, GroupKey, Stats, bounds config
+  config.ts       // ServiceConfig with defaults
+  validation.ts   // validateLine, ValidationError, codes
+  ndjson.ts       // NdjsonSplitter (incremental), chunk-based
+  stats.ts        // WelfordStats, median, summarize
+  aggregate.ts    // Aggregator (bounded): runs, groups, counters, rejection
+  server.ts       // http server, routing, handlers
+  cli.ts          // file/stdin ingest
+  main.ts         // HTTP service entry
+  test/
+    ndjson.test.ts
+    validation.test.ts
+    stats.test.ts
+    aggregate.test.ts
+    server.test.ts
+```
+
+Let me carefully draft each file.
+
+---
+
+### types.ts
+
+```ts
+/** One newline-delimited request-metric record. */
+export interface RequestMetric {
+  runId: string;
+  model: string;
+  fixture: string;
+  latencyMs: number;
+  tokens: number;
+  ok: boolean;
+  ts: number;
+  error?: string;
+}
+
+export type ValidationErrorCode =
+  | "INVALID_JSON"
+  | "NOT_OBJECT"
+  | "UNKNOWN_FIELD"
+  | "MISSING_FIELD"
+  | "WRONG_TYPE"
+  | "OUT_OF_RANGE"
+  | "TOO_LONG";
+
+export interface ValidationError {
+  line: number;        // 1-based line within the ingest payload
+  code: ValidationErrorCode;
+  message: string;
+  field?: string;      // hmm exactOptionalPropertyTypes
+  raw?: string;
+}
+```
+
+With `exactOptionalPropertyTypes`, the declaration `field?: string` means `field` may be absent, or if present, must be a string. Creating objects conditionally: only set the property when defined. Fine.
+
+Stats type:
+
+```ts
+export interface NumericStats {
+  count: number;
+  min: number | null;
+  max: number | null;
+  mean: number | null;
+  median: number | null;
+  stddev: number | null; // sample stddev (n-1 denominator); null when count < 2
+  retained: number;
+  complete: boolean; // retained === count (median is over the whole population)
+}
+```
+
+Bounded config:
+
+```ts
+export interface Bounds {
+  maxLineBytes: number;        // max bytes per NDJSON line
+  maxBodyBytes: number;        // max bytes per ingest request
+  maxRuns: number;
+  maxGroups: number;
+  maxRecordsPerRun: number;
+  maxSamplesPerGroup: number;  // retained for median
+  maxReportedErrors: number;   // errors to keep per ingest response / per run
+  maxGroupLabelLength: number;
+}
+export interface ServiceConfig extends Bounds {
+  port: number;
+  strictUnknownFields: boolean;
+  host: string;
+}
+```
+
+Hmm — let me keep `ServiceConfig` a single interface with all fields; simpler.
+
+---
+
+### stats.ts
+
+Welford's online algorithm:
+
+```ts
+export class Welford {
+  count = 0;
+  private sum = 0; // do we need sum? Welford: mean and m2. Keep mean and m2.
+  private mean = 0;
+  private m2 = 0;
+  min: number | null = null;
+  max: number | null = null;
+
+  add(x: number): void {
+    if (!Number.isFinite(x)) throw ... // the validator guarantees finite; still guard?
+    this.count += 1;
+    const delta = x - this.mean;
+    this.mean += delta / this.count;
+    const delta2 = x - this.mean;
+    this.m2 += delta * delta2;
+    if (this.min === null || x < this.min) this.min = x;
+    if (this.max === null || x

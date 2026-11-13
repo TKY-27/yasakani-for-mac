@@ -1,0 +1,147 @@
+We need answer user's request: produce complete Python 3.11 package for deterministic asynchronous job runner. Must read JSON manifest, enforce one active GPU job, persist atomic state, resume completed work, stream structured JSONL events, handle SIGINT, redact configured secrets, and include pytest tests for success, failure, cancellation, and resume. Present every source file in separate fenced block with path and include pyproject.toml.
+
+Need think carefully. Need final only code files in separate fenced blocks with path? They ask present every source file in separate fenced block with its path and include pyproject.toml. Likely provide each file as:
+path/to/file.py
+```python
+...
+```
+Need complete runnable package.
+
+Need design. Deterministic asynchronous job runner. Requirements:
+- read JSON manifest
+- enforce one active GPU job
+- persist atomic state
+- resume completed work
+- stream structured JSONL events
+- handle SIGINT
+- redact configured secrets
+- pytest tests for success, failure, cancellation, resume.
+- Python 3.11 package.
+
+Need decide architecture. We can create package jobrunner.
+Manifest JSON: maybe:
+{
+  "job_id": "...",
+  "jobs": [
+    {"job_id": "a", "command": "python -c ...", "requires_gpu": true, "env": {...}},
+    ...
+  ],
+  "secrets": ["API_KEY", "TOKEN"]
+}
+Or top-level secrets redact: list of keys or values? "redact configured secrets" could mean environment variables listed in manifest or values? We'll implement redaction of configured secret env var values from events/logs/commands. Secrets config: list of environment variable names or literal strings? Better: secrets: {"API_KEY": "env:API_KEY", "TOKEN": "literal"}? But "configured secrets" likely list of env variable names to redact. Could read manifest "redact_secrets": ["API_KEY", "SECRET"]. Redact values from env and event data. For event redaction, replace values for keys in secrets list, and also redact literal values? Need deterministic.
+
+Runner: async, deterministic order. Jobs sorted by job_id? Deterministic: if manifest provides jobs, run in sorted order by job_id, or explicit order. One active GPU job: if job requires GPU, ensure no other GPU job active. Since deterministic sequential? But asynchronous job runner. Could use semaphore GPU semaphore(1), CPU jobs can run concurrently? But "one active GPU job" enforce. Deterministic maybe all jobs run sequentially? Could be async with limited concurrency? To be deterministic, run jobs in manifest order (sorted), each awaited sequentially, but async still. That trivially enforces one GPU. But requirement likely expects concurrency except GPU exclusive. We can implement deterministic scheduler: process jobs in topological order? Keep simple: jobs have order, run sequentially; but "asynchronous" not necessarily concurrent. Yet "enforce one active GPU job" if sequential enough. But tests for cancellation: SIGINT cancellation. We can implement run with asyncio tasks and a GPU lock. Deterministic: run in manifest order with no randomness, and event order deterministic.
+
+Maybe better: manifest:
+{
+ "schema_version": 1,
+ "run_id": "manual",
+ "concurrency": 2,
+ "gpu_concurrency": 1,
+ "jobs": [
+   {"id": "job1", "command": ["python", "-c", "..."], "gpu": false, "env": {...}, "timeout_seconds": 30, "retry": 0}
+ ],
+ "secrets": ["API_KEY"]
+}
+Runner:
+- load manifest
+- state dir e.g. .jobrunner
+- state file JSON with atomic writes: jobs statuses: pending, running, succeeded, failed, cancelled; started_at, finished_at, returncode, attempts.
+- resume: on start, load state; jobs already succeeded skipped; failed maybe not resume? "resume completed work" means completed succeeded. Could also resume failed? Usually resume not rerun failed? Requirement resume completed work: skip completed successful jobs, rerun pending/failed? We need tests for resume: first run stops after some jobs? Maybe use cancellation after first job, resume continues. Need deterministic. We'll design resume skips jobs with status succeeded; reruns pending/failed/cancelled? Maybe if failed should rerun? "resume completed work" could mean don't rerun completed jobs. For tests, we can simulate cancel after first success, state has one succeeded; resume runs remaining. If a job failed, resume maybe skip failed? We need test failure: job fails and runner records failure and exit code? Maybe tests only run single failing job and assert event and state. Resume test could have two jobs, first succeeds, second cancelled due SIGINT, resume completes second. But to trigger cancellation deterministically in tests, we can inject a signal or use a cancel hook.
+
+Handling SIGINT: install signal handler in runner that canc top-level asyncio task or sets cancellation. In tests, we can call runner.interrupt() or send SIGINT? Better implement public method request_interrupt() and signal handler calls it. For test cancellation, can monkeypatch asyncio? Or run runner in process and send SIGINT? Hard but possible. We can write test using a job that calls os.kill(os.getpid(), SIGINT) at specific time? Need deterministic. Maybe cancellation test: runner with job that sleeps, test sends SIGINT to process? But pytest in same process; sending SIGINT to own process can interrupt pytest? Not good. Instead, use runner's API to request cancellation after start. But requirement handle SIGINT; we can have handle_sigint() that calls cancel. In tests, we can monkeypatch signal.signal? Or directly call runner._handle_sigint? But test should verify cancellation. Could start runner in subprocess? Overkill. We can design Runner.run() takes optional on_event callback; for tests, use an event that triggers cancel after first job? Need cancellation of active job. We can test by running runner with a manifest where job sends SIGINT to itself via command? In subprocess? Hmm.
+
+Maybe implement Runner with an async method start() and stop(). Test cancellation: create manifest with job command: "python -c \"import signal,os,time; time.sleep(3); os.kill(os.getpid(), signal.SIGINT)\"" but if runner uses asyncio subprocess, SIGINT sent to subprocess? The command runs in child process, not runner process. SIGINT in child not handled by runner. Need runner process receives SIGINT. Could use a command that writes a file or event? Not.
+
+Better: runner supports an external "cancel file" or `--cancel-on-signal`? But requirement handle SIGINT. Tests can monkeypatch `signal.signal` to capture handler, then invoke handler after a short delay. But if handler sends SIGINT to current process? We can implement handler sets loop.call_soon_threadsafe(cancel). In test, get handler via signal.getsignal(signal.SIGINT) after run started, call it. However signal handlers are process-wide; if we call handler in test thread, okay if loop running in same thread? In pytest, asyncio.run runs in same thread; handler can be called from same thread? If handler uses loop.call_soon_threadsafe, okay. But if signal.signal in pytest? Need avoid breaking pytest. We can install handler only during run and restore after. In test, start runner in a background thread? asyncio.run in main test thread would block. We can run runner in thread and capture handler, call handler, join. But signal handlers can only be set from main thread in Python? signal.signal must be called from main thread. If run runner in non-main thread, can't set signal handlers. So runner must run in main thread. Tests in pytest main thread. To test SIGINT, could start asyncio.run in main thread, and from another thread? signal handler can't be set in non-main. But we can pre-install a handler that records? Hmm.
+
+Alternative: implement `Runner.run` accepts `install_signal_handlers=False` in tests; tests call `runner.request_cancel()` via callback event. But requirement says handle SIGINT; code has handler. Test cancellation can test `request_cancel` path rather than actual SIGINT? They ask include pytest tests for success, failure, cancellation, and resume. Cancellation test could send SIGINT to process using `os.kill(os.getpid(), signal.SIGINT)` after start? But if test process receives SIGINT, default KeyboardInterrupt? If our handler installed, it will cancel. We can in test start runner in a thread? signal not possible. Could run runner in main thread with a timeout and schedule SIGINT using loop.call_later to send SIGINT? `os.kill(os.getpid(), signal.SIGINT)` can be called from a callback in same thread; that will deliver signal to process, handler runs. But asyncio.run main thread is blocked in event loop; a callback can call os.kill. Signal handler will run in main thread between bytecode? For asyncio, signal handlers registered via signal.signal can be called in main thread, and they can call loop.call_soon_threadsafe. But if we use `signal.signal(SIGINT, handler)`, handler can call `loop.call_soon_threadsafe(task.cancel)`. We can schedule a loop callback that sends SIGINT after a delay. That should work in pytest main thread. But sending SIGINT to own process while pytest running could be okay if handler handles it. Need ensure handler not interfere with pytest's own signal handling. We restore previous handler. During test, schedule os.kill(os.getpid(), signal.SIGINT) after 0.05 sec. Our handler canc task. After run finishes, restore. Should be safe. But if test environment not main thread? pytest tests run in main thread. Good.
+
+However `asyncio.run` will process callbacks, signal handler may be called while loop is running. In handler, if loop is not running? We'll capture loop. Use `loop.call_soon_threadsafe`. Need avoid calling `asyncio.get_event_loop` in handler.
+
+But if handler is invoked by os.kill from callback, it may interrupt main thread and execute handler before callback continues. It can schedule cancellation. Good.
+
+Need deterministic events: JSONL events to stdout? "stream structured JSONL events" likely write to stdout or file. We'll implement `run(..., event_writer: Optional[TextIO]=None)` default sys.stdout. Event JSON includes run_id, event, job_id, timestamp (deterministic? timestamps break determinism). "deterministic" maybe execution order and state, not output timestamps. But deterministic events should maybe omit wall-clock timestamps or use logical monotonic sequence number. We can include `seq` integer and optional timestamp if not deterministic? To be deterministic, avoid time-dependent fields in events, or use `clock` that can be injected. We can include `ts` as logical step count or ISO if injected fake clock? For tests, deterministic. We'll have event fields: seq, event, run_id, job_id, message, data. No timestamps except state? State may need started_at? For deterministic, use logical `at` sequence number. But persistence may need timestamps? Not required. We can use `seq` only. If we include timestamps, tests can use fixed clock. Simpler: no timestamps in state/events; deterministic. But job runner may want `started_at`? We can include `attempt` and `seq`.
+
+Atomic state: write temp file and os.replace. State JSON:
+{
+ "run_id": str,
+ "seq": int,
+ "jobs": {
+   "job_id": {
+      "status": "pending|running|succeeded|failed|cancelled",
+      "attempt": int,
+      "returncode": int|None,
+      "exit_reason": ...,
+      "finished_seq": int
+   }
+ }
+}
+Persist before and after each job status changes.
+
+Resume: load existing state if present. Validate manifest jobs match? If manifest changed, maybe raise. For simplicity, state contains manifest_hash; if mismatch, refuse or reset? Requirement resume completed work. We can include `manifest_sha256` in state; on resume if mismatch, raise error unless --reset? But tests might change manifest? We can implement `reset=True` option. For resume test, same manifest.
+
+One active GPU job: implement `asyncio.Semaphore(1)` for gpu. Each job with gpu=True acquires gpu semaphore. CPU jobs can run in parallel up to concurrency? Deterministic? If concurrency >1, event ordering might not be deterministic due race. To guarantee deterministic events and one GPU, maybe use sequential queue: process jobs one at a time in sorted order, but still async. But "asynchronous job runner" can be sequential await. If we want concurrency while deterministic, we can use a queue and worker count 1? That is sequential. Enforce GPU one: if only one worker, trivial. But maybe too trivial. We can implement deterministic scheduling: jobs are dispatched in order, concurrency default 1. User can set concurrency >1 but then event order may vary; not deterministic. To satisfy deterministic, default concurrency 1 and perhaps enforce concurrency=1? Or make it deterministic by only starting next job after previous finished, but async commands. "deterministic asynchronous job runner" could mean no nondeterministic concurrency; run in manifest order. Let's implement sequential deterministic execution, with async subprocess and one GPU lock (belt and suspenders). It enforces one active GPU job. If user sets concurrency >1, we can still keep deterministic? We can implement a scheduler that releases jobs in order but concurrency may cause nondeterminism. Better to restrict to `max_concurrency: 1` in manifest? But package can support `concurrency` but for deterministic guarantee set 1. The requirement doesn't demand concurrency. Let's implement sequential.
+
+But "asynchronous job runner" could be expected to run jobs asynchronously (await subprocess) not threads. Sequential is fine.
+
+Jobs: command can be list[str] or string? Use subprocess. Environment: os.environ plus job env; secrets redact. For redaction: configured secrets list of env variable names? Also redact values in job env? We can pass env to subprocess with secret values? If command needs secrets, they must be in environment. But redact events not subprocess env. We'll redact event fields and state messages. If job env contains secret names, we won't log them. Event data includes returncode, maybe stderr? We can capture stdout/stderr? To redact, we can capture output and include truncated? For JSONL events, maybe include `returncode` and `stdout_tail`/`stderr_tail`. Need redact secrets from tails. Deterministic? Capture can be nondeterministic? But job output deterministic maybe. We can include output? For failure tests, may need assert stderr contains message but redacted? Maybe avoid output in events except returncode. But failure test can assert state returncode. For redaction, we need demonstrate. We can include event data with `command`? Redact command? If command contains secret literal? We can redact configured literal values too.
+
+Secret redaction design:
+Manifest can specify:
+"redact_secrets": ["API_KEY", "GITHUB_TOKEN"]
+These are environment variable names. The runner will read their values from environment at startup. It redacts those values from any string in events/state, replacing with "REDACTED". It also redacts JSON keys? If key in secrets? If key name matches? Maybe redact values for keys whose name in secrets. For literal values, replace all occurrences of secret value. For env var names, redact value if present. If value empty, ignore.
+Also can specify literal secrets:
+"redact_secret_values": ["abc123"]
+We'll support both:
+"redact_secret_values": ["literal1"]
+"redact_secret_env": ["API_KEY"]
+Or just "secrets": object mapping name to source? Let's keep simple:
+"secrets": {
+  "API_KEY": {"type": "env", "name": "API_KEY"},
+  "literal": {"type": "value", "value": "abc"}
+}
+But user said configured secrets, not necessarily env. Could be list of environment variable names. To be robust, support:
+"secrets": {
+ "API_KEY": "env:API_KEY",
+ "TOKEN": "literal:abc123"
+}
+Or simpler: "secrets": ["API_KEY", "TOKEN"] means env vars. We can implement both: if string item is "env:NAME" or "value:abc"; plain NAME = env var. Values: list of strings. Redactor will replace exact secret values in strings and redact dict values for keys whose name matches a configured secret key? We can define secret names: for env:NAME, name=NAME; value:abc, name=None. For plain NAME, name=NAME. If event dict has key `API_KEY`, value redacted. Also if any string contains secret value, replace.
+Need avoid redacting "REDACTED" loops. Implement Redactor:
+- secret_values: set of non-empty strings
+- secret_names: set of names
+- redact_value(v): if isinstance str, replace each secret value with "REDACTED"; if dict, recursively: for key in secret_names, replace value with "REDACTED" (or redact_value? If value dict? use REDACTED). For other keys, recurse; for lists recurse.
+But if secret value appears as key? Not needed.
+Need ensure not redact secret value if it's the placeholder? Fine.
+
+Manifest schema:
+{
+  "schema_version": 1,
+  "run_id": "run-1",
+  "state_file": ".jobrunner/state.json"? Runner takes state_path.
+  "jobs": [
+    {
+      "id": "job-1",
+      "command": ["python", "-c", "print('ok')"],
+      "gpu": false,
+      "env": {"FOO": "bar"},
+      "timeout_seconds": 10
+    }
+  ],
+  "secrets": ["env:API_KEY", "value:secret-value"],
+  "retry": 0,
+  "timeout_seconds": 30
+}
+Command: list of strings; if string, split? Better require list for security. But tests can use "python -c ..." as list.
+Working directory: maybe job's `cwd`.
+Determinism: jobs are sorted by explicit `order` field or id? If manifest order is deterministic as given, but JSON arrays preserve order. For resume, order matters. We'll execute in manifest order. If duplicate ids, error. If no id, use index? We'll require id.
+
+Runner class:
+- __init__(manifest_path or dict, state_path, event_file=sys.stdout, redactor=None, clock? install_signal_handlers=True, dry_run? maybe)
+- load_manifest: read JSON, validate.
+- load_state / save_state atomic.
+- run(): async
+  - if install_signal_handlers and running in main thread: install SIGINT handler; also SIGTERM? Requirement SIGINT only. Restore after.
+  - create tasks? sequential:
+    for job in jobs:
+       if state

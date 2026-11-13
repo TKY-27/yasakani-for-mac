@@ -1,0 +1,291 @@
+We need answer user's request: "Return one PostgreSQL script with no Markdown fences. Define normalized tables for models, fixtures, runs, and request_metrics; include primary/foreign keys, checks, useful indexes, two views, one transaction-safe upsert function, and at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. The script must run in dependency order."
+
+Need produce only SQL script no Markdown fences. Need think deeply. We need design normalized tables: models, fixtures, runs, request_metrics. Include PK/FK, checks, useful indexes, two views, one transaction-safe upsert function, at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Script dependency order.
+
+Need likely PostgreSQL script. Ensure can run. Need consider functions before/after? Transaction-safe upsert function: maybe plpgsql function that uses INSERT ... ON CONFLICT? "transaction-safe" maybe wraps in savepoint? In PostgreSQL function by default joins transaction; can use SAVEPOINT to make transaction-safe? Could define function that inserts/upserts metrics and returns? Need maybe use SERIALIZABLE? But function can't set transaction isolation. Could use ON CONFLICT DO UPDATE; transaction-safe means if called within transaction, failure rolls back? Could include savepoint within function? A function can execute SAVEPOINT/RELEASE; if error, ROLLBACK TO SAVEPOINT and retry? Need plausible.
+
+We need normalized tables:
+models: model_id serial PK, name unique, version, created_at? checks.
+fixtures: fixture_id serial PK, kind (4 kinds) check in ('synthetic','long_context','mtp','adversarial')? name unique maybe model? fixtures independent.
+runs: run_id serial PK, model_id FK, fixture_id FK, started_at, completed_at, status check, maybe unique (model_id, fixture_id, started_at) or run_name.
+request_metrics: metric_id bigserial PK, run_id FK, request_seq, input_tokens, output_tokens, latency_ms, queue_ms, prefill_ms, decode_ms, mtp_proposed, mtp_accepted, accepted_rate? checks nonnegative, accepted <= proposed maybe, timestamps.
+
+Need at least 80 realistic INSERT rows spanning two models and four fixture kinds. Could interpret rows across tables? "INSERT rows" likely total rows inserted? Need at least 80 realistic INSERT rows. We can insert many into models/fixtures/runs/request_metrics. Spanning two models and four fixture kinds: two models, four fixtures. Need 80 rows total? Could be many request_metrics rows. We can generate 80 rows via explicit values or data generation. Since script must run dependency order. We can use temporary/CTE to insert many rows compactly but realistic. "at least 80 realistic INSERT rows" might mean 80 inserted rows (not 80 literal INSERT statements). We can use a WITH generate_series to produce 80 metrics rows. But request says "at least 80 realistic INSERT rows" could be satisfied by 80 rows in request_metrics. Use realistic values. Need perhaps include explicit INSERTs? Could be dynamic with generate_series deterministic. Need no Markdown fences.
+
+Need two views: maybe v_run_summary, v_model_fixture_performance. Or v_long_context_retention and v_mtp_acceptance? But views can be used by queries. Finish with six analytical SELECT queries. They need for throughput, variability, long-context retention, and MTP acceptance. Six queries total.
+
+Need ensure queries return useful results.
+
+Potential issues:
+- If using INSERT ... ON CONFLICT in function, need unique constraint on request_metrics for upsert. Add unique (run_id, request_seq) maybe. Function upserts metric: parameters model_id, fixture_id, started_at? Hmm "transaction-safe upsert function" maybe for loading request_metrics. Need define function upsert_request_metric(p_model_id int, p_fixture_id int, p_run_started_at timestamptz, p_request_seq int, ...) returning request_metrics? It must find/create run and upsert metric. But for transaction-safe maybe create run if not exists, then upsert. Need ensure FK and uniqueness. Use exception block? Could define function that does:
+CREATE OR REPLACE FUNCTION upsert_request_metric(... ) RETURNS void LANGUAGE plpgsql AS $$ ... BEGIN
+ SAVEPOINT upsert_metric;
+ BEGIN
+   SELECT run_id INTO v_run_id FROM runs WHERE model_id=... fixture_id=... started_at=...;
+   IF NOT FOUND THEN insert run, v_run_id:=lastval; END IF;
+   INSERT INTO request_metrics (...) VALUES (...) ON CONFLICT (run_id, request_seq) DO UPDATE SET ...;
+   RELEASE SAVEPOINT upsert_metric;
+ EXCEPTION WHEN OTHERS THEN
+   ROLLBACK TO SAVEPOINT upsert_metric;
+   RAISE;
+ END;
+END $$;
+But SAVEPOINT inside function: Can you use SAVEPOINT in PL/pgSQL? Yes via EXECUTE? Actually PL/pgSQL supports SQL statements: SAVEPOINT savepoint_name; RELEASE SAVEPOINT; ROLLBACK TO SAVEPOINT. Need syntax: SAVEPOINT savepoint; RELEASE SAVEPOINT savepoint; ROLLBACK TO SAVEPOINT savepoint; In plpgsql you can use them directly? I think yes: SAVEPOINT is a SQL command, plpgsql can execute SQL statements. However inside BEGIN exception block: if SAVEPOINT before exception, and ROLLBACK TO SAVEPOINT in exception, after rollback to savepoint, savepoint remains? It can be released. Need careful. If exception occurs after RELEASE? We can structure:
+BEGIN
+  PERFORM ...;
+  SAVEPOINT upsert_metric;
+  BEGIN
+    ...
+    RELEASE SAVEPOINT upsert_metric;
+  EXCEPTION WHEN OTHERS THEN
+    ROLLBACK TO SAVEPOINT upsert_metric;
+    RAISE;
+  END;
+END;
+This transaction-safe within outer transaction. But if outer transaction aborts? fine. Could also use unique violation. But not necessary.
+
+However, PL/pgSQL exception blocks create an internal savepoint automatically and rollback to it. We can just use INSERT ON CONFLICT, no need savepoint. But user asks transaction-safe upsert function; we can use SAVEPOINT to be explicit. But if we call function outside transaction, it commits. Inside transaction, savepoint ensures failed call doesn't taint whole transaction? Actually exception handler in PL/pgSQL rolls back to implicit savepoint and continues, making function able to catch errors. But if function rethrows, it aborts transaction? In PostgreSQL, if exception re-raised after rolling back to savepoint, the transaction is in aborted state? Let's recall: In plpgsql exception handler, if exception caught and then RAISE, it will abort the transaction? If you catch an error and then raise again, the transaction state is aborted? Actually exception handlers roll back to savepoint, so if you raise after handler, the error propagates and transaction aborts. If you want transaction-safe, maybe catch and return error? But "transaction-safe" maybe means function uses ON CONFLICT and works in transaction. Simpler: function upsert using ON CONFLICT DO UPDATE, with FK checks, and if any violation it fails and caller can roll back. But no need savepoint. Could still use SAVEPOINT and return status.
+
+Need ensure function can be created after tables/views? Dependency order: create tables, indexes, views, function, inserts, selects. But if function uses tables, create after tables. Inserts after tables/functions? Function doesn't need for inserts. But if we use function to insert? Could use function to upsert some rows? But request says INSERT rows; can do direct INSERTs. The function could be used in a test? Maybe finish with SELECTs, no need call function. But function should exist. Could maybe insert data using function? But "realistic INSERT rows" likely direct INSERT. Could still include function and not call it.
+
+Need 80 rows. We can insert models (2), fixtures (4), runs (maybe 8: 2 models x 4 fixtures), request_metrics (80). Total 94 rows. Need spans two models and four fixture kinds. Good.
+
+Could create deterministic metrics using a recursive CTE or generate_series to insert 80 rows. Need "realistic INSERT rows". Maybe use a single INSERT with data derived from generate_series but realistic patterns. Example:
+WITH seq AS (SELECT generate_series(1,80) AS n)
+INSERT INTO request_metrics (run_id, request_seq, input_tokens, output_tokens, latency_ms, queue_ms, prefill_ms, decode_ms, mtp_proposed, mtp_accepted)
+SELECT
+  CASE WHEN n <= 20 THEN 1 WHEN n <= 40 THEN 2 ... END, -- assign 10 requests per run?
+  ...
+FROM seq;
+But need 80 rows spanning 8 runs maybe 10 each. Need ensure run_id exists. We can insert runs: 2 models x 4 fixtures = 8 runs. request_metrics: 80 rows, 10 per run. Use generate_series. For each run, sequence 10 requests. Use cross join runs? E.g.
+INSERT INTO request_metrics (run_id, request_seq, input_tokens, output_tokens, latency_ms, queue_ms, prefill_ms, decode_ms, mtp_proposed, mtp_accepted)
+SELECT r.run_id, s.n, ...
+FROM runs r CROSS JOIN generate_series(1,10) s
+WHERE r.run_id IN (SELECT run_id FROM runs);
+This inserts 8*10=80 rows. Good
+
+My thinking time is over. I must now write the complete final answer from what I already have, without calling any more tools.-- =====================================================================
+-- PostgreSQL script: model benchmark / request metrics
+-- Dependency order:
+--   1) tables
+--   2) indexes
+--   3) views
+--   4) transaction-safe upsert function
+--   5) seed inserts (models, fixtures, runs, 80 request metrics rows)
+--   6) analytical SELECT queries
+-- =====================================================================
+
+BEGIN;
+
+-- ---------------------------------------------------------------------
+-- Tables
+-- ---------------------------------------------------------------------
+
+DROP VIEW IF EXISTS v_run_summary;
+DROP VIEW IF EXISTS v_model_fixture_performance;
+DROP FUNCTION IF EXISTS upsert_request_metric(
+    p_model_id          int,
+    p_fixture_id        int,
+    p_run_started_at    timestamptz,
+    p_request_seq       int,
+    p_input_tokens      int,
+    p_output_tokens     int,
+    p_latency_ms        numeric,
+    p_queue_ms          numeric,
+    p_prefill_ms        numeric,
+    p_decode_ms         numeric,
+    p_mtp_proposed      int,
+    p_mtp_accepted      int
+);
+
+DROP TABLE IF EXISTS request_metrics;
+DROP TABLE IF EXISTS runs;
+DROP TABLE IF EXISTS fixtures;
+DROP TABLE IF EXISTS models;
+
+CREATE TABLE models (
+    model_id      smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name          text NOT NULL,
+    version       text NOT NULL,
+    family        text NOT NULL,
+    context_limit int NOT NULL,
+    notes         text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT models_name_version_unique UNIQUE (name, version),
+    CONSTRAINT models_context_limit_positive CHECK (context_limit > 0),
+    CONSTRAINT models_name_not_empty CHECK (btrim(name) <> '')
+);
+
+CREATE TABLE fixtures (
+    fixture_id    smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    kind          text NOT NULL,
+    name          text NOT NULL,
+    description   text,
+    target_len    int NOT NULL,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT fixtures_kind_allowed CHECK (
+        kind IN ('synthetic', 'long_context', 'mtp', 'adversarial')
+    ),
+    CONSTRAINT fixtures_target_len_positive CHECK (target_len > 0),
+    CONSTRAINT fixtures_name_not_empty CHECK (btrim(name) <> '')
+);
+
+CREATE TABLE runs (
+    run_id           serial PRIMARY KEY,
+    model_id         smallint NOT NULL REFERENCES models (model_id),
+    fixture_id       smallint NOT NULL REFERENCES fixtures (fixture_id),
+    run_name         text NOT NULL,
+    started_at       timestamptz NOT NULL,
+    completed_at     timestamptz,
+    status           text NOT NULL DEFAULT 'completed',
+    concurrency      int NOT NULL DEFAULT 1,
+    temperature      numeric NOT NULL DEFAULT 0.0,
+    top_p            numeric NOT NULL DEFAULT 1.0,
+    notes            text,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT runs_status_allowed CHECK (
+        status IN ('pending', 'running', 'completed', 'failed', 'cancelled')
+    ),
+    CONSTRAINT runs_concurrency_positive CHECK (concurrency > 0),
+    CONSTRAINT runs_temperature_non_negative CHECK (temperature >= 0),
+    CONSTRAINT runs_top_p_range CHECK (top_p BETWEEN 0 AND 1),
+    CONSTRAINT runs_completed_after_started CHECK (
+        completed_at IS NULL OR completed_at >= started_at
+    ),
+    CONSTRAINT runs_name_not_empty CHECK (btrim(run_name) <> '')
+);
+
+CREATE TABLE request_metrics (
+    metric_id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    run_id       int NOT NULL REFERENCES runs (run_id),
+    request_seq  int NOT NULL,
+    input_tokens int NOT NULL,
+    output_tokens int NOT NULL,
+    latency_ms   numeric NOT NULL,
+    queue_ms     numeric NOT NULL,
+    prefill_ms   numeric NOT NULL,
+    decode_ms    numeric NOT NULL,
+    mtp_proposed int NOT NULL,
+    mtp_accepted int NOT NULL,
+    recorded_at  timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT request_metrics_request_seq_positive CHECK (request_seq > 0),
+    CONSTRAINT request_metrics_tokens_non_negative CHECK (
+        input_tokens >= 0 AND output_tokens >= 0
+    ),
+    CONSTRAINT request_metrics_latency_non_negative CHECK (
+        latency_ms >= 0 AND queue_ms >= 0 AND prefill_ms >= 0 AND decode_ms >= 0
+    ),
+    CONSTRAINT request_metrics_mtp_non_negative CHECK (
+        mtp_proposed >= 0 AND mtp_accepted >= 0
+    ),
+    CONSTRAINT request_metrics_mtp_accepted_not_greater CHECK (
+        mtp_accepted <= mtp_proposed
+    ),
+    CONSTRAINT request_metrics_latency_components_sum CHECK (
+        latency_ms = queue_ms + prefill_ms + decode_ms
+    ),
+    CONSTRAINT request_metrics_run_seq_unique UNIQUE (run_id, request_seq)
+);
+
+-- ---------------------------------------------------------------------
+-- Indexes
+-- ---------------------------------------------------------------------
+
+CREATE INDEX idx_runs_model_id
+    ON runs (model_id);
+
+CREATE INDEX idx_runs_fixture_id
+    ON runs (fixture_id);
+
+CREATE INDEX idx_runs_started_at
+    ON runs (started_at DESC);
+
+CREATE INDEX idx_runs_model_fixture_start
+    ON runs (model_id, fixture_id, started_at DESC);
+
+CREATE INDEX idx_request_metrics_run_id
+    ON request_metrics (run_id);
+
+CREATE INDEX idx_request_metrics_run_request_seq
+    ON request_metrics (run_id, request_seq);
+
+CREATE INDEX idx_request_metrics_latency_components
+    ON request_metrics (latency_ms DESC, prefill_ms DESC, decode_ms DESC);
+
+CREATE INDEX idx_request_metrics_mtp
+    ON request_metrics (mtp_proposed DESC, mtp_accepted DESC);
+
+-- ---------------------------------------------------------------------
+-- Views
+-- ---------------------------------------------------------------------
+
+CREATE VIEW v_run_summary AS
+SELECT
+    m.model_id,
+    m.name AS model_name,
+    m.version AS model_version,
+    f.fixture_id,
+    f.kind AS fixture_kind,
+    f.name AS fixture_name,
+    r.run_id,
+    r.run_name,
+    r.started_at,
+    r.completed_at,
+    r.status,
+    r.concurrency,
+    COUNT(rm.metric_id) AS request_count,
+    COALESCE(SUM(rm.input_tokens), 0) AS total_input_tokens,
+    COALESCE(SUM(rm.output_tokens), 0) AS total_output_tokens,
+    COALESCE(SUM(rm.output_tokens), 0) * 1.0
+        / GREATEST(NULLIF(COUNT(rm.metric_id), 0), 1) AS avg_output_tokens_per_request,
+    COALESCE(AVG(rm.latency_ms), 0) AS avg_latency_ms,
+    COALESCE(AVG(rm.queue_ms), 0) AS avg_queue_ms,
+    COALESCE(AVG(rm.prefill_ms), 0) AS avg_prefill_ms,
+    COALESCE(AVG(rm.decode_ms), 0) AS avg_decode_ms,
+    COALESCE(SUM(rm.mtp_proposed), 0) AS mtp_proposed_total,
+    COALESCE(SUM(rm.mtp_accepted), 0) AS mtp_accepted_total,
+    CASE
+        WHEN COALESCE(SUM(rm.mtp_proposed), 0) = 0 THEN NULL
+        ELSE COALESCE(SUM(rm.mtp_accepted), 0) * 100.0 / SUM(rm.mtp_proposed)
+    END AS mtp_accept_rate_pct
+FROM runs r
+JOIN models m ON m.model_id = r.model_id
+JOIN fixtures f ON f.fixture_id = r.fixture_id
+LEFT JOIN request_metrics rm ON rm.run_id = r.run_id
+GROUP BY
+    m.model_id,
+    m.name,
+    m.version,
+    f.fixture_id,
+    f.kind,
+    f.name,
+    r.run_id,
+    r.run_name,
+    r.started_at,
+    r.completed_at,
+    r.status,
+    r.concurrency;
+
+CREATE VIEW v_model_fixture_performance AS
+SELECT
+    m.model_id,
+    m.name AS model_name,
+    m.version AS model_version,
+    f.fixture_id,
+    f.kind AS fixture_kind,
+    f.name AS fixture_name,
+    COUNT(DISTINCT r.run_id) AS run_count,
+    COUNT(rm.metric_id) AS request_count,
+    COALESCE(SUM(rm.output_tokens), 0) AS total_output_tokens,
+    COALESCE(AVG(rm.latency_ms), 0) AS avg_latency_ms,
+    COALESCE(STDDEV(rm.latency_ms), 0) AS latency_stddev_ms,
+    COALESCE(MIN(rm.latency_ms), 0) AS min_latency_ms,
+    COALESCE(MAX(rm.latency_ms), 0) AS max_latency_ms,
+    COALESCE(AVG(rm.queue_ms), 0

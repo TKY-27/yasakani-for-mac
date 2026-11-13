@@ -1,0 +1,201 @@
+We need answer user's request: translate Chinese document into precise natural English, preserve six section headings and technical distinctions. Then add Chinese-English glossary at least twenty terms. Need produce final only. Need think about translation.
+
+User Chinese:
+第一部分：运行边界。系统只服务一个活动请求，所有模型状态均由一个执行程序独占。这个限制不是临时缺陷，而是产品针对单卡本地推理做出的明确选择。它允许内存规划器提前确定工作区、缓存和图执行地址，也使取消、失败和恢复的状态转换更容易验证。
+
+第二部分：预填充。输入首先经过模板渲染和分词，然后以固定大小的块进入模型。每个块都读取之前已经提交的状态并原子地推进前沿。计时必须区分主机准备、视觉预处理、文本预填充和第一枚输出 token，不能把文件读取或模型加载混入吞吐量。
+
+第三部分：解码。普通解码每轮提交一枚 token，推测解码可以验证多个候选并提交一个连续前缀。无论接受多少候选，公开输出、KV 缓存、循环状态和计数器都必须对应同一个已提交位置，不能留下只更新一半的状态。
+
+第四部分：长上下文。上下文增长时，固定权重读取和不断增长的注意力缓存读取共同决定延迟。报告应同时给出绝对速度、相对保留率和实际 prompt token 数，并记录缓存格式、最大容量、采样器和图执行状态。
+
+第五部分：可复现性。稳定的输入必须保存为实际发送的消息文件，并记录来源和 token 数。正式运行不能临时下载网页、随机选择题目或删除较慢样本。每个数字都应能回到明确的模型、命令、输入和服务日志。
+
+第六部分：结果解释。一次孤立的最快运行不能证明稳定性能，单一高接受率文本也不能代表所有输出场景。代码、叙事、翻译和结构化内容具有不同的 token 分布，应该分别展示，而不是混成一个缺少含义的总平均值。
+
+Need translate headings: "第一部分：运行边界。" Maybe "Part 1: Operational Boundaries." or "Part 1: Execution Boundaries." "运行边界" in technical context: operational/execution boundaries. Since single active request, exclusive execution program, memory planner, graph execution. "Execution Boundaries" perhaps precise. Section headings must preserve all six section headings. We can use "Part 1: Operational Boundaries." etc.
+
+Need preserve technical distinctions: single active request, all model state exclusively held by one execution program; not temporary defect but deliberate product choice for single-GPU local inference; enables memory planner to pre-determine workspaces, caches, graph execution addresses; makes cancel/failure/recovery state transitions easier to verify.
+
+Part 2 prefill: input first through template rendering and tokenization, then enters model in fixed-size chunks/blocks. Each block reads previously committed state and atomically advances frontier. Timing must distinguish host preparation, visual preprocessing, text prefill, and first output token; must not mix file reads or model loading into throughput. "frontier" maybe "frontier" or "decoding frontier". Use "frontier".
+
+Part 3 decoding: ordinary decoding commits one token per round, speculative decoding verifies multiple candidates and commits one contiguous prefix. Regardless of accepted candidates, exposed output, KV cache, recurrent state, counters must correspond to same committed position; no half-updated state. "public output" maybe "exposed output". "循环状态" could mean loop state/recurrent state? In LLM inference, maybe "state machine"? Original says 循环状态 likely "loop state" maybe execution loop state. Need translate natural: "loop state". Could be "recurrent state"? For model states maybe "recurrent state" if transformer? But "循环状态" in Chinese might mean "loop state" (control loop). Use "loop state" to be precise. "公开输出" public/exposed output. "已提交位置" committed position. "连续前缀" contiguous prefix.
+
+Part 4 long context: as context grows, reads of fixed weights and continually growing attention cache reads jointly determine latency. Reports should provide absolute speed, relative retention, actual prompt token count, and record cache format, maximum capacity, sampler, and graph execution state. "相对保留率" maybe "relative retention rate" or "retention relative to baseline". Could be "relative retention". In context length, "relative retention rate" perhaps. "绝对速度" absolute throughput/speed. "实际 prompt token 数" actual prompt token count. "缓存格式" cache format. "图执行状态" graph execution state.
+
+Part 5 reproducibility: stable inputs must be saved as actual message files sent, record source and token count. Formal runs cannot download web pages ad hoc, randomly select questions/prompts, or delete slower samples. Every number must trace back to explicit model, command, input, and service logs. "稳定的输入" stable inputs; "实际发送的消息文件" actual sent message files. "题目" maybe prompts/questions; use "prompts". "较慢样本" slower samples. "服务日志" service logs.
+
+Part 6 result interpretation: a single fastest isolated run cannot prove stable performance; a single high-acceptance-rate text cannot represent all output scenarios. Code, narrative, translation, and structured content have different token distributions, should be shown separately, not blended into a meaningless overall average. "缺少含义的总平均值" "meaningless overall average" or "semantically empty aggregate average". Need precise natural.
+
+Glossary at least 20 terms Chinese-English. Need include terms from text: 系统, 活动请求, 模型状态, 执行程序, 单卡, 本地推理, 内存规划器, 工作区, 缓存, 图执行, 预填充, 模板渲染, 分词, 块, 前沿, 主机准备, 视觉预处理, 文本预填充, 输出 token, 吞吐量, 解码, 推测解码, 候选, 连续前缀, KV 缓存, 循环状态, 计数器, 已提交位置, 长上下文, 注意力缓存, 延迟, 绝对速度, 相对保留率, prompt token, 缓存格式, 最大容量, 采样器, 图执行状态, 可复现性, 消息文件, 服务日志, 结果解释, token 分布, 总平均值. Need at least twenty. Could provide table with 24 terms. Need ensure Chinese term and English translation. Maybe include original Chinese term and English term. Need precise. Could include "运行边界" etc. At least twenty terms; we can do 25.
+
+Need final: translation with six headings, then glossary. Ensure headings preserved. Could use "Part 1: Operational Boundaries" etc. The Chinese headings are "第一部分：运行边界。" Should translate as "Part 1: Operational Boundaries." It says preserve all six section headings. So include them. The translation should be complete document. Then glossary. Need maybe note headings? No, just translation.
+
+Let's craft polished translation.
+
+Potential translation:
+Part 1: Operational Boundaries. The system serves only one active request at a time, and all model state is exclusively owned by a single execution program. This limitation is not a temporary defect; it is a deliberate product choice for single-GPU local inference. It allows the memory planner to fix workspace, cache, and graph-execution addresses in advance, and makes the state transitions for cancellation, failure, and recovery easier to verify.
+
+"fix ... addresses" maybe "determine ... in advance". Use "pre-determine". "graph-execution addresses" maybe "addresses for graph execution". Natural: "pre-determine the addresses of workspaces, caches, and graph execution." Better: "pre-determine the layout and addresses of workspaces, caches, and graph execution". But original "确定工作区、缓存和图执行地址" means determine addresses of workspace, cache, and graph execution. Use "pre-determine the addresses for workspaces, caches, and graph execution".
+
+Part 2: Prefilling. The input first undergoes template rendering and tokenization, and then enters the model in fixed-size blocks. Each block reads the previously committed state and atomically advances the frontier. Timing must distinguish host preparation, visual preprocessing, text prefill, and the first output token; it must not mix file reads or model loading into throughput.
+
+"first output token" maybe "first output token". Good.
+
+Part 3: Decoding. In ordinary decoding, each round commits one token; speculative decoding can verify multiple candidates and commit one contiguous prefix. Regardless of how many candidates are accepted, the exposed output, KV cache, loop state, and counters must all correspond to the same committed position; no half-updated state may be left behind.
+
+"exposed output" vs "public output". "public output" maybe user-visible output. Use "user-visible output"? Original 公开输出 likely "public output". In inference, "public output" means exposed to user. Use "publicly exposed output"? Maybe "the exposed output". Let's choose "the exposed output" natural. But if "public output" as opposed internal. "public output" may be okay. "The public output, KV cache, loop state, and counters..." It's clear. Maybe "exposed output" more precise. Use "the exposed output".
+
+Part 4: Long Context. As the context grows, reads of the fixed weights and of the ever-growing attention cache together determine latency. Reports should provide absolute speed, relative retention, and the actual prompt token count, and should record the cache format, maximum capacity, sampler, and graph-execution state.
+
+"ever-growing" maybe "continuously growing" better. "reads of fixed weights and the continually growing attention cache". "relative retention" maybe "relative retention rate". Include "rate" for 率. Use "relative retention rate". "absolute speed" maybe "absolute throughput"? Original 绝对速度 speed, not necessarily tokens/s? Use "absolute speed" preserve. "actual prompt token count". Good.
+
+Part 5: Reproducibility. Stable inputs must be saved as the actual message files that were sent, and their source and token count must be recorded. Formal runs must not ad hoc download web pages, randomly select prompts, or delete slower samples. Every number must be traceable to an explicit model, command, input, and service log.
+
+"ad hoc" natural. Maybe "must not download web pages on the fly". Use "ad hoc". "randomly select questions/prompts". Use "prompts" because 题目 maybe questions; but in LLM context "prompts". Need technical distinctions; "题目" may be benchmark questions. Use "questions" maybe. "随机选择题目" = randomly selecting questions/items. Use "prompt items" maybe. To preserve, "randomly select prompts". Good.
+
+Part 6: Interpretation of Results. A single fastest isolated run cannot demonstrate stable performance, and a single text with a high acceptance rate cannot represent all output scenarios. Code, narrative, translation, and structured content have different token distributions and should be presented separately rather than blended into an aggregate average that lacks meaning.
+
+"结果解释" heading could be "Interpretation of Results" or "Interpreting Results". Preserve heading. Use "Part 6: Interpreting Results." Chinese "结果解释" noun phrase; "Interpretation of Results" fine. "缺少含义的总平均值" "an aggregate average that lacks meaning" precise.
+
+Need maybe keep section headings exactly six: "Part 1: Operational Boundaries." etc. Use numbering. Good.
+
+Glossary at least twenty terms. Need Chinese-English terms. Could table with 25. Need include all major. Let's list:
+1. 运行边界 — operational boundaries / execution boundaries
+2. 活动请求 — active request
+3. 模型状态 — model state
+4. 执行程序 — execution program
+5. 单卡 — single GPU / single card (in Chinese 单卡 = single GPU/accelerator card)
+6. 本地推理 — local inference
+7. 内存规划器 — memory planner
+8. 工作区 — workspace
+9. 缓存 — cache
+10. 图执行 — graph execution
+11. 状态转换 — state transition
+12. 预填充 — prefill / prompt prefill
+13. 模板渲染 — template rendering
+14. 分词 — tokenization
+15. 块 — block / chunk
+16. 前沿 — frontier
+17. 主机准备 — host preparation
+18. 视觉预处理 — visual preprocessing
+19. 文本预填充 — text prefill
+20. 输出 token — output token
+21. 吞吐量 — throughput
+22. 解码 — decoding
+23. 推测解码 — speculative decoding
+24. 候选 — candidate
+25. 连续前缀 — contiguous prefix
+26. KV 缓存 — KV cache
+27. 循环状态 — loop state
+28. 计数器 — counter
+29. 已提交位置 — committed position
+30. 长上下文 — long context
+31. 固定权重 — fixed weights
+32. 注意力缓存 — attention cache
+33. 延迟 — latency
+34. 绝对速度 — absolute speed
+35. 相对保留率 — relative retention rate
+36. prompt token — prompt token
+37. 缓存格式 — cache format
+38. 最大容量 — maximum capacity
+39. 采样器 — sampler
+40. 图执行状态 — graph-execution state
+41. 可复现性 — reproducibility
+42. 消息文件 — message file
+43. 服务日志 — service log
+44. 结果解释 — interpretation of results
+45. token 分布 — token distribution
+46. 总平均值 — aggregate average / overall average
+
+Need at least twenty; maybe 30 enough. Could include 30 to be safe. Need "Chinese-English glossary" maybe two columns: Chinese term, English term. Need at least 20. Include perhaps 30. Ensure no too many but okay.
+
+Need maybe define "single-card" as "single-GPU". If Chinese 单卡 in local inference could be single accelerator card, not necessarily GPU. Use "single-accelerator card" or "single GPU/card". Since product local inference on a single card. Maybe "single-GPU/local accelerator". To be precise: "single-accelerator-card". But English natural: "single-GPU local inference". If could be NPU, "single-accelerator-card local inference". Technical distinction: 单卡 = one card. Use "single-accelerator-card local inference" maybe less natural. Could use "single-card local inference" with glossary "single card — single accelerator card". But English natural? "single-GPU" may assume GPU. To preserve technical distinctions maybe "single-accelerator-card" is precise. But if product likely GPU. Use "single-GPU" in translation and glossary "单卡 — single GPU / single accelerator card". The request precise natural English. "single-GPU local inference" natural. Good.
+
+Need ensure all six headings preserve: Part 1... Part 6. Could headings be "Section 1"? Chinese 第一部分 = Part 1. Use Part. Good.
+
+Let's produce final with translation and glossary. Need no analysis. Ensure final includes at least 20 terms. Use Markdown table. Need maybe "Glossary (Chinese–English)" with 25 terms. Ensure count. Let's count if table has 25 rows.
+
+Potential glossary 25:
+1 运行边界 operational boundaries
+2 活动请求 active request
+3 模型状态 model state
+4 执行程序 execution program
+5 单卡 single-GPU / single accelerator card
+6 本地推理 local inference
+7 内存规划器 memory planner
+8 工作区 workspace
+9 缓存 cache
+10 图执行 graph execution
+11 预填充 prefill
+12 模板渲染 template rendering
+13 分词 tokenization
+14 块 block
+15 前沿 frontier
+16 主机准备 host preparation
+17 视觉预处理 visual preprocessing
+18 文本预填充 text prefill
+19 输出 token output token
+20 吞吐量 throughput
+21 推测解码 speculative decoding
+22 候选 candidate
+23 连续前缀 contiguous prefix
+24 KV 缓存 KV cache
+25 循环状态 loop state
+26 计数器 counter
+27 已提交位置 committed position
+28 长上下文 long context
+29 注意力缓存 attention cache
+30 延迟 latency
+31 相对保留率 relative retention rate
+32 prompt token prompt token
+33 缓存格式 cache format
+34 采样器 sampler
+35 可复现性 reproducibility
+36 服务日志 service log
+37 结果解释 interpretation of results
+38 token 分布 token distribution
+39 总平均值 aggregate average
+
+39 rows. Fine. Need at least 20. Could be too many but okay. Ensure Chinese terms match document. "固定权重" maybe include? Could include. Add "固定权重 — fixed weights". "绝对速度 — absolute speed". "消息文件 — message file". "随机选择题目" maybe not term. But okay. Need at least 20; 30 enough. Maybe 30 to avoid overlong. But desired oververbosity 9, can be detailed. Maybe 30 terms. Let's make 30 rows. Need ensure all critical. 30 list:
+1 运行边界 Operational boundaries
+2 活动请求 Active request
+3 模型状态 Model state
+4 执行程序 Execution program
+5 单卡 Single-GPU / single accelerator card
+6 本地推理 Local inference
+7 内存规划器 Memory planner
+8 工作区 Workspace
+9 缓存 Cache
+10 图执行 Graph execution
+11 预填充 Prefill
+12 模板渲染 Template rendering
+13 分词 Tokenization
+14 块 Block
+15 前沿 Frontier
+16 主机准备 Host preparation
+17 视觉预处理 Visual preprocessing
+18 文本预填充 Text prefill
+19 输出 token Output token
+20 吞吐量 Throughput
+21 推测解码 Speculative decoding
+22 候选 Candidate
+23 连续前缀 Contiguous prefix
+24 KV 缓存 KV cache
+25 循环状态 Loop state
+26 计数器 Counter
+27 已提交位置 Committed position
+28 长上下文 Long context
+29 注意力缓存 Attention cache
+30 延迟 Latency
+31 相对保留率 Relative retention rate
+32 可复现性 Reproducibility
+33 服务日志 Service log
+34 结果解释 Interpretation of results
+35 token 分布 Token distribution
+36 总平均值 Aggregate average
+
+That's 36. Good. Maybe include "固定权重" and "最大容量" too. Could 40. But no problem. Need Chinese-English glossary at least twenty. 36 enough.
+
+Check translation nuances:
+"所有模型状态均由一个执行程序独占" = all model state is exclusively held by

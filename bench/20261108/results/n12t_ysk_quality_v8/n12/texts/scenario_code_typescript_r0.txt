@@ -1,0 +1,167 @@
+The user wants a complete TypeScript 5 service that meets the following:
+1. Consumes newline-delimited request metrics (NDJSON)
+2. Validates them without third-party schema libraries (i.e., hand-written validation)
+3. Groups records by model and fixture
+4. Computes mean/median/sample standard deviation
+5. Exposes /health, /summary, /runs/:id endpoints
+6. Strict typing
+7. Incremental parsing (streaming, not loading all data)
+8. Bounded memory (streaming aggregation — since it's mean/stddev, we don't need to store all values, but median requires data… wait, median requires all values or an approximation. Let me think.)
+
+Median needs all values, or a sorted structure. With bounded memory, we can use a reservoir approach or approximate quantiles. But the requirement says "computes mean/median/sample standard deviation" and "bounded memory."
+
+Options:
+- Store all values per (model, fixture) group — unbounded memory.
+- Bounded: use a capped buffer (e.g., keep at most N values per group, using reservoir sampling or just truncation) and compute median from the sample. But then the median is approximate.
+
+Hmm. The cleanest, most honest approach: maintain streaming aggregates (count, sum, sum of squares, min, max) for exact mean and sample stddev (Welford's algorithm for numerical stability). For median, maintain a bounded two-heap structure or a capped sorted structure with a documented cap. Or: if per-group value counts stay below a cap, compute exact median; beyond that, use a sampled quantile estimate.
+
+Actually, let me design it this way: for each group, keep Welford's aggregate for exact mean and stddev. For median, keep a bounded buffer: if total count per group is ≤ MEDIAN_BUFFER_CAP (say 100k) use the buffer to compute exact median; beyond that, switch to reservoir sampling of size R, and report median as an estimate (flag `medianIsEstimated: true`). This is honest engineering and demonstrates bounded memory. Or simpler: always cap the buffer at the maximum, evicting oldest values? Eviction by oldest is biased. Reservoir sampling is unbiased. But once we hit the cap, we'd need to replace the whole buffer… let's do it: while count ≤ cap, append to buffer. After exceeding cap, do a standard reservoir: for each subsequent item i (starting at i = cap+1), pick k = random in [1, i], and if k ≤ cap replace buffer[k-1] and continue. Then median is the median of the reservoir (a size-cap sample) — a reasonable estimate.
+
+This is a solid, defensible design. It's what I'd do in production.
+
+7. Malformed input errors — validation errors with line numbers, reject policy, error counters.
+8. Unit tests — use Node built-in test runner (node:test) to avoid third-party test frameworks? The constraint says "no third-party schema libraries" specifically. Tests could use Vitest or Jest, but to minimize dependencies, node:test is clean and zero-dependency. TypeScript 5 with node:test is fine. Use `node --test` with tsx? To keep it simple: compile to JS and run tests against compiled JS, or use tsx. Hmm. For zero deps: build with tsc, run `node --test dist/test/`. This works with Node 18/20/22. node:test is stable in 20+. I'll target Node ≥ 20.
+
+Dependencies: express? The requirement says to expose endpoints. Using Node built-in http keeps deps zero. express is common but adds a dep; "No placeholders" suggests they want real code. I'll use the built-in `http` module with a small router — zero runtime deps. That's clean.
+
+Validation: hand-written validator for NDJSON records. Record shape: let's define:
+
+```json
+{"runId":"r-01","model":"llama-7b","fixture":"chat-100","latencyMs":142.7,"tokens":512,"status":"ok","ts":1718000000000}
+```
+
+Fields:
+- runId: non-empty string, maybe pattern ^[A-Za-z0-9_-]{1,64}$
+- model: non-empty string 1..128
+- fixture: non-empty string 1..128
+- latencyMs: finite positive number
+- tokens: non-negative integer (maybe optional)
+- status: enum "ok" | "error"
+- ts: integer epoch ms, optional? Let's keep ts as required integer.
+
+Let me define required fields: runId, model, fixture, latencyMs, status. Optional: tokens (integer), ts (integer epoch ms). All unknown fields: allow or reject? Strict: record unexpected fields → error? Or ignore. Being strict about unexpected keys is a nice validation feature. But might be annoying. Policy: record unexpected fields as errors? Actually, for robustness, unknown fields could be tolerated but logged. Hmm, "strict types" — I'll make unknown fields an error to demonstrate strictness… actually, real pipelines often break on unexpected fields. Make it configurable? No — keep it simple: unknown fields are errors ("strict mode"). Actually let's not over-engineer: unknown fields are validation errors. OK.
+
+Validation errors: { line, byteOffset, code, message }. Codes: INVALID_JSON, MISSING_FIELD, UNEXPECTED_FIELD, TYPE_ERROR, RANGE_ERROR, ENUM_ERROR, DUPLICATE_KEY (maybe). Track errors in a bounded ring buffer (keep last N error details) plus counters by code.
+
+Incremental parsing: NDJSON line-splitting stream with carry-over buffer for partial lines. Implement a LineSplitter transform, or a simple incremental parser class with `push(chunk: string): Line[]` that handles CRLF and a final line without trailing newline. Handle over-long lines (max line length, e.g., 64KB) → error, skip line (but bounded: discard until newline found).
+
+Endpoints:
+- GET /health → { status: "ok", uptimeSec, version, memory: rss/heap, inflight }
+- GET /summary → global counters: totalLines, validRecords, errorCount by code, per-group summary? The requirement: "groups records by model and fixture, computes mean/median/sample standard deviation, and exposes /summary and /runs/:id." So probably /summary is aggregated across all runs (by model+fixture), and /runs/:id is filtered to a single runId (by model+fixture). Both return groups with stats.
+
+Memory bounding for groups: bounded number of groups (max distinct model+fixture combos, e.g., 10k); excess groups are aggregated into an overflow group or counted and rejected? Simpler: count `truncatedGroups` and don't add beyond the cap; record goes to a global counter but isn't grouped. Also per-run: /runs/:id needs per-run, per-(model,fixture) grouping! So two index structures:
+
+1. global: key `${model}\u0000${fixture}` → aggregate
+2. per run: runId → { groupKey → aggregate }
+
+Per-run memory: bound number of tracked runs (LRU-ish, or cap on runs, drop oldest runs once count cap is hit… but requests might arrive out of order; a simple map with a cap that rejects/ignores new runs after cap hit, and we can also drop runs that haven't received records in a long time (TTL). Implement RunRegistry with maxRuns (e.g., 1024) and TTL (e.g., 1 hour). On evict, run is no longer available at /runs/:id (404 with note). That's honest bounded memory.
+
+Also bound the distinct groups within a run.
+
+Data ingestion: how does data "come in"? Service should "consume newline-delimited request metrics." Options: HTTP POST /ingest that accepts NDJSON body, and/or a file tail (stdin). Provide both? A POST /ingest endpoint that accepts NDJSON stream + a file-mode CLI that reads a file or stdin into the same pipeline. That covers "consume" fully. Also GET /errors? Not required but useful; the required endpoints are three. Could add /ingest and /errors. Keeping additions minimal but /ingest is essential to actually feed data. Also POST /ingest supports streaming request body (incremental parsing over chunks).
+
+Stats computation:
+- mean = sum/count (use Welford for stability: M2 for variance). Sample stddev = sqrt(M2/(n-1)), n≥2, else null.
+- Median from the bounded buffer as above.
+
+Response shape for /summary:
+
+```json
+{
+  "generatedAt": "...",
+  "totals": { "lines": n, "records": n, "invalidLines": n, "errorCounts": {...} },
+  "groupCount": n,
+  "groups": [
+    {
+      "model": "...", "fixture": "...",
+      "count": n,
+      "latencyMs": { "mean": x, "median": y, "sampleStdDev": z, "min": a, "max": b, "medianEstimated": bool },
+      "tokens": { ... } // probably latency only + tokens optional sum/mean
+      "statusCounts": { "ok": n, "error": n }
+    }
+  ]
+}
+```
+
+Keep it focused: latencyMs stats (mean/median/sample stddev/min/max), and maybe mean for tokens if present? The requirement says "computes mean/median/sample standard deviation" — for the metrics (latency). We compute latencyMs stats; if tokens present, also sum/mean? Narrow scope: latency stats + counts. Add errorCount.
+
+Actually, let's include per-group: count, errorCount (count of records with status=error), latencyMs: {count (records with latency — all of them), mean, median, sampleStdDev, min, max, medianEstimated}.
+
+/runs/:id: same shape but filtered, plus run-specific: firstSeenAt/lastSeenAt (need ts — I've made ts optional… make ts required for run bookkeeping? If ts is optional, use arrival time for first/last seen). Simpler: track first/last at arrival time. OK, ts optional.
+
+Router: small pattern matcher for '/runs/:id'. Parse URL with `new URL(req.url, 'http://localhost')` for pathname. Method routing: GET for 3 endpoints, POST for /ingest. 404 JSON, 405 for wrong method.
+
+Incremental parsing details:
+- `NdjsonLineParser`: push(chunk) → emits complete lines; handles \n and \r\n; if a line exceeds MAX_LINE_BYTES, mark line as invalid (LONG_LINE) and keep discarding until newline found. Track line number and byte offset.
+- Bounded input: enforce maxBytesPerRequest on /ingest (e.g., 10MB) → 413.
+- Empty lines: skip (count as empty, not as error? Or count as emptyLines). Silently skip empty/whitespace-only lines, but count them.
+
+Validation function: `validateRecord(json: unknown): ValidatedRecord | ValidationError` — hand-written:
+
+- must be object, not array/null
+- check for duplicate keys? Detect duplicate keys by parsing with JSON.parse using a reviver that throws on duplicate keys? JSON.parse with a reviver can't easily detect duplicates because the reviver sees final keys… actually, the classic trick: use `JSON.parse(text, (key, value) => { ... })` — duplicates have already been collapsed by the time the reviver runs. There's a trick using a replacer that tracks… simplest robust: write a duplicate-key detection pass? Overkill. Skip duplicate-key detection; note in guide? Not needed. Skip.
+
+Field validation helpers:
+- assertString(value, name, {min, max, pattern})
+- assertNumber finite
+- assertInt (Number.isInteger)
+- enums
+
+Errors: structured `FieldError { code, field, message }`; a line can produce multiple field errors (collect all and report; code is "INVALID_RECORD" with details array). Error count by code per field error? Keep: `errorCounts` maps error codes to counts, where the codes are like MISSING_FIELD, TYPE_MISMATCH, RANGE, ENUM, INVALID_JSON, LINE_TOO_LONG, DUPLICATE_RECORD? Hmm, counting multiple field errors per line inflates counts. Keep both: `invalidLines` count and `errorCounts` where we count each distinct code across field errors (documented). OK.
+
+Ring buffer for last errors: `BoundedRing<T>` with cap (e.g., 200), storing {seq, line, byteOffset, code, message, sample (truncated raw line)}.
+
+Now stats aggregator:
+
+```ts
+class LatencyStats {
+  n = 0; mean = 0; m2 = 0; min = Infinity; max = -Infinity;
+  // median buffer
+  private buffer: number[] = []; 
+  private bufferedCount = 0; // how many values appended before cap
+  ...
+  add(v: number) { Welford; min/max; median buffer strategy }
+  median(): number | null
+}
+```
+
+Median buffer strategy with reservoir:
+```
+if (bufferedCount < CAP) { buffer.push(v); bufferedCount++; }
+else {
+  // i is the 1-based index of this element (bufferedCount+1? careful)
+}
+```
+Standard reservoir sampling: when we see element i (1-based across the stream), with reservoir size R: if i ≤ R put in; else j = random in [0, i); if j < R replace buffer[j]. Implement with counter `seen` including current element. If seen ≤ CAP: buffer[seen-1] = v. Else j = floor(rand * seen); if j < CAP buffer[j] = v. Track `medianEstimated = seen > CAP`.
+
+Median of reservoir: sort a copy and take middle (even: average of two middles). Buffer cap e.g., 4096 or 8192? Memory: 8192 doubles × groups… global groups up to 10k → 8192×8×10k = 655MB — too much. Need to consider: cap per group × max groups must be reasonable. Max groups 10k is too high with 8192 buffer. Choose: MAX_GROUPS = 512? Hmm, depends on the workload: model × fixture combos is typically small (models ~20, fixtures ~50 → 1000 groups). Per-run groups similar. Let's set defaults: MAX_GLOBAL_GROUPS=2048, MAX_RUNS=256, MAX_RUN_GROUPS=2048? Still 2048×8192×8 = 134MB per index. Hmm.
+
+Better: separate smaller cap for per-run buffers. Let me parameterize: medianCap default 4096; MAX_GLOBAL_GROUPS 2048 → 2048×4096×8 ≈ 67MB… still a lot, but buffer only grows as data flows; with sparse groups, realistic. But worst-case bound is what matters. Let me choose conservative defaults and document: MAX_GLOBAL_GROUPS=1024, MAX_RUNS=128, MEDIAN_BUFFER_CAP=2048. Worst-case global: 1024×2048×8 = 16.8MB; runs: 128×1024×2048×8 = 2.1GB. Oops. Run groups should have lower cap: MAX_RUN_GROUPS=256? 128×256×2048×8 = 537MB. Still heavy. Reduce: per-run MEDIAN_BUFFER_CAP = 512, MAX_RUNS=128, MAX_RUN_GROUPS=256 → 128×256×512×8 = 134MB worst-case. Hmm, still not great but worst case only. Or make run registry evict by LRU and free memory. Realistically, I'll set: MEDIAN_BUFFER_CAP=4096 (global), RUN median cap 1024, MAX_RUNS=128, MAX_RUN_GROUPS=512 → 128×512×1024×8 = 536MB worst-case…
+
+OK, I think I'm overthinking exact numbers; this is an artifact. Let me pick documented defaults and expose them via env/constructor options so operators can tune. I'll choose:
+
+- MAX_GLOBAL_GROUPS = 1024
+- MAX_RUNS = 64
+- MAX_RUN_GROUPS = 512
+- GLOBAL_MEDIAN_BUFFER = 4096
+- RUN_MEDIAN_BUFFER = 1024
+- ERROR_RING_SIZE = 512
+
+Worst-case total for median buffers: 1024×4096×8 = 33.5MB + 64×512×1024×8 = 268MB. Hmm, 268MB worst case is a lot. Let me do RUN cap: MAX_RUNS=64, MAX_RUN_GROUPS=256, RUN_MEDIAN=1024 → 64×256×1024×8 = 134MB. Meh. Or note that per-run aggregates are lazily evicted (LRU on touch), so steady state is far smaller. I'll include LRU eviction by lastSeenAt: when registry exceeds cap, evict least-recently-touched run. And TTL cleanup interval (e.g., 5min) removes runs with no activity for RUN_TTL_MS (default 30min). Good.
+
+Actually, simpler and defensible: expose `options` with these caps, and pick moderate defaults. The unit tests verify bounding behavior (e.g., inserting more groups than cap → overflow counter increments; buffer caps and medianEstimated flag).
+
+Now "sample standard deviation": Welford:
+```
+n++; delta = x - mean; mean += delta/n; delta2 = x - mean; m2 += delta*delta2;
+sampleStdDev = n>=2 ? sqrt(m2/(n-1)) : null
+```
+
+Median: as described.
+
+Server: `createServer(handler)` from http. Request body streaming: accumulate in parser on 'data'; enforce max bytes; on 'end' flush final line (parser.finish()). Respond 200 with { accepted: n, invalidLines: n, totalBytes }.
+
+Also file mode: CLI `src/main.ts`:
+- `node dist/main.js serve --port 8080` (HTTP server)
+- `

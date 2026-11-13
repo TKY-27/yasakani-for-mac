@@ -1,0 +1,128 @@
+We need answer user's request: output exactly 160 JSONL records no Markdown. Each line object with fields id RUN-0001 through RUN-0160, model alternating qwen3.6-27b and qwen3.6-35b-a3b, prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance, status, tags. Use deterministic arithmetic progressions, status values ok/warn in 4:1 pattern, and two tags per record. Every line strict JSON.
+
+Need produce exactly 160 lines. Need ensure JSON valid. We can design formulas.
+
+IDs RUN-0001 to RUN-0160.
+Model alternating: start with qwen3.6-27b for odd i, qwen3.6-35b-a3b for even i.
+prompt_tokens arithmetic progression: maybe 1000 + 10*(i-1) => 1000..2590? For 160: 1000+10*159=2590.
+completion_tokens: 50 + 5*(i-1) => 50..845.
+decode_tok_s: maybe 30 + 0.5*(i-1) => 30..109.5. JSON number okay.
+mtp_acceptance: maybe 0.50 + 0.001*(i-1) => 0.5..0.659. Need deterministic. Could be numeric. Status 4:1 pattern ok ok ok ok warn? "status values ok/warn in a 4:1 pattern" likely 4 ok then 1 warn repeating. For 160 divisible by 5, exactly 128 ok, 32 warn. pattern: i mod 5 == 0 warn else ok.
+tags: two tags per record. Need maybe array of two strings. Deterministic maybe ["run", "seq-001"]? But exactly two tags per record. Could use ["batch-1","alpha"]? But need two tags. Could vary deterministically. Must parse. Use arrays of strings. Maybe ["run","ok"]? But status separate. Need two tags per record. Could use ["qwen3.6", "seq-001"]? But model field present. Simpler: tags: ["run","progression"]. Same for all? Two tags per record yes. But maybe deterministic. It's okay. Could vary based on i: ["run-" + i? no need]. Keep simple: ["deterministic","arithmetic"]. But if same all records? It's okay. Need ensure no Markdown. Exactly 160 lines. Need avoid trailing spaces? Fine.
+
+Need maybe compute lines. We can generate manually? Need ensure 160 records correct. We can produce by formula but as text. Need be careful count. Could maybe use a script mentally? We need output 160 JSON lines. We can construct via reasoning or use systematic enumeration. Since final answer needs 160 lines. Need avoid mistakes. Let's design easy values to count. Maybe make values simple and status pattern. Could set prompt_tokens = i*10? completion_tokens = i*5? decode_tok_s = i*0.5? mtp_acceptance = 0.5 + i*0.001? Need all arithmetic. IDs sequential.
+
+To reduce chance errors, use i from 1 to 160. prompt_tokens = i*10, completion_tokens=i*5, decode_tok_s=i*0.5 (so 0.5 to 80.0), mtp_acceptance = 0.5 + (i-1)*0.001? Or 0.500000 + ... Need avoid floating issues? JSON can have 0.5, 1.0. If i*0.5: values: 0.5,1.0,1.5,... up to 80.0. Use one decimal or integer for .0? JSON accepts 1.0. Good. mtp_acceptance maybe 0.50 + (i-1)*0.001, from 0.50 to 0.659. Need three decimal? 0.500, 0.501... Could use 0.5 + (i-1)*0.001. For i=160: 0.659. Represent as 0.500? JSON number 0.500 valid but maybe parsed as 0.5. Fine. But if we write 0.500 etc.
+
+Could simplify mtp_acceptance = 0.5 for all? Is that arithmetic progression? Common difference 0, yes arithmetic. But maybe expected progression? "Use deterministic arithmetic progressions" likely fields should be AP. Constant is AP. But maybe safer non-constant for prompt/completion/decode/mtp.
+
+Need status pattern. For i=5,10,15,... warn.
+
+Could produce lines using template:
+{"id":"RUN-0001","model":"qwen3.6-27b","prompt_tokens":10,"completion_tokens":5,"decode_tok_s":0.5,"mtp_acceptance":0.5,"status":"ok","tags":["deterministic","arithmetic"]}
+Then i increments. But need 160. We can enumerate. Need ensure model alternates: odd qwen3.6-27b, even qwen3.6-35b-a3b.
+Could use prompt_tokens 10*i? For i=1 =>10. completion 5*i. decode 0.5*i. mtp_acceptance 0.5 + (i-1)*0.001.
+
+Need exactly 160 lines. We can produce 160 lines manually. Risk of count error. We can group by 10 or 20. Let's design a pattern for each block of 10 to ensure status. For each i, line.
+
+Maybe use prompt_tokens = i + 999? Completion = i + 49? decode = 0.5*i? Hmm.
+
+To make enumeration easier, maybe set numeric fields equal to id number? prompt_tokens = i? completion_tokens = i? decode_tok_s = i? mtp_acceptance = i? But AP. However decode_tok_s should maybe tokens/sec, mtp_acceptance 0-1. If mtp_acceptance = i? invalid semantics but JSON okay? Better keep plausible.
+
+Can set prompt_tokens = i, completion_tokens = i, decode_tok_s = 0.5*i, mtp_acceptance = 0.5 + 0.001*(i-1). But prompt tokens 1..160, completion 1..160. Fine.
+
+Maybe easier: prompt_tokens = i, completion_tokens = i, decode_tok_s = i, mtp_acceptance = 0.5? But mtp acceptance constant. Need arithmetic progressions? All constant/linear. But decode_tok_s from 1 to 160 plausible. But mtp_acceptance should probably <=1. Could set 0.5 constant. It's deterministic AP. But user likely expects progressions plural; constant okay? To be safe use non-constant.
+
+Maybe mtp_acceptance = 0.5 + 0.001*(i-1). Need compute values to 3 decimals. This is easy: i=1 0.500, 2 0.501, ... 10 0.509, 20 0.519, 30 0.529, 40 0.539, 50 0.549, 60 0.559, 70 0.569, 80 0.579, 90 0.589, 100 0.599, 110 0.609, 120 0.619, 130 0.629, 140 0.639, 150 0.649, 160 0.659. We can write 0.500? JSON allows leading zero. Could use 0.5, 0.501 etc. For i=1 maybe 0.5 not 0.500. If we want easy, use 0.5 + i*0.001? i=1 =>0.501 to 0.660. But 0.660 still <=1. Use i*0.001 + 0.5. Values from 0.501 to 0.660. Then line 1 mtp 0.501. Easy sequence 0.501, 0.502... 0.660. Good.
+
+Could use mtp_acceptance = 0.001*i + 0.5. Need represent 0.501, 0.502... up to 0.660. That's easy by count. We'll need 160 values.
+
+Could set prompt_tokens = 10*i (10..1600), completion_tokens = 5*i (5..800), decode_tok_s = 0.5*i (0.5..80), mtp_acceptance=0.5+0.001*i (0.501..0.660). All AP. Good.
+
+But writing 160 lines with these numbers is lengthy. Need exact count. We can create in groups of 10:
+For i=1..160.
+Model odd/even.
+Status: for i divisible by 5 warn, else ok.
+Tags: maybe two tags can be ["run","seq"]? Need two tags per record. Could vary: tags: ["run","deterministic"] same. That's acceptable? "two tags per record" doesn't require distinct across records. But maybe to be safe, use two tags that vary but simple: ["model","run"]? Same. If strict validator expects array length 2, okay.
+
+Potential issue: JSONL strict: no trailing comma, double quotes. Use no Markdown. final only lines.
+
+Need ensure exactly 160 records. Could generate final by carefully counting. Since output long, need avoid losing count. Let's create block templates maybe 20 lines each and count blocks 8.
+
+Let's define line for i. Use id zero-padded 4.
+For i 1-9: RUN-0001...
+10-99: RUN-0010...
+100-160: RUN-0100...
+
+We can produce 10-line blocks:
+Block 1 i=1-10:
+1 ok qwen3.6-27b prompt 10 comp 5 decode 0.5 mtp 0.501
+2 ok qwen3.6-35b-a3b prompt 20 comp 10 decode 1.0 mtp 0.502
+3 ok 27b 30 15 1.5 0.503
+4 ok 35b 40 20 2.0 0.504
+5 warn 27b 50 25 2.5 0.505
+6 ok 35b 60 30 3.0 0.506
+7 ok 27b 70 35 3.5 0.507
+8 ok 35b 80 40 4.0 0.508
+9 ok 27b 90 45 4.5 0.509
+10 warn 35b 100 50 5.0 0.510
+
+Then continue. Need count blocks 16 blocks of 10. Could list each block. Need ensure status for multiples of 5. In each 10 block: positions 5 and 10 warn, others ok. Model alternates based absolute i. For blocks starting odd? Let's see block 2 i=11 odd -> 27b, 12 even 35b, etc. So every block first line model 27b if start odd; block start: 11 odd, 21 odd? 21 odd, 31 odd? yes every 10 preserves odd? 10 even addition, so if block 1 start 1 odd, block 2 start 11 odd, all odd. Thus in each 10-block pattern: odd positions (1,3,5,7,9) 27b, even 35b. Nice.
+
+Prompt/completion/decode/mtp for i:
+i= n: prompt=10n, comp=5n, decode=0.5n, mtp=0.5+0.001n.
+For n=11: 110,55,5.5,0.511.
+12:120,60,6.0,0.512
+...
+20:200,100,10.0,0.520.
+
+We can generate blocks quickly. Need be careful numeric representation: decode for even n = integer .0; odd .5. mtp three decimals? Use 0.511 etc. For n=20 0.520 (valid). For n=100 0.600. Good.
+
+Could maybe omit trailing zero? Strict JSON fine. Use 0.520? okay. But maybe JSON parsers accept. Yes.
+
+Need ensure no Markdown. Just lines.
+
+Let's plan final content exactly 160 lines. We can produce using a systematic enumeration. Need count. Let's make 16 blocks of 10. In final, ensure each line separate. We can include no extra newline? It's okay if final has trailing newline? "Output exactly 160 JSONL records" A trailing newline after last line probably okay? But to be safe, no extra blank line. In final, line breaks after each line, maybe last line no trailing newline? We can just output lines; system may add. Fine.
+
+Let's craft blocks:
+
+Block 1 (1-10):
+{"id":"RUN-0001","model":"qwen3.6-27b","prompt_tokens":10,"completion_tokens":5,"decode_tok_s":0.5,"mtp_acceptance":0.501,"status":"ok","tags":["deterministic","arithmetic"]}
+{"id":"RUN-0002","model":"qwen3.6-35b-a3b","prompt_tokens":20,"completion_tokens":10,"decode_tok_s":1.0,"mtp_acceptance":0.502,"status":"ok","tags":["deterministic","arithmetic"]}
+...
+10 warn.
+
+Block 2 (11-20):
+11 ok 27b 110 55 5.5 0.511
+12 ok 35b 120 60 6.0 0.512
+13 ok 27b 130 65 6.5 0.513
+14 ok 35b 140 70 7.0 0.514
+15 warn 27b 150 75 7.5 0.515
+16 ok 35b 160 80 8.0 0.516
+17 ok 27b 170 85 8.5 0.517
+18 ok 35b 180 90 9.0 0.518
+19 ok 27b 190 95 9.5 0.519
+20 warn 35b 200 100 10.0 0.520
+
+Block 3 (21-30): start 21 odd 27b
+21 ok 210 105 10.5 0.521
+22 ok 220 110 11.0 0.522
+23 ok 230 115 11.5 0.523
+24 ok 240 120 12.0 0.524
+25 warn 250 125 12.5 0.525
+26 ok 260 130 13.0 0.526
+27 ok 270 135 13.5 0.527
+28 ok 280 140 14.0 0.528
+29 ok 290 145 14.5 0.529
+30 warn 300 150 15.0 0.530
+
+Block 4 (31-40):
+31 ok 310 155 15.5 0.531
+32 ok 320 160 16.0 0.532
+33 ok 330 165 16.5 0.533
+34 ok 340 170 17.0 0.534
+35 warn 350 175 17.5 0.535
+36 ok 360 180 18.0 0.536
+37 ok 370 185 18.5 0.537
+38 ok 380 190 19.0 0.538
+39 ok 390 195 19

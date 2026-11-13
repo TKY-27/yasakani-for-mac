@@ -1,0 +1,156 @@
+We need answer user's request: Output exactly 160 JSONL records and no Markdown. Each line object with fields id RUN-0001 through RUN-0160, model alternating qwen3.6-27b and qwen3.6-35b-a3b, prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance, status, tags. Use deterministic arithmetic progressions, status values ok/warn in a 4:1 pattern, and two tags per record. Every line strict JSON.
+
+Need produce 160 lines no markdown. Need ensure exactly 160. Need decide arithmetic progressions. Fields likely numeric. We can define:
+id: RUN-0001 ... RUN-0160.
+model alternating: for i=1 odd qwen3.6-27b, i=2 even qwen3.6-35b-a3b.
+prompt_tokens: deterministic arithmetic progression. e.g. 1000 + (i-1)*10 = 1000 to 2590.
+completion_tokens: 50 + (i-1)*5 = 50 to 845.
+decode_tok_s: 20 + (i-1)*0.1? JSON number can be decimal. Strict JSON ok. Maybe integer to avoid? Arithmetic progression. Could be 200 + (i-1)*2 = 200 to 518.
+mtp_acceptance: 0.5 + (i-1)*0.001 = 0.500 to 1.159? Acceptance maybe should be <=1? Better use 0.80 + (i-1)*0.001 => 0.800 to 1.459 too high. Use 0.5 + (i-1)*0.001 = up to 1.159, but acceptance can be >1? Maybe acceptance length not ratio? Could be okay but mtp_acceptance maybe acceptance rate. Better keep <=1: 0.9 + (i-1)*0.0001 = 0.9000 to 0.9159. 4 decimals. Arithmetic progression.
+status: ok/warn in 4:1 pattern. For 160, pattern ok,ok,ok,ok,warn repeated 32 times. i mod 5? If i%5==0 warn? For i=1-4 ok, 5 warn, 6-9 ok,10 warn. That's 4:1. Good.
+tags: two tags per record. Deterministic. Need maybe array of two strings. Could vary? "two tags per record" could same or deterministic. Use tags: ["batch","model1"]? But maybe better deterministic based on i? Need fields tags. Could use ["tag-a","tag-b"]? To be safe, two tags. Could be deterministic arithmetic? Tags not arithmetic. Could use ["run","ok"]? Need independent parse. Maybe tags array length 2 for every record. Could be ["qwen","benchmark"] constant? It says two tags per record, not distinct. Constant ok. But maybe more deterministic: ["alpha","beta"]? Any.
+Need output exactly 160 JSONL records and no Markdown. No explanation. Must be valid JSON each line. Ensure no trailing extra blank? Fine. Need count exactly 160. We can manually generate? Need reliable. Could produce via mental? 160 lines is a lot. Need ensure no mistakes. We can generate in analysis and then final. Need maybe create formula and write 160 lines. Need count carefully. Could use loop mentally? We can produce with patterns in groups of 10 or 5. Need avoid errors in numbers.
+
+We need exact 160 lines. Let's define formulas:
+For n = 1 to 160:
+id: RUN-{n:04d}
+model: if n odd qwen3.6-27b else qwen3.6-35b-a3b
+prompt_tokens = 1000 + (n-1)*10 = 1000,1010,...2590
+completion_tokens = 50 + (n-1)*5 = 50,55,...845
+decode_tok_s = 200 + (n-1)*2 = 200,202,...518
+mtp_acceptance = 0.9000 + (n-1)*0.0001? For n=160: 0.9000 + 0.0159 = 0.9159. Need format with 4 decimals. Could write 0.9, 0.9001? Strict JSON allows 0.9. For deterministic progression, maybe include 4 decimals all: 0.9000, 0.9001,... 0.9159. That's okay.
+status: warn if n%5==0 else ok.
+tags: maybe ["run","qwen"] constant. But maybe tags should deterministic? It's okay. Could use ["seq","n"]? JSON strings. If constant, two tags per record. Maybe better ["baseline","eval"]? The field tags maybe array. We can use ["gen","mtp"]? Doesn't matter. Need no Markdown. 
+
+Need produce 160 lines. Let's consider if user wants "Output exactly 160 JSONL records and no Markdown." So final only lines. Need ensure no code fences.
+
+Need generate 160 lines. I can produce in groups of 10, verify counts. Could construct lines for n=1..160. Need careful arithmetic.
+
+Maybe use pattern and manually list. Let's create a table maybe in analysis. Need final only. Could generate using reasoning. Let's do groups of 10 with n and values.
+
+Formulas:
+n: id suffix 0001...
+model: odd qwen3.6-27b (call A), even qwen3.6-35b-a3b (B)
+prompt = 1000 + 10*(n-1) = 990 + 10n? For n=1 1000. n=10 1090. n=20 1190. n=160 2590.
+completion = 50 + 5*(n-1) = 45 + 5n? n=1 50, n=10 95, n=20 145, n=160 845.
+decode = 200 + 2*(n-1) = 198 + 2n? n=1 200, n=10 216, n=20 236, n=160 518.
+mtp = 0.9000 + (n-1)*0.0001 = 0.9000, 0.9001, ... For n=10 0.9009, n=20 0.9019, n=30 0.9029, etc. n=160 0.9159.
+status: n%5=0 warn.
+
+Tags: maybe use deterministic by parity? Could use ["qwen","even"]? But two tags per record; maybe vary with model? It doesn't say tags progression. We can set tags ["run","mtp"] constant. But if all same, okay. To be more meaningful: tags: ["qwen","eval"] constant. Strict JSON. If they expect two tags per record, array length 2. Constant is fine. Maybe choose ["benchmark","mtp"].
+
+Need ensure JSON strict: keys quoted, strings quoted, numbers plain. mtp with four decimals. Arrays.
+
+Let's generate. Could use block patterns.
+
+For each n line:
+{"id":"RUN-0001","model":"qwen3.6-27b","prompt_tokens":1000,"completion_tokens":50,"decode_tok_s":200,"mtp_acceptance":0.9000,"status":"ok","tags":["benchmark","mtp"]}
+
+Need 160. Let's produce groups of 10, count lines. Need maybe no blank lines? JSONL can have no blank. We'll output one per line.
+
+Let's list values by n 1-160.
+
+Maybe create group 1:
+1 A 1000 50 200 0.9000 ok
+2 B 1010 55 202 0.9001 ok
+3 A 1020 60 204 0.9002 ok
+4 B 1030 65 206 0.9003 ok
+5 A 1040 70 208 0.9004 warn
+6 B 1050 75 210 0.9005 ok
+7 A 1060 80 212 0.9006 ok
+8 B 1070 85 214 0.9007 ok
+9 A 1080 90 216 0.9008 ok
+10 B 1090 95 218 0.9009 warn
+
+Check status pattern 4 ok, 1 warn, yes.
+
+Group 2 (11-20):
+11 A 1100 100 220 0.9010 ok
+12 B 1110 105 222 0.9011 ok
+13 A 1120 110 224 0.9012 ok
+14 B 1130 115 226 0.9013 ok
+15 A 1140 120 228 0.9014 warn
+16 B 1150 125 230 0.9015 ok
+17 A 1160 130 232 0.9016 ok
+18 B 1170 135 234 0.9017 ok
+19 A 1180 140 236 0.9018 ok
+20 B 1190 145 238 0.9019 warn
+
+Group 3 21-30:
+21 A 1200 150 240 0.9020 ok
+22 B 1210 155 242 0.9021 ok
+23 A 1220 160 244 0.9022 ok
+24 B 1230 165 246 0.9023 ok
+25 A 1240 170 248 0.9024 warn
+26 B 1250 175 250 0.9025 ok
+27 A 1260 180 252 0.9026 ok
+28 B 1270 185 254 0.9027 ok
+29 A 1280 190 256 0.9028 ok
+30 B 1290 195 258 0.9029 warn
+
+Group4 31-40:
+31 A 1300 200 260 0.9030 ok
+32 B 1310 205 262 0.9031 ok
+33 A 1320 210 264 0.9032 ok
+34 B 1330 215 266 0.9033 ok
+35 A 1340 220 268 0.9034 warn
+36 B 1350 225 270 0.9035 ok
+37 A 1360 230 272 0.9036 ok
+38 B 1370 235 274 0.9037 ok
+39 A 1380 240 276 0.9038 ok
+40 B 1390 245 278 0.9039 warn
+
+Group5 41-50:
+41 A 1400 250 280 0.9040 ok
+42 B 1410 255 282 0.9041 ok
+43 A 1420 260 284 0.9042 ok
+44 B 1430 265 286 0.9043 ok
+45 A 1440 270 288 0.9044 warn
+46 B 1450 275 290 0.9045 ok
+47 A 1460 280 292 0.9046 ok
+48 B 1470 285 294 0.9047 ok
+49 A 1480 290 296 0.9048 ok
+50 B 1490 295 298 0.9049 warn
+
+Group6 51-60:
+51 A 1500 300 300 0.9050 ok
+52 B 1510 305 302 0.9051 ok
+53 A 1520 310 304 0.9052 ok
+54 B 1530 315 306 0.9053 ok
+55 A 1540 320 308 0.9054 warn
+56 B 1550 325 310 0.9055 ok
+57 A 1560 330 312 0.9056 ok
+58 B 1570 335 314 0.9057 ok
+59 A 1580 340 316 0.9058 ok
+60 B 1590 345 318 0.9059 warn
+
+Group7 61-70:
+61 A 1600 350 320 0.9060 ok
+62 B 1610 355 322 0.9061 ok
+63 A 1620 360 324 0.9062 ok
+64 B 1630 365 326 0.9063 ok
+65 A 1640 370 328 0.9064 warn
+66 B 1650 375 330 0.9065 ok
+67 A 1660 380 332 0.9066 ok
+68 B 1670 385 334 0.9067 ok
+69 A 1680 390 336 0.9068 ok
+70 B 1690 395 338 0.9069 warn
+
+Group8 71-80:
+71 A 1700 400 340 0.9070 ok
+72 B 1710 405 342 0.9071 ok
+73 A 1720 410 344 0.9072 ok
+74 B 1730 415 346 0.9073 ok
+75 A 1740 420 348 0.9074 warn
+76 B 1750 425 350 0.9075 ok
+77 A 1760 430 352 0.9076 ok
+78 B 1770 435 354 0.9077 ok
+79 A 1780 440 356 0.9078 ok
+80 B 1790 445 358 0.9079 warn
+
+Group9 81-90:
+81 A 1800 450 360 0.9080 ok
+82 B 1810 455 362 0.9081 ok
+83 A 1820 460 364 0.9082 ok
+84 B 1830 465 366 0.9083 ok
+8

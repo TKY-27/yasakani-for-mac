@@ -1,0 +1,215 @@
+```cpp
+// bf16_row_norm.cu
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <random>
+#include <chrono>
+
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
+
+// RAII device buffer
+class DeviceBuffer {
+public:
+    DeviceBuffer() : ptr_(nullptr), size_(0) {}
+    
+    explicit DeviceBuffer(size_t bytes) : ptr_(nullptr), size_(bytes) {
+        if (bytes > 0) {
+            CUDA_CHECK(cudaMalloc(&ptr_, bytes));
+        }
+    }
+    
+    ~DeviceBuffer() {
+        if (ptr_) {
+            cudaFree(ptr_);
+            ptr_ = nullptr;
+            size_ = 0;
+        }
+    }
+    
+    // Move constructor
+    DeviceBuffer(DeviceBuffer&& other) noexcept : ptr_(other.ptr_), size_(other.size_) {
+        other.ptr_ = nullptr;
+        other.size_ = 0;
+    }
+    
+    // Move assignment
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            if (ptr_) cudaFree(ptr_);
+            ptr_ = other.ptr_;
+            size_ = other.size_;
+            other.ptr_ = nullptr;
+            other.size_ = 0;
+        }
+        return *this;
+    }
+    
+    // Delete copy operations
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    
+    void* get() const { return ptr_; }
+    size_t size() const { return size_; }
+    
+private:
+    void* ptr_;
+    size_t size_;
+};
+
+// Convert BF16 to FP32
+__device__ inline float bf16_to_float(__nv_bfloat16 b) {
+    return __bfloat162float(b);
+}
+
+// Convert FP32 to BF16
+__device__ inline __nv_bfloat16 float_to_bf16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Vectorized kernel: normalize each row of a BF16 matrix in-place.
+// Each block handles one row. Threads within the block cooperatively compute
+// the sum of squares for that row, then divide each element by sqrt(sum_sq).
+// We use vectorized loads/stores with uint4 (16 bytes = 8 BF16 values per thread load).
+//
+// Layout: Matrix is stored in row-major order. Row i starts at offset i * cols.
+// Each thread processes VEC=8 consecutive BF16 elements.
+//
+// Launch geometry: gridDim.x = num_rows, blockDim.x = threads_per_row
+// where threads_per_row = ceil(cols / VEC)
+
+constexpr int VEC = 8; // 8 BF16 values = 16 bytes = one uint4
+
+__global__ void normalize_rows_bf16(__nv_bfloat16* data, int rows, int cols) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    // Pointer to start of this row
+    __nv_bfloat16* row_ptr = data + static_cast<size_t>(row) * cols;
+    
+    // Number of vector elements in this row
+    int vec_cols = (cols + VEC - 1) / VEC;
+    
+    // Each thread handles one or more vector elements
+    // For simplicity, assume cols is divisible by VEC for the main path,
+    // but handle remainder separately
+    
+    // First pass: compute sum of squares in FP32
+    float local_sum_sq = 0.0f;
+    
+    for (int v = tid; v < vec_cols; v += blockDim.x) {
+        // Load 8 BF16 values as uint4
+        uint4 val = reinterpret_cast<uint4*>(row_ptr)[v];
+        
+        // Extract individual BF16 values and convert to float
+        __nv_bfloat16* elems = reinterpret_cast<__nv_bfloat16*>(&val);
+        for (int j = 0; j < VEC; j++) {
+            float f = bf16_to_float(elems[j]);
+            local_sum_sq += f * f;
+        }
+    }
+    
+    // Block-level reduction for sum of squares
+    __shared__ float sdata[1024];
+    sdata[tid] = local_sum_sq;
+    __syncthreads();
+    
+    // Tree reduction
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    float total_sum_sq = sdata[0];
+    __syncthreads();
+    
+    float inv_norm = 1.0f / sqrtf(total_sum_sq);
+    
+    // Second pass: normalize each element
+    for (int v = tid; v < vec_cols; v += blockDim.x) {
+        uint4 val = reinterpret_cast<uint4*>(row_ptr)[v];
+        __nv_bfloat16* elems = reinterpret_cast<__nv_bfloat16*>(&val);
+        for (int j = 0; j < VEC; j++) {
+            float f = bf16_to_float(elems[j]);
+            float normalized = f * inv_norm;
+            elems[j] = float_to_bf16(normalized);
+        }
+        reinterpret_cast<uint4*>(row_ptr)[v] = val;
+    }
+}
+
+// Reference implementation in FP32 for verification
+void reference_normalize_fp32(std::vector<float>& data, int rows, int cols) {
+    for (int r = 0; r < rows; r++) {
+        float* row = data.data() + static_cast<size_t>(r) * cols;
+        float sum_sq = 0.0f;
+        for (int c = 0; c < cols; c++) {
+            sum_sq += row[c] * row[c];
+        }
+        float norm = std::sqrt(sum_sq);
+        if (norm > 0.0f) {
+            for (int c = 0; c < cols; c++) {
+                row[c] /= norm;
+            }
+        }
+    }
+}
+
+// Deterministic input generation using a fixed seed
+void generate_input(std::vector<__nv_bfloat16>& bf16_data, 
+                    std::vector<float>& fp32_data, 
+                    int rows, int cols, unsigned int seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    
+    size_t total = static_cast<size_t>(rows) * cols;
+    bf16_data.resize(total);
+    fp32_data.resize(total);
+    
+    for (size_t i = 0; i < total; i++) {
+        float val = dist(rng);
+        fp32_data[i] = val;
+        bf16_data[i] = float_to_bf16(val);
+    }
+}
+
+// Parse command-line arguments
+struct Args {
+    int rows = 1024;
+    int cols = 4096;
+    unsigned int seed = 42;
+    bool verbose = false;
+    int warmup_iters = 5;
+    int timing_iters = 20;
+};
+
+bool parse_args(int argc, char** argv, Args& args) {
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--rows" && i + 1 < argc) {
+            args.rows = std::atoi(argv[++i]);
+        } else if (arg == "--cols" && i + 1 < argc) {
+            args.cols = std::atoi(argv[++i]);
+        } else if (arg == "--seed" && i + 1 < argc) {
+            args.seed = static_cast<unsigned int>(std::atoi(argv[++i]));
+        } else if (arg == "--verbose") {
+            args.verbose = true;
+        } else if (arg == "--warmup" && i + 1 < argc) {
+            args.warmup_iters = std::atoi(argv[++i]);
+        } else if (arg == "--iters" && i + 1 < argc) {
+            args.timing_iters

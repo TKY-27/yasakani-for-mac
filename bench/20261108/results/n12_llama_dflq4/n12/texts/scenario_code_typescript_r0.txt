@@ -1,0 +1,564 @@
+# Metrics Service — Complete Implementation
+
+Below is a self-contained, runnable TypeScript 5 service. It uses **only** the Node.js standard library (no third-party runtime dependencies). Tests use `node:test` + `node:assert` (built into Node 18+).
+
+## Project layout
+
+```
+metrics-service/
+├── package.json
+├── tsconfig.json
+├── README.md
+├── src/
+│   ├── types.ts
+│   ├── errors.ts
+│   ├── parser.ts
+│   ├── stats.ts
+│   ├── store.ts
+│   ├── service.ts
+│   ├── server.ts
+│   └── index.ts
+└── test/
+    ├── parser.test.ts
+    ├── stats.test.ts
+    ├── store.test.ts
+    └── service.test.ts
+```
+
+---
+
+## `package.json`
+
+```json
+{
+  "name": "metrics-service",
+  "version": "1.0.0",
+  "description": "Newline-delimited request-metrics ingestion, validation, and aggregation service",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "node --watch --import tsx src/index.ts",
+    "test": "node --test --import tsx test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}
+```
+
+> `tsx` is a dev-only tool for running TS directly during development and tests. The production build compiles to plain JS via `tsc`.
+
+---
+
+## `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "test"]
+}
+```
+
+---
+
+## `src/types.ts`
+
+```typescript
+/**
+ * Core domain types for the metrics service.
+ * All types are strict; no `any` is used.
+ */
+
+/** A single validated request-metric record. */
+export interface MetricRecord {
+  /** Unique identifier for the run (e.g. a UUID or run name). */
+  runId: string;
+  /** Model identifier (e.g. "gpt-4", "llama-7b"). */
+  model: string;
+  /** Fixture / dataset identifier (e.g. "mmlu", "human-eval"). */
+  fixture: string;
+  /** Latency in milliseconds. Must be finite and >= 0. */
+  latencyMs: number;
+  /** Token count. Must be a non-negative integer. */
+  tokens: number;
+  /** Unix epoch timestamp in milliseconds. */
+  timestampMs: number;
+  /** Optional free-form label for the request. */
+  label?: string;
+}
+
+/** A single line of the NDJSON input (before validation). */
+export interface RawLine {
+  /** The raw string content of the line (trimmed). */
+  raw: string;
+  /** 1-based line number in the stream. */
+  line: number;
+}
+
+/** Parsed but not yet validated JSON object from a single line. */
+export type ParsedLine = Record<string, unknown>;
+
+/** Aggregated statistics for a (model, fixture) group. */
+export interface GroupStats {
+  model: string;
+  fixture: string;
+  count: number;
+  mean: number;
+  median: number;
+  /** Sample standard deviation (n-1 denominator). 0 when count < 2. */
+  sampleStdDev: number;
+  min: number;
+  max: number;
+  sum: number;
+}
+
+/** Per-run summary. */
+export interface RunSummary {
+  runId: string;
+  totalRecords: number;
+  groups: GroupStats[];
+  firstTimestampMs: number;
+  lastTimestampMs: number;
+}
+
+/** Overall service summary across all runs. */
+export interface ServiceSummary {
+  totalRuns: number;
+  totalRecords: number;
+  runs: RunSummary[];
+}
+
+/** Health check response. */
+export interface HealthResponse {
+  status: "ok" | "degraded";
+  uptimeMs: number;
+  totalRecords: number;
+  totalRuns: number;
+  memory: {
+    rss: number;
+    heapUsed: number;
+    heapTotal: number;
+  };
+}
+
+/** Error returned for malformed input. */
+export interface MalformedLineError {
+  line: number;
+  raw: string;
+  reason: string;
+}
+
+/** Result of processing a batch of lines. */
+export interface ProcessResult {
+  accepted: number;
+  rejected: MalformedLineError[];
+}
+
+/** Configuration for the in-memory store. */
+export interface StoreConfig {
+  /** Maximum number of records to retain. Oldest are evicted. */
+  maxRecords: number;
+  /** Maximum number of distinct runs to retain. Oldest runs are evicted. */
+  maxRuns: number;
+}
+
+/** HTTP response envelope. */
+export interface ApiResponse<T> {
+  ok: boolean;
+  data?: T;
+  error?: string;
+}
+```
+
+---
+
+## `src/errors.ts`
+
+```typescript
+/**
+ * Custom error types for the metrics service.
+ */
+
+export class MalformedInputError extends Error {
+  public readonly line: number;
+  public readonly raw: string;
+  public readonly reason: string;
+
+  constructor(line: number, raw: string, reason: string) {
+    super(`Line ${line}: ${reason}`);
+    this.name = "MalformedInputError";
+    this.line = line;
+    this.raw = raw;
+    this.reason = reason;
+  }
+}
+
+export class StoreFullError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StoreFullError";
+  }
+}
+
+export class RunNotFoundError extends Error {
+  public readonly runId: string;
+
+  constructor(runId: string) {
+    super(`Run "${runId}" not found`);
+    this.name = "RunNotFoundError";
+    this.runId = runId;
+  }
+}
+```
+
+---
+
+## `src/parser.ts`
+
+```typescript
+/**
+ * Incremental NDJSON parser with strict validation.
+ * No third-party schema libraries — all validation is hand-rolled.
+ */
+
+import type {
+  MetricRecord,
+  ParsedLine,
+  RawLine,
+  MalformedLineError,
+  ProcessResult,
+} from "./types.js";
+import { MalformedInputError } from "./errors.js";
+
+/** Maximum length of a single line (bytes). */
+const MAX_LINE_LENGTH = 65_536;
+
+/** Maximum length for string fields. */
+const MAX_STRING_LENGTH = 512;
+
+/**
+ * Incremental line splitter.
+ * Feeds it chunks of text; it yields complete lines.
+ * Handles partial lines that span chunk boundaries.
+ */
+export class LineSplitter {
+  private buffer: string = "";
+  private lineCounter: number = 0;
+
+  /**
+   * Feed a chunk of text. Returns an array of complete lines.
+   * The last partial line (if any) is retained in the internal buffer.
+   */
+  feed(chunk: string): RawLine[] {
+    this.buffer += chunk;
+    const lines: RawLine[] = [];
+    let start = 0;
+
+    while (true) {
+      const newlineIdx = this.buffer.indexOf("\n", start);
+      if (newlineIdx === -1) {
+        break;
+      }
+      const raw = this.buffer.slice(start, newlineIdx);
+      start = newlineIdx + 1;
+      this.lineCounter += 1;
+      lines.push({ raw, line: this.lineCounter });
+    }
+
+    // Keep the remainder (partial line) in the buffer.
+    this.buffer = this.buffer.slice(start);
+
+    // Guard against unbounded buffer growth.
+    if (this.buffer.length > MAX_LINE_LENGTH) {
+      // Discard the oversized partial line and reset.
+      this.buffer = "";
+      this.lineCounter += 1;
+      lines.push({ raw: "", line: this.lineCounter });
+    }
+
+    return lines;
+  }
+
+  /**
+   * Flush any remaining partial line (e.g. at end of stream).
+   */
+  flush(): RawLine[] {
+    if (this.buffer.length === 0) {
+      return [];
+    }
+    const raw = this.buffer;
+    this.buffer = "";
+    this.lineCounter += 1;
+    return [{ raw, line: this.lineCounter }];
+  }
+
+  /** Reset the splitter state. */
+  reset(): void {
+    this.buffer = "";
+    this.lineCounter = 0;
+  }
+}
+
+/**
+ * Validate a single parsed JSON object against the MetricRecord schema.
+ * Returns the validated record or throws MalformedInputError.
+ */
+export function validateRecord(
+  obj: ParsedLine,
+  line: number,
+  raw: string
+): MetricRecord {
+  // Must be a plain object (not null, not array).
+  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
+    throw new MalformedInputError(line, raw, "Expected a JSON object");
+  }
+
+  // --- runId ---
+  const runId = obj["runId"];
+  if (typeof runId !== "string" || runId.length === 0) {
+    throw new MalformedInputError(line, raw, "runId must be a non-empty string");
+  }
+  if (runId.length > MAX_STRING_LENGTH) {
+    throw new MalformedInputError(line, raw, "runId exceeds max length");
+  }
+
+  // --- model ---
+  const model = obj["model"];
+  if (typeof model !== "string" || model.length === 0) {
+    throw new MalformedInputError(line, raw, "model must be a non-empty string");
+  }
+  if (model.length > MAX_STRING_LENGTH) {
+    throw new MalformedInputError(line, raw, "model exceeds max length");
+  }
+
+  // --- fixture ---
+  const fixture = obj["fixture"];
+  if (typeof fixture !== "string" || fixture.length === 0) {
+    throw new MalformedInputError(line, raw, "fixture must be a non-empty string");
+  }
+  if (fixture.length > MAX_STRING_LENGTH) {
+    throw new MalformedInputError(line, raw, "fixture exceeds max length");
+  }
+
+  // --- latencyMs ---
+  const latencyMs = obj["latencyMs"];
+  if (typeof latencyMs !== "number" || !Number.isFinite(latencyMs)) {
+    throw new MalformedInputError(line, raw, "latencyMs must be a finite number");
+  }
+  if (latencyMs < 0) {
+    throw new MalformedInputError(line, raw, "latencyMs must be >= 0");
+  }
+
+  // --- tokens ---
+  const tokens = obj["tokens"];
+  if (typeof tokens !== "number" || !Number.isInteger(tokens)) {
+    throw new MalformedInputError(line, raw, "tokens must be an integer");
+  }
+  if (tokens < 0) {
+    throw new MalformedInputError(line, raw, "tokens must be >= 0");
+  }
+
+  // --- timestampMs ---
+  const timestampMs = obj["timestampMs"];
+  if (typeof timestampMs !== "number" || !Number.isFinite(timestampMs)) {
+    throw new MalformedInputError(line, raw, "timestampMs must be a finite number");
+  }
+  if (timestampMs < 0) {
+    throw new MalformedInputError(line, raw, "timestampMs must be >= 0");
+  }
+
+  // --- label (optional) ---
+  let label: string | undefined;
+  if (obj["label"] !== undefined) {
+    if (typeof obj["label"] !== "string") {
+      throw new MalformedInputError(line, raw, "label must be a string when present");
+    }
+    if ((obj["label"] as string).length > MAX_STRING_LENGTH) {
+      throw new MalformedInputError(line, raw, "label exceeds max length");
+    }
+    label = obj["label"] as string;
+  }
+
+  const record: MetricRecord = {
+    runId,
+    model,
+    fixture,
+    latencyMs,
+    tokens,
+    timestampMs,
+  };
+  if (label !== undefined) {
+    record.label = label;
+  }
+
+  return record;
+}
+
+/**
+ * Parse and validate a single NDJSON line.
+ * Returns the validated record, or throws MalformedInputError.
+ */
+export function parseLine(rawLine: RawLine): MetricRecord {
+  const trimmed = rawLine.raw.trim();
+
+  // Skip empty lines silently (they are not errors).
+  if (trimmed.length === 0) {
+    throw new MalformedInputError(rawLine.line, rawLine.raw, "Empty line");
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new MalformedInputError(rawLine.line, rawLine.raw, "Invalid JSON");
+  }
+
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new MalformedInputError(rawLine.line, rawLine.raw, "Expected a JSON object");
+  }
+
+  return validateRecord(parsed as ParsedLine, rawLine.line, rawLine.raw);
+}
+
+/**
+ * Process a batch of raw lines.
+ * Returns accepted records and a list of rejection reasons.
+ */
+export function processLines(lines: RawLine[]): {
+  records: MetricRecord[];
+  result: ProcessResult;
+} {
+  const records: MetricRecord[] = [];
+  const rejected: MalformedLineError[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.raw.trim();
+    if (trimmed.length === 0) {
+      continue; // silently skip empty lines
+    }
+    try {
+      const record = parseLine(line);
+      records.push(record);
+    } catch (err) {
+      if (err instanceof MalformedInputError) {
+        rejected.push({
+          line: err.line,
+          raw: err.raw,
+          reason: err.reason,
+        });
+      } else {
+        rejected.push({
+          line: line.line,
+          raw: line.raw,
+          reason: "Unexpected internal error",
+        });
+      }
+    }
+  }
+
+  return {
+    records,
+    result: {
+      accepted: records.length,
+      rejected,
+    },
+  };
+}
+```
+
+---
+
+## `src/stats.ts`
+
+```typescript
+/**
+ * Statistical computations: mean, median, sample standard deviation.
+ * All functions are pure and operate on number arrays.
+ */
+
+/**
+ * Compute the arithmetic mean.
+ * Returns 0 for an empty array.
+ */
+export function mean(values: readonly number[]): number {
+  if (values.length === 0) {
+    return 0;
+  }
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) {
+    sum += values[i]!;
+  }
+  return sum / values.length;
+}
+
+/**
+ * Compute the median.
+ * For even-length arrays, returns the average of the two middle values.
+ * Returns 0 for an empty array.
+ * Does not mutate the input.
+ */
+export function median(values: readonly number[]): number {
+  if (values.length === 0) {
+    return 0;
+  }
+  // Copy and sort to avoid mutating the caller's array.
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) {
+    return sorted[mid]!;
+  }
+  return (sorted[mid - 1]! + sorted[mid]!) / 2;
+}
+
+/**
+ * Compute the sample standard deviation (n-1 denominator, Bessel's correction).
+ * Returns 0 when n < 2.
+ */
+export function sampleStdDev(values: readonly number[]): number {
+  const n = values.length;
+  if (n < 2) {
+    return 0;
+  }
+  const m = mean(values);
+  let sumSqDiff = 0;
+  for (let i = 0; i < n; i++) {
+    const diff = values[i]! - m;
+    sumSqDiff += diff * diff;
+  }
+  return Math.sqrt(sumSqDiff / (n - 1));
+}
+
+/**
+ * Compute min and max.
+ * Returns { min: 0, max: 0 } for an empty array.
+ */
+export function minMax(values: readonly number[]): { min: number; max: number } {
+  if (values.length === 0) {
+    return { min: 0,

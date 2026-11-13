@@ -1,0 +1,84 @@
+We need answer user: "Implement a complete CUDA 13.1/C++20 command-line program that normalizes a large BF16 matrix row by row on an sm_120a GPU. Include argument parsing, RAII device buffers, a numerically stable FP32 reference, a vectorized CUDA kernel, warm-up, CUDA-event timing, deterministic input generation, error checking, tolerance-based verification, and a CMakeLists.txt. Explain the memory layout and launch geometry after the code. Do not omit implementations or replace sections with comments."
+
+Need provide complete code and CMakeLists and explanation. Need consider CUDA 13.1? Actually latest maybe 12.x, 13? User says CUDA 13.1. sm_120a likely Blackwell? Need support bf16 via cuda_bf16? In CUDA C++ 12.8? For sm_120a? Need use __nv_bfloat16, __nv_bfloat162. CUDA 13.1 maybe okay. Need C++20. Program normalizes large BF16 matrix row by row. What normalization? likely row-wise normalization: each row vector normalized to unit L2 norm? Could be row mean/std? "normalize a large BF16 matrix row by row" likely row-wise L2 normalization. Need include deterministic input generation, FP32 reference stable. We can define: for each row i, y[j] = x[j] / sqrt(sum_{k=0}^{C-1} x[k]^2 + eps) maybe with eps. Stable FP32: compute sum of squares in FP32 using Kahan or pairwise? In kernel, compute row norm in FP32, maybe use Welford? For stability, use compensated summation (Kahan) for squares. For reference, same stable FP32 but host. Need BF16 output.
+
+Need complete program: argument parsing: --rows, --cols, --seed, --warmup, --iters, --epsilon? --block? --verify? Maybe. RAII device buffers: class CudaBuffer or unique_ptr with custom deleter? Need ensure error checking macro. Deterministic input generation: CPU generate random bf16 values using splitmix/Philox? Deterministic across runs: seed. Could generate as float then convert to bf16. Maybe large matrix: rows*cols maybe 1M rows 1M cols? Need memory. Use size_t and check 64-bit.
+
+Vectorized CUDA kernel: row by row. If cols large and multiple of 8, use float4 or bf16x8 vector. __nv_bfloat162 pairs? Need vectorized loads. For sm_120a, 128-bit loads. We can define struct BF16x8 alignas(16) { __nv_bfloat162 v[4]; } or __nv_bfloat162. But simpler: use uint4? Need ensure type. CUDA provides __nv_bfloat162. We can create:
+struct alignas(16) BF16x8 { __nv_bfloat162 x[4]; };
+But loading as BF16x8* maybe alignment. Need kernel:
+__global__ void row_normalize_bf16_kernel(const __nv_bfloat16* x, __nv_bfloat16* y, int rows, int cols, float eps)
+One block per row? For large rows maybe block per row is okay but if cols huge need grid-stride. Or one block per row with vectorized grid-stride over row elements. Launch geometry: rows blocks, maybe block size 256/512. If rows large, max grid dims? x dim up to 2^31-1? CUDA max grid.x 2^31-1? 1D grid max 2^31-1? 2^31-1 = 2147483647. Rows could exceed? But practical. Could use grid.y/z for rows to support > 2^31? Max total blocks 2^31-1? Actually 3D total grid dims product? Grid y,z max 65535. Rows could fit in y? 65535 only. Could use blockIdx.x + blockIdx.y*gridDim.x? But gridDim.x max 2^31-1? 1D enough. We'll restrict rows <= 2^31-1? Use uint32_t.
+
+Vectorization: require cols % 8 ==0 for vector path? Or handle tail scalar? Complete robust: kernel supports arbitrary cols, but vectorized path for cols % 8 == 0? User asks vectorized kernel. Could implement if cols multiple of 8; otherwise fall back to scalar kernel. But complete should handle any cols. Could implement vectorized with tail handled: process vector chunks and tail. But to ensure vectorization, for large cols multiple of 8. Maybe require cols % 8 ==0 by program? We can parse and validate; but better handle tail.
+
+Kernel design:
+- One block per row.
+- Each thread processes elements in stride of blockDim.x * 8 (if vector path). For each vector element (8 bf16), convert to float, square, add to thread local sum with Kahan? Then reduction across threads to row sum. Then compute inv_norm = rsqrtf(sum + eps) maybe stable: if sum==0, inv=1? Normalization of zero row: avoid NaN; y = x. For eps. Use sqrtf? inv = 1.0f / sqrtf(norm2 + eps). If norm2 zero maybe 1/sqrt(eps). But row normalization typically divide by norm, eps to avoid zero. If norm2 + eps. We'll define epsilon argument default 1e-12. If norm2 is 0, denominator sqrt(eps). Could choose if norm2 == 0 then 0 output? "normalize" maybe unit norm; zero vector remains zero. More mathematically: y = x / sqrt(sum x^2 + eps). If sum zero, y = 0/sqrt(eps)=0. Good.
+- Reduction: Use shared float array. Each thread writes partial sum with Kahan? Need reduce sum of squares. If each thread uses Kahan, thread's sum accurate. Then block reduction sum partial sums using Kahan? For stability, use Kahan over partial sums or pairwise? Simpler: each thread accumulates with Kahan, then block reduce using shared memory tree; for numerical stable, we can use Kahan across block reduction? Not necessary but can implement: after threads write partials, reduce in tree. For exact stable, maybe use double? But reference FP32. Could compute sum in double? "numerically stable FP32 reference" likely FP32. Use Kahan in kernel and reference. For reference, use FP32 Kahan.
+
+Need memory layout: Matrix row-major contiguous: row i offset i*cols. Rows length cols. BF16 2 bytes each. 8 BF16 = 16 bytes. Use row-major, alignment to 16 bytes if base allocation aligned by CUDA (cudaMalloc returns 256 byte alignment? likely 256). Ensure cols*cols? offset i*cols*2; for vector loads all rows need 16-byte alignment if cols %8==0. If cols %8 !=0, vector loads not aligned for row offsets except first? If row length not multiple of 8, row starts at 16-byte alignment? offset multiple of 16 only if cols %8==0. For arbitrary cols, use scalar for vector? Could implement vector path only when cols %8==0 and base aligned; else scalar. That's robust. CudaMalloc aligns to 256 bytes I believe, but use cudaMalloc. Good.
+
+Kernel scalar path:
+__global__ void row_normalize_scalar_kernel(...)
+Each thread processes stride. Use float sum, comp.
+For vector path, need convert BF16x8 to 8 floats, square. Could use __bfloat1622float2 for pairs. Then square each. We can unroll. Need accumulate Kahan:
+inline __device__ void kahan_add(float &sum, float &comp, float val) {
+ float y = val - comp;
+ float t = sum + y;
+ comp = (t - sum) - y;
+ sum = t;
+}
+For vector: val = a*a etc; call kahan_add for each. Or accumulate local float sum, comp; but each val square. Need avoid too many function calls? fine.
+
+But vector path block reduction: Each thread has sum. Need shared float partials[blockDim.x]. Write. __syncthreads. Tree reduce. Use kahan? Tree sum not Kahan. Could use two-phase: after tree, maybe use Kahan sequentially? But tree reduction order deterministic. For stable, can do shared reduction with pairwise, and then one thread uses Kahan over shared partials? Actually partials already Kahan per thread. Tree sums of 256 values; FP32 addition. To be stable, can reduce using Kahan in one thread over 256 partials: after sync, thread0 loop over shared, Kahan. But need sync before and after. Better:
+__shared__ float s_data[512];
+int tid = threadIdx.x;
+s_data[tid] = sum;
+__syncthreads();
+for (int stride = blockDim.x/2; stride >0; stride >>=1) if (tid<stride) s_data[tid] += s_data[tid+stride];
+__syncthreads();
+float total = s_data[0]; if (tid==0) { /* maybe kahan? */ }
+Could do Kahan after tree? But tree already summed. For exact stable, maybe use double in reduction? But "FP32 reference" not necessarily kernel must be FP32 stable; but use FP32. Could do Kahan reduction across partials: after writing partials, __syncthreads, if tid==0 { float total=0, c=0; for i in 0..blockDim.x-1 kahan_add(total,c,s_data[i]); s_data[0]=total; } __syncthreads(); That is O(N) by one thread but small. Deterministic. It preserves stable. But if blockDim up to 1024, fine. However other threads waiting. Good. But if block processes large row in multiple vector iterations, each thread has partial Kahan. Single-thread Kahan over 1024 values is stable. Use blockDim <=1024. Good. Then write total. Then all threads need inv_norm. Use s_data[0] after sync.
+
+But if rows large and cols small, block per row with 1024 threads wasted. Could choose block size min(512, cols/8 maybe). But launch geometry fixed? Could parse --block-size. Need ensure vector path threads >0. For scalar if cols < block size, threads handle. We can set block size default 256. Use min(512, next? no). For performance, one block per row; block size chosen 256 or 512. If cols/8 < block, threads idle in first vector iteration; tail? For vector path if cols%8==0, vec_count=cols/8. Each thread does for idx=tid; idx<vec_count; idx+=blockDim.x. If vec_count less than blockDim, some threads sum=0. Reduction okay.
+
+Need maybe support large matrix where rows exceed int? Use size_t total elements; kernel args int rows, int cols? If rows*cols > 2^31? Could use int64_t? CUDA grid max? Need use unsigned int for indices? Let's think. "large BF16 matrix" likely rows*cols big but each dimension fits 32-bit? Could use int for rows, cols; validate total elements <= SIZE_MAX / sizeof. For CUDA, kernel pointers and indices: if total > 2^31, need 64-bit indexing. Use long long or int64_t for row offset. But grid dims 32-bit. We can have rows, cols as int? Maybe large: 100k x 100k = 1e10 elements => 20GB BF16; too big. Realistic large maybe 100k x 8192. int okay. But to be robust, use int64_t rows, cols in host, but pass int? If >2^31 impossible grid. Could validate rows <= INT_MAX, cols <= INT_MAX, total <= maybe 2^31? But memory bigger. Use size_t for allocation; kernel can use int row, int cols but offset int64_t? Let's design with int32 rows, cols for grid and index, but check product <= 2^31? Not necessary if memory. But for correctness, use int64_t offsets inside kernel: long long row_start = (long long)row * cols; Then index long long. Use vector pointer: const BF16x8* xrow = reinterpret_cast<const BF16x8*>(x + row_start); if cols %8==0. row_start int64. Good. cols int. vec_count = cols/8 int. Use int loop but row offset 64-bit.
+
+CUDA grid: dim3 grid(rows); rows int. Need check rows <= gridDim.x max (2147483647). C++ int max. Use int rows. Argument parse rows/cols as long long then validate >0 and <= INT_MAX? Good.
+
+Argument parsing: simple manual C++20. Options:
+--rows <N>
+--cols <N>
+--seed <I> default 0
+--warmup <N> default 3
+--iterations <N> default 10
+--epsilon <float> default 1e-12
+--block-size <int> default 256
+--threads-per-row? same.
+--verify <0/1> default 1
+--help
+Maybe --output? Not needed.
+Need maybe --check? We'll implement.
+Parsing using std::filesystem? No.
+Need error checking: CUDA_TRY macro for cudaError_t. For host errors, std::cerr, exit.
+Use std::format? CUDA 13 C++20, can use std::print? But for portability use iostream/cstdio. Complete.
+
+RAII device buffers: struct CudaBuffer {
+ explicit CudaBuffer(size_t bytes) { if (bytes>0) cudaMalloc... }
+ ~CudaBuffer() { if (ptr) cudaFree; }
+ CudaBuffer(const&)=delete; CudaBuffer& operator=(...)=delete;
+ CudaBuffer(CudaBuffer&&) noexcept { ptr = other.ptr; other.ptr=nullptr; size=other.size; other.size=0; }
+ operator=(CudaBuffer&&) ...
+ void* get() const;
+};
+Maybe need zero initialization? No.
+Need maybe CudaEvent RAII: struct CudaEvent { cudaEvent_t ev; CudaEvent(cudaEventRecord?); ~; }; But can just create events and free. RAII for buffers required. Events can be RAII too. Use class CudaEvent.
+
+Deterministic input generation: On host, fill std::vector<__nv_bfloat16> or float? Need generate reproducible random BF16 values. Use splitmix64. Convert float to bf16 using __float2bfloat16_rn. Need values in range maybe [-1,1) or normal distribution? Use deterministic uniform [-1,1) to avoid overflow. For each row, could generate row values. But large matrix memory host might be huge. Need generate deterministic input for reference. We need both device input and host reference input. If matrix huge, storing host copy as bf16/fp32 huge. Could generate on CPU twice? Need input for device and reference. For verification, need input and output. Could generate host input vector of bf16 for reference? For large matrix, maybe too much. But user asks deterministic input generation; probably host generate and copy. For "large" maybe still need host. Could generate in chunks to verify to reduce memory? Complete but efficient? Need tolerance-based verification. Could compute reference row by row in chunks and compare to device output. That avoids storing entire host input? Need device output. We can generate deterministic input on host chunk-wise, copy chunk to device? But device input must be fully present. Could generate full host input then copy; memory maybe double. Alternative generate on GPU deterministically? But reference needs same values; can regenerate on host in chunks. We can avoid full host input by generating chunks: first fill device input by generating chunks and copying; second pass generate chunks for reference and compare with device output (read back chunks). But device output full needed. This is better for large matrices. Need ensure deterministic generation independent of chunking. Use global index = row*cols + col. Use splitmix64(seed + global_index) maybe. But per-element random. For each element generate float in [-1,1). Then bf16. Could be slow for huge but okay.
+
+But to verify, we can process host chunks of e.g. 1024 rows. For each row, compute reference normalized values in FP32 stable, compare to device output chunk. Need output read into host bf16 chunk. We can allocate host vector bf16 chunk. For input generation, need generate bf16 values; for reference, same values but in FP32? Important: input stored as BF16, reference should use exact BF16 values converted to FP32, not original float before rounding. So when generating, convert float to bf16, then for reference convert bf16 back to float (or use __bfloat162float). For device, input is bf16. Good.
+
+Need input generation function:
+template <typename T> void generate_bf16_chunk(const Args& a, size_t start_index, size_t count, __nv_bfloat16* out) {
+ uint64_t state = seed ^ start_index? Need deterministic. If using splitmix per element with state = seed + i? Simpler: for i from 0 to count-1: uint64_t z = seed + global_index; uint64_t x = z; z = x + 0x9e3779b97f4a7c15; x ^= x >> 30; x *= 0xbf58476d1ce4e5b9; x ^= x >> 27; x *= 0x94d049bb133111eb; x ^= x >> 31; uint32_t r = (x & 0x7fffffff); float f = (r / 0x7fffffff) *

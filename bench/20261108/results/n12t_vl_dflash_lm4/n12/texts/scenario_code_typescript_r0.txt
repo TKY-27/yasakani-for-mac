@@ -1,0 +1,213 @@
+The user wants a complete TypeScript 5 service:
+
+- Consumes newline-delimited request metrics (NDJSON)
+- Validates without third-party schema libraries (no Zod / Joi, hand-rolled validation)
+- Groups records by model and fixture
+- Computes mean / median / sample standard deviation
+- Exposes /health, /summary, /runs/:id endpoints
+- Strict typing, incremental parsing, memory-bounded (bounded buffer, sliding window, or capped aggregation), malformed-input errors, unit tests, package.json, tsconfig.json, short operations guide, no placeholders.
+
+This is a large deliverable. I should create a complete, executable codebase. Let me design carefully.
+
+## Design
+
+**Input format:** NDJSON lines like:
+
+```json
+{"runId":"run-123","model":"gpt-x","fixture":"fct-alpha","requestId":"r-1","latencyMs":123.4,"status":"ok","ts":1699999999123}
+```
+
+Fields:
+- `runId` (string) — required, non-empty
+- `model` (string) — required, non-empty
+- `fixture` (string) — required, non-empty
+- `latencyMs` (number) — required, finite, >= 0
+- `requestId`? optional
+- `status`? optional
+- `ts`? optional, a number or an ISO string
+
+Keep required fields minimal so tests stay simple: `runId`, `model`, `fixture`, `latencyMs`.
+
+**Validation rules (no third-party schema library):**
+- Each line must be valid JSON (per line).
+- Top-level must be an object (not array / primitive).
+- `runId`: string, non-empty after trim, maybe max length 128.
+- `model`: string, non-empty, max 64, allowed charset? Keep it simple: non-empty string, max 128.
+- `fixture`: string, non-empty, max 128.
+- `latencyMs`: number (not NaN / Infinity), >= 0, upper bound 86_400_000 (24h) to reject absurd values.
+- `ts`: optional, number (ms since epoch), or ISO 8601 string; when present, validate within a plausible range.
+- Unknown fields: tolerate (forward-compatible) — or reject? Tolerate with a note. Actually, strictness may matter; be lenient: ignore unknown fields but count them? Keep it simple: ignore.
+- Duplicate `requestId` within same run/model/fixture: optional deduplication. Deduplicate on `(runId, model, fixture, requestId)` if requestId is present; if not, count all.
+
+**Bounded memory:**
+- Maintain a capped aggregate map keyed by `${runId}|${model}|${fixture}`. Keep running sums + squared sums for mean and sample std (n, sum, sumSq), plus a bounded reservoir for median... Median requires all values. Options:
+  - A bounded per-group reservoir sampling to approximate the median.
+  - Or, if the number of distinct groups is bounded, keep a fully sorted structure per group, capping the number of values stored per group (e.g., a capped priority queue: keep up to K most recent values per group; compute the median on the capped set and report `sampleCount` vs `reportedCount`).
+  - Document clearly: `valuesKept` vs `totalCount`, median computed on a capped window. This is honest and memory-bounded.
+  - Bounded number of groups: cap at e.g. 512 distinct groups; if exceeded, reject the record with an error (or route to an overflow bucket). Better: reject with a `group_limit_exceeded` error and count it in `rejectedCount`. Actually, in a streaming service it's better to reject the offending record with an error code and continue.
+  - Also a global buffer cap: an in-memory pending-line ring buffer of recent lines for /health or diagnostics? Not needed. Keep it: bounded error ring buffer (last N errors) for /health or /errors? The requirement is malformed-input errors — meaning the service must surface errors for malformed input. In NDJSON streaming: parse errors, schema violations, JSON syntax errors — produce structured error objects with line numbers and continue processing. Expose counters in /health. Also, if the input comes via an HTTP POST /ingest? The user said "consumes newline-delimited request metrics". The source of NDJSON isn't specified — could be a file, stdin, or an ingest endpoint. To make it a complete service: support multiple sources:
+  - File watch? Overkill.
+  - Simplest, complete approach: POST /ingest accepts a `text/plain` NDJSON body and returns per-line results (line, ok/error). The service also exposes GET /health, GET /summary, GET /runs/:id.
+  - Additionally a `--file path` CLI mode reads a file, processes, prints a summary and exits. That gives us incremental parsing + bounded memory even for huge files.
+
+This makes it a "complete service". Endpoints:
+- `GET /health` → 200 `{ status: "ok", uptimeSec, receivedLines, processedLines, errorLines, groups: n, bufferHighWater, ... }`
+- `GET /summary` → global aggregate: total records, distinct runs/models/fixtures, overall mean/median/std across all values? And per-group table (bounded, maybe top N by count). Include per-group stats.
+- `GET /runs/:id` → all groups (model × fixture) for that run with stats; 404 if unknown; 404 body.
+- `POST /ingest` → body is NDJSON; returns `{ accepted, rejected, errors: [ ... ] }`, bounded list of errors (last 50).
+
+**Incremental parsing:** an NDJSONLineParser that accepts string chunks (any boundaries) and yields complete lines incrementally. Must handle partial lines straddling chunk boundaries, CRLF, skipping empty lines (or counting them), max-line-length guard (reject lines longer than N, e.g., 64KB, to bound memory).
+
+**Statistics:**
+- Mean: sum/n.
+- Sample standard deviation: sqrt( (Σx² - n·mean²) / (n-1) ) — but numerically unstable; better to use Welford's online algorithm. Welford gives M2 = Σ(x - xbar)². Sample std = sqrt(M2/(n-1)). Mean = M1. Use Welford for accuracy.
+- Median: on a capped bounded reservoir (e.g., last K values per group, K configurable, default maybe 4096 — or 20000?). Use a ring buffer per group; compute median by copying and sorting on demand (O(K log K) at query time, fine). Report `medianSource: "window"` and `windowSize`, plus `windowFill`... Report `n` (total count for group) and `kept` (values in window). Median is computed on the kept values. Document: when n <= kept, the median is exact; otherwise approximate.
+
+**Types:** strict TS 5, `strict: true`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`? exactOptionalPropertyTypes can get finicky; include? Might be annoying for API types; leave off but keep `strict`. Include `noUncheckedIndexedAccess: true` and `noImplicitOverride`, `forceConsistentCasingInFileNames`. TS 5.x.
+
+**Runtime:** Node 18+, zero runtime dependencies? Tests need a test framework. "Unit tests" — I can use `node:test` built-in (Node 18/20) to avoid dependencies. That keeps the project dependency-free (dev deps just typescript + @types/node). tsconfig with `module: NodeNext` or `Node16`, `target ES2022`. Build with `tsc`, run with `node dist/...` or `tsx`. Use `node --test` on compiled JS, or use `ts-node`? Simplest: compile with tsc, run tests on dist via `node --test dist/test/*.test.js`. Set tsconfig outDir to dist. Tests import from `../src/...`? If compiled, the relative paths remain valid. Write tests that import from `../src/...`, and after compilation they resolve to `../src/...` under dist.
+
+package.json scripts:
+- `build`: tsc -p tsconfig.json
+- `test`: node --test dist/test/ (after build) → script: `npm test` = `tsc -p tsconfig.json && node --test dist/test/`
+- `start`: `tsc && node dist/src/index.js`? Hmm, layout.
+
+Layout:
+
+```
+package.json
+tsconfig.json
+README.md (ops guide)
+src/
+  index.ts          (bootstrap: express-free HTTP server + optional file mode)
+  config.ts         (config types + defaults + env parsing)
+  types.ts          (public types: MetricRecord, ValidationErrors, GroupStats, etc.)
+  parse/ndjson.ts   (incremental line parser)
+  validate/validate.ts (field validators + validateRecord)
+  stats/aggregate.ts (GroupKey, Welford, ring window, GroupAggregator, Store)
+  errors.ts        (ErrorCodes, MalformedLineError, IngestResult, etc.)
+  http/server.ts   (createServer, routes, JSON helpers, body limits)
+  cli.ts           (file mode: read file, stream-process, print summary)
+test/
+  ndjson.test.ts
+  validate.test.ts
+  aggregate.test.ts
+  stats.test.ts (mean/median/std known values)
+  server.test.ts (integration: POST /ingest, GET /summary, /runs/:id, /health)
+```
+
+Keep it complete but manageable. The user wants "no placeholders" — everything must be executable. I have to be careful that code compiles under strict TS. Let me write everything meticulously.
+
+Key design decisions to spell out:
+
+**Record schema (documented in README):**
+
+```ts
+interface MetricRecord {
+  runId: string;
+  model: string;
+  fixture: string;
+  latencyMs: number;
+  requestId?: string;
+  ts?: number; // epoch ms
+}
+```
+
+Validation function returns `{ ok: true, record }` or `{ ok: false, errors: FieldError[] }`.
+
+Error codes: `E_JSON_SYNTAX`, `E_NOT_OBJECT`, `E_MISSING_FIELD`, `E_FIELD_TYPE`, `E_FIELD_RANGE`, `E_FIELD_LENGTH`, `E_GROUP_LIMIT`, `E_LINE_TOO_LONG`, `E_DUPLICATE`? Deduplication: if a duplicate key `(runId,model,fixture,requestId)` appears, treat as a warning count but still ingest? Better to reject duplicates with `E_DUPLICATE_REQUEST` and count them. Need a bounded dedup set: store seen requestKeys in a Set per group bounded by the window size? Simpler: global dedup Set bounded to say 200_000; on overflow, clear? Bounded memory: `Map<string, GroupAgg>` with a per-group Set of requestId strings, bounded by windowSize — discard oldest? A Set is not a FIFO by default; we can track and prune... Simplest: keep dedup only for requestIds seen within the current capped window? That's a semantic change. Alternative: skip dedup entirely; not required. Drop it — not required by the spec. Avoid complexity. No deduplication.
+
+**Group key:** `${runId}\u0000${model}\u0000${fixture}` — use NUL as separator to avoid collisions with normal strings. Key type as string.
+
+**Store:**
+
+```ts
+class MetricsStore {
+  private groups = new Map<string, GroupAgg>();
+  ...
+  ingest(rec: MetricRecord): IngestOutcome
+  groupStats(runId?): ...
+  summary(): ...
+}
+```
+
+Bounded groups: `maxGroups` (default 1024). If a new group would exceed, reject with `E_GROUP_LIMIT` and increment a counter. Known groups always accepted.
+
+Per-group ring window: `maxWindow` (default 8192? make it 4096). Values stored in a Float64Array ring with an index pointer; when full, overwrite the oldest. Welford tracks all values (memory O(1) per group), so mean/std are over all values; median is over the last `kept` values. Report `windowSize: kept`.
+
+**Incremental NDJSON parser:**
+
+```ts
+class LineParser {
+  private buf: string = '';  // actually use string chunks; bounded
+  ...
+  push(chunk: string): ParsedLine[]
+  end(): ParsedLine[]
+}
+```
+
+With `maxLineLength` (default 65_536): if the pending buffer exceeds this without a newline, emit an error `E_LINE_TOO_LONG` and resync to next newline. Implementation: track `sinceNewline` counter; when buf.length exceeds the limit and no newline has been found yet... Simpler: after appending chunk, process: find newlines sequentially; if segment length between newlines exceeds limit, produce an error and skip to the next newline. Buffer management: keep the unprocessed tail.
+
+Implementation approach:
+- `private buffer = ''` (unprocessed tail).
+- `push(chunk)`: `buffer += chunk`; then loop: find index of `\n` or `\r`. Handle `\r\n`: if char is `\r` and next is `\n`, strip both; lone `\r` also counts as a separator (old Mac) — treat as a separator.
+- On newline found at i: `line = buffer.slice(0, i)`; if the line (after trim) exceeds maxLineLength → emit error line with code `E_LINE_TOO_LONG` (don't attempt JSON.parse); otherwise emit `{ lineNo, text: line }`. Advance buffer.
+- Line numbering: count separator occurrences to track a logical line number.
+- Track "long-line" state: if buffer grows and no newline found within `maxLineLength` since the last newline, need to flush early. To keep it O(1)-ish: after appending, while scanning: maintain `scanPos`; if `buffer.length - scanPos > maxLineLength` and no newline in between — actually, if no newline is found anywhere in the remaining buffer and buffer exceeds max, we can emit an error for the current partial line and clear the buffer (discard the partial line, wait for next chunk? no — the rest of the long line will keep arriving; we should resync at the next newline). Approach: mark `oversized = true` when `(buffer.length - scanPos) > maxLineLength` with no newline seen; when we find the next newline, emit `E_LINE_TOO_LONG` error once, discard content; continue processing. Also guard: if oversized and no newline, drop buffer contents as we receive more? If we keep appending to buffer it grows unbounded. So if oversized and buffer length > maxLineLength + margin and no newline found in the latest chunk... Actually simpler: while oversized, on each push, search for `\n` in the chunk; if found, emit an error and resume from after it, keeping only the tail after the last newline in buffer; if not found, keep buffer = chunk.slice(lastNewline+1), but cap: if that tail exceeds maxLineLength, discard entirely (set buffer = '', oversized stays true, but the next time we find a newline we still emit an error... but we lost track of the fact that we had a partial line — that's fine: emit the error when we eventually resync; if the stream just ends in a giant line, emit on end()).
+
+Let me define the parser precisely:
+
+```ts
+interface ParsedLine {
+  lineNo: number;
+  kind: 'line' | 'error';
+  text?: string;   // for kind === 'line'
+  code?: 'E_LINE_TOO_LONG' | 'E_EMPTY_LINE';
+}
+```
+
+Empty lines: skip silently, but count them? Emit an 'empty' event? Silently skip; track `emptyLines` in stats. Keep parser pure: return `{ lines, errors }` arrays.
+
+Simpler API: `push(chunk): { lines: string[]; longErrors: number; lineNos: number[] }` hmm messy. Let me make it an event: `type LineEvent = { type:'line'; lineNo:number; text:string } | { type:'error'; lineNo:number; code:'E_LINE_TOO_LONG' }`. `push` returns `LineEvent[]`. `flush()` returns a final event (if a partial line remains, treat as line if it has content; if the remaining buffer exceeds max... it can't exceed, because we discard overflow; the remainder is at most max; emit as line).
+
+Line numbers: count logical lines = number of separators seen + 1. If we discard a long-line's content, the lineNo of the next line remains sequential.
+
+Let me write it out:
+
+```ts
+export interface NdjsonLine { lineNo: number; text: string; }
+export interface NdjsonLongLineError { lineNo: number; code: 'E_LINE_TOO_LONG'; approxLength: number }
+
+export interface LineParserOptions {
+  maxLineLength?: number; // default 65536
+}
+
+export class NdjsonLineParser {
+  private buffer: string = '';
+  private lineNo = 0;
+  private oversized = false;
+  private readonly maxLineLength: number;
+  private oversizedApproxLength = 0;
+
+  constructor(opts: LineParserOptions = {}) { this.maxLineLength = opts.maxLineLength ?? 65536; }
+
+  push(chunk: string): NdjsonLine[] & { longErrors: ... }
+```
+
+Return type: `ParserOutput = { lines: NdjsonLine[]; tooLong: {lineNo:number; approxLength:number}[] }`.
+
+Algorithm of push:
+```
+if (chunk.length === 0) return empty
+this.buffer += chunk
+out.lines = []; out.tooLong = []
+// scan for newlines
+let i = 0
+for (let idx = 0; idx < buffer.length; idx++) {
+  const c = buffer.charCodeAt(idx)
+  if (c === 10) { // \n
+    if (!this.oversized) {
+      const text = buffer.slice(i, idx)
+      i = idx + 1
+      if (text.trim() !== '') { this.lineNo++; out.lines.push({lineNo: this.lineNo, text}) }
+      // Note: CRLF: handle \r: if text ends with \r,

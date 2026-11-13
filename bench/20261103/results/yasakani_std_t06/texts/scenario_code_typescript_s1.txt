@@ -1,0 +1,561 @@
+Below is a complete, runnable TypeScript 5 service. It uses **only** the Node.js standard library (no third‑party schema or HTTP libraries), so the only install step is `npm install`.
+
+**Project layout**
+
+```
+metrics-service/
+├── package.json
+├── tsconfig.json
+├── README.md
+└── src/
+    ├── types.ts
+    ├── errors.ts
+    ├── parser.ts
+    ├── aggregator.ts
+    ├── ringBuffer.ts
+    ├── server.ts
+    ├── index.ts
+    └── test/
+        ├── parser.test.ts
+        ├── aggregator.test.ts
+        ├── ringBuffer.test.ts
+        └── server.test.ts
+```
+
+---
+
+### `package.json`
+
+```json
+{
+  "name": "metrics-service",
+  "version": "1.0.0",
+  "description": "Streaming NDJSON request-metrics service with in-memory aggregation and bounded memory.",
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": { "node": ">=18.0.0" },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "node --watch --import tsx src/index.ts",
+    "test": "node --test dist/test/",
+    "test:build": "tsc && node --test dist/test/",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}
+```
+
+---
+
+### `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "rootDir": "src",
+    "outDir": "dist",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
+```
+
+> `moduleResolution: "bundler"` + `module: "ES2022"` lets the source use clean extensionless imports while Node 18+ runs the emitted ESM. `tsx` is only needed for the `dev` script.
+
+---
+
+### `src/types.ts`
+
+```ts
+/**
+ * Shared, strict type definitions for the metrics service.
+ * No third-party schema libraries are used; validation lives in parser.ts.
+ */
+
+/** A fully validated request-metric record. */
+export interface MetricRecord {
+  /** Unique run identifier (e.g. "run-2024-0001"). */
+  runId: string;
+  /** Model identifier (e.g. "gpt-4o", "llama-3-70b"). */
+  model: string;
+  /** Fixture / workload identifier (e.g. "long-context", "tool-use"). */
+  fixture: string;
+  /** Wall-clock timestamp in milliseconds since the Unix epoch. */
+  timestamp: number;
+  /** Latency in milliseconds. */
+  latencyMs: number;
+  /** Total tokens processed (prompt + completion). */
+  tokens: number;
+  /** Tokens per second throughput. */
+  tokensPerSec: number;
+  /** HTTP status code (100-599). */
+  status: number;
+  /** Optional free-form error message for failed runs. */
+  error?: string;
+}
+
+/** A group of records sharing the same (model, fixture) pair. */
+export interface Group {
+  model: string;
+  fixture: string;
+  count: number;
+  mean: number;
+  median: number;
+  /** Sample standard deviation (n - 1). 0 when fewer than 2 samples. */
+  stdDev: number;
+  min: number;
+  max: number;
+  distinctRuns: number;
+}
+
+/** Shape of a /summary response. */
+export interface SummaryResponse {
+  totalRecords: number;
+  distinctModels: number;
+  distinctFixtures: number;
+  distinctRuns: number;
+  groups: Group[];
+}
+
+/** Shape of a /runs/:id response. */
+export interface RunResponse {
+  runId: string;
+  count: number;
+  mean: number;
+  median: number;
+  stdDev: number;
+  min: number;
+  max: number;
+  models: string[];
+  fixtures: string[];
+}
+
+/** Shape of a /health response. */
+export interface HealthResponse {
+  status: "ok";
+  uptimeSec: number;
+  totalRecords: number;
+  bufferedRecords: number;
+  maxBuffer: number;
+  memory: { rssMB: number; heapUsedMB: number };
+}
+
+/**
+ * A single error raised while parsing one NDJSON line.
+ * `line` is 1-based and refers to the record currently being parsed.
+ */
+export interface ParseError {
+  line: number;
+  message: string;
+  raw: string;
+}
+```
+
+---
+
+### `src/errors.ts`
+
+```ts
+/**
+ * Custom error hierarchy. The service never throws for malformed input;
+ * it records ParseError objects instead. These classes are used for
+ * programmer errors and for the test-suite's expectations.
+ */
+
+export class ValidationError extends Error {
+  readonly field: string;
+  constructor(field: string, message: string) {
+    super(message);
+    this.name = "ValidationError";
+    this.field = field;
+  }
+}
+
+export class JsonSyntaxError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "JsonSyntaxError";
+  }
+}
+
+export class BoundedBufferOverflowError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BoundedBufferOverflowError";
+  }
+}
+```
+
+---
+
+### `src/ringBuffer.ts`
+
+```ts
+/**
+ * A fixed-capacity, FIFO ring buffer. Used to bound memory for the
+ * in-flight record buffer so a producer can never exhaust the heap.
+ */
+export class RingBuffer<T> {
+  private readonly buffer: T[];
+  private head = 0;   // next write index
+  private size = 0;
+
+  constructor(private readonly capacity: number) {
+    if (capacity < 1) {
+      throw new RangeError("RingBuffer capacity must be >= 1");
+    }
+    this.buffer = new Array<T>(capacity);
+  }
+
+  get length(): number {
+    return this.size;
+  }
+
+  get isFull(): boolean {
+    return this.size === this.capacity;
+  }
+
+  /**
+   * Push a value. If the buffer is full the oldest value is evicted.
+   * Returns the evicted value, or undefined when nothing was evicted.
+   */
+  push(value: T): T | undefined {
+    let evicted: T | undefined;
+    if (this.size === this.capacity) {
+      evicted = this.buffer[this.head];
+      this.buffer[this.head] = value;
+      this.head = (this.head + 1) % this.capacity;
+    } else {
+      const writeIndex = (this.head + this.size) % this.capacity;
+      this.buffer[writeIndex] = value;
+      this.size += 1;
+    }
+    return evicted;
+  }
+
+  /** Iterate over the buffer from oldest to newest. */
+  *[Symbol.iterator](): IterableIterator<T> {
+    for (let i = 0; i < this.size; i++) {
+      const index = (this.head + i) % this.capacity;
+      yield this.buffer[index] as T;
+    }
+  }
+
+  /** Drain all current values (oldest first) and reset the buffer. */
+  drain(): T[] {
+    const out: T[] = [];
+    for (const value of this) out.push(value);
+    this.head = 0;
+    this.size = 0;
+    return out;
+  }
+
+  clear(): void {
+    this.head = 0;
+    this.size = 0;
+  }
+}
+```
+
+---
+
+### `src/parser.ts`
+
+```ts
+/**
+ * Incremental NDJSON parser + strict, dependency-free validator.
+ *
+ * The parser is a state machine that can be fed arbitrary chunks of bytes
+ * (e.g. from a TCP socket or a stream) and emits complete, validated
+ * MetricRecord objects plus ParseError objects for malformed lines.
+ */
+
+import { JsonSyntaxError, ValidationError } from "./errors.js";
+import type { MetricRecord, ParseError } from "./types.js";
+
+type ParserState = "value" | "string" | "escape";
+
+/**
+ * Incremental NDJSON parser. Feed it chunks via `write(chunk)`; complete
+ * records and errors are delivered through the `onRecord` / `onError`
+ * callbacks. Call `end()` when the stream closes to flush a final line.
+ */
+export class NdjsonParser {
+  private buffer = "";
+  private state: ParserState = "value";
+  private lineCount = 0;
+  private inString = false;
+  private escapePending = false;
+
+  constructor(
+    private readonly onRecord: (record: MetricRecord) => void,
+    private readonly onError: (error: ParseError) => void
+  ) {}
+
+  /** Feed a chunk of UTF-8 text. */
+  write(chunk: string): void {
+    this.buffer += chunk;
+    let newlineIndex: number;
+    while ((newlineIndex = this.buffer.indexOf("\n")) !== -1) {
+      const line = this.buffer.slice(0, newlineIndex);
+      this.buffer = this.buffer.slice(newlineIndex + 1);
+      this.lineCount += 1;
+      this.processLine(line);
+    }
+  }
+
+  /** Signal end-of-stream; flushes any trailing line without a newline. */
+  end(): void {
+    if (this.buffer.length > 0) {
+      const line = this.buffer;
+      this.buffer = "";
+      this.lineCount += 1;
+      this.processLine(line);
+    }
+  }
+
+  private processLine(line: string): void {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) return; // ignore blank lines
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (err) {
+      this.onError({
+        line: this.lineCount,
+        message: `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+        raw: trimmed,
+      });
+      return;
+    }
+
+    const record = this.validate(parsed);
+    if (record) {
+      this.onRecord(record);
+    } else {
+      this.onError({
+        line: this.lineCount,
+        message: this.lastValidationError ?? "Unknown validation error",
+        raw: trimmed,
+      });
+    }
+  }
+
+  private lastValidationError: string | null = null;
+
+  /** Validate an arbitrary JSON value into a MetricRecord. */
+  private validate(raw: unknown): MetricRecord | null {
+    this.lastValidationError = null;
+
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      this.fail("root", "Expected a JSON object");
+      return null;
+    }
+
+    const obj = raw as Record<string, unknown>;
+
+    const runId = this.requireString(obj, "runId");
+    const model = this.requireString(obj, "model");
+    const fixture = this.requireString(obj, "fixture");
+    if (!runId || !model || !fixture) return null;
+
+    const timestamp = this.requireNumber(obj, "timestamp");
+    const latencyMs = this.requireNumber(obj, "latencyMs");
+    const tokens = this.requireNumber(obj, "tokens");
+    const tokensPerSec = this.requireNumber(obj, "tokensPerSec");
+    const status = this.requireNumber(obj, "status");
+    if (
+      timestamp === undefined ||
+      latencyMs === undefined ||
+      tokens === undefined ||
+      tokensPerSec === undefined ||
+      status === undefined
+    ) {
+      return null;
+    }
+
+    if (latencyMs < 0) {
+      this.fail("latencyMs", "Must be >= 0");
+      return null;
+    }
+    if (tokens < 0) {
+      this.fail("tokens", "Must be >= 0");
+      return null;
+    }
+    if (tokensPerSec < 0) {
+      this.fail("tokensPerSec", "Must be >= 0");
+      return null;
+    }
+    if (!Number.isInteger(status) || status < 100 || status > 599) {
+      this.fail("status", "Must be an integer in [100, 599]");
+      return null;
+    }
+
+    let error: string | undefined;
+    if (obj["error"] !== undefined) {
+      if (typeof obj["error"] !== "string") {
+        this.fail("error", "Must be a string when present");
+        return null;
+      }
+      error = obj["error"] as string;
+    }
+
+    return {
+      runId,
+      model,
+      fixture,
+      timestamp,
+      latencyMs,
+      tokens,
+      tokensPerSec,
+      status,
+      ...(error !== undefined ? { error } : {}),
+    };
+  }
+
+  private requireString(obj: Record<string, unknown>, key: string): string | undefined {
+    const value = obj[key];
+    if (typeof value !== "string" || value.length === 0) {
+      this.fail(key, "Must be a non-empty string");
+      return undefined;
+    }
+    return value;
+  }
+
+  private requireNumber(obj: Record<string, unknown>, key: string): number | undefined {
+    const value = obj[key];
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      this.fail(key, "Must be a finite number");
+      return undefined;
+    }
+    return value;
+  }
+
+  private fail(field: string, message: string): void {
+    this.lastValidationError = `${field}: ${message}`;
+  }
+}
+
+/**
+ * Convenience one-shot validator for a single NDJSON line.
+ * Returns a MetricRecord or throws a ValidationError / JsonSyntaxError.
+ */
+export function parseLine(line: string): MetricRecord {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    throw new ValidationError("root", "Empty line");
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(trimmed);
+  } catch (err) {
+    throw new JsonSyntaxError(err instanceof Error ? err.message : String(err));
+  }
+
+  const parser = new NdjsonParser(() => {}, () => {});
+  const record = (parser as unknown as { validate: (v: unknown) => MetricRecord | null }).validate(
+    raw
+  );
+  if (!record) {
+    throw new ValidationError("root", parser.lastValidationError ?? "Invalid record");
+  }
+  return record;
+}
+```
+
+---
+
+### `src/aggregator.ts`
+
+```ts
+/**
+ * In-memory aggregation. Groups records by (model, fixture) and by runId,
+ * maintaining running statistics and a bounded per-group sample cache so
+ * memory stays bounded even for very large workloads.
+ */
+
+import { RingBuffer } from "./ringBuffer.js";
+import type { Group, MetricRecord, RunResponse, SummaryResponse } from "./types.js";
+
+interface GroupState {
+  model: string;
+  fixture: string;
+  count: number;
+  sum: number;
+  sumSq: number;
+  min: number;
+  max: number;
+  /** Bounded cache of recent latencies for median computation. */
+  sample: RingBuffer<number>;
+  /** True when the sample cache has overflowed (median is approximate). */
+  sampleTruncated: boolean;
+  runs: Set<string>;
+}
+
+interface RunState {
+  runId: string;
+  count: number;
+  sum: number;
+  sumSq: number;
+  min: number;
+  max: number;
+  sample: RingBuffer<number>;
+  sampleTruncated: boolean;
+  models: Set<string>;
+  fixtures: Set<string>;
+}
+
+export interface AggregatorOptions {
+  /** Bounded cache size per group/run (default 10_000). */
+  sampleCapacity?: number;
+}
+
+/**
+ * Computes mean, median, and sample standard deviation over a stream of
+ * records. Mean and standard deviation are exact (Welford-style running
+ * sums). Median is exact while the bounded sample cache is not truncated,
+ * and becomes an approximation of the recent window once it is.
+ */
+export class Aggregator {
+  private readonly groups = new Map<string, GroupState>();
+  private readonly runs = new Map<string, RunState>();
+  private readonly sampleCapacity: number;
+  private totalRecords = 0;
+
+  constructor(options: AggregatorOptions = {}) {
+    this.sampleCapacity = options.sampleCapacity ?? 10_000;
+  }
+
+  get totalRecords(): number {
+    return this.totalRecords;
+  }
+
+  get distinctModels(): number {
+    return this.modelSet.size;
+  }
+
+  get distinctFixtures(): number {
+    return this.fixtureSet.size;
+  }
+
+  get distinct

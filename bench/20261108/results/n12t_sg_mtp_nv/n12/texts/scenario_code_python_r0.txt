@@ -1,0 +1,240 @@
+The user is asking for a complete Python 3.11 package for a deterministic async job runner with the following requirements:
+
+1. Reads a JSON manifest
+2. Enforces a single active GPU job
+3. Persists state atomically
+4. Resumes completed work
+5. Streams structured JSONL events
+6. Handles SIGINT
+7. Redacts (conceals) configured secrets
+8. Includes pytest tests for success, failure, cancellation, and resume
+9. Presents each source file in a separate fenced block with the path
+10. Includes pyproject.toml
+
+Let's design this package.
+
+**Package structure:**
+
+```
+gpu_runner/
+├── pyproject.toml
+├── README.md (optional)
+├── src/
+│   └── gpu_runner/
+│       ├── __init__.py
+│       ├── manifest.py       # Manifest loading/validation
+│       ├── state.py          # Atomic state persistence
+│       ├── events.py         # JSONL event streaming
+│       ├── redaction.py      # Secret redaction
+│       ├── runner.py         # Core deterministic runner
+│       ├── cli.py            # CLI entry point
+│       └── __main__.py       # python -m gpu_runner
+├── tests/
+│   ├── conftest.py
+│   ├── test_success.py
+│   ├── test_failure.py
+│   ├── test_cancellation.py
+│   └── test_resume.py
+```
+
+**Design decisions:**
+
+*Deterministic async job runner:* deterministic means the execution order is deterministic. We can implement a scheduler that picks jobs by a deterministic policy — for example, stable sort by job ID, respecting dependencies. "Deterministic" also means no timing-based behavior — jobs run in a fixed order. We'll make the runner schedule jobs in the order defined in the manifest, using dependencies if any, and use a priority queue keyed by (order, id) for determinism.
+
+Actually, simpler: jobs have IDs, and the runner processes them in deterministic topological order: sort by the manifest's declaration order? To make it deterministic and robust: use a topological sort, break ties by lexicographic order of job IDs.
+
+**Manifest format:**
+
+```json
+{
+  "version": 1,
+  "jobs": [
+    {
+      "id": "train-1",
+      "command": ["python", "train.py", "--epochs", "2"],
+      "env": {"CUDA_VISIBLE_DEVICES": "0"},
+      "depends_on": [],
+      "timeout_s": 30,
+      "retries": 0
+    }
+  ],
+  "secrets": ["API_TOKEN"],   // names to redact
+  "secret_values": {"API_TOKEN": "supersecret"}  // optional; for redacting values
+}
+```
+
+Hmm, about redaction: "redacts configured secrets". The simplest and most robust interpretation: the manifest (or CLI) specifies secret values (or environment variable names to read) and the runner redacts them from all event output and state. Let's support both:
+
+- `"redact": {"values": ["supersecret", "hunter2"], "env_names": ["API_TOKEN"]}` — collect values at startup; at runtime, also read values from env for the given names. Then all JSONL event lines and state files pass through the redactor.
+
+**Single active GPU job:** use an `asyncio.Semaphore(1)` dedicated to GPU jobs. Jobs with `gpu: true` must acquire the GPU semaphore; CPU jobs can run in parallel (up to `max_workers`). Enforcement: only one GPU job at a time. We should also have a test asserting that concurrency of GPU jobs never exceeds 1 — the test can simulate that via environment variables or via the event stream (checking overlap of start/end events for GPU jobs in the event stream).
+
+To make the test feasible without a real GPU, jobs are command executions (`subprocess`) or built-in "sleep" pseudo-commands. Deterministic: use `asyncio.create_subprocess_exec`. For tests, we can use `python -c "import time,os; time.sleep(0.2)"`, but that's a bit timing-based. Better: a special pseudo-command scheme: `{"kind": "shell", "argv": [...]}` and `{"kind": "sleep", "seconds": 0.05, "gpu": true}` for fast tests? Hmm, but "job runner" typically runs commands.
+
+Let's keep commands as argv lists while also allowing `"sleep"` builtin for tests. Actually, tests can spawn real processes fast: `python -c "import sys,time; sys.stderr.write('x'); time.sleep(0.05)"`. Subprocess overhead is around 30-100ms each. A test with a few jobs should still be fast enough (< 2s total). But CI could be slow. A builtin sleep command is cleaner and deterministic. Let's support:
+
+```json
+{"id": "a", "command": ["sleep", "0.1"]}  // shell argv
+```
+
+and for determinism/tests:
+
+```json
+{"id": "b", "builtin": {"name": "noop"}}
+{"id": "c", "builtin": {"name": "sleep", "seconds": 0.05}}
+{"id": "d": "builtin": {"name": "fail", "exit_code": 3}}
+```
+
+Hmm, that's mixing. Simpler: `"command": ["builtin:fail", "3"]`? I think a clean schema is:
+
+```json
+{
+  "id": "job-a",
+  "kind": "shell",           // "shell" or "builtin"
+  "argv": ["python3", "x.py"],   // for shell
+  "builtin": "sleep:0.1",        // for builtin: "noop", "sleep:<sec>", "fail:<code>"
+  "gpu": true,
+  "env": {...},
+  "depends_on": [...],
+  "timeout_s": 5.0,
+  "max_attempts": 1
+}
+```
+
+Validation: exactly one of argv/builtin.
+
+**State persistence (atomic):**
+State file `state.json` with schema:
+
+```json
+{
+  "version": 1,
+  "manifest_hash": "sha256...",
+  "phase": "running" | "succeeded" | "failed" | "cancelled",
+  "jobs": {
+     "job-a": {"status": "succeeded"|"failed"|"cancelled"|"running", "attempts": 1, "exit_code": 0, "started_at": ..., "finished_at": ...}
+  }
+}
+```
+
+Atomic writes: write to a temp file in the same directory, `f.flush()`, `os.fsync`, then `os.replace`. Use `os.replace` for atomicity. Also, on startup, load the state and mark `running` → `failed/cancelled` (crash recovery: running jobs become "pending" since the process died, or mark them as failed? For "resuming completed work", completed (succeeded) jobs are skipped; failed jobs — do we retry or remain failed? Deterministic behavior: on resume, succeeded jobs are skipped entirely (no re-run, recorded as `resumed_skipped`), failed jobs are re-run (unless marked `no_retry`), running are re-run. Hmm — "resumes completed work": completed = succeeded. Let's define resume semantics:
+
+- `succeeded` → skip, count as resumed.
+- `failed` → re-run (fresh attempt), so the user can fix the environment and re-run. But then tests for failure + resume are... let's keep it: failed jobs re-run. Actually, maybe we should persist the attempt count and honor `max_attempts` on resume. That's more correct: don't exceed total attempts. If failed attempts == max_attempts, mark as `permanently_failed` and skip; otherwise, re-run. This is deterministic and testable. Let's implement this: the state records total attempts; on resume, if attempts < max_attempts and status == failed, we run; otherwise, we skip with "exhausted".
+
+- Crash while running → status `running` → re-run (treat as pending).
+
+Phase transitions: on load, if the old phase is one of {succeeded, failed, cancelled}:
+- succeeded: exit with "already complete" event? If all jobs are succeeded, resume is a no-op: emit `run_completed` with `resumed: true` and exit 0.
+- Otherwise, continue.
+
+manifest_hash mismatch → error (state invalid), exit with `manifest_mismatch` event, and non-zero code, unless `--reset` is passed. This is a nice safety property.
+
+**Event stream (JSONL):**
+Each line:
+
+```json
+{"ts": "...", "seq": 1, "type": "job_started", "job": "a", ...}
+```
+
+`seq` is monotonic for determinism/order. Timestamp: include it, but it's fine for determinism of *order*; for strict determinism, ts could be excluded, but... events are naturally going to carry ts. To be safe, we include `"ts"` as ISO8601 UTC, but the determinism guarantee is about order/state. Actually, to emphasize determinism, we could make `seq` the order key and allow omitting ts? Let's include ts, but tests assert order by `seq` and type.
+
+Event types:
+- `run_started` (includes manifest_hash, jobs count, resumed count)
+- `job_queued` / `job_resumed_skipped`
+- `job_attempt_started` (attempt number, gpu: bool, gpu_locked: bool)
+- `job_attempt_finished` (exit_code, signal, timed_out)
+- `log_line` (stdout/stderr lines, redacted) — stream of structured events: yes, include per-line logs.
+- `job_succeeded`, `job_failed`, `job_cancelled`, `job_skipped`
+- `gpu_acquired` / `gpu_released` (nice for tests: assert single active GPU job by tracking acquire/release in tests)
+- `run_finished` (phase, summary)
+- `fatal` (invalid manifest, etc.)
+
+All payloads pass through the redactor before being written.
+
+**SIGINT handling:**
+On SIGINT receipt, initiate a graceful cancel: set an event, cancel running tasks, mark phase as `cancelled`, write state, emit `run_cancelled`/`job_cancelled` events. On second SIGINT → force-terminate? Let's implement it: the first SIGINT initiates graceful shutdown (wait up to `--cancel-timeout`, default 5s); the second SIGINT hard-exits (os._exit or raise). Also handle SIGTERM the same way? Let's do SIGINT as required; optionally SIGTERM too.
+
+Use `loop.add_signal_handler(signal.SIGINT, ...)` in the CLI/runner main.
+
+Implementation details: `asyncio.run` installs its own handler... use `loop.add_signal_handler`. In tests, we can send SIGINT to the runner task via `loop.add_signal_handler` or call `runner.request_cancel()`. For the pytest cancellation test, we can either send a signal to the process itself (os.kill(os.getpid(), SIGINT)) or call the runner's cancel API directly. Sending a real SIGINT to the pytest process is dangerous: pytest itself catches KeyboardInterrupt. Better approach: the runner takes an optional `cancel_callback`; in the test, run the runner coroutine and call `runner.request_shutdown()` from a task; assert phase == cancelled and state file updated. Additionally, have a separate test that installs the signal handler in a subprocess (a python -m gpu_runner with a slow job; send SIGINT; assert JSONL contains run_cancelled and exit code). Subprocess tests add realism; let's include one, but make it fast (sleep builtin 0.5, send SIGINT after 0.15s). That's about 0.7s. OK.
+
+Actually, subprocess tests require the package to be importable/executable — `python -m gpu_runner` works if cwd is the project root (src layout requires install). To keep the test self-contained, run with `sys.executable -m gpu_runner` with env PYTHONPATH = src directory. Compute it in the test. This works without install.
+
+**Redaction:**
+Redactor class:
+- `__init__(values: Iterable[str], env_names: Iterable[str])` — reads env values for names (non-empty) and merges.
+- `redact(s: str) -> str` replaces each secret with `"[REDACTED]"` (and shorter ones... beware replacement order: replace longer values first to avoid partial overwrites. Also avoid redacting empty strings).
+- Apply to event dicts: walk strings (recursively) and replace in all str values.
+- Also redact subprocess env? No — the env for jobs should contain the actual secret values, and redaction is only for outputs/logs.
+
+Also, the CLI allows `--redact value` and `--redact-env NAME` flags.
+
+Manifest secrets config: `"redact": {"values": [...], "env_names": [...]}`.
+
+**Determinism:**
+- Scheduler: deterministic topological order; ready set is sorted by (stable declaration order index, id). Actually, tie-breaking by declaration order is most deterministic given a manifest. But the lexicographic order of IDs is also deterministic. Let's use a priority queue of (ready_time?? no—) Let's keep it: use `heapq` with (seq_index, job_id) where seq_index is declaration order. When dependencies complete, the job becomes ready with its declaration index. This gives manifest-order execution when parallelism allows.
+- Worker model: `max_concurrent` CPU jobs; GPU jobs are additionally serialized with a semaphore of 1. To keep it deterministic, GPU jobs are... hmm, if a GPU job is ready while a CPU job is running, which one starts next? With a general worker pool, a CPU job might grab a worker while the GPU job is waiting — that's fine; still deterministic under a fixed schedule? Under async, timing can interleave differently... strictly speaking, any async scheduling can vary. Let's make it a single scheduler task that:
+  - Maintains a heap of ready jobs.
+  - When capacity allows (workers < max_workers) and the head is a CPU job or the GPU semaphore is free, pop it; if the head is a GPU job with GPU locked, peek the next non-GPU job? This gets complex.
+
+Simpler deterministic model: a single dispatcher loop:
+
+```
+while not all_done:
+    if pending_gpu_job_ready and gpu_free and slot_free: start gpu job
+    else if any_ready and slot_free: start the lowest (idx) ready job
+    await next completion event or state change
+```
+
+Priority: GPU jobs take priority when free? Or strictly FIFO by index? Let's be strict: FIFO by declaration order, but the dispatcher only starts a job when its resource (a slot, and GPU semaphore if GPU) is available; if the head job is blocked on the GPU, allow starting a lower-priority non-GPU ready job (work-conserving). This is deterministic given a fixed completion order, and completion order is deterministic for a deterministic test. Good enough, and we'll document the policy.
+
+The simplest, most robust implementation:
+
+```python
+async def dispatch(self):
+    while self.remaining:
+        ready = [j for j in self.remaining if all deps done]
+        # pick the first ready job with resources
+        picked = None
+        for j in ready (sorted by idx):
+            needs = slot always; gpu if j.gpu
+            if self.slots_free and (not j.gpu or self.gpu_free):
+                picked = j; break
+        if picked is None:
+            # wait for any in-flight to finish (wait FIRST in completion order? no—wait for any)
+            await self.wait_any_done()
+            continue
+        start picked
+```
+
+Wait for any done: use `asyncio.wait(return_when=FIRST_COMPLETED)` on the set of running tasks, or an asyncio.Event set on each completion. Let's use a condition-like loop: gather running tasks; `done, _ = await asyncio.wait(running, return_when=FIRST_COMPLETED)`. Careful: a task finishing triggers state writes and events. Good.
+
+This is O(n^2) but fine for manifest-scale.
+
+**Resume:** on startup, load state; for each job in the manifest:
+- If status is succeeded → mark done (resumed), emit `job_resumed` event with skipped true.
+- If status is failed and attempts >= max_attempts → permanently failed; if it's a dependency target... it's failed anyway.
+- Otherwise, pending.
+
+If all jobs are succeeded → emit run_started + run_finished (succeeded, resumed=true) and exit 0.
+
+Also, `failed` jobs below max_attempts → re-run on resume (retry after fix). Documented.
+
+**CLI exit codes:**
+- 0: all succeeded
+- 1: one or more jobs failed
+- 130: cancelled (SIGINT)
+- 2: manifest invalid / config error
+
+**Testing:**
+
+conftest fixtures:
+- `tmp_manifest_dir` that writes manifest + runner options.
+- Helper that runs the runner in-process via `asyncio.run` (or pytest-asyncio?). To avoid external dependency (pytest-asyncio), write a synchronous test helper: `def run_async(coro): return asyncio.run(coro)`. pytest runs plain functions; that's fine.
+
+Tests:
+1. `test_success` — a 3-job DAG (a → b, c; one is GPU, with two GPU jobs to prove serialization), assert: exit code 0, all events present, state phase succeeded, GPU acquisition is strictly non-overlapping, event seq is monotonic, log redaction works (shell command that echoes a secret → log_line shows [REDACTED]).
+2. `test_gpu_single_active` — covered within success or separately: two concurrent GPU sleep jobs; assert from events that gpu_acquired is not followed by a second acquire before release. Additionally, record the max concurrent count with a builtin? Can't inject into the builtin. It's inferable from events: count active GPU by scanning events.
+3. `test_failure` — a job with a failing builtin exit 2 → exit code 1, state failed, dependent jobs skipped, events present. Also test attempt semantics with max_attempts=2: 2 attempt events, then `job_failed` with attempts 2.
+4. `test_cancellation` — in-process: start the runner coroutine, after ~0.15s call `request_cancel()`; assert phase cancelled, running job marked cancelled, state persisted atomically, exit code 130. Plus subprocess SIGINT test: run `python -m gpu_runner --manifest m.json --events e.jsonl --state s

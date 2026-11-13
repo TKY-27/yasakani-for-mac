@@ -1,0 +1,125 @@
+We need answer user's request. Need produce final: one PostgreSQL script no Markdown fences. Need define normalized tables models, fixtures, runs, request_metrics; PK/FK, checks, indexes, two views, one transaction-safe upsert function, at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Script must run in dependency order.
+
+Need ensure PostgreSQL syntax. No markdown fences. Need likely use DO? Single script. Need tables dependency: models, fixtures, runs, request_metrics. Maybe sequences. Need constraints. Need 80 rows: maybe insert models 2, fixtures 4, runs many, request_metrics at least 80. User says at least 80 realistic INSERT rows spanning two models and four fixture kinds. Could be all rows total? We need include 80 INSERT rows. Safer make 80 request_metrics rows, plus 2 models and 4 fixtures = 86. Could make one INSERT with 80 rows? It says at least 80 realistic INSERT rows. Could have individual INSERT statements? Maybe one statement with multiple rows counts? Usually rows. To be safe, include explicit INSERT INTO request_metrics VALUES ... 80 rows maybe multi-row. And separate models/fixtures. Need no markdown.
+
+Need "transaction-safe upsert function". Define function maybe plpgsql with INSERT ... ON CONFLICT DO UPDATE. Transaction-safe means no explicit transaction? In PG functions can't COMMIT. Could use atomic DML. Maybe function upsert_request_metric returns. Need one function. Could have unique constraint for upsert: runs (model_id, fixture_id, run_number) and request_metrics maybe unique (run_id, request_id, metric_name?) We need normalized tables. Let's design.
+
+Tables:
+models(model_id serial pk, model_name text unique not null, family text, context_length int check >0, mtp_enabled bool default false, created_at timestamptz default now())
+fixtures(fixture_id serial pk, fixture_name text unique, fixture_kind text not null check (kind in ('chat','summarization','code','retrieval')), avg_tokens int check >=0, notes text)
+runs(run_id serial pk, model_id fk, fixture_id fk, run_number int check >0, started_at timestamptz default now(), status text check in ('completed','failed','cancelled'), unique(model_id, fixture_id, run_number), check started_at is not null?)
+request_metrics(metric_id bigserial pk, run_id fk, request_id int check >=0, prompt_tokens int check >=0, completion_tokens int check >=0, latency_ms numeric(10,3) check >=0, first_token_ms numeric check>=0, tokens_per_second numeric check>=0, mtp_acceptance_rate numeric check between 0 and 1? maybe null, error bool default false, check maybe completion_tokens>=0, latency > first token? Could add check if latency_ms is not null and first_token_ms is not null then first_token_ms <= latency_ms? Need careful NULLs. Use check (latency_ms is null or first_token_ms is null or first_token_ms <= latency_ms). Also maybe mtp acceptance between 0 and 1 when not null. Use generated? Maybe.
+
+Indexes: models (model_name) unique already; fixtures kind index; runs (model_id, fixture_id) and started_at; request_metrics (run_id, request_id), (latency_ms), (tokens_per_second), (mtp_acceptance_rate), maybe partial where error=false. Need unique for upsert: maybe request_metrics unique (run_id, request_id). If each request one row. Use unique constraint request_metrics_run_request_key(run_id, request_id). Then upsert function takes run_id, request_id, prompt_tokens,... and upserts.
+
+Views two:
+v_run_summary: per run aggregate total requests, errors, avg latency, avg tps, avg mtp acceptance, throughput.
+v_model_fixture_performance: aggregate across runs by model fixture kind.
+
+Need six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Need include topics: throughput, variability, long-context retention, MTP acceptance. Six queries. Could:
+1 throughput by model and fixture: avg tokens per second total completion+prompt? Maybe total completion tokens / sum latency seconds? Better aggregate.
+2 variability: stddev and coefficient of variation of latency and tps by model/fixture.
+3 long-context retention: compare avg latency/tps/error rate for requests with prompt_tokens near high buckets (e.g., >16384) vs shorter by model. Need fixtures maybe have avg_tokens? We can categorize prompt_tokens. Could use request_metrics.prompt_tokens. Long context retention maybe measure success and latency degradation. Query.
+4 MTP acceptance by model/fixture average and p90.
+5 MTP acceptance over request sequence or run? Maybe top/bottom.
+6 Throughput trend across runs (by run_number or started_at) and p95 latency.
+Need exactly six SELECT queries at end. They can be after data. Ensure they run. Need maybe use CTEs.
+
+Need data: 2 models, 4 fixture kinds. At least 80 request_metrics rows spanning two models and four fixture kinds. We can create 2 models, 4 fixtures. Need runs. To have 80 metrics across 2 models x 4 fixtures = 8 combinations. 10 metrics per combination = 80. That works. Need runs? Could one run per combination = 8 runs, each with 10 requests. Then 80 metrics. Realistic. Or multiple runs. 8 runs ok. Need include 4 fixture kinds: chat, summarization, code, retrieval. Two models: e.g., 'mtp-model-a' and 'mtp-model-b'. Need context lengths, mtp enabled. Need fixtures avg_tokens maybe. Need runs with model/fixture/run_number. Need request_metrics for each run with request_id 1..10. Need generate data manually or via script? Single script can include INSERTs generated by SQL? User likely wants script with INSERT rows. Could use INSERT INTO ... SELECT generate_series? But "at least 80 realistic INSERT rows" maybe wants rows. Using generate_series may not be considered INSERT rows? Better include literal rows. But 80 rows manual is long but doable. Need realistic values. Could compress with multi-row INSERT. 80 rows in one statement. Need no markdown. Long output ok.
+
+Need dependency order: create tables, indexes, views, function, then insert models, fixtures, runs, request_metrics, then queries. Views can be before data. Function before/after? Dependency: function uses table, can create after table. Data before queries. If views before data ok. But if queries after data.
+
+Need ensure PostgreSQL can run from scratch. Use DROP? Could use CREATE SCHEMA? Not necessary. For idempotent maybe DROP VIEW IF EXISTS, DROP FUNCTION, DROP TABLE IF EXISTS CASCADE. But if drop tables, dependency. Could include DROP in reverse. But user asked script must run in dependency order. We can include DROP statements to be safe. But if running on empty, fine. If existing, drop. Need not overcomplicate. Use DO? No.
+
+Potential issue: serial ids if drop/recreate, okay. Use bigserial. If inserting explicit ids? Could let default. For runs need refer to generated ids. Since models/fixtures inserted before runs, can use subqueries to get ids by name. To keep simple, define models with explicit model_id 1,2; fixtures explicit fixture_id 1..4. But if drop/recreate serial default set? Could insert explicit id and setval sequences. If use default, need subqueries. Better use fixed ids for deterministic. But if sequences not reset? Drop table resets. Insert with id values: (1, ...). Then SELECT setval('models_model_id_seq', 1, true); fixtures setval. For runs maybe explicit run_id 1..8 and setval. request_metrics maybe bigserial explicit 1..80? Or default. For explicit, setval. Could be cumbersome. Use DEFAULT for runs and metrics? But request_metrics needs upsert function maybe no. For runs, can insert without run_id and use RETURNING? Can't easily insert multiple with FK referencing. Use explicit run ids for simplicity.
+
+If using explicit ids and sequences, need setval after inserts. Or use ALTER TABLE ... ALTER COLUMN ... SET DEFAULT? No. If drop tables, sequences start at 1, inserting explicit 1 leaves sequence at 1? Actually inserting explicit doesn't change sequence, next default would duplicate. But we don't use default later. Upsert maybe if user calls function with existing run_id. But maybe okay. To be safe setval after data. Use SELECT setval('models_model_id_seq', (SELECT max(model_id) FROM models)); For bigserial request_metrics maybe max 80.
+
+Could also avoid explicit ids for metrics: INSERT INTO request_metrics (run_id, request_id,...) VALUES (1,1,...). Need 80 rows. If no metric_id, sequence increments. Good. For runs explicit run_id 1..8. Need sequences for runs setval. For request_metrics no explicit metric_id, sequence auto. If drop/recreate, fine. For models/fixtures explicit ids, setval.
+
+Need checks: fixture_kind in four. For mtp_acceptance_rate, if model not MTP? We can still have values. Maybe for model B no MTP, null or 0? Query MTP acceptance should handle nulls. Could have model A mtp_enabled true with acceptance rates, model B false with nulls. But need MTP acceptance analysis. If only one model has MTP, still ok. But perhaps both have MTP? "MTP" maybe multi-token prediction. Two models could both support. Could set one mtp_enabled true, other true? Or one false. Need MTP acceptance across two models maybe compare. Let's set both mtp_enabled true? But one has lower acceptance. Or one false? The request says MTP acceptance; likely metrics can be null for non-MTP. To analyze both, set both true. But realistic maybe "Model A MTP v2" and "Model B MTP v1". Let's do both true.
+
+Need long-context retention: request_metrics.prompt_tokens can vary. Fixture kinds: chat short, summarization long, code medium, retrieval long? We can create prompt_tokens per request. For long-context retention query, compare prompt_tokens >= 16000 vs <4000 maybe. Need ensure data has long context rows. Fixtures:
+1 chat avg_tokens 512, prompt_tokens ~300-700
+2 summarization avg_tokens 12000, prompt_tokens ~8000-20000
+3 code avg_tokens 3000, prompt_tokens ~1500-6000
+4 retrieval avg_tokens 15000, prompt_tokens ~10000-24000 maybe some >16k.
+Need request_metrics 10 per run. Can craft values. Need realistic: prompt_tokens, completion_tokens, latency_ms, first_token_ms, tokens_per_second, mtp_acceptance_rate. For each model, fixture, 10 rows. Need 80 rows. Could create pattern. Need avoid too much manual. But final answer can be long. Need ensure no syntax errors. Could use 8 multi-row inserts per run to keep readability. Each row tuple: (run_id, request_id, prompt_tokens, completion_tokens, latency_ms, first_token_ms, tokens_per_second, mtp_acceptance_rate). Check latency >= first_token. tokens_per_second maybe completion_tokens / ((latency-first_token)/1000) maybe approximate. But not need exact. Need realistic. MTP acceptance between 0 and 1. For long context, maybe lower acceptance, higher latency.
+
+Could generate rows via SQL using arrays? But user says INSERT rows. Could use INSERT INTO ... SELECT with row arrays? Maybe not. Literal is safer.
+
+Need 80 rows: 8 runs x 10 requests. Let's assign:
+models:
+1 'atlas-70b-mtp2' family 'Atlas', context_length 32768, mtp_enabled true
+2 'nova-32b-mtp1' family 'Nova', context_length 16384, mtp_enabled true
+fixtures:
+1 'short_chat' kind 'chat' avg_tokens 512
+2 'long_summarization' kind 'summarization' avg_tokens 12288
+3 'code_refactor' kind 'code' avg_tokens 3072
+4 'retrieval_qa' kind 'retrieval' avg_tokens 15360
+runs:
+1 model1 fixture1 run 1
+2 model1 fixture2 run 1
+3 model1 fixture3 run 1
+4 model1 fixture4 run 1
+5 model2 fixture1 run 1
+6 model2 fixture2 run 1
+7 model2 fixture3 run 1
+8 model2 fixture4 run 1
+Maybe include status completed. started_at staggered.
+
+Need 80 metrics. We can craft per run:
+Model1 fixture1 short chat: prompt_tokens around 400-800, completion 100-250, latency 800-1500 ms, first 80-180, tps 120-220, acceptance 0.72-0.86.
+Model1 fixture2 summarization long: prompt 8000-22000, completion 600-1500, latency 6000-14000, first 400-900, tps 80-150, acceptance 0.65-0.80 decreasing for >16k.
+Model1 fixture3 code: prompt 1500-6000, completion 400-1200, latency 2000-5000, first 150-350, tps 100-180, acceptance 0.68-0.84.
+Model1 fixture4 retrieval long: prompt 9000-26000 (but model context 32768), completion 300-900, latency 7000-16000, first 500-1000, tps 70-140, acceptance 0.60-0.78.
+Model2 fixture1: smaller model maybe tps 160-260, acceptance 0.58-0.75, latency lower.
+Model2 fixture2: prompt 8000-16000 (context 16384, keep <=16000), completion 500-1200, latency 5000-11000, first 300-700, tps 90-170, acceptance 0.52-0.70; maybe longer degrade.
+Model2 fixture3: prompt 1500-6000, completion 400-1200, latency 1800-4500, tps 120-210, acceptance 0.55-0.72.
+Model2 fixture4: prompt 9000-15000 (<=16384), completion 300-900, latency 6000-13000, tps 80-150, acceptance 0.48-0.66.
+
+Need ensure no prompt_tokens > context length? Could add check prompt_tokens <= model context? FK to run/model? Check constraint can't easily reference model context unless unique? Could add generated? Not necessary. But maybe add check prompt_tokens >=0. Could add check prompt_tokens + completion_tokens <= 32768? But model2 context 16384, if row model2 >16384 invalid. We can avoid >16000. Could add check prompt_tokens + completion_tokens <= 32768 global. Good. But if we want long context 26000 + 900 = 26900 okay. For model2 keep <16384.
+
+Need upsert function transaction-safe. Let's design:
+CREATE OR REPLACE FUNCTION upsert_request_metric(
+ p_run_id bigint,
+ p_request_id integer,
+ p_prompt_tokens integer,
+ p_completion_tokens integer,
+ p_latency_ms numeric(10,3),
+ p_first_token_ms numeric(10,3),
+ p_tokens_per_second numeric(10,3),
+ p_mtp_acceptance_rate numeric(6,4)
+)
+RETURNS request_metrics
+LANGUAGE plpgsql
+AS $$
+DECLARE rec request_metrics;
+BEGIN
+  IF p_latency_ms IS NOT NULL AND p_first_token_ms IS NOT NULL AND p_first_token_ms > p_latency_ms THEN
+    RAISE EXCEPTION 'first_token_ms cannot exceed latency_ms';
+  END IF;
+  IF p_mtp_acceptance_rate IS NOT NULL AND (p_mtp_acceptance_rate < 0 OR p_mtp_acceptance_rate > 1) THEN
+    RAISE EXCEPTION 'mtp_acceptance_rate must be between 0 and 1';
+  END IF;
+  INSERT INTO request_metrics (...)
+  VALUES (...)
+  ON CONFLICT (run_id, request_id) DO UPDATE SET ...
+  WHERE request_metrics.error IS NOT EXCLUDED.error? No, just update all. RETURNING * INTO rec;
+  RETURN rec;
+END;
+$$;
+But ON CONFLICT DO UPDATE can update metric_id? no. Need include excluded. Need check function language plpgsql. Transaction-safe: no commit. Could add SAVEPOINT? In a function called within transaction, if error rolls back to savepoint? Transaction-safe maybe means uses atomic upsert. Could add BEGIN? PL/pgSQL doesn't allow BEGIN atomic? It allows BEGIN/END block with exception? For transaction-safe, maybe create function with exception handler and savepoint? Example:
+CREATE FUNCTION ... RETURNS request_metrics AS $$
+DECLARE rec request_metrics;
+BEGIN
+  PERFORM ...;
+  INSERT ... ON CONFLICT ...;
+EXCEPTION WHEN OTHERS THEN
+  RAISE;
+END;
+$$;
+But savepoint? In PostgreSQL, function cannot COMMIT, but can use SAVEPOINT? You can't DECLARE SAVEPOINT? In PL/pgSQL, you can use BEGIN ATOMIC block with EXCEPTION WHEN OTHERS THEN ROLLBACK TO SAVEPOINT; Actually PL/pgSQL supports BEGIN ... EXCEPTION ... END blocks which create savepoints. Could make it robust:
+BEGIN
+  ... validation ...
+  BEGIN

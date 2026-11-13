@@ -1,0 +1,193 @@
+We need respond to user: "Return one PostgreSQL script with no Markdown fences. Define normalized tables for models, fixtures, runs, and request_metrics; include primary/foreign keys, checks, useful indexes, two views, one transaction-safe upsert function, and at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. The script must run in dependency order."
+
+Need produce single PostgreSQL script, no markdown fences. Need ensure runs in dependency order. Need include normalized tables: models, fixtures, runs, request_metrics. Primary/foreign keys, checks, useful indexes, two views, one transaction-safe upsert function, at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance.
+
+Need craft PostgreSQL compatible. Need think details.
+
+Requirement "Return one PostgreSQL script with no Markdown fences." So just SQL text.
+
+Need likely use CREATE TABLE IF NOT EXISTS? For dependency order. Use schema? maybe public. Need transaction-safe upsert function. Could use CREATE OR REPLACE FUNCTION upsert_request_metrics(...). It should upsert by unique key, maybe model_id, fixture_id, run_id, request_index? Need normalize.
+
+Tables:
+models(model_id PK, name unique, vendor, architecture, context_length, mtp_enabled bool?) 
+fixtures(fixture_id PK, name, kind enum maybe 'short','medium','long','mixed'? four kinds; input_tokens, output_tokens, domain, description). Could use CHECK kind in (...). 
+runs(run_id PK, model_id FK, fixture_id FK, started_at, ended_at, status, batch_size, max_tokens, temperature, gpu_type, seed maybe). Unique (model_id, fixture_id, run_id?) run_id maybe uuid. Or surrogate id. request_metrics(run_metric_id PK, run_id FK, request_idx int, input_tokens, output_tokens, latency_ms, ttfb_ms, tokens_per_sec, accepted_mtp_tokens? maybe mtp_accept_rate). Need normalized: request_metrics references runs.
+
+Need at least 80 INSERT rows spanning two models and four fixture kinds. Could be request_metrics rows? "at least 80 realistic INSERT rows spanning two models and four fixture kinds." It might mean total inserted rows? It says INSERT rows spanning two models and four fixture kinds. Could be 80 rows of request_metrics with two models and four fixture kinds. But normalized tables for models/fixtures/runs/request_metrics. Need include INSERTs for models (2), fixtures (4), runs maybe multiple, request_metrics 80. "at least 80 realistic INSERT rows" probably total or request metrics. We can do 2 model rows + 4 fixture rows + 20 runs + 80 request_metrics = 106. To be safe, at least 80 request_metrics rows plus others. Need realistic. Could generate 80 request_metrics rows manually. Need ensure all rows use two models and four fixture kinds. Could insert runs for each model x fixture (8 runs) and request metrics maybe 10 per run = 80. Nice. Each run 10 requests. 8 runs * 10 = 80. Two models, four fixture kinds. Good.
+
+Need checks. Use CHECK for positive tokens, latency, accept rates. MTP acceptance: maybe accepted_mtp_tokens <= proposed_mtp_tokens? Need fields: proposed_mtp_tokens, accepted_mtp_tokens, maybe mtp_accept_rate = accepted/proposed. Check accepted <= proposed, proposed >=0, accepted >=0. If mtp disabled? could still 0. Maybe model has mtp_enabled; if not enabled proposed=0. Check proposed_mtp_tokens <= max? OK.
+
+Useful indexes: models name unique; fixtures kind; runs model_id, fixture_id, started_at; request_metrics run_id, model? Can't have model in request_metrics? normalized, but could include run_id only. Index on run_id, latency, tokens_per_sec, accepted. Maybe composite (run_id, request_idx). Unique key for upsert: (run_id, request_idx). Could create unique constraint.
+
+Two views: view_model_fixture_summary aggregates throughput, variability? view_long_context_retention maybe retention score? Could define as views over request_metrics/runs/fixtures/models. Need two views only? exactly? "include ... two views" likely exactly two. We'll create two views: v_run_performance, v_mtp_acceptance? But analytical queries need throughput, variability, long-context retention, MTP acceptance. Views can help. Maybe view_throughput_by_model_fixture and view_mtp_acceptance_by_model. But queries can compute. Need two views.
+
+Transaction-safe upsert function: CREATE OR REPLACE FUNCTION upsert_request_metrics(...) RETURNS request_metrics LANGUAGE plpgsql AS $$ BEGIN INSERT ... ON CONFLICT (run_id, request_idx) DO UPDATE SET ... RETURNING *; END; $$; Need be transaction-safe: inside function, no BEGIN/COMMIT? It participates in caller's transaction. Use SAVEPOINT? "transaction-safe upsert function" could mean uses unique constraint ON CONFLICT and is idempotent. Could include validation. But PL/pgSQL function executes in current transaction; no internal COMMIT. Could use SERIALIZABLE? No. We can mention? final just script.
+
+Need finish with six analytical SELECT queries: for throughput, variability, long-context retention, and MTP acceptance. Could be:
+1 throughput by model and fixture kind (avg tps).
+2 variability: stddev, coefficient of variation by model/fixture.
+3 long-context retention: maybe compare short/medium vs long? Need define long-context retention metric. Could use acceptance of MTP? Or output token count vs expected? Realistic: long-context retention maybe accuracy proxy using request_metrics? We have no correctness. Could use "retention_score" derived from MTP acceptance? Hmm. Long-context retention for LLM inference: maybe ability to retain info across context; could use "retention_error"? Need table can include fields: expected_key_facts? But request_metrics normalized. Maybe include `expected_output_tokens`? Long-context retention query can compare output_tokens to fixture.output_tokens? Not retention. Could include `context_position`? Maybe for long context retention, request has input_tokens near context length; retention can be measured by `late_context_hit_rate`? Need realistic. Could add column to request_metrics: `long_context_retention_score`? But normalized? It's a metric. Could be NULL for non-long fixtures. Or `late_answer_correct`? Need checks.
+
+Maybe define `request_metrics` with columns: run_id, request_idx, prompt_tokens, completion_tokens, latency_ms, time_to_first_token_ms, tokens_per_sec, proposed_mtp_tokens, accepted_mtp_tokens, cache_hit_rate? For long-context retention, we can use `retention_score` numeric 0-1. But is it normalized? It's metric, fine. Or use `long_context_retention_score` only when fixture kind in ('long','mixed')? Check. But query for long-context retention can aggregate by model and fixture kind for long fixtures: avg retention score, maybe decay by input_tokens. We can create `retention_score` in request_metrics with check between 0 and 1. Realistic values. Need 80 rows.
+
+But "long-context retention" might be a query comparing average retention for long-context vs short-context. Use fixture kind = 'long' and maybe input_tokens > 16k. We'll define retention_score. Good.
+
+Need MTP acceptance query: average accepted/proposed by model/fixture, maybe MTP acceptance rate = sum accepted / nullif sum proposed. For models with MTP. Use proposed_mtp_tokens >0.
+
+Need two models: e.g. 'Model A: acme/llama-70b-mtp' and 'Model B: acme/llama-70b' one MTP enabled. Four fixture kinds: short_qa, medium_summ, long_doc, mixed_multiturn? Need realistic.
+
+Need 80 request_metrics rows. Could write INSERT INTO request_metrics VALUES (...) 80 rows. Need maintain consistency with runs. Need ensure columns align. Let's design schema carefully.
+
+Potential SQL:
+
+BEGIN;
+DROP FUNCTION IF EXISTS ...? Maybe no. Use CREATE IF NOT EXISTS.
+
+CREATE TABLE IF NOT EXISTS models (
+  model_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name text NOT NULL UNIQUE,
+  vendor text NOT NULL,
+  architecture text NOT NULL,
+  context_length int NOT NULL CHECK (context_length > 0),
+  mtp_enabled boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+fixtures:
+  fixture_id uuid PK default,
+  fixture_name text NOT NULL UNIQUE,
+  fixture_kind text NOT NULL CHECK (fixture_kind IN ('short_qa','medium_summ','long_doc','mixed_multiturn')),
+  description text,
+  base_prompt_tokens int NOT NULL CHECK (base_prompt_tokens >0),
+  expected_completion_tokens int NOT NULL CHECK (expected_completion_tokens >0),
+  has_long_context boolean generated? no.
+
+runs:
+  run_id uuid PK default,
+  model_id uuid NOT NULL REFERENCES models,
+  fixture_id uuid NOT NULL REFERENCES fixtures,
+  run_number int NOT NULL CHECK (run_number >0),
+  started_at timestamptz NOT NULL DEFAULT now(),
+  ended_at timestamptz CHECK (ended_at > started_at),
+  batch_size int NOT NULL CHECK (batch_size >0),
+  temperature numeric(4,2) NOT NULL CHECK (temperature >=0),
+  gpu_type text NOT NULL,
+  status text NOT NULL CHECK (status IN ('completed','failed','partial')),
+  CONSTRAINT unique_model_fixture_run_number UNIQUE (model_id, fixture_id, run_number)
+);
+
+request_metrics:
+  metric_id uuid PK default,
+  run_id uuid NOT NULL REFERENCES runs ON DELETE CASCADE,
+  request_idx int NOT NULL CHECK (request_idx >=0),
+  prompt_tokens int NOT NULL CHECK (prompt_tokens >0),
+  completion_tokens int NOT NULL CHECK (completion_tokens >=0),
+  latency_ms numeric(10,3) NOT NULL CHECK (latency_ms >=0),
+  time_to_first_token_ms numeric(10,3) NOT NULL CHECK (time_to_first_token_ms >=0),
+  tokens_per_sec numeric(10,3) NOT NULL CHECK (tokens_per_sec >=0),
+  proposed_mtp_tokens int NOT NULL DEFAULT 0 CHECK (proposed_mtp_tokens >=0),
+  accepted_mtp_tokens int NOT NULL DEFAULT 0 CHECK (accepted_mtp_tokens >=0 AND accepted_mtp_tokens <= proposed_mtp_tokens),
+  retention_score numeric(4,3) CHECK (retention_score IS NULL OR (retention_score >=0 AND retention_score <=1)),
+  unique (run_id, request_idx)
+
+Maybe check if proposed_mtp_tokens > 0 implies model MTP? Hard with FK? Could not easily. Could add check accepted <= proposed. If model not MTP, rows should proposed 0. Could enforce with trigger? Not necessary. But maybe add check? Not possible without join. Could add view? Maybe not.
+
+Useful indexes:
+CREATE INDEX IF NOT EXISTS idx_models_name ON models(name);
+CREATE INDEX IF NOT EXISTS idx_fixtures_kind ON fixtures(fixture_kind);
+CREATE INDEX IF NOT EXISTS idx_runs_model_fixture ON runs(model_id, fixture_id);
+CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_request_metrics_run ON request_metrics(run_id, request_idx);
+CREATE INDEX IF NOT EXISTS idx_request_metrics_latency ON request_metrics(latency_ms);
+CREATE INDEX IF NOT EXISTS idx_request_metrics_tps ON request_metrics(tokens_per_sec);
+CREATE INDEX IF NOT EXISTS idx_request_metrics_mtp ON request_metrics(proposed_mtp_tokens, accepted_mtp_tokens);
+
+Two views:
+CREATE VIEW v_run_throughput AS
+SELECT r.run_id, m.model_id, m.name model_name, f.fixture_id, f.fixture_name, f.fixture_kind,
+ count(*) requests, sum(q.completion_tokens) completion_tokens, sum(q.latency_ms)/1000.0 total_seconds,
+ (sum(q.completion_tokens) / nullif(sum(q.latency_ms),0)*1000.0) throughput_tps,
+ avg(q.tokens_per_sec) avg_tps
+FROM request_metrics q JOIN runs r ON ... JOIN models m ... JOIN fixtures f ... GROUP BY ...;
+
+CREATE VIEW v_mtp_acceptance AS
+SELECT m.model_id, m.name, f.fixture_kind,
+ sum(q.proposed_mtp_tokens) proposed, sum(q.accepted_mtp_tokens) accepted,
+ sum(q.accepted_mtp_tokens)::numeric / nullif(sum(q.proposed_mtp_tokens),0) as acceptance_rate,
+ count(*) FILTER (WHERE q.proposed_mtp_tokens >0) mtp_requests
+FROM request_metrics q JOIN runs... GROUP BY...;
+
+Need exactly two views? Yes.
+
+Function:
+CREATE OR REPLACE FUNCTION upsert_request_metrics(
+  p_run_id uuid,
+  p_request_idx integer,
+  p_prompt_tokens integer,
+  p_completion_tokens integer,
+  p_latency_ms numeric,
+  p_time_to_first_token_ms numeric,
+  p_tokens_per_sec numeric,
+  p_proposed_mtp_tokens integer DEFAULT 0,
+  p_accepted_mtp_tokens integer DEFAULT 0,
+  p_retention_score numeric DEFAULT NULL
+) RETURNS request_metrics
+LANGUAGE plpgsql AS $$
+DECLARE r record;
+BEGIN
+  IF p_run_id IS NULL THEN RAISE ...; END IF;
+  ... validate
+  BEGIN
+    INSERT INTO request_metrics(...) VALUES (...)
+    ON CONFLICT (run_id, request_idx) DO UPDATE SET ...
+    RETURNING * INTO r;
+    RETURN r;
+  EXCEPTION WHEN unique_violation THEN
+    -- if unique violation due to FK? Actually ON CONFLICT handles unique, but if FK invalid unique_violation? Better use check.
+  END;
+END $$;
+
+Transaction-safe: We can avoid explicit BEGIN/COMMIT. Use ON CONFLICT. But to be "transaction-safe" maybe include `SAVEPOINT` and rollback on error? Function in PL/pgSQL automatically transaction safe? Could implement with `BEGIN ... EXCEPTION WHEN OTHERS THEN ROLLBACK USING SAVEPOINT`? But if we use savepoint, transaction remains. Example:
+DECLARE sp text;
+BEGIN
+  SAVEPOINT upsert_request_metrics_sp;
+  BEGIN
+    INSERT ... ON CONFLICT ... RETURNING * INTO r;
+    RELEASE SAVEPOINT ...;
+    RETURN r;
+  EXCEPTION WHEN OTHERS THEN
+    ROLLBACK TO SAVEPOINT ...;
+    RAISE;
+  END;
+END;
+But if exception, raise preserves transaction abort? In PostgreSQL, if exception caught, transaction not aborted, savepoint rollback. Good. But if error is not catch? fine. However if FK violation, rollback to savepoint and raise, transaction remains? If a statement error occurs, subtransaction aborts but transaction continues if caught. Good.
+
+But we can keep simple. Need script runs. Need ensure function uses `request_metrics` table. If table created before function. Good.
+
+INSERT rows:
+Need generate UUIDs. Could use fixed UUIDs to keep referential integrity and deterministic. For 2 models, 4 fixtures, 8 runs, 80 metrics. Need assign UUIDs. We can choose readable UUIDs. But UUID type can use '11111111-1111-1111-1111-111111111111' etc. Need maybe use `uuid_generate_v4()`? But references harder. Fixed easier.
+
+Need at least 80 realistic INSERT rows. Could use multi-row INSERT for each table. For 80 request metrics, can use multi-row VALUES. Need maintain column list. Could be long. Need be valid. Let's plan values.
+
+Models:
+- model_id '00000000-0000-0000-0000-000000000001' name 'acme-llm-70b-mtp' vendor 'Acme' architecture 'transformer-decoder' context_length 131072 mtp_enabled true.
+- '00000000-0000-0000-0000-000000000002' name 'acme-llm-70b' mtp_enabled false.
+
+Fixtures:
+1 'fixture-short-qa' kind 'short_qa' base_prompt_tokens 256 expected 32.
+2 'fixture-medium-summary' kind 'medium_summ' base_prompt 4096 expected 128.
+3 'fixture-long-document' kind 'long_doc' base_prompt 32768 expected 256.
+4 'fixture-mixed-multiturn' kind 'mixed_multiturn' base_prompt 8192 expected 64.
+Need four fixture kinds. Maybe names.
+
+Runs: 8: model1 fixture1 run 1; model1 fixture2; model1 fixture3; model1 fixture4; model2 fixture1; model2 fixture2; model2 fixture3; model2 fixture4. run_id UUIDs. run_number 1. started_at fixed times. ended_at. batch_size 8 or 16. temperature 0.2/0.5. gpu_type 'H100'. status completed. Could include different batch sizes for throughput variation.
+
+Need 80 request_metrics: 10 per run. For each run, request_idx 0-9. Need prompt_tokens based fixture base +/-; completion_tokens expected +/-; latency_ms; ttfb; tps; proposed/accepted mtp; retention_score.
+
+Need ensure for model2 (MTP disabled) proposed=accepted=0. For model1 proposed positive. Could realistic: model1 MTP acceptance 0.7-0.9 short, 0.65 long. Proposed tokens maybe e.g. 4 per step? For each request, proposed_mtp_tokens total across decoding? Maybe sum of speculative tokens proposed. Use values 0-25. Accepted <= proposed. For model2 0.
+
+Need long-context retention: retention_score for long_doc and mixed? Could high for short/medium, lower for long; model1 better. For short maybe 0.95. For long maybe 0.72-0.88. For mixed 0.86. Could be NULL? Check allows NULL or 0-1. Use numeric.
+
+Need queries at end: six analytical SELECTs. They should maybe use views or direct. Need cover throughput, variability, long-context retention, MTP acceptance. Let's define:
+1 Throughput by model and fixture kind: SELECT ... FROM request_metrics q JOIN runs ... GROUP BY model, fixture_kind; avg tokens_per_sec, total output tokens / total latency.
+2 Variability: coefficient of variation

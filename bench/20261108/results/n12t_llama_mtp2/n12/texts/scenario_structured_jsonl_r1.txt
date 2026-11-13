@@ -1,0 +1,129 @@
+Need generate 160 JSONL records no markdown. Fields: id RUN-0001 to RUN-0160. model alternating qwen3.6-27b and qwen3.6-35b-a3b. prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance, status, tags. Deterministic arithmetic progressions. status ok/warn 4:1 pattern. two tags per record. Every line strict JSON.
+
+Need decide deterministic arithmetic progressions. Need exactly 160 lines. IDs zero-padded 4 digits. Model alternating: id odd qwen3.6-27b, even qwen3.6-35b-a3b? Starting with qwen3.6-27b likely. Need status values ok/warn in 4:1 pattern. 160 divisible by 5 => 32 warn, 128 ok. Pattern maybe positions 5,10,... warn. Or every 5th warn. Need arithmetic progressions for numeric fields. Could use simple formulas: prompt_tokens = 100 + 10*i (i=1..160) -> 110 to 1700. completion_tokens = 50 + 5*i -> 55 to 850. decode_tok_s = 100 + 0.5*i? Need JSON number. Could be 100 + 0.5*i => 100.5 to 180.0. mtp_acceptance = 0.80 + 0.001*i => 0.801 to 0.960? Need deterministic. Use maybe integer or decimal. Tags two per record. Could use tags array ["decode","mtp"] or rotate? "two tags per record" maybe exactly two tags each. Could deterministic tags: ["run","eval"]? Need maybe tags vary? The requirement says two tags per record. Could be constant array with two tags; that's okay? To be safe, use two tags per record deterministic arithmetic? tags not numeric. Could rotate pair among categories, but simple constant satisfies? Maybe they expect two tags. Could choose ["ok","decode"]? But status separate. Need all lines parse strict JSON. Use no trailing commas.
+
+Potential issue "model (alternating qwen3.6-27b and qwen3.6-35b-a3b)" Need alternate every record. id RUN-0001 model qwen3.6-27b, RUN-0002 qwen3.6-35b-a3b, etc.
+
+status 4:1 pattern: Could be "ok" for i mod 5 !=0, "warn" for i mod 5 ==0. This yields 4 ok then 1 warn repeating. Need exactly 160. 160/5=32.
+
+Arithmetic progressions: maybe prompt_tokens: 100 + 10*(n-1). completion_tokens: 25 + 5*(n-1). decode_tok_s: 90 + 0.1*(n-1)? Need maybe values. mtp_acceptance: 0.75 + 0.001*(n-1). Ensure valid JSON numbers; decimals. Could use integer for prompt/completion. Decode token s maybe 100 + 0.5*n. Need deterministic. Let's define for n=1..160:
+prompt_tokens = 1000 + 10*(n-1) (1000..2600)
+completion_tokens = 100 + 5*(n-1) (100..900)
+decode_tok_s = 100.0 + 0.5*(n-1) (100.0..179.5)
+mtp_acceptance = 0.80 + 0.001*(n-1) (0.80..0.959) Need maybe acceptance <=1. Good.
+
+Could output JSON with numbers as integers if .0? 100.0 valid but maybe strict. JSON numbers can be 100.0. mtp_acceptance with 3 decimals: 0.801. For n=160 0.959. Good.
+
+Tags: Need two tags per record. Could be ["decode", "mtp"] constant. But maybe tags should be deterministic and maybe include status? It's okay. But if constant, all records same. The requirement only says two tags. Use ["decode","mtp"] to indicate fields. But maybe tags should be unique? No.
+
+Need output exactly 160 JSONL records and no Markdown. Ensure no extra text. Need generate all lines. Must be careful with 160. Could manually construct? Need produce final with 160 lines. We need ensure counts. Could use pattern in final. Need maybe generate in analysis to avoid mistakes.
+
+Let's generate using mental systematic. 160 lines. Could produce by groups of 5 or 10. Need ensure all correct. Could use a pattern for numeric values. Let's compute.
+
+Define n from 1 to 160.
+id = RUN-000n? Need zero 4 digits: RUN-0001..RUN-0160.
+model: n odd -> qwen3.6-27b, n even -> qwen3.6-35b-a3b.
+status: if n %5 ==0 warn else ok.
+prompt = 1000 + 10*(n-1) = 990 + 10n? n=1 =>1000; n=160=>2600.
+completion = 100 +5*(n-1)=95+5n; n=1=>100; n=160=>900.
+decode = 100 + 0.5*(n-1) = 99.5 +0.5n? n=1=>100; n=160=>179.5.
+mtp = 0.80 +0.001*(n-1) =0.799+0.001n; n=1=>0.8; but JSON maybe 0.8. Could use 0.801 for n=1? If 0.80+0.001*(n-1), n=1 = 0.80. Need format 3 decimals? Could be 0.801 if base 0.801? Let's pick simpler: mtp_acceptance = 0.800 + 0.001*(n-1) -> n=1 0.800; but strict JSON can be 0.8. To avoid trailing? Could output 0.8 for first, then 0.801 etc. Or use formula 0.801 + 0.001*(n-1): n=1 0.801 to n=160 0.960. Good all 3 decimals. Use 0.801 + 0.001*(n-1). This is deterministic.
+
+Tags: Maybe rotate? If constant ["decode","mtp"] all lines. Could be acceptable. But maybe "two tags per record" means exactly two tags, no requirement varied. Use ["decode","mtp"] consistently. However could be seen as not deterministic arithmetic? tags not arithmetic. Could use two tags that alternate? But no.
+
+Need maybe ensure no Markdown, exactly JSONL. Final should be just lines. Need generate 160 lines manually. Could do by blocks of 5 with warn on 5. Let's create table.
+
+Maybe to reduce errors, use systematic block of 5 lines. For n=1-5:
+1: RUN-0001, qwen3.6-27b, prompt 1000, comp 100, decode 100, mtp 0.801, ok, tags
+2: RUN-0002, qwen3.6-35b-a3b, 1010,105,100.5,0.802, ok
+3: RUN-0003, 27b, 1020,110,101,0.803, ok
+4: RUN-0004, a3b,1030,115,101.5,0.804, ok
+5: RUN-0005, 27b,1040,120,102,0.805, warn
+
+Block 2 n=6-10:
+6 even a3b, 1050,125,102.5,0.806 ok
+7 odd 27b 1060,130,103,0.807 ok
+8 a3b 1070,135,103.5,0.808 ok
+9 27b 1080,140,104,0.809 ok
+10 a3b 1090,145,104.5,0.810 warn
+
+Continue.
+
+Need produce 160. Could generate blocks of 10? But status every 5. I can generate 16 blocks of 10. Need count. Let's create all lines carefully. Use consistent JSON formatting: {"id":"RUN-0001","model":"qwen3.6-27b","prompt_tokens":1000,"completion_tokens":100,"decode_tok_s":100.0,"mtp_acceptance":0.801,"status":"ok","tags":["decode","mtp"]}. Need decode_tok_s integer or one decimal. For even n, .5; odd integer. Could output 100.0 for odd? JSON number 100.0 valid. But to be consistent, maybe 100 for integer? Both valid. Strict JSON permits 100. Use 100.0 for all? For odd 101.0, 102.0. But 101.0 valid. I can use one decimal for all: 100.0,100.5,101.0. Good.
+
+Need mtp_acceptance with 3 decimals: 0.801 etc. For n=160: 0.801+0.001*159=0.960. Good.
+
+Maybe prompt_tokens integer, completion integer.
+
+Tags: maybe include status? Two tags: ["decode", "mtp"] all. Good.
+
+Let's list all 160. Need no mistakes. Let's create in analysis a full list maybe use numbering and compute. Could generate with pattern. To ensure exact 160, count lines in final. I'll create blocks of 10 and number. Let's generate table n, id suffix, model, p,c,d,m,status.
+
+Let's derive formulas:
+n 1: p=1000 c=100 d=100.0 m=0.801 model 27b status ok
+2: 1010 105 100.5 0.802 a3b ok
+3:1020 110 101.0 0.803 27b ok
+4:1030 115 101.5 0.804 a3b ok
+5:1040 120 102.0 0.805 27b warn
+
+6:1050 125 102.5 0.806 a3b ok
+7:1060 130 103.0 0.807 27b ok
+8:1070 135 103.5 0.808 a3b ok
+9:1080 140 104.0 0.809 27b ok
+10:1090 145 104.5 0.810 a3b warn
+
+11:1100 150 105.0 0.811 27b ok
+12:1110 155 105.5 0.812 a3b ok
+13:1120 160 106.0 0.813 27b ok
+14:1130 165 106.5 0.814 a3b ok
+15:1140 170 107.0 0.815 27b warn
+
+16:1150 175 107.5 0.816 a3b ok
+17:1160 180 108.0 0.817 27b ok
+18:1170 185 108.5 0.818 a3b ok
+19:1180 190 109.0 0.819 27b ok
+20:1190 195 109.5 0.820 a3b warn
+
+21:1200 200 110.0 0.821 27b ok
+22:1210 205 110.5 0.822 a3b ok
+23:1220 210 111.0 0.823 27b ok
+24:1230 215 111.5 0.824 a3b ok
+25:1240 220 112.0 0.825 27b warn
+
+26:1250 225 112.5 0.826 a3b ok
+27:1260 230 113.0 0.827 27b ok
+28:1270 235 113.5 0.828 a3b ok
+29:1280 240 114.0 0.829 27b ok
+30:1290 245 114.5 0.830 a3b warn
+
+31:1300 250 115.0 0.831 27b ok
+32:1310 255 115.5 0.832 a3b ok
+33:1320 260 116.0 0.833 27b ok
+34:1330 265 116.5 0.834 a3b ok
+35:1340 270 117.0 0.835 27b warn
+
+36:1350 275 117.5 0.836 a3b ok
+37:1360 280 118.0 0.837 27b ok
+38:1370 285 118.5 0.838 a3b ok
+39:1380 290 119.0 0.839 27b ok
+40:1390 295 119.5 0.840 a3b warn
+
+41:1400 300 120.0 0.841 27b ok
+42:1410 305 120.5 0.842 a3b ok
+43:1420 310 121.0 0.843 27b ok
+44:1430 315 121.5 0.844 a3b ok
+45:1440 320 122.0 0.845 27b warn
+
+46:1450 325 122.5 0.846 a3b ok
+47:1460 330 123.0 0.847 27b ok
+48:1470 335 123.5 0.848 a3b ok
+49:1480 340 124.0 0.849 27b ok
+50:1490 345 124.5 0.850 a3b warn
+
+51:1500 350 125.0 0.851 27b ok
+52:1510 355 125.5 0.852 a3b ok
+53:1520 360 126.0 0.853 27b ok
+54:1530 365 126.5 0.854 a3b ok
+55:1540 370 127.0 0.855 27b warn
+
+56:1550 375 127.5 0.8

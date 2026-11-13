@@ -1,0 +1,45 @@
+# 发布流程
+
+发布负责人必须原样保留诸如 `request_id`、`max_context`、`kv_dtype` 和 `mtp_rounds` 等标识符。将正文翻译为中文，但请勿翻译代码、JSON 键、命令行标志、文件名或表格中的值。
+
+| Phase | Required evidence | Failure action |
+|---|---|---|
+| prepare | fixture hash and prompt-token count | stop before generation |
+| warmup | one successful unmeasured request | restart the service |
+| measure | five sequential responses | invalidate the complete block |
+| publish | summary plus per-request rows | withhold the headline |
+
+```json
+{"model":"qwen3.6-35b-a3b","max_completion_tokens":1024,"seed":42,"stream":false}
+```
+
+## 备注
+
+操作员需检查前缀复用已禁用，缓存命中次数为零，且没有无关的 GPU 进程处于活动状态。自然停止的响应仍视为有效观测；因客户端断开连接而丢失的响应则不然。报告区分了服务器内部 TTFT 与网络观测时间，并说明首个生成的 token 被分配给 prefill 阶段。
+
+## 双语术语表
+
+1.  **Release procedure** (发布流程): 软件或模型版本从开发到最终发布的标准化步骤。
+2.  **Release owner** (发布负责人): 负责确保发布过程合规、数据准确及流程顺利的关键人员。
+3.  **Identifier** (标识符): 用于唯一识别特定对象、请求或配置的字符串或变量名。
+4.  **`request_id`**: 用于追踪特定 API 请求的唯一标识符。
+5.  **`max_context`**: 模型允许处理的最大上下文长度（token 数）。
+6.  **`kv_dtype`**: 键值缓存（Key-Value Cache）所使用的数据类型（如 float16, bfloat16）。
+7.  **`mtp_rounds`**: 多 token 预测（Multi-Token Prediction）的迭代轮数。
+8.  **Phase** (阶段): 发布流程中的特定步骤或时期。
+9.  **Evidence** (证据): 证明某阶段成功完成所需的数据或日志。
+10. **Failure action** (失败操作): 当阶段验证失败时预定义的应对措施。
+11. **Fixture** (测试夹具): 用于测试的固定数据集合或环境配置。
+12. **Hash** (哈希值): 用于验证数据完整性的摘要算法输出。
+13. **Prompt-token count** (提示词 token 数量): 输入提示词中包含的 token 总数。
+14. **Warmup** (预热): 在正式测量前运行非计时请求以稳定系统状态的过程。
+15. **Unmeasured request** (未测量请求): 不计入性能统计的测试请求。
+16. **Sequential responses** (顺序响应): 按时间顺序依次生成的多个响应。
+17. **Invalidate** (使无效): 标记数据或结果不可用，需重新生成。
+18. **Headline** (头条/主要结论): 报告中总结性的关键性能指标或结论。
+19. **Prefix reuse** (前缀复用): 利用相同前缀的缓存以加速推理的技术。
+20. **Cache-hit count** (缓存命中次数): 成功从缓存中获取数据的次数。
+21. **GPU process** (GPU 进程): 占用图形处理单元资源的操作系统进程。
+22. **TTFT** (Time To First Token): 从请求发出到收到第一个生成 token 的时间。
+23. **Prefill** (预填充): 模型处理输入提示词并生成初始 KV 缓存的阶段。
+24. **Observation** (观测): 在实验或测试中记录到的有效数据点。

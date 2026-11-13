@@ -1,0 +1,543 @@
+Below is a complete, self-contained Python 3.11 package named `deterministic_job_runner`. It satisfies every requirement: JSON manifest loading, single active GPU job enforcement, atomic state persistence, resume of completed work, structured JSONL event streaming, SIGINT handling, secret redaction, and pytest coverage for success/failure/cancellation/resume.
+
+Design notes (so the code is easier to follow):
+- **Determinism:** all timestamps are injected via a `Clock` protocol; tests use a `FakeClock`. The runner is fully synchronous (no real threads), so behavior is reproducible.
+- **Atomicity:** state files are written to a temp file in the same directory then `os.replace`'d (atomic on POSIX).
+- **Single GPU job:** enforced by an `active_gpu_job` field plus a lockfile with PID liveness check.
+- **Redaction:** configured secrets are replaced with `[REDACTED]` in both emitted events and persisted state.
+- **Cancellation:** SIGINT sets a flag; the loop checks it between jobs and mid-job steps, persisting `cancelled` state.
+
+---
+
+### pyproject.toml
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deterministic-job-runner"
+version = "0.1.0"
+description = "A deterministic asynchronous job runner with atomic state, resume, JSONL events, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Example" }]
+keywords = ["jobs", "runner", "gpu", "deterministic", "resume"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+job-runner = "deterministic_job_runner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["deterministic_job_runner*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+```
+
+---
+
+### deterministic_job_runner/__init__.py
+
+```python
+"""Deterministic asynchronous job runner.
+
+Public API surface.
+"""
+
+from .clock import Clock, FakeClock, RealClock
+from .config import Config, load_config
+from .manifest import JobSpec, Manifest, load_manifest
+from .redact import Redactor
+from .state import StateStore
+from .events import EventStream
+from .lock import LockManager
+from .runner import JobRunner, RunResult
+from .errors import (
+    JobRunnerError,
+    ManifestError,
+    ConfigError,
+    StateError,
+    LockError,
+)
+
+__all__ = [
+    "Clock",
+    "RealClock",
+    "FakeClock",
+    "Config",
+    "load_config",
+    "JobSpec",
+    "Manifest",
+    "load_manifest",
+    "Redactor",
+    "StateStore",
+    "EventStream",
+    "LockManager",
+    "JobRunner",
+    "RunResult",
+    "JobRunnerError",
+    "ManifestError",
+    "ConfigError",
+    "StateError",
+    "LockError",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+### deterministic_job_runner/errors.py
+
+```python
+"""Exception hierarchy for the job runner."""
+
+
+class JobRunnerError(Exception):
+    """Base class for all runner errors."""
+
+
+class ManifestError(JobRunnerError):
+    """Raised when the manifest is invalid or unreadable."""
+
+
+class ConfigError(JobRunnerError):
+    """Raised when configuration is invalid or unreadable."""
+
+
+class StateError(JobRunnerError):
+    """Raised when state cannot be read or written atomically."""
+
+
+class LockError(JobRunnerError):
+    """Raised when another process holds the GPU lock."""
+```
+
+---
+
+### deterministic_job_runner/clock.py
+
+```python
+"""Time abstraction for determinism.
+
+The runner never calls ``time.time()`` directly; it always goes through a
+``Clock``. Tests inject a :class:`FakeClock` so that every run produces
+byte-for-byte identical output.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Protocol
+
+
+class Clock(Protocol):
+    """Provides monotonically increasing timestamps in seconds."""
+
+    def now(self) -> float:
+        ...
+
+
+class RealClock:
+    """Wall-clock backed implementation."""
+
+    def now(self) -> float:
+        return time.time()
+
+
+class FakeClock:
+    """Deterministic clock that advances by a fixed step per call."""
+
+    def __init__(self, start: float = 1_000_000.0, step: float = 1.0) -> None:
+        self._t = start
+        self._step = step
+
+    def now(self) -> float:
+        t = self._t
+        self._t += self._step
+        return t
+
+    def set(self, value: float) -> None:
+        self._t = value
+```
+
+---
+
+### deterministic_job_runner/config.py
+
+```python
+"""Configuration loading and validation."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .errors import ConfigError
+
+
+@dataclass(frozen=True)
+class Config:
+    """Runtime configuration for a runner invocation."""
+
+    workdir: Path
+    manifest_path: Path
+    state_path: Path
+    events_path: Path
+    lock_path: Path
+    secrets: dict[str, str] = field(default_factory=dict)
+    max_retries: int = 0
+    gpu_device: str = "cuda:0"
+
+    @property
+    def state_dir(self) -> Path:
+        return self.state_path.parent
+
+    @property
+    def events_dir(self) -> Path:
+        return self.events_path.parent
+
+    @property
+    def lock_dir(self) -> Path:
+        return self.lock_path.parent
+
+
+def _require_str(obj: dict[str, Any], key: str) -> str:
+    if key not in obj:
+        raise ConfigError(f"Missing required config key: {key!r}")
+    val = obj[key]
+    if not isinstance(val, str):
+        raise ConfigError(f"Config key {key!r} must be a string")
+    return val
+
+
+def load_config(path: Path) -> Config:
+    """Load and validate a JSON configuration file.
+
+    Expected keys:
+      - workdir (str)
+      - manifest (str)
+      - state (str)
+      - events (str)
+      - lock (str)
+      - secrets (dict[str, str])   optional
+      - max_retries (int)          optional, default 0
+      - gpu_device (str)           optional, default "cuda:0"
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Cannot read config {path}: {exc}") from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"Invalid JSON in config {path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ConfigError("Config root must be a JSON object")
+
+    workdir = Path(_require_str(data, "workdir"))
+    manifest = Path(_require_str(data, "manifest"))
+    state = Path(_require_str(data, "state"))
+    events = Path(_require_str(data, "events"))
+    lock = Path(_require_str(data, "lock"))
+
+    secrets_raw = data.get("secrets", {})
+    if not isinstance(secrets_raw, dict):
+        raise ConfigError("'secrets' must be an object mapping names to values")
+    secrets: dict[str, str] = {}
+    for k, v in secrets_raw.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            raise ConfigError("Secrets entries must be string -> string")
+        secrets[k] = v
+
+    max_retries = data.get("max_retries", 0)
+    if not isinstance(max_retries, int) or max_retries < 0:
+        raise ConfigError("'max_retries' must be a non-negative integer")
+
+    gpu_device = data.get("gpu_device", "cuda:0")
+    if not isinstance(gpu_device, str):
+        raise ConfigError("'gpu_device' must be a string")
+
+    # Resolve relative paths against workdir for convenience.
+    def resolve(p: Path) -> Path:
+        return p if p.is_absolute() else (workdir / p)
+
+    return Config(
+        workdir=workdir,
+        manifest_path=resolve(manifest),
+        state_path=resolve(state),
+        events_path=resolve(events),
+        lock_path=resolve(lock),
+        secrets=secrets,
+        max_retries=max_retries,
+        gpu_device=gpu_device,
+    )
+```
+
+---
+
+### deterministic_job_runner/manifest.py
+
+```python
+"""Manifest parsing and validation.
+
+A manifest is a JSON document describing an ordered list of jobs. Each job
+may declare a list of sequential "steps". A job is considered complete once
+all of its steps have succeeded.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .errors import ManifestError
+
+
+@dataclass(frozen=True)
+class StepSpec:
+    id: str
+    command: str
+    args: tuple[str, ...] = ()
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    id: str
+    name: str
+    steps: tuple[StepSpec, ...]
+    requires_gpu: bool = True
+    timeout_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class Manifest:
+    version: int
+    jobs: tuple[JobSpec, ...]
+
+    def job_ids(self) -> tuple[str, ...]:
+        return tuple(j.id for j in self.jobs)
+
+
+def _parse_step(idx: int, raw: Any, job_id: str) -> StepSpec:
+    if not isinstance(raw, dict):
+        raise ManifestError(f"Job {job_id!r} step #{idx} must be an object")
+    sid = raw.get("id")
+    cmd = raw.get("command")
+    if not isinstance(sid, str) or not sid:
+        raise ManifestError(f"Job {job_id!r} step #{idx} missing 'id'")
+    if not isinstance(cmd, str) or not cmd:
+        raise ManifestError(f"Job {job_id!r} step {sid!r} missing 'command'")
+    args_raw = raw.get("args", [])
+    if not isinstance(args_raw, list) or not all(isinstance(a, str) for a in args_raw):
+        raise ManifestError(f"Job {job_id!r} step {sid!r} 'args' must be a list of strings")
+    env_raw = raw.get("env", {})
+    if not isinstance(env_raw, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in env_raw.items()
+    ):
+        raise ManifestError(f"Job {job_id!r} step {sid!r} 'env' must be an object of strings")
+    return StepSpec(id=sid, command=cmd, args=tuple(args_raw), env=dict(env_raw))
+
+
+def _parse_job(idx: int, raw: Any) -> JobSpec:
+    if not isinstance(raw, dict):
+        raise ManifestError(f"Job #{idx} must be an object")
+    jid = raw.get("id")
+    if not isinstance(jid, str) or not jid:
+        raise ManifestError(f"Job #{idx} missing 'id'")
+    name = raw.get("name", jid)
+    if not isinstance(name, str):
+        raise ManifestError(f"Job {jid!r} 'name' must be a string")
+    steps_raw = raw.get("steps", [])
+    if not isinstance(steps_raw, list):
+        raise ManifestError(f"Job {jid!r} 'steps' must be a list")
+    steps = tuple(_parse_step(i, s, jid) for i, s in enumerate(steps_raw))
+    requires_gpu = raw.get("requires_gpu", True)
+    if not isinstance(requires_gpu, bool):
+        raise ManifestError(f"Job {jid!r} 'requires_gpu' must be a boolean")
+    timeout = raw.get("timeout_seconds")
+    if timeout is not None and (not isinstance(timeout, (int, float)) or timeout <= 0):
+        raise ManifestError(f"Job {jid!r} 'timeout_seconds' must be a positive number")
+    return JobSpec(
+        id=jid,
+        name=name,
+        steps=steps,
+        requires_gpu=requires_gpu,
+        timeout_seconds=float(timeout) if timeout is not None else None,
+    )
+
+
+def load_manifest(path: Path) -> Manifest:
+    """Load and validate a manifest file."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ManifestError(f"Cannot read manifest {path}: {exc}") from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ManifestError(f"Invalid JSON in manifest {path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ManifestError("Manifest root must be a JSON object")
+
+    version = data.get("version", 1)
+    if not isinstance(version, int):
+        raise ManifestError("'version' must be an integer")
+
+    jobs_raw = data.get("jobs")
+    if not isinstance(jobs_raw, list):
+        raise ManifestError("'jobs' must be a list")
+
+    jobs = tuple(_parse_job(i, j) for i, j in enumerate(jobs_raw))
+
+    seen: set[str] = set()
+    for j in jobs:
+        if j.id in seen:
+            raise ManifestError(f"Duplicate job id: {j.id!r}")
+        seen.add(j.id)
+
+    return Manifest(version=version, jobs=jobs)
+```
+
+---
+
+### deterministic_job_runner/redact.py
+
+```python
+"""Secret redaction.
+
+Any occurrence of a configured secret value is replaced with a placeholder
+in both emitted events and persisted state. This prevents accidental
+leakage of credentials into logs or on-disk artifacts.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+PLACEHOLDER = "[REDACTED]"
+
+
+class Redactor:
+    def __init__(self, secrets: dict[str, str]) -> None:
+        # Sort by length descending so longer secrets are matched first.
+        self._values: list[str] = sorted(
+            (v for v in secrets.values() if v), key=len, reverse=True
+        )
+
+    def redact_string(self, s: str) -> str:
+        out = s
+        for v in self._values:
+            if v in out:
+                out = out.replace(v, PLACEHOLDER)
+        return out
+
+    def redact(self, obj: Any) -> Any:
+        """Recursively redact a JSON-compatible structure."""
+        if isinstance(obj, str):
+            return self.redact_string(obj)
+        if isinstance(obj, list):
+            return [self.redact(item) for item in obj]
+        if isinstance(obj, dict):
+            return {k: self.redact(v) for k, v in obj.items()}
+        return obj
+
+    def redact_json(self, obj: Any) -> str:
+        """Serialize to JSON after redacting, with stable ordering."""
+        return json.dumps(self.redact(obj), sort_keys=True, separators=(",", ":"))
+```
+
+---
+
+### deterministic_job_runner/state.py
+
+```python
+"""Atomic, resumable state persistence.
+
+State is stored as a single JSON document. Writes are performed to a
+temporary file in the same directory and then atomically renamed over the
+target using ``os.replace``, which is atomic on POSIX filesystems.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .errors import StateError
+from .redact import Redactor
+
+
+@dataclass
+class JobState:
+    status: str  # pending | running | succeeded | failed | cancelled
+    attempts: int = 0
+    completed_steps: list[str] = field(default_factory=list)
+    error: str | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+
+
+@dataclass
+class State:
+    version: int = 1
+    active_gpu_job: str | None = None
+    jobs: dict[str, JobState] = field(default_factory=dict)
+    last_updated: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "active_gpu_job": self.active_gpu_job,
+            "last_updated": self.last_updated,
+            "jobs": {
+                jid: {
+                    "status": js.status,
+                    "attempts": js.attempts,
+                    "completed_steps": list(js.completed_steps),
+                    "error": js.error,
+                    "started_at": js.started_at,
+                    "finished_at": js.finished_at,
+                }
+                for jid, js in self.jobs.items()
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "State":
+        jobs: dict[str, JobState] = {}
+        for jid, raw in data.get("jobs", {}).items():
+            jobs[jid] = JobState(
+                status=raw.get("status", "pending"),
+                attempts=int(raw.get("attempts", 0)),
+                completed_steps=list(raw.get("completed_steps", [])),
+                error=raw.get("error"),
+                started_at=raw.get("started_at"),
+                finished_at=raw.get("finished_at"),
+            )

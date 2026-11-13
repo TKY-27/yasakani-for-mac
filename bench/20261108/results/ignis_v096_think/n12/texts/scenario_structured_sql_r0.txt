@@ -1,0 +1,261 @@
+We need respond to user: "Return one PostgreSQL script with no Markdown fences. Define normalized tables for models, fixtures, runs, and request_metrics; include primary/foreign keys, checks, useful indexes, two views, one transaction-safe upsert function, and at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. The script must run in dependency order."
+
+Need produce one PostgreSQL script, no Markdown fences. Need ensure script runs dependency order. Need normalized tables: models, fixtures, runs, request_metrics. Include PK/FK, checks, useful indexes. Two views. One transaction-safe upsert function. At least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Need likely request_metrics has columns relevant: run_id, fixture_id? Or maybe per request metrics includes token counts, latency, mtp acceptance, retention? Need define.
+
+Need script only. No fences. Must be valid PostgreSQL. Need consider transaction-safe upsert function: maybe function upsert_run_result(...) called in transaction? PostgreSQL functions transaction-safe? We can define a function that uses CTE and INSERT ... ON CONFLICT. Need "transaction-safe upsert function" likely means the function respects caller's transaction, can be called inside transaction, and maybe uses LOCAL TEMP? Need include one function.
+
+Need at least 80 realistic INSERT rows spanning two models and four fixture kinds. Could generate 40 rows for model A and 40 for model B across four fixtures (10 each). Need INSERT INTO runs? Or request_metrics? The requirement "at least 80 realistic INSERT rows spanning two models and four fixture kinds." Could mean inserted rows in runs/request_metrics? Need define normalized tables. Models 2 rows, fixtures 4 rows, runs maybe 80? Or request_metrics 80? We need at least 80 realistic INSERT rows. To be safe, insert 80 rows into runs spanning two models and four fixtures, then maybe request_metrics maybe 80 rows? But user asks tables include request_metrics; 80 rows spanning two models and four fixture kinds. Could be 80 request_metrics rows. But normalized: runs reference model and fixture; request_metrics reference run. Could insert 80 runs and 80 request_metrics? At least 80 INSERT rows total? They said at least 80 realistic INSERT rows spanning two models and four fixture kinds. I can insert 2 models, 4 fixtures, 80 runs, 80 request_metrics? That is 166 rows. But script length okay. Need maybe not too huge. Could insert 80 rows into runs, with each run having a request_metric? "request_metrics" table likely individual request metrics. Need at least 80 realistic INSERT rows spanning two models and four fixture kinds. If only 80 rows in request_metrics, that's good. But need runs to link. Could do 2 models * 4 fixtures * 10 request_metrics = 80. Each metric row references a run. Need runs? Could one run per model/fixture? But request_metrics per run maybe multiple requests. To have 80 request_metrics, can have 8 runs (2x4) each with 10 request_metrics, total 80 metric rows. That satisfies 80 realistic INSERT rows? But "spanning two models and four fixture kinds" if metrics. However, they specifically: "Return one PostgreSQL script with no Markdown fences. Define normalized tables for models, fixtures, runs, and request_metrics; include primary/foreign keys, checks, useful indexes, two views, one transaction-safe upsert function, and at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. The script must run in dependency order."
+
+Likely they expect a single script with tables, indexes, views, function, inserts, selects. Need "two views" maybe view for run_summary and metric_aggregates.
+
+Need analytical SELECT queries: throughput, variability, long-context retention, MTP acceptance. Six queries.
+
+Need define columns:
+- models: model_id serial or text? normalized. Could use model_name unique, model_id serial PK. Check model_name not null.
+- fixtures: fixture_id serial, fixture_kind text check in ('code_completion','summarization','long_context_qa','function_calling') maybe four kinds. fixture_name unique.
+- runs: run_id serial, model_id FK, fixture_id FK, experiment_id? maybe run_date, batch_size, max_tokens, context_length, created_at. Check unique (model_id, fixture_id, run_index?) to allow multiple. PK run_id. FK to model, fixture.
+- request_metrics: metric_id serial, run_id FK, request_index int, input_tokens int, output_tokens int, ttft_ms numeric, e2e_latency_ms numeric, tokens_per_second numeric, long_context_retention_pct numeric, mtp_acceptance_rate numeric, check constraints: tokens positive, rates 0-1, retention 0-100, request_index >=0.
+
+Need useful indexes: on runs(model_id, fixture_id, run_date), request_metrics(run_id, request_index), request_metrics(tokens_per_second), request_metrics(mtp_acceptance_rate), request_metrics(long_context_retention_pct), etc.
+
+Two views:
+1. v_run_summary: aggregates per model/fixture: count requests, avg tps, p95 latency maybe, avg MTP, avg retention.
+2. v_long_context_analysis: filter long-context retention and MTP by fixture kind maybe context bucket. Could view with request_metrics joined.
+
+Need transaction-safe upsert function. We need define function maybe:
+CREATE OR REPLACE FUNCTION upsert_run_metric(
+  p_model_name text, p_fixture_kind text, p_request_index int,
+  p_input_tokens int, p_output_tokens int, p_ttft_ms numeric, p_e2e_latency_ms numeric,
+  p_tokens_per_second numeric, p_long_context_retention_pct numeric, p_mtp_acceptance_rate numeric,
+  p_context_length int default 8192, p_batch_size int default 1
+) RETURNS request_metrics AS $$ ...
+WITH upsert_model AS (INSERT INTO models(model_name) VALUES (p_model_name) ON CONFLICT (model_name) DO NOTHING RETURNING model_id), ... fixture ... run? Need upsert run: maybe run keyed by model_id, fixture_id, request_index? But request_index belongs metric. If function to upsert a single request metric, it can find or create model, fixture, run (unique run by model, fixture, maybe run_label or run_seq). Need transaction-safe: if no run for model/fixture? Could create a default run. But to be normalized, run must be unique. Could use function upsert_metric that takes run_id? But "upsert function" maybe upsert a run aggregate. Need transaction-safe meaning uses ON CONFLICT and can be called in transaction; not commit inside function (Postgres functions can't commit). We can define a function that updates or inserts a metric row based on run_id and request_index, with conflict on (run_id, request_index) unique. That's simpler. Need include check unique constraint on request_metrics(run_id, request_index). Then function upsert_request_metric(p_run_id int, p_request_index int, ...) INSERT ... ON CONFLICT (run_id, request_index) DO UPDATE SET ... RETURNING ... It is transaction-safe (part of caller's transaction). Need maybe call in transaction. But requirement says include one transaction-safe upsert function; just define. Could also wrap in transaction? Function itself can't commit; we can note via comments? But no fences. We can include BEGIN; ... COMMIT;? Maybe whole script can be run in transaction. But if it runs in dependency order, can have BEGIN; at top and COMMIT at end? It's okay. But SELECTs inside transaction? Fine. However, if script is executed by psql -v ON_ERROR_STOP, can have BEGIN; and COMMIT;? PostgreSQL supports BEGIN at top-level. We can start with BEGIN; and end before SELECTs? If include SELECTs after COMMIT, okay. Or wrap inserts. Transaction-safe upsert function maybe use SAVEPOINT? No.
+
+Need ensure no issues with p95 percentile: PostgreSQL doesn't have percentile_cont unless stats extension? percentile_cont available in PG? Yes aggregate percentile_cont(0.95) WITHIN GROUP (ORDER BY ...) works. Use.
+
+Need six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Need topics maybe:
+1. Average and p95 throughput (tokens/sec) by model/fixture.
+2. Variability of latency/throughput: stddev, coefficient of variation, min/max.
+3. Long-context retention by context length bucket or fixture kind: avg retention, degradation.
+4. MTP acceptance rate by model/fixture and maybe output token bucket.
+5. Correlation of throughput and MTP acceptance? Or request-level MTP acceptance with token length.
+6. Long-context retention + MTP acceptance combined: average retention and acceptance by model/fixture, maybe percentile.
+
+Need queries use views maybe. Six queries can reference v_run_summary, v_long_context_mtp, request_metrics. Need finish with six analytical SELECT queries. "Finish with" means script ends with six SELECTs? If include COMMIT before selects? We can finish with selects after all definitions and inserts. Need no Markdown fences. So output raw SQL. Need ensure script is one PostgreSQL script. Could include comments? Fine. But no
+
+My thinking time is over. I must now write the complete final answer from what I already have, without calling any more tools.BEGIN;
+
+CREATE TABLE models (
+    model_id bigserial PRIMARY KEY,
+    model_name text NOT NULL UNIQUE CHECK (model_name <> ''),
+    vendor text CHECK (vendor IS NULL OR vendor <> ''),
+    parameter_size_b float8 CHECK (parameter_size_b IS NULL OR parameter_size_b >= 0),
+    max_context_tokens int CHECK (max_context_tokens IS NULL OR max_context_tokens > 0),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE fixtures (
+    fixture_id bigserial PRIMARY KEY,
+    fixture_kind text NOT NULL CHECK (
+        fixture_kind IN (
+            'code_completion',
+            'summarization',
+            'long_context_qa',
+            'function_calling'
+        )
+    ),
+    fixture_name text NOT NULL UNIQUE CHECK (fixture_name <> ''),
+    default_context_tokens int CHECK (default_context_tokens IS NULL OR default_context_tokens > 0),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE runs (
+    run_id bigserial PRIMARY KEY,
+    model_id bigint NOT NULL REFERENCES models(model_id) ON DELETE RESTRICT,
+    fixture_id bigint NOT NULL REFERENCES fixtures(fixture_id) ON DELETE RESTRICT,
+    run_label text NOT NULL CHECK (run_label <> ''),
+    run_started_at timestamptz NOT NULL DEFAULT now(),
+    batch_size int NOT NULL DEFAULT 1 CHECK (batch_size > 0),
+    max_output_tokens int NOT NULL DEFAULT 512 CHECK (max_output_tokens > 0),
+    temperature float8 NOT NULL DEFAULT 0.0 CHECK (temperature >= 0 AND temperature <= 2),
+    top_p float8 NOT NULL DEFAULT 1.0 CHECK (top_p > 0 AND top_p <= 1),
+    UNIQUE (model_id, fixture_id, run_label)
+);
+
+CREATE TABLE request_metrics (
+    metric_id bigserial PRIMARY KEY,
+    run_id bigint NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    request_index int NOT NULL CHECK (request_index >= 0),
+    input_tokens int NOT NULL CHECK (input_tokens >= 0),
+    output_tokens int NOT NULL CHECK (output_tokens >= 0),
+    ttft_ms numeric(10, 3) CHECK (ttft_ms IS NULL OR ttft_ms >= 0),
+    e2e_latency_ms numeric(12, 3) CHECK (e2e_latency_ms IS NULL OR e2e_latency_ms >= 0),
+    tokens_per_second float8 CHECK (tokens_per_second IS NULL OR tokens_per_second >= 0),
+    long_context_retention_pct float8 CHECK (
+        long_context_retention_pct IS NULL
+        OR (long_context_retention_pct >= 0 AND long_context_retention_pct <= 100)
+    ),
+    mtp_acceptance_rate float8 CHECK (
+        mtp_acceptance_rate IS NULL
+        OR (mtp_acceptance_rate >= 0 AND mtp_acceptance_rate <= 1)
+    ),
+    request_finished_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (run_id, request_index)
+);
+
+CREATE INDEX idx_runs_model_fixture_time
+    ON runs (model_id, fixture_id, run_started_at);
+
+CREATE INDEX idx_runs_label
+    ON runs (run_label);
+
+CREATE INDEX idx_request_metrics_run_order
+    ON request_metrics (run_id, request_index);
+
+CREATE INDEX idx_request_metrics_throughput
+    ON request_metrics (tokens_per_second);
+
+CREATE INDEX idx_request_metrics_mtp
+    ON request_metrics (mtp_acceptance_rate);
+
+CREATE INDEX idx_request_metrics_retention
+    ON request_metrics (long_context_retention_pct);
+
+CREATE INDEX idx_request_metrics_latency
+    ON request_metrics (e2e_latency_ms);
+
+CREATE INDEX idx_request_metrics_input_tokens
+    ON request_metrics (input_tokens);
+
+CREATE INDEX idx_request_metrics_output_tokens
+    ON request_metrics (output_tokens);
+
+CREATE VIEW v_run_summary AS
+SELECT
+    r.run_id,
+    r.run_label,
+    r.run_started_at,
+    r.batch_size,
+    r.max_output_tokens,
+    r.temperature,
+    r.top_p,
+    m.model_id,
+    m.model_name,
+    f.fixture_id,
+    f.fixture_kind,
+    f.fixture_name,
+    COALESCE(SUM(qm.input_tokens), 0)::bigint AS total_input_tokens,
+    COALESCE(SUM(qm.output_tokens), 0)::bigint AS total_output_tokens,
+    COALESCE(AVG(qm.tokens_per_second), 0)::numeric(10, 3) AS avg_tokens_per_second,
+    COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY qm.tokens_per_second), 0)::numeric(10, 3) AS p95_tokens_per_second,
+    COALESCE(AVG(qm.e2e_latency_ms), 0)::numeric(12, 3) AS avg_e2e_latency_ms,
+    COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY qm.e2e_latency_ms), 0)::numeric(12, 3) AS p95_e2e_latency_ms,
+    COALESCE(AVG(qm.mtp_acceptance_rate), 0)::numeric(8, 4) AS avg_mtp_acceptance_rate,
+    COALESCE(AVG(qm.long_context_retention_pct), 0)::numeric(8, 3) AS avg_long_context_retention_pct
+FROM runs r
+JOIN models m
+    ON m.model_id = r.model_id
+JOIN fixtures f
+    ON f.fixture_id = r.fixture_id
+LEFT JOIN request_metrics qm
+    ON qm.run_id = r.run_id
+GROUP BY
+    r.run_id,
+    r.run_label,
+    r.run_started_at,
+    r.batch_size,
+    r.max_output_tokens,
+    r.temperature,
+    r.top_p,
+    m.model_id,
+    m.model_name,
+    f.fixture_id,
+    f.fixture_kind,
+    f.fixture_name;
+
+CREATE VIEW v_long_context_mtp AS
+SELECT
+    r.run_id,
+    r.run_label,
+    r.batch_size,
+    m.model_id,
+    m.model_name,
+    f.fixture_id,
+    f.fixture_kind,
+    f.fixture_name,
+    qm.request_index,
+    qm.input_tokens,
+    qm.output_tokens,
+    qm.tokens_per_second,
+    qm.long_context_retention_pct,
+    qm.mtp_acceptance_rate,
+    CASE
+        WHEN qm.input_tokens < 2048 THEN 'short'
+        WHEN qm.input_tokens < 8192 THEN 'medium'
+        ELSE 'long'
+    END AS context_bucket,
+    CASE
+        WHEN f.fixture_kind = 'long_context_qa' THEN TRUE
+        ELSE FALSE
+    END AS is_long_context_fixture
+FROM runs r
+JOIN models m
+    ON m.model_id = r.model_id
+JOIN fixtures f
+    ON f.fixture_id = r.fixture_id
+JOIN request_metrics qm
+    ON qm.run_id = r.run_id;
+
+CREATE OR REPLACE FUNCTION upsert_request_metric(
+    p_run_id bigint,
+    p_request_index int,
+    p_input_tokens int,
+    p_output_tokens int,
+    p_ttft_ms numeric,
+    p_e2e_latency_ms numeric,
+    p_tokens_per_second float8,
+    p_long_context_retention_pct float8,
+    p_mtp_acceptance_rate float8
+) RETURNS request_metrics AS $$
+DECLARE
+    v_existing request_metrics;
+    v_inserted request_metrics;
+BEGIN
+    IF p_run_id IS NULL THEN
+        RAISE EXCEPTION 'p_run_id must not be NULL';
+    END IF;
+
+    IF p_request_index IS NULL OR p_request_index < 0 THEN
+        RAISE EXCEPTION 'p_request_index must be non-negative';
+    END IF;
+
+    IF p_input_tokens IS NULL OR p_input_tokens < 0 THEN
+        RAISE EXCEPTION 'p_input_tokens must be non-negative';
+    END IF;
+
+    IF p_output_tokens IS NULL OR p_output_tokens < 0 THEN
+        RAISE EXCEPTION 'p_output_tokens must be non-negative';
+    END IF;
+
+    IF p_tokens_per_second IS NOT NULL AND p_tokens_per_second < 0 THEN
+        RAISE EXCEPTION 'p_tokens_per_second must be non-negative';
+    END IF;
+
+    IF p_mtp_acceptance_rate IS NOT NULL AND (p_mtp_acceptance_rate < 0 OR p_mtp_acceptance_rate > 1) THEN
+        RAISE EXCEPTION 'p_mtp_acceptance_rate must be between 0 and 1';
+    END IF;
+
+    IF p_long_context_retention_pct IS NOT NULL AND (p_long_context_retention_pct < 0 OR p_long_context_retention_pct > 100) THEN
+        RAISE EXCEPTION 'p_long_context_retention_pct must be between 0 and 100';
+    END IF;
+
+    SELECT *
+    INTO v_existing
+    FROM request_metrics
+    WHERE run_id = p_run_id
+      AND request_index = p_request_index;
+
+    IF FOUND THEN
+        UPDATE request_metrics
+        SET
+            input

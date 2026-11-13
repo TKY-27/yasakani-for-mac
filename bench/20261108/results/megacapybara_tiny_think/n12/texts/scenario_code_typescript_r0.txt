@@ -1,0 +1,141 @@
+The user is asking for a complete TypeScript 5 service that satisfies the following:
+
+1. Consumes newline-delimited (NDJSON) request metrics
+2. Validates them without using any third-party schema library (manual validation)
+3. Groups records by model and fixture
+4. Computes mean, median, and sample standard deviation (statistics)
+5. Exposes `/health`, `/summary`, and `/runs/:id` endpoints
+6. Includes strict types
+7. Incremental parsing
+8. Bounded memory
+9. Errors for malformed input
+10. Unit tests
+11. package.json
+12. tsconfig.json
+13. A concise operations guide
+14. No placeholders
+
+Let me design this properly.
+
+**Architecture:**
+
+- An HTTP server using Node.js's built-in `http` module (no third-party dependencies needed for the server — keeps things simple and dependency-free. Tests might use `node:test` which is built in, or I could write tests with no framework, but... "unit tests" is requested. Node 18+/20's built-in `node:test` runner is a great choice — zero third-party dependencies, works with tsx or ts-node. In practice, to run TS tests, you'd use `tsx` or `ts-node`. Node 22+ can run TS files with type stripping (`--experimental-strip-types`). Hmm, to be safe and broadly compatible, I'll set up `tsx` as a devDependency for running the server and tests. That's a dev-only dependency, acceptable. Or compile with tsc then run. Let me think.
+
+Options:
+- package.json with `tsx` as devDependency; scripts: `start: tsx src/server.ts`, `test: tsx --test src/**/*.test.ts` (does tsx support `--test`? The `tsx --test` pattern works: `tsx --test src/**/*.test.ts` — actually, `node --test` combined with tsx... tsx provides `tsx --test file...` as an alias for `node --test`. Yes, tsx supports `--test`.)
+- Alternatively, compile: `tsc -p tsconfig.build.json`, then `node dist/server.js`, `node --test dist/*.test.js`. This requires Node 18+ for `node --test` (Node 18 has it, and it's nearly stable from 20 onwards). This is actually the cleanest and most "production-like" approach: type-check with tsc, run the compiled JS, run tests on the compiled JS with `node --test`. No tsx needed at runtime. But writing tests in TS and compiling them is fine.
+
+Simplest and most robust: use `tsx` for both dev and test. `node:test` is built in. devDependencies: typescript, tsx, @types/node. No runtime dependencies at all — fits the "no third-party schema library" requirement and is good practice.
+
+Let me decide:
+- devDependencies: `typescript` (^5.x), `tsx` (^4.x), `@types/node` (^20 or ^22).
+- engines: node >= 20.
+- scripts:
+  - `build`: `tsc -p tsconfig.json` (output to dist)
+  - `start`: `node dist/server.js`
+  - `dev`: `tsx watch src/server.ts`
+  - `test`: `tsx --test src/**/*.test.ts` — glob expansion might be shell-dependent. Safer: `tsx --test "src/**/*.test.ts"`? On Linux, `node --test` accepts globs natively from Node 21 onwards. `tsx --test` forwards to node test runner with tsx loader... Actually the safest cross-platform: list files explicitly or use a small helper. `tsx --test src/**/*.test.ts` — on bash, unquoted globs are expanded by the shell. In PowerShell, `**` glob doesn't work. Node's test runner accepts multiple file paths. To make it cross-platform, `tsx --test src/` — Node's test runner (Node 20.8+? The `node --test <dir>` feature was added in Node 20) accepts a directory and finds test files matching the pattern (`*.test.js` etc.). For TS via tsx, do the default test file patterns include `.test.ts`? Node's test runner pattern: `**/*.test.{js,mjs,cjs}` plus `.ts` variants when using --experimental... Hmm. Node's default test file patterns (Node 21+): files matching `**/*.test.{cjs,mjs,js}`, `**/*-test.{...}`, `**/*-spec.{...}`, `test/**/*.js`, etc. Under strip-types, TS variants also match.
+
+To avoid the uncertainty, I'll enumerate test files explicitly in the test script:
+`"test": "tsx --test src/parsing.test.ts src/stats.test.ts src/service.test.ts src/validators.test.ts"`
+This is explicit and cross-platform. Fine — but "no placeholders" means real files. I'll enumerate the actual files I create.
+
+Actually, let me reconsider: maybe simpler and more robust: compile to dist, then `node --test dist/`. Node 20's `node --test dist/` finds `*.test.js` files in the directory. This works on Node 20+. But dist would include the server file. That's fine. Tests import from the compiled output.
+
+But for a deliverable, `tsx` gives a faster dev loop and works on Node 18+ too? Node's `node --test` requires Node 18 (experimental) or 20. tsx --test requires Node >= 18.
+
+I'll go with `tsx --test` and explicit file listing. And engines: `"node": ">=18.17"`. Node 18's `node --test`: available experimentally from 18.0? Test runner in Node 18: `node --test` was added in v18.0.0 (experimental). `node:test` module was added in 16.17/18. tsx supports --test (documented: `tsx --test <files>`). Yes, tsx's README has `tsx --test tests/`.
+
+Let me pick Node >= 20 to be safe for `node:test` with assertions.
+
+**Data model:**
+
+NDJSON request metrics. What does a record look like? Let me define a concrete schema (since "no placeholders" requires a concrete format). Records for request metrics grouped by "model" and "fixture" — sounds like LLM benchmarking: each run has a model name, fixture (prompt/test case), and per-request metrics like latency, tokens, status, tokens/sec, cost, etc.
+
+Define the metric record:
+
+```json
+{
+  "runId": "run-2024-06-01-001",
+  "model": "gpt-4o-2024-05-13",
+  "fixture": "math-hard-042",
+  "requestId": "req-000123",
+  "latencyMs": 1832.4,
+  "tokensIn": 214,
+  "tokensOut": 1024,
+  "status": "ok",
+  "error": null,
+  "costUsd": 0.0231
+}
+```
+
+Types:
+- `runId`: non-empty string, pattern like /^[A-Za-z0-9._-]+$/.
+- `model`: non-empty string, with length limit.
+- `fixture`: non-empty string.
+- `requestId`: non-empty string.
+- `latencyMs`: number >= 0, finite.
+- `tokensIn`: non-negative integer.
+- `tokensOut`: non-negative integer.
+- `status`: one of "ok" | "error" | "timeout" (enum).
+- `error`: string or null.
+- `costUsd`: number >= 0.
+
+Validation rules:
+- JSON must parse (malformed JSON error with line number).
+- Top level must be an object (not array or string).
+- No unknown fields? Should I make unknown fields an error or just warn. For strictness, unknown fields are a validation error (strict input). Hmm — strict schema validation typically rejects unknown keys. I'll reject them with a clear error. Might be annoying, but "strict types" suggests strictness. Reject unknown fields.
+- Missing required field -> error.
+- Wrong type -> error with field path.
+- Constraint violation (negative latency, non-integer tokens) -> error.
+- Line too long -> error (bounded input).
+- Empty line -> skip? NDJSON usually allows trailing newline. A trailing newline after the last record creates an empty final chunk — we should ignore pure-whitespace lines. But empty lines in the middle are either errors or ignored. Safer: whitespace-only lines are ignored (common tolerance), but documented. Actually to be strict: blank lines are skipped, documented.
+
+Each line is one record.
+
+**Incremental parsing:** A `LineSplitter` / `NdjsonParser` class that accepts arbitrary string/Buffer chunks (bounded chunk size), splits on newlines, buffers any incomplete trailing line (bounded: if the buffered line exceeds MAX_LINE_BYTES, emit a LineTooLongError and reset), and emits complete lines. Must handle \r\n and \n. Also guard against a huge single line.
+
+**Bounded memory:**
+- Grouping by (model, fixture): keep per-group statistics incrementally (mean via running sum, or Welford's; sample standard deviation via Welford's; median requires full data — that's the challenge).
+- Median: computing median requires all data or an approximation. To bound memory, I can use a two-heap selection algorithm that maintains the median incrementally with O(n) memory in the heaps — that's still unbounded in n! Two heaps grow with n. So median with bounded memory requires approximate median (e.g., GK algorithm) or reservoir sampling (approximate). Options:
+  1. Store all values: unbounded — violates bounded memory.
+  2. Reservoir sampling: keep K samples (e.g., 1000) per group, compute median of the sample — approximate median. Bound memory at K per group. Approximate but documented.
+  3. GK (Greenwald-Khanna) quantile sketch: approximate median with bounded space and error guarantee. More complex but doable and "senior engineer" worthy.
+
+Since the requirement says "bounded memory," I should implement either GK or reservoir sampling with explicit bounds. GK is more impressive and provides actual error guarantees on rank. Let me implement a compact GK sketch:
+
+GK algorithm:
+- Store tuples (v, delta, rank).
+- Maintain sample size n, precision parameter epsilon (e.g., 0.01 for 1% rank error).
+- insert(v), quantile(q), compress().
+
+A simplified "randomized GK" implementation that is easier to get right: store all values in memory with a cap M (e.g., 5000 per group). While size < M, store all. Once full, probabilistically drop entries (with rank deltas) to halve the count. Standard algorithm.
+
+Let me write the randomized GK as in the original paper:
+
+Data structure: S = [(v, Δ, r)]. Invariants: for each i, sum_{j≤i} Δ_j ≥ r - (n/2 - 1), etc.
+
+Algorithm:
+- n = 0, ε = ε (target), m = min sample size (e.g., max(ceil(1/ε), some minimum like 10)).
+- insert(v): n++; if |S| < m: S.append((v,0,1)); compress(). Else: i = random int in [1, |S|]; r_i = sum of ranks up to i; Δ = max(0, floor(εn/2) - (n - r_i)); S.insert at position i a (v, Δ, r_i); compress().
+- compress(): i = 1..|S|-2; if for all j≤i and all j'≥i (r_j' - r_j) ≤ floor(εn/2), drop S[i] (i.e., merge). Standard condition: for i in 1..|S|-1 (1-based, not last), if (sum of Δ up to i... ) let me recall precisely:
+
+GK compress: for i = 1 to |S|-2 (1-based, not including the last two? actually not including the last): if for all i' ≤ i and i' ≥ i, (r_{i'} - r_i) ≤ ⌊εn/2⌋, then delete S_i. This is O(|S|^2). With m = 1/ε ~ 100 entries, fine.
+
+Simplified practical version many implementations use: track a band: compute the minimum possible and maximum possible for rank(v_i) = r_i + ... Actually, the classic condition: drop S[i] if r_{i+1} - r_{i-1} ≤ ⌊εn/2⌋. That's the O(|S|) version! Yes — in Greenwald-Khanna, it suffices to check r_{i+1} - r_{i-1} ≤ εn/2 (since r_{i'} for j<i ≤ r_{i-1}... hmm, not exactly, but the standard "efficient" version uses r_{i+1} - r_{i-1}).
+
+Let me verify: In GK, the invariant requires |r_i - R(v_i)| ≤ εn/2 for each tuple, where R(v) is the true rank. r_{i-1} - r_i ≤ Δ_{i-1}... The condition (r_{i+1} - r_{i-1}) ≤ ⌊εn/2⌋ is used in many implementations (e.g., the Python `gk` implementation uses a band computation that checks min/max rank difference). I'll use r_{i+1} - r_{i-1} ≤ t where t = floor(ε n / 2), for i in 1..|S|-2 (1-based, skipping first and last). This maintains the invariant: after deletion, for neighboring tuples, rank ranges overlap appropriately. This is well-established (e.g., "gk.py" implementations and the original paper mention this optimization). Yes, in the paper's algorithm 2, compress uses a band of ranks. The condition r_{i+1} - r_{i-1} ≤ εn/2 is correct and standard.
+
+- quantile(q): target rank r = ceil(q * n). Find the tuple that minimizes... Return: find the smallest i such that r_i + sum_{j>i} Δ_j ≥ target? Standard: find i such that cumulative rank range contains target, return v_i with guarantee |R(v) - r| ≤ εn/2. Implementation: compute total = sum of Δ; iterate from the end? Common impl: r = 0; for i in 1..|S|: r += Δ_{i-1}... Let me implement:
+
+```
+quantile(q):
+  if n == 0: error
+  if |S| == 1: return S[0].v (approximate for n==1)
+  target = Math.ceil(q * n)  // 1-based target rank
+  // For each i, the rank of v_i lies in [r_i - sum_{j<i}Δ_j? ...]
+```
+
+Hmm, simpler: rank_i range: lower_i = r_i - sum_{j>i} Δ_j? Let me define: r_i is the "recorded" rank. True rank R(v_i) satisfies r_i ≤ R(v_i) ≤ r_i + sum_{j>i} Δ_j (deltas from i+1..end), and also R(v_i) ≥ r_i - sum_{j<i} Δ_j? Actually the invariant in GK: for tuple i, r_i - εn/2 ≤ R(v_i) ≤ r_i + εn/2 (this is the maintained invariant). So for quantile q: target t = q*n. Find the tuple i that minimizes |r_i - t|, or find the first i such that r_i ≥ t and return v_i (with guarantee |R - t| ≤ εn/2). Standard implementations pick i minimizing (|r_i - t|) or the smallest i where r_i ≥ t - ... Let me do: find the smallest i such that r_i + sum_{j>i} Δ_j ≥ t (i.e., even with uncertainty, v_i's rank could be ≥ t), then return v_i. Simpler and widely used: pick i that minimizes |r_i - t| and return v_i. The guarantee holds: R(v_i) within r_i ± εn/2... wait, is the invariant R(v_i) ∈ [r_i - t, r_i + t] with t=εn/2? For new random inserts, Δ may be nonzero and rank is recorded as r_i, so R(v_i) = r_i exactly at insertion... then compressions preserve |R(v_i) - r_i| ≤ εn/2 for the tuples... hmm, actually the GK invariant maintained is: for all i, |r_i - R(v_i)| ≤ εn/2, which is guaranteed by the insertion/compression rules (insert uses random r_i within ±εn/2 of true rank due to Δ construction; compression maintains it). Yes — that's the core invariant. So quantile: pick i minimizing |r_i - q n| (or the first i with r_i ≥ q n). Then |R(v_i) - q n| ≤ |r_i - q n| + ε n/2. The first i with r_i ≥ q n gives R(v_i) ≥ ... hmm, r_i ≥ qn and R ≥ r_i - εn/2 ⇒ R ≥ qn - εn/2. Also R(v_i) ≤ r_i + εn/2. And for i-1: r_{i-1} < qn ⇒ R(v_{i-1}) ≤ r_{i-1} + εn/2 < qn + εn/2, so v_i is the smallest value with rank ≥ qn - εn/2 or so. This gives us rank in [qn - εn/2, qn + something]. Standard result: returned value is within εn of true quantile. Good enough — documented: "median is approximate within ε rank (default 0.01)".
+
+With m = ceil(1/ε) = 100 for ε=0.01, memory per group is ≤ 100 tuples — bounded

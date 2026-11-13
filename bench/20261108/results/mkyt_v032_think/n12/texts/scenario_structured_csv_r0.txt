@@ -1,0 +1,139 @@
+We need answer user's request: produce CSV only, one header and exactly 220 data rows. Columns: sample_id,language,category,prompt_tokens,output_tokens,accepted_drafts,drafted_tokens,decode_tok_s,valid. sample IDs S0001-S0220. cycle languages en/zh/ja, cycle categories code/story/translation/structured. generate internally consistent positive numeric values. Quote fields only when CSV requires it. No commentary.
+
+Need ensure exactly 220 data rows. IDs S0001 to S0220 likely zero-padded 4 digits. Languages cycle en, zh, ja for i=1..220. categories cycle code, story, translation, structured. Need positive numeric values. Internally consistent: maybe output_tokens positive, drafted_tokens positive, accepted_drafts <= drafted_tokens? decode_tok_s positive. prompt_tokens positive. valid maybe boolean? Column valid positive numeric values? They said positive numeric values; valid likely 1? But "valid" maybe true? Need positive numeric values for all columns? sample_id not numeric. language/category strings. valid could be 1 (positive numeric). Maybe ensure accepted_drafts <= output_tokens? Drafted tokens likely total proposed, accepted drafts maybe count of accepted draft chunks? Need consistency: accepted_drafts could be <= drafted_tokens and maybe <= output_tokens? Drafted tokens could be greater than output_tokens due rejected tokens. decode_tok_s positive. Let's create deterministic values based on index. Need no commas in fields, so no quoting needed except if field contains comma. None. Could include valid as 1. Need exactly header + 220 lines. Need final CSV only.
+
+Need generate rows. Let's devise formula.
+For i from 1 to 220:
+sample_id = S + zero pad 4.
+language = [en, zh, ja][ (i-1)%3 ]
+category = [code, story, translation, structured][ (i-1)%4 ]
+prompt_tokens = maybe 100 + i*3
+output_tokens = 50 + i*2
+accepted_drafts = 5 + (i%7) maybe <=? drafted_tokens = output_tokens + 10 + (i%5) or at least accepted_drafts? accepted_drafts count of drafts accepted, drafted_tokens tokens. Ensure accepted_drafts <= drafted_tokens. If output_tokens min 52, drafted_tokens >. decode_tok_s = 20.0 + (i%10)*0.5? positive. valid = 1 maybe all valid. Or some 0? They said positive numeric values, so valid=1.
+
+Need ensure no extra spaces. CSV header exactly: sample_id,language,category,prompt_tokens,output_tokens,accepted_drafts,drafted_tokens,decode_tok_s,valid
+
+Need produce 220 rows. Let's compute carefully. Could write mental? Need avoid mistakes. Maybe use reasoning to generate all rows. Could construct patterns. Need exactly 220. Could use cycles. Let's generate with formula and list. We can manually produce? 220 rows long. Need be accurate. We can use a deterministic sequence and maybe write them in blocks of 12 (lcm 3,4) because language cycle length 3, category length 4. Pattern repeats every 12 for language/category. For each block of 12, i offset 0..11.
+
+Languages: i mod 3: 1 en, 2 zh, 3 ja. (if 1-based)
+Categories: i mod4: 1 code,2 story,3 translation,4 structured.
+12-block pairs:
+i1 en code
+i2 zh story
+i3 ja translation
+i4 en structured
+i5 zh code
+i6 ja story
+i7 en translation
+i8 zh structured
+i9 ja code
+i10 en story
+i11 ja? Wait let's do systematically:
+1: en code
+2: zh story
+3: ja translation
+4: en structured
+5: zh code
+6: ja story
+7: en translation
+8: zh structured
+9: ja code
+10: en story
+11: ja translation? language 11 mod3: 11%3=2 -> zh? Let's use 1-based: language index = (i-1)%3: 0 en,1 zh,2 ja. i=11 =>10%3=1 zh. Category (i-1)%4:10%4=2 translation? Categories 0 code,1 story,2 translation,3 structured. So 11 zh translation.
+12: i=12 =>11%3=2 ja; 11%4=3 structured. So block ends ja structured.
+Check i=10:9%3=0 en;9%4=1 story. yes.
+Block 13 repeats: 13 en code, etc.
+
+Can generate 18 full blocks of 12 = 216, plus 4 rows for 217-220: block pattern first four: 217? 217-216=1: en code; 218 zh story; 219 ja translation; 220 en structured.
+
+Need numeric values for each row. Could use simple formula by row number n = 1..220:
+prompt_tokens = 100 + 3*n
+output_tokens = 20 + 2*n
+accepted_drafts = 1 + (n % 10) maybe 1..10
+drafted_tokens = output_tokens + 5 + (n % 7) maybe positive and > accepted. decode_tok_s = 10 + 0.1*n (could one decimal). valid = 1.
+Need positive. All good. But ensure numeric values maybe no commas. decode_tok_s with decimal .0? Could be 10.1 etc. CSV fine.
+Potential internal consistency: accepted_drafts should not exceed drafted_tokens and maybe not exceed output_tokens? It can be count of accepted drafts, not tokens, so could exceed output tokens if many drafts each length 1? But better ensure accepted_drafts <= output_tokens. For n=1 output=22 accepted<=10 ok. n=220 output=460 accepted<=10. Good.
+drafted_tokens maybe output_tokens + rejected tokens, so >= output_tokens? If accepted drafts count not tokens, maybe drafted tokens could be less than output? No. We make drafted_tokens = output_tokens + 5 + n%7, so > output. positive.
+Could also set accepted_drafts = min(1+n%9, output_tokens) but formula okay.
+
+Need create 220 rows. We can produce manually using block formula. Need be careful with numbers. Maybe easier to generate all rows via patterns in blocks of 12. For each n, compute prompt=100+3n, output=20+2n, accepted=1+(n%10), drafted=output+5+(n%7), decode=10+0.1n.
+Let's verify n%10 yields 0..9 so accepted 1..10. n%7 yields 0..6 drafted offset 5..11.
+
+Need output decode one decimal? 10 + 0.1 n gives values 10.1 for n=1? 10.1. n=10 =>11.0. Need format one decimal? Could use one decimal always, e.g. 10.1, 10.2, ... 32.0 for 220. Fine. But 10+0.1*n floating could have 10.200000? We'll write one decimal.
+
+Let's make table. Since 220 rows, need no mistakes. Could maybe use block of 12 with formulas. Let's enumerate n 1-220.
+I can create each row by calculating. Need ensure exactly 220. Let's do in chunks maybe 10 or 12.
+
+Define n, id S####, lang, cat, p=100+3n, o=20+2n, a=1+n%10, d=o+5+(n%7), dec=10+n/10 one decimal, valid=1.
+
+Let's list n 1..220.
+Will produce CSV. Need double-check calculations.
+
+Maybe use a systematic table with columns. Let's do blocks of 12. For each n compute p, o, a, d, dec.
+
+Block 1 (n=1-12):
+1: p=103, o=22, a=1+1=2 (1%10=1), d=22+5+1=28, dec=10.1. lang en cat code.
+2: p=106, o=24, a=1+2=3, d=24+5+2=31, dec=10.2. zh story.
+3: p=109, o=26, a=4, d=26+5+3=34, dec=10.3. ja translation.
+4: p=112, o=28, a=5, d=28+5+4=37, dec=10.4. en structured.
+5: p=115, o=30, a=6, d=30+5+5=40, dec=10.5. zh code.
+6: p=118, o=32, a=7, d=32+5+6=43, dec=10.6. ja story.
+7: p=121, o=34, a=8, d=34+5+0=39 (7%7=0), dec=10.7. en translation.
+8: p=124, o=36, a=9, d=36+5+1=42, dec=10.8. zh structured.
+9: p=127, o=38, a=10, d=38+5+2=45, dec=10.9. ja code.
+10: p=130, o=40, a=1+0=1, d=40+5+3=48, dec=11.0. en story.
+11: p=133, o=42, a=2, d=42+5+4=51, dec=11.1. zh translation.
+12: p=136, o=44, a=3, d=44+5+5=54, dec=11.2. ja structured.
+
+Block 2 n=13-24. Could compute based on n.
+13: p=139, o=46, a=13%10=3? 1+3=4, d=46+5+(13%7=6)=57, dec=11.3. en code.
+14: p=142, o=48, a=5, d=48+5+(0?14%7=0)=53, dec=11.4. zh story.
+15: p=145, o=50, a=6, d=50+5+1=56, dec=11.5. ja translation.
+16: p=148, o=52, a=7, d=52+5+2=59, dec=11.6. en structured.
+17: p=151, o=54, a=8, d=54+5+3=62, dec=11.7. zh code.
+18: p=154, o=56, a=9, d=56+5+4=65, dec=11.8. ja story.
+19: p=157, o=58, a=10, d=58+5+5=68, dec=11.9. en translation.
+20: p=160, o=60, a=1, d=60+5+6=71, dec=12.0. zh structured.
+21: p=163, o=62, a=2, d=62+5+0=67, dec=12.1. ja code.
+22: p=166, o=64, a=3, d=64+5+1=70, dec=12.2. en story.
+23: p=169, o=66, a=4, d=66+5+2=73, dec=12.3. zh translation.
+24: p=172, o=68, a=5, d=68+5+3=76, dec=12.4. ja structured.
+
+Block3 25-36
+25 p175 o70 a6 (5) d=70+5+4=79 dec12.5 en code
+26 p178 o72 a7 (6) d=72+5+5=82 dec12.6 zh story
+27 p181 o74 a8 (7) d=74+5+6=85 dec12.7 ja translation
+28 p184 o76 a9 (8) d=76+5+0=81 dec12.8 en structured
+29 p187 o78 a10 (9) d=78+5+1=84 dec12.9 zh code
+30 p190 o80 a1 (0) d=80+5+2=87 dec13.0 ja story
+31 p193 o82 a2 (1) d=82+5+3=90 dec13.1 en translation
+32 p196 o84 a3 (2) d=84+5+4=93 dec13.2 zh structured
+33 p199 o86 a4 (3) d=86+5+5=96 dec13.3 ja code
+34 p202 o88 a5 (4) d=88+5+6=99 dec13.4 en story
+35 p205 o90 a6 (5) d=90+5+0=95 dec13.5 zh translation
+36 p208 o92 a7 (6) d=92+5+1=98 dec13.6 ja structured
+
+Block4 37-48
+37 p211 o94 a7? 37%10=7 ->8? Wait 1+7=8. d=94+5+(37%7=2)=101 dec13.7 en code
+38 p214 o96 a9 d=96+5+3=104 dec13.8 zh story
+39 p217 o98 a10 d=98+5+4=107 dec13.9 ja translation
+40 p220 o100 a1 d=100+5+5=110 dec14.0 en structured
+41 p223 o102 a2 d=102+5+6=113 dec14.1 zh code
+42 p226 o104 a3 d=104+5+0=109 dec14.2 ja story
+43 p229 o106 a4 d=106+5+1=112 dec14.3 en translation
+44 p232 o108 a5 d=108+5+2=115 dec14.4 zh structured
+45 p235 o110 a6 d=110+5+3=118 dec14.5 ja code
+46 p238 o112 a7 d=112+5+4=121 dec14.6 en story
+47 p241 o114 a8 d=114+5+5=124 dec14.7 zh translation
+48 p244 o116 a9 d=116+5+6=127 dec14.8 ja structured
+
+Block5 49-60
+49 p247 o118 a10? 49%10=9 ->10, d=118+5+(49%7=0)=123 dec14.9 en code
+50 p250 o120 a1, d=120+5+1=126 dec15.0 zh story
+51 p253 o122 a2, d=122+5+2=129 dec15.1 ja translation
+52 p256 o124 a3, d=124+5+3=132 dec15.2 en structured
+53 p259 o126 a4, d=126+5+4=135 dec15.3 zh code
+54 p262 o128 a5, d=128+5+5=138 dec15.4 ja story
+55 p265 o130 a6, d=130+5+6=141 dec15.5 en translation
+56 p268 o132 a7, d=132+5+0=137 dec15.6 zh structured
+57 p271 o134 a8, d=134+5+1=140 dec15.7 ja

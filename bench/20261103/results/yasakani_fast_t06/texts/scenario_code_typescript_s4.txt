@@ -1,0 +1,492 @@
+# `metricsd` — NDJSON request-metrics service
+
+Below is a complete, self-contained project. Every file is finished — no `TODO`s, no `// ...`, no placeholders. It uses only Node's built-in `http` module (no Express, no schema libraries), strict TypeScript, a bounded in-memory store, incremental NDJSON parsing, and a full unit suite.
+
+---
+
+## Project layout
+
+```
+metricsd/
+├── package.json
+├── tsconfig.json
+├── README.md
+├── src/
+│   ├── index.ts            # entrypoint (wires everything, starts the server)
+│   ├── types.ts            # strict domain types
+│   ├── errors.ts           # error taxonomy
+│   ├── metrics.ts          # mean / median / sample std dev (Welford)
+│   ├── schema.ts           # dependency-free NDJSON validation
+│   ├── parser.ts           # incremental, bounded NDJSON parser
+│   ├── store.ts            # bounded, model/fixture-grouped store
+│   ├── server.ts           # HTTP server + /health /summary /runs/:id
+│   └── ingest.ts           # NDJSON → store pipeline
+└── test/
+    ├── helpers.ts
+    ├── metrics.test.ts
+    ├── schema.test.ts
+    ├── parser.test.ts
+    ├── store.test.ts
+    └── server.test.ts
+```
+
+---
+
+## `package.json`
+
+```json
+{
+  "name": "metricsd",
+  "version": "1.0.0",
+  "description": "NDJSON request-metrics ingestion, grouping, and aggregation service.",
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  }
+}
+```
+
+> `tsx` is only needed to run the tests and `dev` in TS; the production `build`/`start` path is plain `tsc` + `node` with **zero runtime dependencies**.
+
+---
+
+## `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "declaration": true,
+    "types": ["node"]
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist", "test"]
+}
+```
+
+`test/` is excluded from the build; it runs directly under `tsx` (see the `test` script).
+
+---
+
+## `src/types.ts`
+
+```ts
+/**
+ * Strict domain types shared across the service.
+ */
+
+/** A single validated request-metric record. */
+export interface MetricRecord {
+  runId: string;
+  model: string;
+  fixture: string;
+  latencyMs: number;
+  tokensPerSec: number;
+  tokens: number;
+  timestamp: string; // ISO-8601
+  status: string;
+}
+
+/** Per-fixture aggregate for a given (model, fixture) pair. */
+export interface FixtureAggregate {
+  fixture: string;
+  count: number;
+  meanLatencyMs: number;
+  medianLatencyMs: number;
+  sampleStdDevMs: number | null;
+  meanTokensPerSec: number;
+  medianTokensPerSec: number;
+  sampleStdDevTokensPerSec: number | null;
+  meanTokens: number;
+  medianTokens: number;
+  sampleStdDevTokens: number | null;
+}
+
+/** Per-model aggregate (mean/median/std of per-fixture means). */
+export interface ModelAggregate {
+  model: string;
+  fixtureCount: number;
+  totalRecords: number;
+  meanLatencyMs: number;
+  medianLatencyMs: number;
+  sampleStdDevMs: number | null;
+  meanTokensPerSec: number;
+  medianTokensPerSec: number;
+  sampleStdDevTokensPerSec: number | null;
+  meanTokens: number;
+  medianTokens: number;
+  sampleStdDevTokens: number | null;
+  fixtures: FixtureAggregate[];
+}
+
+/** Per-run aggregate (mean/median/std of per-fixture means). */
+export interface RunAggregate {
+  runId: string;
+  modelCount: number;
+  totalRecords: number;
+  meanLatencyMs: number;
+  medianLatencyMs: number;
+  sampleStdDevMs: number | null;
+  meanTokensPerSec: number;
+  medianTokensPerSec: number;
+  sampleStdDevTokensPerSec: number | null;
+  meanTokens: number;
+  medianTokens: number;
+  sampleStdDevTokens: number | null;
+  models: ModelAggregate[];
+}
+
+/** The full summary payload (all runs, grouped by run). */
+export interface Summary {
+  generatedAt: string;
+  totalRuns: number;
+  totalRecords: number;
+  runs: RunAggregate[];
+}
+
+/** A single raw NDJSON line, before validation. */
+export interface RawLine {
+  line: string;
+  lineNumber: number;
+}
+
+/** A record that failed validation, with the reason. */
+export interface MalformedLine {
+  line: string;
+  lineNumber: number;
+  reason: string;
+}
+```
+
+---
+
+## `src/errors.ts`
+
+```ts
+/**
+ * Error taxonomy. Every error carries a stable `code` so clients can
+ * map HTTP status codes / retry behaviour without parsing messages.
+ */
+
+export type ErrorCode =
+  | 'MALFORMED_LINE'      // a single NDJSON line failed validation
+  | 'STORE_FULL'          // bounded store is at capacity
+  | 'NOT_FOUND'           // run id does not exist
+  | 'BAD_METHOD'          // HTTP method not allowed
+  | 'BAD_PATH'             // path not recognized
+  | 'INTERNAL';           // unexpected failure
+
+export class ServiceError extends Error {
+  readonly code: ErrorCode;
+  readonly status: number;
+  readonly details?: unknown;
+
+  constructor(code: ErrorCode, message: string, status: number, details?: unknown) {
+    super(message);
+    this.name = 'ServiceError';
+    this.code = code;
+    this.status = status;
+    this.details = details;
+  }
+
+  /** True for errors that should surface as a 4xx client error. */
+  isClientError(): boolean {
+    return this.status >= 400 && this.status < 500;
+  }
+}
+
+export const Errors = {
+  malformedLine: (line: string, lineNumber: number, reason: string): ServiceError =>
+    new ServiceError('MALFORMED_LINE', `Line ${lineNumber}: ${reason}`, 422, {
+      line,
+      lineNumber,
+      reason,
+    }),
+  storeFull: (max: number): ServiceError =>
+    new ServiceError('STORE_FULL', `In-memory store at capacity (${max} records)`, 507),
+  notFound: (runId: string): ServiceError =>
+    new ServiceError('NOT_FOUND', `Run "${runId}" not found`, 404, { runId }),
+  badMethod: (method: string): ServiceError =>
+    new ServiceError('BAD_METHOD', `Method ${method} not allowed`, 405),
+  badPath: (path: string): ServiceError =>
+    new ServiceError('BAD_PATH', `Path "${path}" not recognized`, 404),
+  internal: (message: string): ServiceError =>
+    new ServiceError('INTERNAL', message, 500),
+};
+```
+
+---
+
+## `src/metrics.ts`
+
+```ts
+/**
+ * Pure numeric aggregation helpers.
+ *
+ * - `mean` / `median` are computed from a full array (used for small,
+ *   per-fixture sample sizes).
+ * - `sampleStdDev` uses the sample (n-1) formula and returns null when
+ *   there is not enough data (n < 2).
+ * - `WelfordAccumulator` is an online single-pass accumulator used to
+ *   build per-fixture aggregates incrementally without keeping every
+ *   raw value in memory.
+ */
+
+export function mean(values: number[]): number {
+  if (values.length === 0) return 0;
+  let sum = 0;
+  for (const v of values) sum += v;
+  return sum / values.length;
+}
+
+/**
+ * Median of a non-empty array. The input is NOT mutated; a copy is
+ * sorted. For even-length inputs the midpoint is the average of the
+ * two central values.
+ */
+export function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) {
+    return sorted[mid] as number;
+  }
+  return ((sorted[mid - 1] as number) + (sorted[mid] as number)) / 2;
+}
+
+/**
+ * Sample standard deviation (n-1 denominator). Returns null when n < 2
+ * because the sample variance is undefined for a single observation.
+ */
+export function sampleStdDev(values: number[]): number | null {
+  const n = values.length;
+  if (n < 2) return null;
+  const m = mean(values);
+  let ss = 0;
+  for (const v of values) {
+    const d = v - m;
+    ss += d * d;
+  }
+  return Math.sqrt(ss / (n - 1));
+}
+
+/**
+ * Online Welford accumulator for mean and (sample) variance.
+ *
+ * After `n` observations:
+ *   mean      = mean
+ *   variance  = variance / (n - 1)   (sample variance, undefined for n < 2)
+ *   stdDev    = sqrt(variance / (n - 1))
+ *
+ * This is numerically stable and requires O(1) memory per accumulator.
+ */
+export class WelfordAccumulator {
+  private n = 0;
+  private mean = 0;
+  private m2 = 0; // sum of squared differences from the running mean
+
+  add(value: number): void {
+    this.n += 1;
+    const delta = value - this.mean;
+    this.mean += delta / this.n;
+    this.m2 += delta * (value - this.mean);
+  }
+
+  get count(): number {
+    return this.n;
+  }
+
+  get meanValue(): number {
+    return this.n === 0 ? 0 : this.mean;
+  }
+
+  /** Sample variance (n-1). null when n < 2. */
+  get sampleVariance(): number | null {
+    if (this.n < 2) return null;
+    return this.m2 / (this.n - 1);
+  }
+
+  /** Sample standard deviation (n-1). null when n < 2. */
+  get sampleStdDevValue(): number | null {
+    const v = this.sampleVariance;
+    return v === null ? null : Math.sqrt(v);
+  }
+}
+```
+
+---
+
+## `src/schema.ts`
+
+```ts
+import type { MetricRecord, RawLine } from './types.js';
+import { ServiceError, Errors } from './errors.js';
+
+/**
+ * Dependency-free NDJSON record validation.
+ *
+ * `validateLine` takes a raw line (object) and either returns a fully
+ * typed `MetricRecord` or throws a `ServiceError` with code
+ * `MALFORMED_LINE` and a precise reason.
+ *
+ * Accepted JSON shape (all fields required):
+ *   {
+ *     "runId":        "string",
+ *     "model":        "string",
+ *     "fixture":      "string",
+ *     "latencyMs":    number,
+ *     "tokensPerSec": number,
+ *     "tokens":       integer >= 0,
+ *     "timestamp":    ISO-8601 string,
+ *     "status":       "string"
+ *   }
+ */
+
+const REQUIRED_FIELDS = [
+  'runId',
+  'model',
+  'fixture',
+  'latencyMs',
+  'tokensPerSec',
+  'tokens',
+  'timestamp',
+  'status',
+] as const;
+
+type RequiredField = (typeof REQUIRED_FIELDS)[number];
+
+/** A timestamp is valid ISO-8601 if it parses to a finite Date. */
+function isValidIso8601(value: string): boolean {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed);
+}
+
+/**
+ * Validate a single NDJSON line. Throws `ServiceError` (422) on any
+ * violation. Returns a fully typed record on success.
+ */
+export function validateLine(raw: RawLine): MetricRecord {
+  const { line, lineNumber } = raw;
+
+  // 1) Must parse as JSON.
+  let obj: unknown;
+  try {
+    obj = JSON.parse(line);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'invalid JSON';
+    throw Errors.malformedLine(line, lineNumber, `invalid JSON: ${msg}`);
+  }
+
+  // 2) Must be a non-null object (not array / primitive).
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) {
+    throw Errors.malformedLine(line, lineNumber, 'top-level value must be a JSON object');
+  }
+
+  const record = obj as Record<string, unknown>;
+
+  // 3) All required fields must be present.
+  for (const field of REQUIRED_FIELDS) {
+    if (!(field in record)) {
+      throw Errors.malformedLine(line, lineNumber, `missing required field "${field}"`);
+    }
+  }
+
+  // 4) Per-field type + semantic checks.
+  const runId = record['runId'];
+  if (typeof runId !== 'string' || runId.length === 0) {
+    throw Errors.malformedLine(line, lineNumber, '"runId" must be a non-empty string');
+  }
+
+  const model = record['model'];
+  if (typeof model !== 'string' || model.length === 0) {
+    throw Errors.malformedLine(line, lineNumber, '"model" must be a non-empty string');
+  }
+
+  const fixture = record['fixture'];
+  if (typeof fixture !== 'string' || fixture.length === 0) {
+    throw Errors.malformedLine(line, lineNumber, '"fixture" must be a non-empty string');
+  }
+
+  const latencyMs = record['latencyMs'];
+  if (typeof latencyMs !== 'number' || !Number.isFinite(latencyMs) || latencyMs < 0) {
+    throw Errors.malformedLine(line, lineNumber, '"latencyMs" must be a finite non-negative number');
+  }
+
+  const tokensPerSec = record['tokensPerSec'];
+  if (typeof tokensPerSec !== 'number' || !Number.isFinite(tokensPerSec) || tokensPerSec < 0) {
+    throw Errors.malformedLine(line, lineNumber, '"tokensPerSec" must be a finite non-negative number');
+  }
+
+  const tokens = record['tokens'];
+  if (typeof tokens !== 'number' || !Number.isInteger(tokens) || tokens < 0) {
+    throw Errors.malformedLine(line, lineNumber, '"tokens" must be a non-negative integer');
+  }
+
+  const timestamp = record['timestamp'];
+  if (typeof timestamp !== 'string' || !isValidIso8601(timestamp)) {
+    throw Errors.malformedLine(line, lineNumber, '"timestamp" must be a valid ISO-8601 string');
+  }
+
+  const status = record['status'];
+  if (typeof status !== 'string' || status.length === 0) {
+    throw Errors.malformedLine(line, lineNumber, '"status" must be a non-empty string');
+  }
+
+  return {
+    runId: runId,
+    model,
+    fixture,
+    latencyMs,
+    tokensPerSec,
+    tokens,
+    timestamp,
+    status,
+  };
+}
+
+/**
+ * Convenience: validate an array of raw lines, returning the typed
+ * records for valid lines and the list of malformed lines. Used by the
+ * ingest pipeline and by tests.
+ */
+export function validateLines(lines: RawLine[]): {
+  records: MetricRecord[];
+  malformed: { line: string; lineNumber: number; reason: string }[];
+} {
+  const records: MetricRecord[] = [];
+  const malformed: { line: string; lineNumber: number; reason: string }[] = [];
+
+  for (const raw of lines) {
+    try {
+      records.push(validateLine(raw));
+    } catch (err) {
+      if (err instanceof ServiceError && err.code === '

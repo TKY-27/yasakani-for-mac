@@ -1,0 +1,71 @@
+**第一章 — 所有权**
+
+可靠的推理服务为每个可变边界指定唯一的所有者。程序可以将数学运算委托给内核执行，但内核不得静默推进请求状态。这种分离使得成功的轮次、被拒绝的投机草稿、取消操作以及前缀恢复，都能被观察为完整的状态转换。
+
+**第二章 — 测量**
+
+加载时间、提示词准备、预填充（prefill）、解码（decode）和网络传输分别回答不同的问题。基准测试应明确标注每个报告速率所对应的测量区间。在本引擎中，首个生成的令牌属于预填充阶段，其余生成的令牌属于解码阶段，因此令牌计数必须遵循相同的边界划分。
+
+**第三章 — 可复现性**
+
+在正式运行前，输入数据被冻结。请求体、解析后的采样参数、模型标识、上下文容量、缓存格式以及原始计时字段均被保留。预热请求会被标记并排除，而非混入受测的重复运行中。
+
+**第四章 — 长上下文**
+
+分配最大缓存容量并不等同于呈现最大长度的提示词。引擎可以维持 262,144 个令牌的分配量，同时测试中实际准备的提示词长度可以变化。这样可以在不改变不同测试用例之间内存规划的前提下，隔离出可见上下文的成本。
+
+**第五章 — 投机解码**
+
+草稿接受率取决于工作负载。代码、散文、翻译和结构化记录具有不同的局部可预测性，因此既需要草稿接受百分比，也需要每轮输出的令牌数。吞吐量仍是用户可见的结果；接受率统计用于解释而非替代该结果。
+
+**第六章 — 报告**
+
+应发布完整的配置、重复测量结果、变异情况以及重大局限性。不要丢弃有效的慢速运行结果，也不要将内部计时器描述为客户端观察到的延迟。清晰的边界使优异的结果更值得信赖。
+
+***
+
+**英中术语表**
+
+1.  **Inference service** — 推理服务
+2.  **Mutable frontier** — 可变边界
+3.  **Owner** — 所有者
+4.  **Kernel** — 内核
+5.  **Request state** — 请求状态
+6.  **Speculative draft** — 投机草稿
+7.  **Prefix restoration** — 前缀恢复
+8.  **Complete transition** — 完整转换
+9.  **Prompt preparation** — 提示词准备
+10. **Prefill** — 预填充
+11. **Decode** — 解码
+12. **Network transport** — 网络传输
+13. **Benchmark** — 基准测试
+14. **Interval** — 区间
+15. **Generated token** — 生成的令牌
+16. **Token count** — 令牌计数
+17. **Reproducibility** — 可复现性
+18. **Sampling parameters** — 采样参数
+19. **Context capacity** — 上下文容量
+20. **Cache format** — 缓存格式
+21. **Raw timing fields** — 原始计时字段
+22. **Warm-up requests** — 预热请求
+23. **Measured repetitions** — 受测重复运行
+24. **Long context** — 长上下文
+25. **Cache capacity** — 缓存容量
+26. **Memory plan** — 内存规划
+27. **Visible context** — 可见上下文
+28. **Speculation** — 投机解码
+29. **Draft acceptance** — 草稿接受
+30. **Workload dependent** — 取决于工作负载
+31. **Local predictability** — 局部可预测性
+32. **Accepted-draft percentage** — 草稿接受百分比
+33. **Output tokens per round** — 每轮输出令牌数
+34. **Throughput** — 吞吐量
+35. **User-visible result** — 用户可见结果
+36. **Reporting** — 报告
+37. **Configuration** — 配置
+38. **Repeated measurements** — 重复测量
+39. **Variation** — 变异
+40. **Material limitations** — 重大局限性
+41. **Valid slow run** — 有效的慢速运行
+42. **Internal timer** — 内部计时器
+43. **Client-observed latency** — 客户端观察到的延迟

@@ -1,0 +1,48 @@
+[2026/11/06 12:12:42.05] 079 start 
+[12:12:42] deps
+Setting up libjpeg-dev:amd64 (8c-2ubuntu11) ...
+Processing triggers for man-db (2.12.0-4build2) ...
+Processing triggers for libc-bin (2.39-0ubuntu8.9) ...
+2.10.0 2.5 60.16.100 8.5.0 
+[build] source a754fcf3bf524494aa927c2f54e0cbfb58f569ab 2026-11-02 13:08:36 +0800 fix(runtime): prevent request starvation under context pressure
+[12:12:59] configure
+-- NInfer target: rtx5090 (x86_64, sm_120a)
+-- Found JPEG: /usr/lib/x86_64-linux-gnu/libjpeg.so (found version "80") 
+-- Checking for modules 'libavformat;libavcodec;libavutil;libswscale'
+--   Found libavformat, version 60.16.100
+--   Found libavcodec, version 60.31.102
+--   Found libavutil, version 58.29.100
+--   Found libswscale, version 7.5.100
+-- Checking for module 'libcurl>=7.85'
+--   Found libcurl, version 8.5.0
+-- Configuring done (6.1s)
+-- Generating done (0.1s)
+-- Build files have been written to: <ninfer_src_dir>/ninfer_master/build
+[12:13:05] build
+[802/809] Building CXX object src/serve/CMakeFiles/ninfer_serve.dir/monitor.cpp.o
+[803/809] Building CXX object src/serve/CMakeFiles/ninfer_serve.dir/http_server.cpp.o
+[804/809] Building CXX object src/serve/CMakeFiles/ninfer_serve.dir/openai_responses_http.cpp.o
+[805/809] Building CXX object src/runtime/CMakeFiles/ninfer_engine.dir/engine/engine.cpp.o
+[806/809] Linking CXX static library src/runtime/libninfer_engine.a
+[807/809] Linking CXX static library src/serve/libninfer_serve.a
+[808/809] Linking CXX executable apps/ninfer
+[809/809] Linking CXX executable apps/ninfer-serve
+-rwxr-xr-x 1 root root 17903992 Nov  6 12:16 build/apps/ninfer-serve
+[12:16:07] serve --help (spec / kv / prefix lines)
+  --max-context N
+  --kv-dtype bf16|int8|fp8|nvfp4|k8v4
+  --prefill-chunk N|default
+  --max-concurrency N
+  --prefix-reuse / --no-prefix-reuse
+  --host-cache-capacity SIZE|default
+      Shared Host State/KV and in-flight capacity; 0B disables backing.
+speculative:
+  --spec none|mtp|dflash|dflash2
+      Speculative backend; none clears drafts and proposal head.
+  --draft-tokens N
+  --host ADDRESS
+  --port N
+      Listen port (8080).
+Host context: CLI 0B; serve RTX 5090 8GiB + 8 StateImages, Spark 0B.
+[12:16:07] ninfer_master_build done
+[2026/11/06 12:16:07.67] 079 done 

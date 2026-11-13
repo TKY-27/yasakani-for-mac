@@ -1,0 +1,15 @@
+[2026-11-10 09:42:32] GPU before start: 39, 2460, 14201, 70.45, 1486, 32607, 0 | median utilisation 0 %, memory used 1486 MiB
+[2026-11-10 09:42:33] plan off4, reps 12, max_ctx 65536, warm-up no, state hash yes, engine settings added to the defaults: none
+[2026-11-10 09:42:33] model folder <model_dir_fastest> | dll <yasakani_dir>\bin\yskn.dll
+[q35_g6] prefill only, temporary workspace 111543640 bytes
+[KV-PROTOCOL] target_kv=int8-row-f32-scale
+[TB-CAP] capacity mode (k=5): packed K streams 16/16, packed V streams 13/16; KV of the attention layers 1384.0 MiB (INT8 containers: 2080.0 MiB); staging 4096 rows
+[qwen3_5] 64 layers loaded, LNORD codes 9.76 GB, free 19.3 / 34.2 GB
+[qwen3_5] SHEAD drafter head loaded (<model_dir_fastest>\bdraft2_k8.shead): rank 512, 1.41 GB, score grid 340 blocks; GPU free 16.4 / 34.2 GB
+[2026-11-10 09:42:58] steady/jp_q1/greedy/off_nodraft              runs 12  distinct outputs 1  {'34758e5e078a226d': 12}   passes [218]
+[2026-11-10 09:43:23] steady/prose_en_cpu/seed1234/off_nodraft     runs 12  distinct outputs 1  {'a16a3b3ee547f573': 12}   passes [255]
+[2026-11-10 09:43:47] steady/jp_q5/seed1234/off_nodraft            runs 12  distinct outputs 1  {'8ae14e0f45b3202a': 12}   passes [255]
+[2026-11-10 09:44:12] steady/scenario_code_cuda/greedy/off_nodraft runs 12  distinct outputs 1  {'26c0d057e2adf54a': 12}   passes [255]
+[2026-11-10 09:44:28] steady/jp_q5/seed1234/on                     runs 12  distinct outputs 1  {'8ae14e0f45b3202a': 12}   passes [130]
+[2026-11-10 09:44:29] repeat probe: 5 arms, 60 runs; arms with more than one output: 0 []
+[2026-11-10 09:44:29]    runs that differ from the most common output of their arm: 0 of 60   (settings added: none)

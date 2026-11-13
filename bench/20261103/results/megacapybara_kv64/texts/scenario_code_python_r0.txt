@@ -1,0 +1,559 @@
+Below is a complete, runnable Python 3.11 package named `deterministic_job_runner`. It satisfies every requirement:
+
+- Reads a JSON manifest
+- Enforces **one active GPU job** (single-writer lock + in-process guard)
+- Persists **atomic state** (temp file + `os.replace`)
+- **Resumes** completed work on restart
+- Streams **structured JSONL events**
+- Handles **SIGINT** (graceful cancel of the active job)
+- **Redacts configured secrets** from all emitted text
+- Includes pytest tests for success, failure, cancellation, and resume
+
+---
+
+### Project layout
+
+```
+deterministic_job_runner/
+├── pyproject.toml
+├── src/
+│   └── deterministic_job_runner/
+│       ├── __init__.py
+│       ├── config.py
+│       ├── manifest.py
+│       ├── redaction.py
+│       ├── state.py
+│       ├── events.py
+│       ├── gpu_lock.py
+│       ├── runner.py
+│       └── cli.py
+└── tests/
+    ├── conftest.py
+    ├── test_success.py
+    ├── test_failure.py
+    ├── test_cancellation.py
+    └── test_resume.py
+```
+
+---
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deterministic-job-runner"
+version = "0.1.0"
+description = "Deterministic asynchronous job runner with atomic state, single-GPU enforcement, JSONL event streaming, SIGINT handling, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Example Author", email = "example@example.com" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+djrunner = "deterministic_job_runner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+---
+
+### `src/deterministic_job_runner/__init__.py`
+
+```python
+"""Deterministic asynchronous job runner."""
+
+from .config import RunnerConfig
+from .manifest import JobManifest, JobSpec
+from .redaction import Redactor
+from .state import StateStore
+from .events import EventStream
+from .gpu_lock import GpuLock
+from .runner import JobRunner
+
+__all__ = [
+    "RunnerConfig",
+    "JobManifest",
+    "JobSpec",
+    "Redactor",
+    "StateStore",
+    "EventStream",
+    "GpuLock",
+    "JobRunner",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+### `src/deterministic_job_runner/config.py`
+
+```python
+"""Configuration dataclasses for the job runner."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class RunnerConfig:
+    """Immutable configuration for a JobRunner instance."""
+
+    state_dir: Path
+    manifest_path: Path
+    event_log_path: Path
+    gpu_lock_path: Path
+    # Secrets to redact from any emitted text (values, not keys).
+    secrets: tuple[str, ...] = ()
+    # Optional environment variable names whose values should be treated as secrets.
+    secret_env_vars: tuple[str, ...] = ()
+    # Timeout per job in seconds (None = no timeout).
+    job_timeout: float | None = None
+    # Whether to enforce exactly one active GPU job via the lock file.
+    enforce_single_gpu: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "state_dir", Path(self.state_dir))
+        object.__setattr__(self, "manifest_path", Path(self.manifest_path))
+        object.__setattr__(self, "event_log_path", Path(self.event_log_path))
+        object.__setattr__(self, "gpu_lock_path", Path(self.gpu_lock_path))
+
+        # Resolve secrets from env vars if specified.
+        resolved_secrets: list[str] = list(self.secrets)
+        for var_name in self.secret_env_vars:
+            val = os.environ.get(var_name)
+            if val is not None:
+                resolved_secrets.append(val)
+        object.__setattr__(self, "secrets", tuple(resolved_secrets))
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RunnerConfig":
+        """Build a RunnerConfig from a plain dictionary."""
+        return cls(
+            state_dir=Path(data["state_dir"]),
+            manifest_path=Path(data["manifest_path"]),
+            event_log_path=Path(data["event_log_path"]),
+            gpu_lock_path=Path(data["gpu_lock_path"]),
+            secrets=tuple(data.get("secrets", ())),
+            secret_env_vars=tuple(data.get("secret_env_vars", ())),
+            job_timeout=data.get("job_timeout"),
+            enforce_single_gpu=data.get("enforce_single_gpu", True),
+        )
+```
+
+---
+
+### `src/deterministic_job_runner/manifest.py`
+
+```python
+"""JSON manifest parsing and validation."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    """A single job definition from the manifest."""
+
+    job_id: str
+    name: str
+    command: list[str]
+    # Arbitrary metadata; used for determinism checks and display.
+    metadata: dict[str, Any] = field(default_factory=dict)
+    # Expected exit code (default 0).
+    expected_exit_code: int = 0
+    # Optional timeout override for this specific job.
+    timeout: float | None = None
+
+    @property
+    def key(self) -> str:
+        """Stable identifier used for state tracking."""
+        return self.job_id
+
+
+@dataclass(frozen=True)
+class JobManifest:
+    """Parsed manifest containing an ordered list of jobs."""
+
+    version: int
+    jobs: tuple[JobSpec, ...]
+
+    @classmethod
+    def load(cls, path: Path) -> "JobManifest":
+        """Load and validate a JSON manifest file."""
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return cls.from_dict(raw)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "JobManifest":
+        version = data.get("version", 1)
+        jobs_raw: list[dict[str, Any]] = data.get("jobs", [])
+        jobs: list[JobSpec] = []
+        seen_ids: set[str] = set()
+        for i, j in enumerate(jobs_raw):
+            job_id = j.get("id")
+            if job_id is None:
+                raise ValueError(f"Job at index {i} missing 'id'")
+            if job_id in seen_ids:
+                raise ValueError(f"Duplicate job id: {job_id}")
+            seen_ids.add(job_id)
+            command = j.get("command")
+            if not isinstance(command, list) or not all(isinstance(c, str) for c in command):
+                raise ValueError(f"Job '{job_id}' has invalid 'command'")
+            spec = JobSpec(
+                job_id=job_id,
+                name=j.get("name", job_id),
+                command=tuple(command),
+                metadata=j.get("metadata", {}),
+                expected_exit_code=j.get("expected_exit_code", 0),
+                timeout=j.get("timeout"),
+            )
+            jobs.append(spec)
+        return cls(version=version, jobs=tuple(jobs))
+
+    def get_job(self, job_id: str) -> JobSpec:
+        for j in self.jobs:
+            if j.job_id == job_id:
+                return j
+        raise KeyError(f"Job '{job_id}' not found in manifest")
+```
+
+---
+
+### `src/deterministic_job_runner/redaction.py`
+
+```python
+"""Secret redaction for all emitted text."""
+
+from __future__ import annotations
+
+import re
+from typing import Iterable
+
+
+class Redactor:
+    """Replaces configured secret strings with a placeholder in any text."""
+
+    PLACEHOLDER = "***REDACTED***"
+
+    def __init__(self, secrets: Iterable[str]) -> None:
+        # Sort by length descending so longer secrets are matched first.
+        self._secrets: list[str] = sorted(secrets, key=len, reverse=True)
+        # Build a combined regex pattern for efficiency.
+        if self._secrets:
+            escaped = [re.escape(s) for s in self._secrets]
+            self._pattern = re.compile("|".join(escaped))
+        else:
+            self._pattern = None
+
+    def redact(self, text: str) -> str:
+        """Return *text* with all secrets replaced by the placeholder."""
+        if not self._pattern:
+            return text
+        return self._pattern.sub(self.PLACEHOLDER, text)
+
+    def redact_bytes(self, data: bytes) -> bytes:
+        """Redact secrets in a byte string (decoded as UTF-8, errors ignored)."""
+        if not self._pattern:
+            return data
+        text = data.decode("utf-8", errors="replace")
+        redacted = self.redact(text)
+        return redacted.encode("utf-8")
+```
+
+---
+
+### `src/deterministic_job_runner/state.py`
+
+```python
+"""Atomic persistent state store."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class JobState:
+    """State of a single job."""
+
+    job_id: str
+    status: str  # "pending" | "running" | "completed" | "failed" | "cancelled"
+    exit_code: int | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    error_message: str | None = None
+    attempts: int = 0
+
+
+@dataclass
+class RunState:
+    """Aggregate state for a full run."""
+
+    run_id: str
+    status: str  # "pending" | "running" | "completed" | "failed" | "cancelled"
+    jobs: dict[str, JobState] = field(default_factory=dict)
+    created_at: str | None = None
+    updated_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "status": self.status,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "jobs": {
+                jid: {
+                    "job_id": js.job_id,
+                    "status": js.status,
+                    "exit_code": js.exit_code,
+                    "started_at": js.started_at,
+                    "finished_at": js.finished_at,
+                    "error_message": js.error_message,
+                    "attempts": js.attempts,
+                }
+                for jid, js in self.jobs.items()
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RunState":
+        jobs: dict[str, JobState] = {}
+        for jid, jd in data.get("jobs", {}).items():
+            jobs[jid] = JobState(
+                job_id=jd["job_id"],
+                status=jd["status"],
+                exit_code=jd.get("exit_code"),
+                started_at=jd.get("started_at"),
+                finished_at=jd.get("finished_at"),
+                error_message=jd.get("error_message"),
+                attempts=jd.get("attempts", 0),
+            )
+        return cls(
+            run_id=data["run_id"],
+            status=data["status"],
+            jobs=jobs,
+            created_at=data.get("created_at"),
+            updated_at=data.get("updated_at"),
+        )
+
+
+class StateStore:
+    """Persists RunState atomically using temp-file + os.replace."""
+
+    def __init__(self, state_dir: Path) -> None:
+        self._dir = state_dir
+        self._dir.mkdir(parents=True, exist_ok=True)
+
+    def _path_for(self, run_id: str) -> Path:
+        return self._dir / f"{run_id}.json"
+
+    def save(self, state: RunState) -> None:
+        """Atomically write state to disk."""
+        target = self._path_for(state.run_id)
+        payload = json.dumps(state.to_dict(), indent=2, sort_keys=True)
+        # Write to a temp file in the same directory, then atomically replace.
+        fd, tmp_path = tempfile.mkstemp(dir=self._dir, prefix=".tmp_state_", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, target)
+        except BaseException:
+            # Clean up temp file on failure.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def load(self, run_id: str) -> RunState | None:
+        """Load state from disk, or return None if it doesn't exist."""
+        path = self._path_for(run_id)
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return RunState.from_dict(data)
+
+    def exists(self, run_id: str) -> bool:
+        return self._path_for(run_id).exists()
+
+    def delete(self, run_id: str) -> None:
+        path = self._path_for(run_id)
+        if path.exists():
+            path.unlink()
+```
+
+---
+
+### `src/deterministic_job_runner/events.py`
+
+```python
+"""Structured JSONL event stream."""
+
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .redaction import Redactor
+
+
+@dataclass
+class Event:
+    """A single structured event."""
+
+    timestamp: float
+    event_type: str
+    run_id: str
+    job_id: str | None = None
+    message: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+
+    def to_jsonl(self) -> str:
+        obj = {
+            "ts": self.timestamp,
+            "type": self.event_type,
+            "run_id": self.run_id,
+            "job_id": self.job_id,
+            "message": self.message,
+            "data": self.data,
+        }
+        return json.dumps(obj, sort_keys=True)
+
+
+class EventStream:
+    """Writes structured JSONL events to a log file and optionally to stdout."""
+
+    def __init__(
+        self,
+        log_path: Path,
+        redactor: Redactor,
+        echo_to_stdout: bool = False,
+    ) -> None:
+        self._log_path = log_path
+        self._redactor = redactor
+        self._echo = echo_to_stdout
+        self._file = open(log_path, "a", encoding="utf-8")
+
+    def emit(
+        self,
+        event_type: str,
+        run_id: str,
+        job_id: str | None = None,
+        message: str = "",
+        data: dict[str, Any] | None = None,
+    ) -> Event:
+        """Emit a single event, redacting secrets before writing."""
+        ts = time.time()
+        # Redact the message and any string values in data.
+        redacted_message = self._redactor.redact(message)
+        redacted_data = self._redact_dict(data or {})
+        event = Event(
+            timestamp=ts,
+            event_type=event_type,
+            run_id=run_id,
+            job_id=job_id,
+            message=redacted_message,
+            data=redacted_data,
+        )
+        line = event.to_jsonl()
+        self._file.write(line + "\n")
+        self._file.flush()
+        if self._echo:
+            print(line, flush=True)
+        return event
+
+    def _redact_dict(self, d: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for k, v in d.items():
+            if isinstance(v, str):
+                out[k] = self._redactor.redact(v)
+            elif isinstance(v, dict):
+                out[k] = self._redact_dict(v)
+            elif isinstance(v, list):
+                out[k] = [
+                    self._redactor.redact(item) if isinstance(item, str) else item
+                    for item in v
+                ]
+            else:
+                out[k] = v
+        return out
+
+    def close(self) -> None:
+        self._file.close()
+
+    def __enter__(self) -> "EventStream":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+```
+
+---
+
+### `src/deterministic_job_runner/gpu_lock.py`
+
+```python
+"""Single-active-GPU-job enforcement via a lock file."""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+
+
+class GpuLockError(Exception):
+    """Raised when the GPU lock cannot be acquired."""
+
+
+class GpuLock:
+    """
+    File-based lock ensuring only one process holds the GPU at a time.
+
+    Uses O_CREAT|O_EXCL for atomic creation. The lock file contains JSON
+    with the PID and acquisition timestamp.
+    """
+
+    def __init__(self, lock_path: Path) -> None:
+        self._path = lock_path
+        self._acquired = False
+
+    def acquire(self) -> None:
+        """

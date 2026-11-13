@@ -1,0 +1,170 @@
+We need answer user's request: Produce CSV only, one header and exactly 220 data rows. Columns sample_id,language,category,prompt_tokens,output_tokens,accepted_drafts,drafted_tokens,decode_tok_s,valid. sample IDs S0001-S0220, cycle languages en/zh/ja, cycle categories code/story/translation/structured, generate internally consistent positive numeric values. Quote fields only when CSV requires it. Do not add commentary.
+
+Need generate 220 rows. Need ensure CSV valid. No commas in fields likely. valid maybe boolean? positive numeric values? Column valid maybe numeric? They say generate internally consistent positive numeric values. valid could be 0/1? Positive numeric values maybe all numeric positive? "valid" could be 1 maybe. But positive numeric values maybe valid=1. Need all values positive. decode_tok_s positive. accepted_drafts, drafted_tokens positive? accepted_drafts maybe <= drafted_tokens? internal consistency: accepted_drafts <= drafted_tokens maybe. output_tokens maybe >= accepted_drafts? Drafted tokens are speculative tokens? decode_tok_s is decode tokens per second, maybe related to output_tokens/time but no time. Could just positive. Need maybe valid=1.
+
+Need exactly 220 data rows. Cycle languages en/zh/ja repeating. Cycle categories code/story/translation/structured repeating. Need IDs sequential.
+
+Need produce only CSV. Must ensure 220 rows. We can generate deterministic pattern manually or via reasoning. Need count. Could create rows S0001..S0220.
+
+Need be careful exactly 220. Could use pattern formulas. We need output large. Can generate in final. Need maybe no trailing issues? CSV only. Need header:
+sample_id,language,category,prompt_tokens,output_tokens,accepted_drafts,drafted_tokens,decode_tok_s,valid
+
+Need 220 lines. Let's design deterministic values.
+
+Indices i=1..220.
+language: cycle en, zh, ja based on ((i-1)%3): en=0, zh=1, ja=2.
+category: cycle code, story, translation, structured based on ((i-1)%4). This period lcm 12.
+
+Need positive numeric values. Could make:
+prompt_tokens = 100 + i
+output_tokens = 50 + 2*i? positive.
+drafted_tokens = output_tokens + 10? Or maybe drafted_tokens >= accepted_drafts. accepted_drafts = max(1, floor(output_tokens*0.7))? Need integer positive. decoded_tok_s = 10 + (i mod 10)? positive numeric maybe one decimal? "positive numeric values" can be integer or decimal. Use integers for simplicity. decode_tok_s maybe tokens/sec can be integer. valid=1.
+
+But internal consistency: accepted_drafts maybe number of accepted drafts, drafted_tokens total tokens drafted. accepted_drafts <= drafted_tokens? If each draft can have multiple tokens? But accepted_drafts could be count of accepted speculative tokens? Usually accepted_drafts maybe count accepted drafts (number of accepted token sequences), drafted_tokens total tokens in drafts. Could set drafted_tokens = accepted_drafts + something. Need positive.
+
+Maybe set:
+prompt_tokens = 100 + i
+output_tokens = 200 + i
+drafted_tokens = output_tokens + 50
+accepted_drafts = output_tokens/2? Need integer. output_tokens even? If output=200+i, parity varies. accepted_drafts = output_tokens // 2 maybe positive and <= drafted_tokens. valid=1.
+decode_tok_s = 20 + (i % 7) positive.
+
+But output_tokens maybe should be >= accepted_drafts? yes.
+Could have accepted_drafts integer. Need positive. For i=1 output=201 accepted=100. drafted=251.
+
+Need exactly 220. We can list. Need avoid mistakes. Could generate with pattern but manually 220 lines is lengthy. Need ensure no missing rows. We can create in chunks of 20 maybe. Need verify counts.
+
+Alternative: Use compressed? No, CSV only. Need 220 rows. Could write programmatically in my mind? Need generate accurately.
+
+Could use a systematic table. Maybe use formulas and write rows sequentially. Need 220 lines. That's okay but risk count errors. We can count in chunks.
+
+Let's define values:
+For i from 1 to 220:
+sample_id S + zero padded 4: S0001...
+language by i mod 3: if i%3==1 en, 2 zh, 0 ja.
+category by i mod 4: if i%4==1 code, 2 story, 0 translation, 3 structured? Let's check: i=1 -> code, i=2 -> story, i=3 -> translation, i=4 -> structured, i=5 -> code. Formula (i-1)%4: 0 code,1 story,2 translation,3 structured. Using i%4: 1 code,2 story,3 translation,0 structured.
+prompt_tokens = 100 + i
+output_tokens = 200 + i
+accepted_drafts = output_tokens / 2 integer floor? output_tokens = 200+i. floor((200+i)/2). Positive.
+drafted_tokens = output_tokens + 50 = 250 + i. accepted <= drafted.
+decode_tok_s = 20 + (i % 7). For i%7: 1..0 gives 21,22,23,24,25,26,20. Positive integer.
+valid=1.
+
+All positive. No commas. No quotes needed.
+
+Need output 220 rows. Let's generate carefully. Could produce by cycles of 12? Since languages and categories period 12. Values increment by 1 per i except decode periodic. Could make 12-row blocks for i ranges. Need 220 = 18*12=216 +4. We can generate blocks maybe easier count.
+
+Let's make row template for block starting n (i=n..n+11). But values depend i. Could write 220 rows in 11 blocks of 20? Count easier if each block header? No commentary. Could internally count.
+
+Maybe produce using 20 rows per block, 11 blocks (20*11=220). For each block 1-20,21-40,...201-220. Need ensure. Could create using formulas manually. Let's do 20-row chunks. Each chunk 20 lines. Need 11 chunks. We can count lines. Use final with header + 220 lines. Need no extra blank? Fine.
+
+Let's generate chunk 1 i=1..20.
+
+i, lang, cat, prompt=101, output=201, accepted=floor(201/2)=100, drafted=251, decode=20+i%7: i=1 ->21.
+1 en code 101,201,100,251,21,1
+2 zh story 102,202,101,252,22
+3 ja translation 103,203,101,253,23 (floor 203/2=101)
+4 structured 104,204,102,254,24
+5 code 105,205,102,255,25
+6 story 106,206,103,256,26
+7 translation 107,207,103,257,20 (7%7=0)
+8 structured 108,208,104,258,21
+9 code 109,209,104,259,22
+10 story 110,210,105,260,23
+11 translation 111,211,105,261,24
+12 structured 112,212,106,262,25
+13 code 113,213,106,263,26
+14 story 114,214,107,264,20
+15 translation 115,215,107,265,21
+16 structured 116,216,108,266,22
+17 code 117,217,108,267,23
+18 story 118,218,109,268,24
+19 translation 119,219,109,269,25
+20 structured 120,220,110,270,26
+
+Check language: i=20: 20%3=2 zh? Wait earlier: i%3: 1 en, 2 zh, 0 ja. I incorrectly assigned for i=20? Let's recalc: i=1 en, 2 zh, 3 ja, 4 en, 5 zh, 6 ja, 7 en,8 zh,9 ja,10 en,11 zh,12 ja,13 en,14 zh,15 ja,16 en,17 zh,18 ja,19 en,20 zh. I omitted? In chunk above I assigned:
+1 en
+2 zh
+3 ja
+4 structured? language missing? I didn't include language for 4? I wrote 4 structured no language. Need correct.
+Let's list properly.
+
+Category cycle: i 1 code,2 story,3 translation,4 structured,5 code,6 story,7 translation,8 structured,9 code,10 story,11 translation,12 structured,13 code,14 story,15 translation,16 structured,17 code,18 story,19 translation,20 structured.
+
+Let's create chunk1:
+S0001,en,code,101,201,100,251,21,1
+S0002,zh,story,102,202,101,252,22,1
+S0003,ja,translation,103,203,101,253,23,1
+S0004,en,structured,104,204,102,254,24,1
+S0005,zh,code,105,205,102,255,25,1
+S0006,ja,story,106,206,103,256,26,1
+S0007,en,translation,107,207,103,257,20,1
+S0008,zh,structured,108,208,104,258,21,1
+S0009,ja,code,109,209,104,259,22,1
+S0010,en,story,110,210,105,260,23,1
+S0011,zh,translation,111,211,105,261,24,1
+S0012,ja,structured,112,212,106,262,25,1
+S0013,en,code,113,213,106,263,26,1
+S0014,zh,story,114,214,107,264,20,1
+S0015,ja,translation,115,215,107,265,21,1
+S0016,en,structured,116,216,108,266,22,1
+S0017,zh,code,117,217,108,267,23,1
+S0018,ja,story,118,218,109,268,24,1
+S0019,en,translation,119,219,109,269,25,1
+S0020,zh,structured,120,220,110,270,26,1
+
+Good.
+
+Chunk 2 i=21..40.
+i=21: 21%3=0 ja; cat i%4=1 code. prompt121 output221 accepted floor110? 221/2=110.5 floor110. drafted271 decode 21%7=0 ->20.
+22 zh? 22%3=1 en? Wait i%3: 1 en,2 zh,0 ja. 22 mod3=1 => en. cat story. prompt122 out222 accepted111 drafted272 decode22%7=1 ->21.
+23 mod3=2 zh, cat translation, out223 acc111 dec22.
+24 mod3=0 ja, structured, out224 acc112 dec23.
+25 mod3=1 en, code, out225 acc112 dec24.
+26 zh, story, out226 acc113 dec25.
+27 ja, translation, out227 acc113 dec26.
+28 en, structured, out228 acc114 dec20 (28%7=0)
+29 zh, code, out229 acc114 dec21
+30 ja, story, out230 acc115 dec22
+31 en, translation, out231 acc115 dec23
+32 zh, structured, out232 acc116 dec24
+33 ja, code, out233 acc116 dec25
+34 en, story, out234 acc117 dec26
+35 zh, translation, out235 acc117 dec20
+36 ja, structured, out236 acc118 dec21
+37 en, code, out237 acc118 dec22
+38 zh, story, out238 acc119 dec23
+39 ja, translation, out239 acc119 dec24
+40 en, structured, out240 acc120 dec25
+
+Check 40%3=1 en yes. Good.
+
+Chunk 3 i=41..60.
+41 mod3=2 zh, cat code (41%4=1), out241 acc120 dec41%7=6 ->26? 41 mod7 =6, decode 26.
+42 mod3=0 ja, story, out242 acc121 dec20? 42 mod7=0 ->20.
+43 mod3=1 en, translation, out243 acc121 dec21.
+44 mod3=2 zh, structured, out244 acc122 dec22.
+45 mod3=0 ja, code, out245 acc122 dec23.
+46 mod3=1 en, story, out246 acc123 dec24.
+47 mod3=2 zh, translation, out247 acc123 dec25.
+48 mod3=0 ja, structured, out248 acc124 dec26.
+49 mod3=1 en, code, out249 acc124 dec20.
+50 mod3=2 zh, story, out250 acc125 dec21.
+51 mod3=0 ja, translation, out251 acc125 dec22.
+52 mod3=1 en, structured, out252 acc126 dec23.
+53 mod3=2 zh, code, out253 acc126 dec24.
+54 mod3=0 ja, story, out254 acc127 dec25.
+55 mod3=1 en, translation, out255 acc127 dec26.
+56 mod3=2 zh, structured, out256 acc128 dec20.
+57 mod3=0 ja, code, out257 acc128 dec21.
+58 mod3=1 en, story, out258 acc129 dec22.
+59 mod3=2 zh, translation, out259 acc129 dec23.
+60 mod3=0 ja, structured, out260 acc130 dec24.
+
+Chunk 4 i=61..80.
+61 mod3=1 en, cat code, out261 acc130, dec61%7=5? 56 rem5 =>25.
+62 mod3=2 zh, story, out262 acc131, dec26.
+63 mod3=0 ja, translation, out263 acc131, dec20.
+64 mod3=1 en, structured, out264 acc132, dec21.
+65 mod3=2 zh, code, out265 acc132, dec22.
+66 mod3=0 ja, story, out266

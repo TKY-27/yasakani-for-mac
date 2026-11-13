@@ -1,0 +1,60 @@
+{
+ "kind": "a_speed",
+ "session": "2026-11-01 05:20:16",
+ "tag": "a0",
+ "base": "http://127.0.0.1:8765",
+ "serve": true,
+ "loop_guard": "off",
+ "model_dir": "<model_dir>",
+ "dll": "<yasakani_dir>\\bin\\yskn.dll",
+ "gpu_start": "55, 2955, 14001, 224.50, 19369, 32607, 0",
+ "rounds": [
+  {
+   "round": 1,
+   "gpu_before": "69, 2887, 14001, 508.86, 19377, 32607, 100",
+   "started": "2026-11-01 05:20:17",
+   "gpu_after": "72, 2865, 14001, 600.99, 19379, 32607, 100",
+   "finished": "2026-11-01 05:20:25"
+  }
+ ],
+ "runs": [
+  {
+   "test": "chat",
+   "round": 1,
+   "prompt": "chat",
+   "run": 1,
+   "decode_tok_s": 257.5,
+   "completion_tokens": 2048,
+   "prompt_tokens": 112,
+   "finish": "length",
+   "used": true,
+   "ttft_s": 0.06,
+   "wall_s": 8.01,
+   "note": ""
+  }
+ ],
+ "prompt_sha256": {
+  "chat": "4e18ff402bd91b2db1c6e0c27deaa0a06d2aea7e20d3943f0df028165910186d"
+ },
+ "prompt_warnings": [],
+ "system": {
+  "python": "3.14.4",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "script_sha256": "8136122af66116f0",
+  "dll_sha256": "1fa3a25362f150c885ab7eb23fa32e672fbeebf7820c5b19a56ee452227a3718",
+  "dll_bytes": 26184192,
+  "model_files": {
+   "bdraft2_k8.shead": 1411010584,
+   "bdraft2_k8.yskn": 1164969472,
+   "kvq_u5.bin": 17432,
+   "qwen38_27b_e3x.yskn": 12365242368
+  }
+ },
+ "health": {
+  "status": "ok",
+  "version": "0.1.0.dev0",
+  "model": "qwen3.8-27b",
+  "max_context_tokens": 16384
+ },
+ "gpu_end": "72, 2865, 14001, 600.99, 19379, 32607, 100"
+}

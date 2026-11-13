@@ -1,0 +1,98 @@
+The user is asking for a complete CUDA 13.1 / C++20 command-line program that normalizes a large BF16 matrix row by row on sm_120a GPUs. Requirements:
+
+1. Argument parsing
+2. RAII device buffers
+3. Numerically stable FP32 reference
+4. Vectorized CUDA kernel
+5. Warmup
+6. CUDA event timing
+7. Deterministic input generation
+8. Error checking
+9. Tolerance-based verification
+10. CMakeLists.txt
+11. Explanation of memory layout and launch configuration after the code
+
+Key technical considerations:
+
+**sm_120a** — This is the architecture for Blackwell (RTX 50-series, i.e., GB202/GB203/GB205 consumer Blackwell). sm_120a corresponds to compute capability 12.0. CUDA 13.x supports sm_120/sm_120a. The "a" suffix means architecture-specific features. Actually, sm_120a is the consumer Blackwell (Blackwell GeForce RTX 50-series). sm_100/sm_101/sm_103 are datacenter Blackwell (B100/B200/GB200). So sm_120a is what's relevant for RTX 5090 etc.
+
+**BF16** — bfloat16. In CUDA, there's `__nv_bfloat16` in `<cuda_bf16.h>`, and `__nv_bfloat162` for 2-packing. CUDA 13 has a new C++ header for bf16: `<cuda_bf16.h>` is the classic one; there's also `<cuda_bf16.h>` providing `__nv_bfloat16`. Also, C++20 with `#include <cuda_bf16.h>`. Additionally, CUDA 12.8+ has a new header `<cuda/bf16.h>` providing `cuda::bfloat16_t`. In CUDA 13.1 we can use the modern C++ API `cuda::bfloat16` (in the `cuda::` namespace) from `<cuda/bf16.h>`. Let's use this — it has strong type safety and arithmetic overloads. Actually, `cuda::bfloat16` requires compute capability 8.0+, which is fine for sm_120.
+
+Hmm, but which is safer? The classic `__nv_bfloat16` and `__nv_bfloat162` are well known and stable. The new `cuda::bfloat16` is available since CUDA 12.8. Since the user says CUDA 13.1, we can use the modern API. Though mixing might be risky. Let's consistently use `__nv_bfloat162`-based vectorization with the classic header — no, let me think about what "vectorized CUDA kernel" means: read 8 bytes at a time with `float2` or `uint2`? `__nv_bfloat162` is 32-bit = 2 bf16s. For 128-bit vector loads we can use `uint4` (16 bytes = 8 bf16s). Using `__nv_bfloat162` pairs: `uint4` = 4 × `__nv_bfloat162`.
+
+Row-wise normalization: for each row i, compute the sum of squares of the row elements (in FP32 for stability), sqrt, and divide each element by the norm. "Numerically stable FP32 reference" — compute the reference in FP32 on the host (or a separate kernel), using e.g., a stable algorithm. Actually, "numerically stable FP32 reference" probably means a reference implementation that upcasts to FP32 and computes normalization stably (e.g., max-abs scaling to avoid overflow/underflow before the sum of squares). The BF16 kernel should compute the norm in FP32 accumulation anyway. The reference would be double precision? Hmm — it says "FP32 reference", so reference in float. Stability: use Kahan summation, or scale by max abs first.
+
+BF16 has a large dynamic range (same exponent as FP32) so overflow in the sum of squares isn't much of a problem, but for numerical stability let's implement a scaled norm: m = max|x|, sum((x/m)^2), norm = m * sqrt(sum). This is the classical stable normalization. Do the same in the kernel, so it matches the reference.
+
+Design:
+
+- Matrix M: rows × cols, row-major, stored in device memory as BF16.
+- Kernel: grid of (row_blocks, col_blocks) or one row per threadblock? For large matrices with wide rows, better: each threadblock handles a chunk of one row, using a shared-memory tree reduction to compute the row norm, then normalize. Two-phase: kernel 1 computes row norms, kernel 2 normalizes. Or one kernel with grid sync? Simpler and more standard: 2 kernels, or one kernel where the block handles the entire row (block size limited to 1024; cols can exceed that). For large cols, e.g., cols = 4096+, a single-block-per-row with 1024 threads works but has low occupancy. Alternatively, grid = (num_row_blocks, num_rows), each block processing row chunk [c0, c1), computing partial max and partial sum of squares in FP32, reducing within the block via shared memory, writing partials to global memory, and after a second reduction (on the host or another kernel) computing the norm… this is getting complex.
+
+A cleaner approach that still shows "vectorized kernel":
+
+Kernel A (`row_norm_kernel`): 2D grid; each block handles one row chunk; computes (maxabs, sumsq) within the chunk using vectorized loads of 8 bf16; block reduction; atomically merges into per-row (maxabs, sumsq) in FP32? Atomics are non-deterministic in order — but since we're doing the same stable normalization as the reference, small nondeterminism in the addition order is fine, and it's tolerable under a tolerance-based check. However, the user asked for "deterministic input generation" — that's about the input, not about the kernel. Still, deterministic output is better. Alternative: two-phase: first kernel writes per-chunk partials into a work area `partials[num_rows][num_chunks]`, and the second kernel (one thread per row) reduces the chunk partials to a per-row norm, and the third kernel normalizes. That's 3 kernels. Or: 1 kernel per row with gridDim.x = num_chunks… hmm.
+
+Simpler, deterministic design:
+
+- If cols ≤ max_block_elements, one block per row; block reduces, normalizes. Grid (1, rows).
+- General case: 2 kernels:
+  1. `kernel_partial_stats`: grid (rowChunks, rows), block computes chunk's (maxabs, sumsq) → writes to `stats[row * rowChunks + chunk]`.
+  2. `kernel_row_norm`: grid rows, thread (or small block) per row reduces stats → norm → `norms[row]`.
+  3. `kernel_normalize`: grid (rowChunks, rows), divides.
+
+That's 3 kernels. Acceptable and shows more CUDA. But maybe overkill. Alternatively, compute the norm in the same kernel via cooperative groups' grid sync (requires cooperative launch, grid limited by concurrent occupancy). For "large matrices" this can exceed the occupancy limit. The 3-kernel approach is robust.
+
+Actually, simpler and still robust: since we're doing tolerance-based verification with an FP32 reference, tiny differences in addition order are tolerable. But deterministic is better for reproducibility of the verification. Let's go with deterministic multi-kernel:
+
+Actually, let me reconsider: for a "large" matrix, e.g., default 8192×8192 or 16384×16384. With chunk size = 1024 threads × 8 elements = 8192 elements per chunk… if cols=8192, one chunk per row suffices → 2 kernels + normalization could be fused with kernel 1 when chunks==1? Keep it generic: always 3 kernels; when chunks_per_row == 1, the middle kernel is trivial but cheap.
+
+Hmm, but I want the code to be complete without being bloated. Let's do this:
+
+- `row_stats_kernel`: vectorized, computes per-chunk (maxabs, sumsq), block reduction via shared memory tree, deterministic.
+- `reduce_stats_kernel`: 1 warp per row (or 1 thread per row if chunks ≤ 32; simpler: 1 thread per row looping over chunks — deterministic sequential order; or warp with shuffle; 1 thread per row with a loop is simplest and deterministic; chunks is usually small).
+- `normalize_kernel`: vectorized, divides by the row norm (handle zero norm: if norm == 0 output zero).
+
+Or fuse: the last block to finish on a row does the finalization (atomic counter) — nondeterministic timing but deterministic values, since we combine max/sq deterministically (max is commutative; sum order via chunk index, if… no, atomic adds have nondeterministic order). Avoid atomics.
+
+OK, 3 kernels, all deterministic.
+
+**BF16 conversion**: use `__nv_bfloat16`, `__nv_bfloat162`, `__bfloat162float2`, `__float2bfloat16_rn`, etc. Vector load: reinterpret as `uint4` (16 bytes) and convert each `__nv_bfloat162` component.
+
+Layout: matrix stored in device memory as BF16, row-major. Row length in bytes = cols * 2. For 128-bit vectorized access we need cols % 8 == 0 and base pointer 16-byte aligned (cudaMalloc guarantees 256B alignment). We can require/enforce that cols is a multiple of 8, otherwise fall back? The user says "complete… don't omit" — let's enforce as an argument check that cols % 8 == 0 and rows >= 1 etc. Or handle the remainder: tail elements. For completeness and robustness, handle a generic cols with vector width 8 and a scalar tail (deterministic). Hmm, but vectorized + tail handling makes the kernel complex. Since we control input generation and can document that we require cols % 8 == 0, let's enforce it in argument validation with a clear error. Actually "normalize a large BF16 matrix" — a robust implementation should handle arbitrary shapes. But a complete implementation including tail handling is also fine: vector loop over `cols / 8` chunks, then scalar loop for `cols % 8`. Let's include tail handling in both the stats kernel and the normalization kernel and the reference. That's complete. Hmm, wait: in the stats kernel, the tail elements get processed by only thread 0 — fine, then block reduction includes them.
+
+Hmm, but actually there's a subtle point: each block handles a chunk of the row of `BLOCK_THREADS * 8` elements. The last chunk may be partial. Tail handling: elements within the last chunk beyond cols: threads compute only the real elements. Let's structure it as: block covers element range [start, start + size). For each thread t: base = start + t*8; handle up to min(8, cols - base) elements… that's awkward with vector types. Alternative: per-thread scalar loop: `for (int c = start + t; c < end && c < cols; c += blockDim.x)` — simple strided scalar loop, no vectorization. To keep the "vectorized kernel" claim, use vector 8 for the bulk: compute per thread the number of full 8-vectors it can take: elements assigned to thread t: from idx = start + t*8 up to min(start + (t+1)*8, end, cols)… if end isn't aligned, the last vector is partial. To handle generically:
+
+```
+int nvec = (cols) / 8;          // number of full 8-vectors in the row
+int tail = cols - nvec*8;
+```
+
+Block covers column range [c0, c1) of the row, size = min(blockStride, cols - c0). Within that, number of full vectors = (c1 - c0) / 8… hmm c0 is aligned to blockStride (multiple of 8192, so multiple of 8). c1 - c0 is ≤ 8192, multiple of 8 except for the last chunk where cols isn't a multiple of 8.
+
+Cleanest: threads 0..vec_threads-1 handle the vector part: `int vbase = c0 + tid*8; if (vbase + 8 <= cols) load uint4` — but if c1 <= cols and vbase+8 <= c1 then… since c0 is a multiple of 8 and c1 - c0 is a multiple of 8 (blockStride = 8192 is a multiple of 8; all but the last chunk are full; last chunk c1 = cols, c0 is a multiple of 8, so c1 - c0 = cols - c0 is multiple of 8 only if cols is a multiple of 8). Ugh.
+
+Simplest complete approach: vector part covers columns [0, nvec*8) in blocks of 8*blockDim, and the tail part [nvec*8, cols) by the first `tail` threads (tail < 8) with scalar loads. Since nvec*8 is a multiple of blockStride (8192) only if nvec*8 is a multiple of 8192 — not guaranteed. Hmm, the vector part's column range [0, nvec*8) split into chunks of 8192: number of chunks = ceil(nvec*8 / 8192). If the last chunk partially covers… the last vector chunk: c0 = k*8192, c1 = min(c0+8192, nvec*8); since nvec*8 is a multiple of 8, if c0 is a multiple of 8 then c1 - c0 is a multiple of 8 (it is). 8192 is a multiple of 8. OK: within a chunk, number of vectors = (c1-c0)/8 = 1024 exactly, since c1-c0 ≤ 8192 and a multiple of 8. Wait, c1-c0 can be less than 8192 only when it's the last chunk; still multiple of 8. Good.
+
+But this makes the code messy: separate grid dimensions for vector chunks and tail chunks. Alternative pragmatic choice (still "complete"): require that cols is a multiple of 8 (document it, validate with a clear error message). Since we also generate deterministic input ourselves, and the user said "large BF16 matrix", vectorization width 8 (128-bit) with a shape constraint is standard practice (e.g., cuBLAS requires alignment). I think this is defensible and keeps the code focused. But "don't omit implementations" — a tail handling path isn't an omitted section if we document the constraint… it's a design decision. Hmm. Let me implement tail handling anyway to be thorough — it's not that much code. Let me design it carefully.
+
+Actually, let me reconsider the block/column layout to make it cleaner:
+
+Grid: (num_chunks, num_rows), num_chunks = ceil(cols / CHUNK_ELEMS), CHUNK_ELEMS = BLOCK_THREADS * VEC = 1024 * 8 = 8192.
+
+Kernel `row_stats`:
+```
+row = blockIdx.y
+chunk = blockIdx.x
+c0 = chunk * 8192
+elements in [c0, min(c0+8192, cols))
+```
+Per thread: tid ∈ [0,1024). Element base = c0 + tid*8. avail = min(c0+8192, cols) - base. If avail >= 8: 128-bit vector load; otherwise if avail > 0: scalar load for `avail` elements (only happens if cols % 8 != 0 in the last chunk, and only for one thread since avail < 8 only for the last thread). Otherwise: nothing (threads beyond ceil(avail/8)).
+
+Each thread computes local maxabs and sumsq over its (up to) 8 elements (converting to float). Then block reduction: shared-memory 2-stage reduction of the pair (max, sum). Deterministic tree reduction. Thread 0 writes to `stats[row*num_chunks + chunk] = {maxabs, sumsq}`.
+
+Kernel `finalize_rows`: 1 thread per row (grid rows), sequentially loops over chunks, computing m = max of chunk maxabs, s = sum of chunk sumsq, norm = m==0 ? 0 : m*sqrt(s); writes to `norms[row]`. Sequential → deterministic. (Alternatively, a block of 1 warp per row with shuffle — unnecessary.)
+
+Kernel `normalize`: same geometry as stats; per thread loads its vector, converts to float, divides by norm (if norm > 0, else output 0), converts back to bf16 (round to nearest), stores as vector.
+
+**Reference (FP32, host)**: per row: upcast all elements to float; m = maxabs; s = Σ (x/m)^2 with Kahan? Kahan over up to 16384 elements × 16384 rows in FP32 on the host is fine. Actually, for "numerically stable": scaled sum of squares is the key stability trick; Kahan is optional. Since the reference is FP32, we use simple sequential sum of (x/m)^2… for safety, use Kahan in the reference to make it "more accurate"; the kernel is also FP32 accumulation; the difference will be tiny. Tolerance: compare final BF16 outputs — but the outputs are BF16 (rounded to bf16) both from kernel and reference? Reference output: should we round the reference to BF16 for comparison? Or compare in FP32 with tolerance that accounts for the bf16 quantization. Let's decide: kernel writes BF16 output; reference computes FP32 normalized values and rounds to BF16 (round-to-nearest-even as done by __float2bfloat16_rn), then compares kernel output bits == reference bits? Tolerance-based verification suggests numeric tolerance, not bit-exact. Since both round

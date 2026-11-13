@@ -1,0 +1,571 @@
+Below is a complete, runnable Python 3.11 package. It is designed to be deterministic (no wall‑clock timestamps in state, no randomness, no thread races), to enforce a single active GPU job, to persist state atomically, to resume completed work, to stream structured JSONL events, to handle SIGINT, to redact configured secrets, and to include pytest tests for success, failure, cancellation, and resume.
+
+### Project layout
+
+```
+gpujobrunner/
+├── pyproject.toml
+├── gpujobrunner/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── cli.py
+│   ├── config.py
+│   ├── events.py
+│   ├── manifest.py
+│   ├── redact.py
+│   ├── runner.py
+│   └── state.py
+└── tests/
+    ├── __init__.py
+    ├── conftest.py
+    └── test_runner.py
+```
+
+---
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpujobrunner"
+version = "0.1.0"
+description = "Deterministic asynchronous GPU job runner with atomic state, resume, JSONL events, SIGINT handling, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Example" }]
+keywords = ["gpu", "jobs", "runner", "async", "deterministic"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: POSIX",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+gpujobrunner = "gpujobrunner.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gpujobrunner*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+```
+
+---
+
+### `gpujobrunner/__init__.py`
+
+```python
+"""Deterministic asynchronous GPU job runner."""
+
+from .config import RunnerConfig
+from .events import Event, EventStream
+from .manifest import Job, Manifest
+from .redact import Redactor
+from .runner import JobRunner
+from .state import StateStore
+
+__all__ = [
+    "RunnerConfig",
+    "Event",
+    "EventStream",
+    "Job",
+    "Manifest",
+    "Redactor",
+    "JobRunner",
+    "StateStore",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+### `gpujobrunner/config.py`
+
+```python
+"""Configuration for the job runner."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class RunnerConfig:
+    """Immutable configuration for a runner run.
+
+    Attributes:
+        state_dir: Directory where atomic state files are written.
+        events_path: Path to the JSONL event stream file.
+        secrets: Mapping of secret name -> literal value to redact.
+        max_retries: Maximum number of retries per job (0 disables retries).
+        gpu_device: Logical GPU device identifier (informational).
+    """
+
+    state_dir: Path
+    events_path: Path
+    secrets: dict[str, str] = field(default_factory=dict)
+    max_retries: int = 0
+    gpu_device: str = "gpu:0"
+
+    def __post_init__(self) -> None:
+        # Ensure directories exist.
+        self.state_dir = Path(self.state_dir)
+        self.events_path = Path(self.events_path)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.events_path.parent.mkdir(parents=True, exist_ok=True)
+```
+
+---
+
+### `gpujobrunner/manifest.py`
+
+```python
+"""Manifest parsing and validation."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+class ManifestError(Exception):
+    """Raised when the manifest is invalid."""
+
+
+@dataclass(frozen=True)
+class Job:
+    """A single job in the manifest."""
+
+    id: str
+    command: list[str]
+    gpu: bool = True
+    env: dict[str, str] = field(default_factory=dict)
+    timeout_seconds: float | None = None
+    retries: int = 0
+
+
+@dataclass(frozen=True)
+class Manifest:
+    """Parsed and validated manifest."""
+
+    jobs: list[Job]
+    raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @property
+    def job_ids(self) -> list[str]:
+        return [j.id for j in self.jobs]
+
+
+def load_manifest(path: Path) -> Manifest:
+    """Load and validate a JSON manifest file.
+
+    Expected schema:
+    {
+      "jobs": [
+        {
+          "id": "train-1",
+          "command": ["python", "train.py", "--epochs", "10"],
+          "gpu": true,
+          "env": {"CUDA_VISIBLE_DEVICES": "0"},
+          "timeout_seconds": 3600,
+          "retries": 2
+        }
+      ]
+    }
+    """
+    path = Path(path)
+    if not path.exists():
+        raise ManifestError(f"Manifest not found: {path}")
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ManifestError(f"Invalid JSON in manifest: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise ManifestError("Manifest root must be a JSON object")
+
+    jobs_raw = raw.get("jobs")
+    if not isinstance(jobs_raw, list):
+        raise ManifestError("Manifest must contain a 'jobs' list")
+
+    jobs: list[Job] = []
+    seen_ids: set[str] = set()
+
+    for i, j in enumerate(jobs_raw):
+        if not isinstance(j, dict):
+            raise ManifestError(f"Job at index {i} must be an object")
+
+        job_id = j.get("id")
+        if not isinstance(job_id, str) or not job_id:
+            raise ManifestError(f"Job at index {i} must have a non-empty string 'id'")
+        if job_id in seen_ids:
+            raise ManifestError(f"Duplicate job id: {job_id}")
+        seen_ids.add(job_id)
+
+        command = j.get("command")
+        if not isinstance(command, list) or not command:
+            raise ManifestError(f"Job '{job_id}' must have a non-empty 'command' list")
+        if not all(isinstance(c, str) for c in command):
+            raise ManifestError(f"Job '{job_id}' command entries must be strings")
+
+        gpu = j.get("gpu", True)
+        if not isinstance(gpu, bool):
+            raise ManifestError(f"Job '{job_id}' 'gpu' must be a boolean")
+
+        env = j.get("env", {})
+        if not isinstance(env, dict):
+            raise ManifestError(f"Job '{job_id}' 'env' must be an object")
+        if not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+            raise ManifestError(f"Job '{job_id}' env keys and values must be strings")
+
+        timeout = j.get("timeout_seconds")
+        if timeout is not None and not isinstance(timeout, (int, float)):
+            raise ManifestError(f"Job '{job_id}' 'timeout_seconds' must be a number")
+
+        retries = j.get("retries", 0)
+        if not isinstance(retries, int) or retries < 0:
+            raise ManifestError(f"Job '{job_id}' 'retries' must be a non-negative integer")
+
+        jobs.append(
+            Job(
+                id=job_id,
+                command=command,
+                gpu=gpu,
+                env=env,
+                timeout_seconds=float(timeout) if timeout is not None else None,
+                retries=retries,
+            )
+        )
+
+    return Manifest(jobs=jobs, raw=raw)
+```
+
+---
+
+### `gpujobrunner/redact.py`
+
+```python
+"""Secret redaction for logs and events."""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+
+class Redactor:
+    """Redacts configured secret values from strings and nested structures."""
+
+    def __init__(self, secrets: dict[str, str]) -> None:
+        self._secrets = secrets
+        # Build a regex that matches any secret value.
+        # Escape each secret for regex safety.
+        if secrets:
+            patterns = [re.escape(v) for v in secrets.values() if v]
+            if patterns:
+                self._pattern = re.compile("|".join(f"({p})" for p in patterns))
+            else:
+                self._pattern = None
+        else:
+            self._pattern = None
+
+    def redact_string(self, s: str) -> str:
+        """Replace all occurrences of secret values with [REDACTED]."""
+        if not s or self._pattern is None:
+            return s
+        return self._pattern.sub("[REDACTED]", s)
+
+    def redact(self, obj: Any) -> Any:
+        """Recursively redact secrets in a JSON-serializable structure."""
+        if isinstance(obj, str):
+            return self.redact_string(obj)
+        if isinstance(obj, list):
+            return [self.redact(item) for item in obj]
+        if isinstance(obj, dict):
+            return {k: self.redact(v) for k, v in obj.items()}
+        return obj
+```
+
+---
+
+### `gpujobrunner/events.py`
+
+```python
+"""Structured JSONL event streaming."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .redact import Redactor
+
+
+@dataclass(frozen=True)
+class Event:
+    """A single structured event."""
+
+    seq: int
+    type: str
+    job_id: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"seq": self.seq, "type": self.type}
+        if self.job_id is not None:
+            d["job_id"] = self.job_id
+        if self.data:
+            d["data"] = self.data
+        return d
+
+
+class EventStream:
+    """Streams structured events to a JSONL file.
+
+    Events are written atomically (one line at a time, flushed after each write)
+    and are redacted before serialization.
+    """
+
+    def __init__(self, path: Path, redactor: Redactor) -> None:
+        self._path = Path(path)
+        self._redactor = redactor
+        self._seq = 0
+        self._file = None
+
+    def open(self) -> None:
+        self._file = open(self._path, "a", encoding="utf-8")
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.flush()
+            self._file.close()
+            self._file = None
+
+    def emit(self, type: str, job_id: str | None = None, **data: Any) -> Event:
+        """Emit an event and return it."""
+        self._seq += 1
+        event = Event(seq=self._seq, type=type, job_id=job_id, data=data)
+        redacted = self._redactor.redact(event.to_dict())
+        line = json.dumps(redacted, separators=(",", ":"), sort_keys=True)
+        if self._file is not None:
+            self._file.write(line + "\n")
+            self._file.flush()
+        return event
+
+    def __enter__(self) -> "EventStream":
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+```
+
+---
+
+### `gpujobrunner/state.py`
+
+```python
+"""Atomic state persistence."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+class StateStore:
+    """Persists runner state atomically.
+
+    State is written to a temporary file in the same directory, then
+    atomically renamed over the target file. This ensures that a crash
+    mid-write never leaves a corrupt state file.
+    """
+
+    STATE_FILENAME = "state.json"
+
+    def __init__(self, state_dir: Path) -> None:
+        self._dir = Path(state_dir)
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._path = self._dir / self.STATE_FILENAME
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def load(self) -> dict[str, Any]:
+        """Load state from disk, returning an empty default if absent."""
+        if not self._path.exists():
+            return self._default_state()
+        try:
+            return json.loads(self._path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            # Corrupt state; start fresh.
+            return self._default_state()
+
+    def save(self, state: dict[str, Any]) -> None:
+        """Atomically persist state to disk."""
+        data = json.dumps(state, indent=2, sort_keys=True)
+        # Write to a temp file in the same directory, then rename.
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(self._dir), prefix=".state_", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, str(self._path))
+        except BaseException:
+            # Clean up temp file on failure.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def _default_state(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "jobs": {},
+            "active_job": None,
+            "completed": [],
+            "failed": [],
+            "cancelled": [],
+        }
+```
+
+---
+
+### `gpujobrunner/runner.py`
+
+```python
+"""Core deterministic asynchronous job runner."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import signal
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from .config import RunnerConfig
+from .events import EventStream
+from .manifest import Job, Manifest
+from .redact import Redactor
+from .state import StateStore
+
+
+class JobRunner:
+    """Deterministic asynchronous GPU job runner.
+
+    Guarantees:
+      - At most one GPU job is active at any time.
+      - State is persisted atomically after every transition.
+      - Completed jobs are not re-run on resume.
+      - Events are streamed as structured JSONL.
+      - SIGINT triggers graceful cancellation of the active job.
+      - Configured secrets are redacted from all events.
+    """
+
+    def __init__(
+        self,
+        manifest: Manifest,
+        config: RunnerConfig,
+        *,
+        event_stream: EventStream | None = None,
+        state_store: StateStore | None = None,
+    ) -> None:
+        self._manifest = manifest
+        self._config = config
+        self._redactor = Redactor(config.secrets)
+        self._state_store = state_store or StateStore(config.state_dir)
+        self._events = event_stream or EventStream(config.events_path, self._redactor)
+        self._state: dict[str, Any] = {}
+        self._cancel_event = asyncio.Event()
+        self._active_process: subprocess.Popen | None = None
+        self._active_job_id: str | None = None
+        self._sigint_received = False
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def run(self) -> dict[str, Any]:
+        """Run all jobs from the manifest, respecting prior state.
+
+        Returns the final state dictionary.
+        """
+        self._state = self._state_store.load()
+        self._events.open()
+
+        try:
+            self._events.emit("run_start", data={"total_jobs": len(self._manifest.jobs)})
+
+            for job in self._manifest.jobs:
+                if self._sigint_received:
+                    # Stop scheduling new jobs after SIGINT.
+                    self._events.emit(
+                        "run_cancelled",
+                        job_id=job.id,
+                        data={"reason": "sigint"},
+                    )
+                    self._state["cancelled"].append(job.id)
+                    self._state_store.save(self._state)
+                    continue
+
+                # Skip already-completed jobs (resume).
+                if job.id in self._state["completed"]:
+                    self._events.emit(
+                        "job_skipped",
+                        job_id=job.id,
+                        data={"reason": "already_completed"},
+                    )
+                    continue
+
+                # Skip already-failed jobs (no auto-retry across runs unless configured).
+                if job.id in self._state["failed"]:
+                    self._events.emit(
+                        "job_skipped",
+                        job_id=job.id,
+                        data={"reason": "already_failed"},
+                    )
+                    continue
+
+                # Skip already-cancelled jobs.
+                if job.id in self._state["cancelled"]:
+                    self._events.emit(
+                        "job_skipped",
+                        job_id=job.id,
+                        data={"reason": "already_cancelled"},
+                    )
+                    continue
+
+                # Enforce single active GPU job: wait for any prior job to finish.
+                # (In this sequential design, the prior job is always finished
+                # before we get here, but we assert the invariant.)
+                assert self._active_job_id is None, (
+                    f"Invariant violated: job {self._active_job_id} still active"
+                )

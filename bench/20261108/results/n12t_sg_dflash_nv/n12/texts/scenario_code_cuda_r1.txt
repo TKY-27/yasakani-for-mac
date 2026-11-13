@@ -1,0 +1,94 @@
+The user wants a complete CUDA 13.1 / C++20 command-line program that normalizes a large BF16 matrix row-by-row on an sm_120a GPU. What needs to be included:
+
+1. Argument parsing
+2. RAII device buffers
+3. Numerically stable FP32 reference
+4. Vectorized CUDA kernel
+5. Warm-up
+6. Timing via CUDA events
+7. Deterministic input generation
+8. Error checking
+9. Tolerance-based verification
+10. CMakeLists.txt
+
+And after the code, explain the memory layout and launch geometry.
+
+Let me think through the details:
+
+- CUDA 13.1: This is a recent CUDA version. sm_120a is the Blackwell architecture (RTX 50-series / B120 / B122? actually sm_120 is Blackwell consumer GPU — RTX 5090 etc. have sm_120). The `a` suffix denotes architecture-specific features (like sm_90a for Hopper, sm_120a for Blackwell). In CUDA 13.x, `-gencode arch=compute_120a,code=sm_120a` works. In fact in CUDA 13.0+ sm_120 is supported. Also `__NV_BFLOAT16` / `__nv_bfloat16` are available. Vectorized load: 128-bit load of 8 BF16 values.
+
+- C++20: use of concepts, span, etc.
+
+- Row normalization: probably each row is normalized by its norm (L2). "Normalize row-by-row" — normalize each row vector to unit L2 norm. The numerically stable FP32 reference: compute row norms in FP32 with scaling (like scaled sum of squares to avoid overflow/underflow) — e.g., compute max |x| per row, then norm = max * sqrt(sum((x/max)^2)), or use a Kahan summation. Then divide.
+
+- Kernel: vectorized — each thread loads 8 BF16s via uint4 (128-bit = 8 x bf16). Row length may be a multiple of 8, or handle the remainder. Launch geometry: 1 warp per row? Or a block per row with a grid-stride over rows. Let me think.
+
+Design: matrix M is M×N, row-major. Row normalization: y[i][j] = x[i][j] / norm_i, norm_i = sqrt(sum_j x[i][j]^2).
+
+Stability: in FP32, sum-of-squares can overflow if values are large. Numerically stable approach: per-row max absolute value `m`; norm = m * sqrt(sum((x/m)^2)). This is similar to the LAPACK approach. Implement both in the device kernel (bf16 -> convert to fp32, compute scaled norm, then divide) and in the FP32 CPU reference (using the same stable algorithm, possibly with Kahan summation to make it even more stable).
+
+Actually "numerically stable FP32 reference" — probably means compute the reference on the CPU in FP32 with stable norm computation. The kernel is also in FP32 arithmetic but input/output are bf16. Since bf16 has ~3 decimal digits of precision, tolerance: relative error vs reference, with absolute tolerance.
+
+Plan:
+
+- CLI args: `--rows`, `--cols`, `--iterations`, `--warmup`, `--seed`, `--check` (verify), `--help`, `--device`. Defaults: large matrix e.g., 16384 rows x 65536 cols? That's 16384*65536 = 1,073,741,824 elements = 1G elements, 2 GB of bf16 input + 2 GB output = 4 GB. That's "large". Make it configurable with a default like 16384 x 16384? Or rows=32768, cols=8192 => 268M elements ~ 512MB each. Hmm, let me pick rows=16384, cols=65536 as default => 2^30 elements; 2 GiB per buffer. A lot but a Blackwell consumer GPU has 32GB (5090) and datacenter B200 has 192GB. But the user may run with less. Make it default to something reasonably large but not too big: rows=16384, cols=32768 => 512M elements => 1 GiB per buffer. That's fine.
+
+- Deterministic input generation: seeded LCG (e.g., 64-bit splitmix64 or a custom LCG) on the host, generating FP32 values from [-1,1) via hash, then scaled by a random magnitude; convert to BF16. To make the input "large" and stress overflow, maybe scale some rows. But keep it simple: uniform distribution in [-1,1], plus occasional outliers scaled up to 100. Deterministic via seed.
+
+- RAII device buffers: a `CudaBuffer` class that allocates with cudaMalloc in the constructor, frees in the destructor, move semantics, delete copy. Or a template `DeviceArray<T>`. Provide a `CudaMemory` RAII class.
+
+- Error checking: `CUDART_CHECK` macro that throws `std::runtime_error` with file/line; also check driver init, device selection.
+
+- Vectorized CUDA kernel:
+  - `bf16` vector load: reinterpret row pointers as `uint4*` (16 bytes = 8 bf16).
+  - Each thread processes a chunk of the row; block-level reduction via shared memory + warp shuffle for partial sum of squares (scaled).
+  - Then in a second pass, re-read the row (from global; may hit L2), divide, and store with a vectorized store.
+  - Handling rows where cols is not a multiple of 8: handle the tail elements scalar.
+  
+  Or a warp-per-row design: warp size 32; each thread loads 8 elements => warp covers 256 elements per iteration; grid-stride loop over the row. That gives a natural warp reduction with just shuffles (no shared memory) — clean. But the requested "launch geometry" explanation suggests something like 1 block per row with grid-stride, or 1 warp per row. Let me pick a robust, explainable design:
+
+  Option A: 1 block per row, block size = e.g. 256 threads (or min(cols/8, 256)). Grid = number of rows (maybe capped; if rows > grid cap, use grid-stride over rows). Two phases: compute partial sum of squares in registers, block reduce (warp shuffle + shared memory), all threads compute inv_norm, then each thread divides its own chunk and writes. This keeps the data in registers so no second global read (well, the data stays in registers) — good: single read, single write, no L2 dependence.
+
+  If cols is large (e.g., 65536 => 8192 uint4 vectors), then 256 threads * 8 bf16 = 2048 elements per iteration; each thread processes 8192/256 = 32 vectors. Register pressure: need to hold values to divide later — 32 * 8 floats = 256 registers — too many. Alternative: keep as bf16 vector in registers: 32 * uint4 = 32*4 = 128 registers — still a lot, and conversion twice. Hmm.
+
+  Better: process the row in tiles: for each tile, load, accumulate sum-of-squares (in fp32), then re-read for the divide (second pass through global memory). Data probably stays in L2 (row is 65536*2 = 128KB; L2 of Blackwell is 96MB+ on B200, 128MB? GB202 has 96 MB). With many concurrent rows, total working set may exceed L2, but that's fine.
+
+  Alternatively, restrict block size to a number that fits in registers: cols/8 <= blockDim.x, so 1 vector per thread, then no grid loop over elements, data stays in registers as uint4 (4 registers per thread). If cols <= 8*256 = 2048, 1 vector per thread. But cols may be up to 65536. Can we template/tier: choose threadsPerRow = min(cols/8, 256), and if cols > 2048, loop with re-read, otherwise single-pass. That's complex.
+
+  Simpler, cleaner approach: warp-per-row with grid-stride:
+  - Each warp handles one row at a time; within a row, each thread handles elements in stride 32*8 (element stride 256) — i.e., thread t owns vec indices t, t+32, ... so each thread loads 8 elements, accumulates sum-of-squares in fp32 (with scaling? For per-thread partial, we can accumulate raw sum of squares with a running max to keep it stable...).
+
+  Stability in the kernel: to be stable like the reference: two passes: first pass compute per-row max absolute value; second pass compute sum of squares of x/max; norm = max*sqrt(s). This is inherently stable (avoids overflow/underflow). Do this: pass 1: load vec, compute local max of |x| (fp32 after conversion), warp reduce to row max. Pass 2: load vec (likely L2 hit), accumulate scaled squares, warp reduce with Kahan? A plain fp32 sum across 65536/32=2048 terms per thread — worst-case error ~ sqrt(2048)*eps*sum... acceptable for bf16 precision. Reference uses Kahan to be "numerically stable". Tolerance accounts for bf16 quantization anyway (bf16 relative eps = 2^-8 = ~0.39%... wait bf16 is 8 mantissa bits => eps = 2^-8 ≈ 0.0039 = 0.4%). So a tolerance like 1e-2 relative / 2e-3 absolute is appropriate.
+
+  Warp-per-row grid-stride: gridDim.x = min(rows, maxWarpCount), e.g., 8192 warps (256K threads). Each warp loops `for (row = warpId; row < rows; row += gridWarps)`.
+
+  This is clean and explainable: 1 warp per row, block size 256 (8 warps), grid = min(rows, SMs*warpsPerSM*... capped e.g. at 24576 threads? let me compute: maxWarp = min(rows, 32 * 256 * #SMs?) Actually, occupancy: 256 threads per block, say up to 16 blocks per SM? Blackwell sm_120: max threads per SM = 2048? consumer Blackwell sm_120 is similar to Ada: 2048 threads per SM. 148 SMs on 5090 (GB202?) hmm — RTX 5090 has 170 SMs (GB202 full: 21760 cores, 170 SM). Datacenter GB200 is a different SKU. Anyway, cap grid at say 2048 warps? grid-stride anyway so any number works; cap by rows to avoid excessive tail latency... just use `gridDim = min(rows, kMaxBlocks * blocksPerWarp)`? Let me define: threadsPerBlock = 256; warpsPerBlock = 8; maxBlocks = 8192 (i.e., 64 warps per SM equivalent on a ~128-SM chip, over-provisioned but grid-stride handles it). Grid = min(rows, 8192). Hmm, 8192 blocks * 256 threads = 2M threads; each thread 1 warp-lane; fine.
+
+  Actually simpler: grid = min(rows, 4096) blocks? Explain in launch geometry section. Let me pick:
+  - Block = 256 threads (8 warps)
+  - 1 warp handles 1 row
+  - Grid = min(rows, 2048) blocks = up to 16384 warps
+  - Grid-stride loop over rows.
+
+  Element handling: vec = 8 bf16 (16B). `vecsPerRow = cols/8`, tail = cols%8 handled scalar by threads 0..tail-1 (only if tail>0). Each thread t in warp handles vec indices t, t+32, t+64... up to vecsPerRow.
+
+- Reference: host FP32:
+  ```
+  for each row:
+    m = max |x|  (x = fp32 value derived from bf16 — quantized to bf16 first, exactly the same input the kernel sees)
+    if m == 0 -> output 0
+    else: s = kahan sum of (x/m)^2 ; norm = m * sqrt(s); y = x / norm
+  ```
+  Wait — reference input: deterministic generation yields FP32 values that are converted to BF16 for the device. The reference must use the same BF16 values (up-converted to fp32) — that is, generate fp32, quantize to bf16, store bf16 to device, and for reference compute on fp32 = float(bf16). That's the correct approach: reference = f(quantized input), ensuring the only difference is the order of operations and precision of the kernel's arithmetic.
+
+  To make the reference input exactly the bf16-rounded values, I could generate fp32, round to bf16 (round-to-nearest-even), and use that. The kernel takes bf16 in global memory, so both sides see identical inputs.
+
+  Also: to exercise stability (overflow), generate data with some large-scale rows? "Numerically stable" matters when sum of squares overflows fp32 (max ~3.4e38 => |x| up to ~1e19 per element). BF16 max is ~3.39e38 (like fp32's exponent range). If any element in a row is huge (>1e19), naive fp32 sum-of-squares overflows. With max-scaled approach it's fine. Include a flag/mix: values = (rand in [-1,1]) * exp2(rand in [-20, 30])? Then some elements up to ~1e9... to exercise overflow need up to 1e20. Let me generate with exponents drawn from [-24, +48], so max |x| ~ 2^48 * 1 ≈ 2.8e14 — still no overflow. To truly overflow, need per-element values near 1e19 or many elements of 1e8: 65536 * (1e8)^2 = 6.5e19 > 3.4e38? No: (1e8)^2 = 1e16, times 65536 = 6.55e20 > 3.4e38? 3.4e38 is larger. 6.55e20 < 3.4e38. Hmm, need sum of squares to exceed 3.4e38: with 2^16 elements, average x^2 > 3.4e38/6.55e4 ≈ 5.2e33 => |x| ~ 7e16. So to force overflow of naive sum, elements would need to be ~1e17+. That's fine for bf16 (max 3.4e38). Let me make it optional: `--magnitude` scaling? Simpler: mix in uniform random per-row scale factor from exp2(U(-30, +50)). Occasionally ~1e15 rows. Hmm.
+
+  Alternatively, keep it simple: values ~ N(0,1) with occasional ± large spikes; the stable algorithm is what matters for underflow (small values), not overflow. With max-scaling, small rows also work (if m=1e-30 then m^2 underflows? we compute (x/m)^2 so fine). Naive sum-of-squares underflows for tiny values. So include small-magnitude rows too.
+
+  Include per-row magnitude: `scale = exp2f(uniform(-30, +30))`, elements = uniform(-1,1) * scale. This covers underflow (naive) territory but not overflow. That's enough and I'll mention that the max-scaled algorithm handles both; and tolerance check will verify against a reference that uses the same stable algorithm in fp32 — both are stable so it's a fair comparison. Actually, the point of "numerically stable FP32 reference" is that the reference itself is stable (so we're not comparing against a reference that overflows). Good.
+
+  Could add a `--stress-overflow` flag that inserts some huge values to demonstrate stability. Maybe overkill; but the prompt says "numerically stable FP32 reference" — I'll implement Kahan + max-scaling on reference and max-scaling in kernel. Let me include a modest per-row random scale to keep it realistic.
+
+- Verification: compare device output (bf16 -> fp32) to reference fp32 (then? The reference is a fp32 normalized value; the device output is quantized to bf16!). Important: the kernel's output is BF16 (input bf16 matrix, output bf16 matrix, presumably). The tolerance check must account for bf16 quantization of the output: compare device_output_fp32 vs reference_fp32 with relative tolerance ~ 2 * 2^-8? bf16 rounding error up to half ulp = 2^-9 of value ≈ 0.195% relative. The kernel also computes in fp32 then rounds to bf16, so the difference vs reference fp32 is dominated by bf16 rounding: |d| <= ~0.2% * |value|,

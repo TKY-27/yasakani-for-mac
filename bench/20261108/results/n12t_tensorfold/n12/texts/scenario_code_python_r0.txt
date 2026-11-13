@@ -1,0 +1,328 @@
+The user is asking for a complete Python 3.11 package for a deterministic asynchronous job runner. Requirements:
+
+1. Load a JSON manifest
+2. Enforce a single active GPU job (at most one concurrent job with a GPU requirement)
+3. Persist state atomically
+4. Resume completed work (on resume, skip already-completed jobs)
+5. Stream structured JSONL events
+6. Handle SIGINT
+7. Redact configured secrets
+8. Pytest tests for success, failure, cancellation, and resume
+9. Present every source file in a separate fenced block with its path
+10. Include pyproject.toml
+
+Let me design the package.
+
+Package name: `asyncjobrunner`, or `jobrunner`? Let me go with something clear: `deterministic_runner`, or just `jobrunner`. Should I use `asyncjobrunner`? Let me pick `jobrunner` — shorter. Actually since it's a "deterministic asynchronous job runner", maybe the package name `detrunner`? Hmm, let's keep it simple: `jobrunner`.
+
+Layout:
+
+```
+jobrunner/
+  pyproject.toml
+  src/
+    jobrunner/
+      __init__.py
+      __main__.py
+      models.py          # dataclasses: Manifest, JobSpec, JobStatus, etc.
+      manifest.py        # manifest loading + validation
+      state.py           # atomic state persistence
+      events.py          # JSONL event stream
+      scheduler.py       # asyncio scheduler enforcing single active GPU job
+      redaction.py       # secret redaction
+      runner.py          # Runner class tying it all together
+  tests/
+    __init__.py (maybe not needed)
+    conftest.py
+    test_success.py
+    test_failure.py
+    test_cancellation.py
+    test_resume.py
+    test_manifest.py
+    test_redaction.py
+```
+
+Actually, a simpler src layout works: `src/jobrunner/...`. The tests reference it via the installed package. pyproject uses hatchling or setuptools. Use hatchling with a src layout, or go with the plain approach: a top-level package dir `jobrunner/` (no src). A src layout is nicer as a package. But for tests, pytest needs the package to be importable — with pyproject and `pip install -e .` it works. Or, if the package is at the repo root, it works without installing. I'll use a src layout and document that `pip install -e ".[dev]"` is required. Actually to make tests runnable out of the box, I can add a `pythonpath = ["src"]` option to pyproject's pytest config. That's clean and avoids the install.
+
+Let me design the core.
+
+**Manifest format** (JSON):
+
+```json
+{
+  "version": 1,
+  "jobs": [
+    {
+      "id": "train-a",
+      "command": ["python", "train.py", "--data", "{secrets.DATA_DIR}"],
+      "gpu": true,
+      "env": {"API_KEY": "{secrets.OPENAI_KEY}"},
+      "timeout_s": 300,
+      "retries": 1
+    }
+  ],
+  "secrets": {
+    "OPENAI_KEY": {"env": "OPENAI_KEY"},
+    "DATA_DIR": {"value": "/data"}
+  },
+  "settings": {
+    "state_path": "state/runner.json",
+    "events_path": "events/runner.jsonl",
+    "gpu_parallelism": 1,   // should be 1; enforce single active GPU job
+    "cpu_parallelism": 4
+  }
+}
+```
+
+Secrets: the manifest declares a `secrets` block. Sources: `env` (read from environment at runtime) or `value` (literal). Redaction: any output text containing a secret's value is replaced with `"[REDACTED:NAME]"`. The redaction is applied to events (stdout/stderr of jobs, error messages).
+
+**Determinism**: The scheduling order must be deterministic. How? Jobs have a `priority` and `id`. The scheduler picks the next runnable job by deterministic order: sort by (priority, topological order/index, id). Dependencies via a `deps` list. Deterministic: no wall-clock-based ordering; ties broken by manifest order / id. Use a monotonic counter for sequencing.
+
+Actually "deterministic" here means: the same manifest + same state produces the same event stream (except for timing). Let me enforce:
+- Jobs run in a deterministic order (topological sort, tie-broken by manifest index).
+- GPU jobs serialized (only one active GPU job at a time).
+- CPU jobs can run concurrently up to `cpu_parallelism`.
+- Event sequence numbers assigned in emission order.
+
+The event stream will include timestamps, but the ordering and content (excluding timestamps) is deterministic.
+
+**State persistence** (atomic): Write state to a temp file in the same directory, `os.replace` for atomic rename. State: a mapping of job id -> record {status, attempts, started, finished, exit code, ...}. Statuses: pending, running, succeeded, failed, skipped, cancelled. After each state transition, persist (flush+fsync before rename). Also on exit.
+
+Resume: on startup, load the existing state file; jobs with status `succeeded` are skipped (resume of completed work). Failed jobs: optionally re-run? The requirement says "resume completed work" — completed = succeeded jobs should not re-run. Failed jobs: rerun if retries remain? To keep determinism, if `retries` exhausted and it failed, keep failed status on resume; if retries remain, rerun. Cancellation: if the previous run was cancelled, running jobs become pending again (re-runnable), since they didn't complete.
+
+**Events** (JSONL): Each event: `{"seq": n, "ts": iso8601, "type": ..., "job_id": ..., "data": {...}}`. Types: `run_started`, `job_started`, `job_stdout`/`job_stderr` (maybe aggregated), `job_finished`, `run_finished`, `state_saved`, `shutdown_requested`. The redaction is applied to data strings.
+
+The event stream writes to the JSONL file (append, per-line flush) and optionally to stdout. Tests will read the JSONL file.
+
+**SIGINT handling**: `asyncio`'s `loop.add_signal_handler(SIGINT, ...)` — set a shutdown flag; cancel running jobs gracefully (send SIGTERM/SIGKILL to child processes via process-group kill), wait for them to finish, persist state, emit a `run_finished` event with status `cancelled`, exit code 130. A second SIGINT for force-quit? I can add: a second SIGINT forces immediate termination. Keep it but simple.
+
+**Execution**: Jobs run as subprocesses via `asyncio.create_subprocess_exec`. Determinism: env vars from manifest + redaction of secret values. The GPU flag controls the semaphore.
+
+Simulate a "GPU" semaphore: `asyncio.Semaphore(1)` for GPU jobs; `cpu_parallelism` semaphore for CPU jobs.
+
+**Deterministic scheduler algorithm**:
+
+- Build the job DAG from `deps`.
+- Maintain a `ready` queue: jobs whose deps are all succeeded and which are pending.
+- Loop: while there is work:
+  - Select the next job: sort the ready set by (manifest index). Pick the first whose semaphore is available. GPU semaphore 1, CPU semaphore N.
+  - If the selected job's semaphore is unavailable, wait for any running job to finish (await event/queue).
+  - To make it deterministic: rather than racing, process the ready list in order; start as many as fit.
+- After each job completion, recompute ready.
+
+Implement it with an asyncio queue of completion events, or just `asyncio.gather` tasks and a select loop. Simpler: a scheduler loop that keeps a `pending_tasks: dict[job_id, asyncio.Task]`, on each iteration scans the ready jobs in manifest order, starts those whose resource class has free permits (a semaphore with `locked()` check / value tracking). Track available permits via an integer counter (deterministic, avoids semaphore internals). Use a `ValueSemaphore` class: acquire via `async wait_if_needed`, release increments and wakes.
+
+Simplest, most robust approach: each job's coroutine acquires its class's semaphore; the scheduler starts jobs in manifest order up to a "max outstanding" — but starting a job that blocks on a semaphore is fine; the ordering of *start* is deterministic, and *completion* ordering is naturally non-deterministic in real time, but the *emission* of events is… hmm. Events get seq numbers in emission order, and since completion is time-dependent, it's non-deterministic in real time. "Deterministic" claim: the event stream content (excluding ts) is deterministic given the manifest for CPU jobs. For GPU jobs, since they're serialized, they complete in start order. If a GPU job and a CPU job finish around the same time, the emission order may vary. In tests, everything will be fast/synthetic. I'll document the determinism guarantee: job start order is deterministic (manifest order subject to deps and resources); job completion events are ordered by actual completion; seq is assigned in emission order. Tests will avoid asserting interleavings with timing dependencies, or they'll use only GPU jobs or only one CPU job at a time.
+
+To make tests robust:
+- Success test: two CPU jobs (fast) + one GPU job; all succeed; verify exit code 0, state file, event stream types, redaction.
+- Failure test: a job exits with code 2 → status failed, run finishes with status failed; exit code non-zero; events include job_finished with exit_code.
+- Cancellation: run a job that sleeps for a long time; send SIGINT to the runner process (or simulate the signal handler in-process via os.kill(os.getpid(), SIGINT)); assert state is saved, events include shutdown_requested/run_finished cancelled, process exits with 130. In-process test: run the runner in a child? In-process, a signal handler via loop.add_signal_handler only works on the main loop/thread. Easier: run the CLI in a subprocess via `sys.executable -m jobrunner ...` and send SIGINT via `proc.send_signal`. This is realistic. But it makes tests slow? Fine — use a job that sleeps 30 seconds, sleep 0.5s, send SIGINT, wait for exit.
+- Resume: run the manifest where the first job succeeds, and the second (GPU, sleeps) is cancelled/failed; on the second run, the first job should not be re-run (assert its `job_started` doesn't appear twice / no `job_started` with that id on the second run; maybe state file's attempts stays 1), and the remaining jobs run.
+
+Determinism check in tests: run twice with the same manifest (fresh state) and compare the event streams ignoring ts/seq? That would be a nice determinism test but flaky due to interleavings; use a manifest with only serial GPU jobs → fully deterministic ordering. I can add a small test for it. The user asked for success, failure, cancellation, resume tests; adding manifest and redaction tests plus a determinism-order test would be nice but let me keep the scope manageable. I'll include a determinism test using serial GPU jobs (sleeping 0.1 each) run twice → identical event types/ids sequence. This strengthens the "deterministic" claim. I'll include it but make it safe (sleep 0.1 → fine).
+
+**Redaction**: Configured via the manifest's `secrets`: names → sources. The secret value is resolved at runtime (env or literal). The redactor keeps a list of (value, replacement). Replacement: `"[REDACTED:name]"`. Apply to every string in event data (recursive). Also redact in the rendered env: env vars passed to the subprocess should contain the real value (needed), but *logged* env must be redacted. Also, commands in the manifest can reference `{secrets.NAME}` placeholders — substituted in the command/env values. Nice.
+
+Edge case: an empty secret value → skip redaction for it.
+
+**CLI**: `python -m jobrunner run --manifest path [--state path --events path]`? Keep it simple: `python -m jobrunner MANIFEST`. Exit codes: 0 all ok, 1 some failed, 130 cancelled, 2 bad manifest.
+
+Now let me write the code.
+
+### pyproject.toml
+
+```toml
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jobrunner"
+version = "0.1.0"
+description = "Deterministic asynchronous job runner with atomic state, JSONL events, and secret redaction."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+jobrunner = "jobrunner.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jobrunner"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+```
+
+No external deps — stdlib only.
+
+### src layout
+
+```
+jobrunner/
+├── pyproject.toml
+├── src/
+│   └── jobrunner/
+│       ├── __init__.py
+│       ├── __main__.py
+│       ├── cli.py
+│       ├── manifest.py
+│       ├── models.py
+│       ├── redaction.py
+│       ├── scheduler.py
+│       ├── state.py
+│       ├── events.py
+│       └── runner.py
+└── tests/
+    ├── conftest.py
+    ├── test_manifest.py
+    ├── test_redaction.py
+    ├── test_state.py
+    ├── test_success.py
+    ├── test_failure.py
+    ├── test_cancellation.py
+    └── test_resume.py
+```
+
+Now let me write each file.
+
+#### models.py
+
+```python
+"""Dataclasses shared across the package."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    CANCELLED = "cancelled"
+
+
+TERMINAL_STATUSES = frozenset({JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.SKIPPED, JobStatus.CANCELLED})
+
+
+class RunStatus(str, Enum):
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class SecretSpec:
+    name: str
+    source: dict[str, Any]  # {"env": "..."} or {"value": "..."}
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    id: str
+    command: list[str]
+    gpu: bool = False
+    deps: tuple[str, ...] = ()
+    env: dict[str, str] = field(default_factory=dict)
+    timeout_s: float | None = None
+    priority: int = 0
+
+    @property
+    def resource_class(self) -> str:
+        return "gpu" if self.gpu else "cpu"
+
+
+@dataclass
+class JobRecord:
+    job_id: str
+    status: JobStatus = JobStatus.PENDING
+    attempts: int = 0
+    exit_code: int | None = None
+    error: str | None = None
+    started_ts: str | None = None
+    finished_ts: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        ...
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "JobRecord":
+        ...
+```
+
+#### manifest.py
+
+Loading + validation. What to validate: unique ids, deps exist, no self-dependencies, no cycles, known keys, gpu_parallelism == 1 (force single active GPU job!). Enforce: `settings.gpu_parallelism` must be 1 (or missing) — if greater than 1, error. Actually "enforce single active GPU job" is a runner guarantee; validation enforces config consistency. Default for settings: gpu_parallelism=1, cpu_parallelism=4, state_path, events_path relative to the manifest's directory.
+
+Placeholder substitution: `{secrets.NAME}` inside strings of command args and env values.
+
+```python
+class ManifestError(ValueError): ...
+
+@dataclass(frozen=True)
+class Manifest:
+    path: Path
+    version: int
+    jobs: list[JobSpec]
+    secrets: dict[str, SecretSpec]
+    settings: RunnerSettings
+
+    @classmethod
+    def load(cls, path: Path) -> "Manifest": ...
+```
+
+Settings dataclass:
+
+```python
+@dataclass(frozen=True)
+class RunnerSettings:
+    state_path: Path
+    events_path: Path
+    gpu_parallelism: int = 1
+    cpu_parallelism: int = 4
+    default_timeout_s: float | None = None
+```
+
+Paths resolve relative to the manifest file's parent.
+
+#### redaction.py
+
+```python
+class Redactor:
+    def __init__(self, mappings: Sequence[tuple[str, str]]):  # (value, replacement)
+        self._pairs = [(v, r) for v, r in mappings if v]
+        # sort by length desc to redact longer values first
+        self._pairs.sort(key=lambda p: len(p[0]), reverse=True)
+
+    def redact(self, text: str) -> str:
+        out = text
+        for value, repl in self._pairs:
+            if value in out:
+                out = out.replace(value, repl)
+        return out
+
+    def redact_obj(self, obj: Any) -> Any:
+        # recursively walk dict/list/str
+```
+
+Replacement string: `"[REDACTED:" + name + "]"`.
+
+#### state.py
+
+```python
+class StateStore:
+    def __init__(self, path: Path, manifest_hash: str, run_id: str):
+        self._path = path
+        self._lock = ... (asyncio lock? we're in a single-threaded async; use an asyncio lock for safety)
+
+    def load(self) -> dict[str, JobRecord] | None  # None if missing/corrupt? corrupt -> error?
+    def save(self, records: dict[str, JobRecord], run_status: RunStatus, manifest_hash: str) ->

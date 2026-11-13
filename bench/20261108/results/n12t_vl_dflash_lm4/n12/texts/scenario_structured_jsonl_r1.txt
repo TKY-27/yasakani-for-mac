@@ -1,0 +1,75 @@
+We need to output exactly 160 JSONL records no Markdown. Each line object fields id RUN-0001 through RUN-0160, model alternating qwen3.6-27b and qwen3.6-35b-a3b, prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance, status, and tags. Use deterministic arithmetic progressions, status values ok/warn in a 4:1 pattern, and two tags per record. Every line must parse independently as strict JSON.
+
+Need produce 160 lines. Need ensure fields exactly? "with fields id, model, prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance, status, and tags" likely include these. tags two per record array of two strings. Need deterministic arithmetic progressions. Could choose:
+prompt_tokens = 1000 + i*5? completion_tokens = 100 + i*2? decode_tok_s = 20 + i*0.5? mtp_acceptance = 0.90 - i*0.0005? Need avoid negative or too small? 160 records: i 0..159.
+Maybe:
+prompt_tokens: 1024 + i*10.
+completion_tokens: 256 + i*4.
+decode_tok_s: 30 + i*0.2 (float).
+mtp_acceptance: 0.95 - i*0.001 (for i=159 => 0.791) okay.
+status 4:1 pattern: ok for 4, warn for 1 repeating? 160/5 =32, so 128 ok, 32 warn. Use index i mod 5 == 4? warn, else ok. But "in a 4:1 pattern" can be 4 ok then 1 warn.
+model alternating: i even qwen3.6-27b, i odd qwen3.6-35b-a3b. Need 160 lines.
+Need JSON strict: numbers no trailing. Use integer/float. Could use fixed floats. For i=0 decode 30.0? JSON accepts 30? Field decode_tok_s maybe numeric. Use int or float. We can produce numbers deterministically.
+Need exactly 160 records and no Markdown. We can manually generate? Need 160 lines. Could generate via mental? Need reliable. We can construct formula and produce all lines. Need avoid errors. We can maybe write in analysis a table? But final must be 160 lines. Need ensure each JSON valid.
+Could produce a compact deterministic sequence. Need manually list 160 lines. This is long. Need be careful.
+Maybe use repeated block of 10 or 5 to reduce. But final requires 160 lines, no explanation.
+We can generate lines with formulas. Let's define for n from 1 to 160? id RUN-0001..RUN-0160. Let n = 1..160.
+model: if n odd qwen3.6-27b, if even qwen3.6-35b-a3b (alternating). Or i 0..159 even qwen, odd a3b. If id number n, n odd -> qwen, n even -> a3b.
+prompt_tokens = 1024 + (n-1)*10 = 1034 + 10n? For n=1 1034? Wait 1024 + 0=1024. Use 1024+(n-1)*10 = 1034 -10? Actually n=1:1024. n=160:1024+1590=2614.
+completion_tokens = 256 + (n-1)*4 = 260 +4n? n=1 260? 256+0=256. Formula 260 +4n? n=1 264? Let's use 256+4*(n-1). n=160 256+636=892.
+decode_tok_s = 30 + 0.2*(n-1). To keep JSON neat, maybe integer? decode tokens per second can be integer? arithmetic progression integer: 30 + (n-1). Or 3000 + n? But decode_tok_s typical maybe 30. Could use integer 30 + n? deterministic. But "decode_tok_s" maybe float okay. To avoid decimal formatting, use integer. Let's use decode_tok_s = 30 + n? n=1 31, n=160 190. But "deterministic arithmetic progressions" okay. Or 30 + 2*(n-1). Need not be too high. Use int: decode_tok_s = 30 + 2*(n-1) => n=1 30, n=160 358. Good.
+mtp_acceptance: Need float. Could use percentage? 0.95 - 0.001*(n-1) yields decimals. For n=1 0.95; n=160 0.791. Need ensure JSON valid. Decimal 3 places. For n=1 0.95 (two decimal okay). n=2 0.949. Strict JSON allows. Could use 95 - (n-1) percent? mtp_acceptance maybe 0-1 float. Use 0.95 - 0.001*(n-1). We can compute values.
+Status: 4:1. Let's use n mod 5 == 0? Need 4 ok then 1 warn. For n=1..4 ok, 5 warn, 6..9 ok, 10 warn. So if n % 5 == 0 warn, else ok. That's 32 warns at multiples of 5.
+Tags: two tags per record. Need deterministic. Could be ["batch","cpu"]? But every record two tags, can vary by pattern. Need maybe tags array length 2. Could use ["run","decode"]? It says two tags per record, likely each record two tags. Could be fixed? Better deterministic varied. Use ["decode","throughput"] or based on status/model. Need ensure two tags. Could use ["decode", "mtp"]? But tags maybe should vary. We can use ["batch-1", "throughput"]? Need 160 lines; can use simple tags by n mod? For simplicity, tags: ["qwen","decode"]? But model in tags? Maybe fine. Need two tags per record. Use ["throughput", "decode"] for all? It satisfies. But maybe better "two tags" means exactly two. Could be same. Use ["benchmark", "decode"].
+Need output exactly 160 JSON lines. Need generate all 160. We can produce in blocks 10. Need ensure no markdown. Could use mental loop. Need be very careful.
+Potential risk: manually generating 160 lines with numbers can have errors. Could produce using pattern and maybe verify. Let's design formulas to make generation easier.
+For n from 1 to 160:
+id: RUN-0001 ... zero-padded 4 digits.
+model: odd -> qwen3.6-27b; even -> qwen3.6-35b-a3b.
+prompt_tokens: 1024 + 10*(n-1) => 1024, 1034, 1044,...,2614.
+completion_tokens: 256 + 4*(n-1) => 256,260,264,...,892.
+decode_tok_s: 30 + 2*(n-1) => 30,32,...,358.
+mtp_acceptance: 0.95 - 0.001*(n-1). Values from 0.95 to 0.791. Need three decimals? For n=1 0.95 (could be 0.950? JSON 0.950 allowed? Yes but leading? 0.950 fine. To make consistent, use three decimals: 0.950, 0.949, ... 0.791. JSON number 0.950 is valid (trailing zero in fractional part). Good. Need compute sequence decreasing by .001 each line. For n=1 0.950; n=2 0.949; ... n=160 0.791.
+Status: if n % 5 ==0 warn else ok.
+tags: Need two tags. Could use ["decode","mtp"] constant. But maybe to be more record-specific, use ["decode","mtp"] okay. It says tags not necessarily unique. Use ["decode", "mtp"] exactly two.
+Now generate 160 lines. Need no Markdown. Could create line template:
+{"id":"RUN-0001","model":"qwen3.6-27b","prompt_tokens":1024,"completion_tokens":256,"decode_tok_s":30,"mtp_acceptance":0.950,"status":"ok","tags":["decode","mtp"]}
+...
+Need ensure model alternates. For odd id number? RUN-0001 odd -> qwen3.6-27b. RUN-0002 even -> qwen3.6-35b-a3b. Good.
+Status warn at 5,10,...160. Since 160 multiple of 5 warn. 32 warns.
+Need check mtp values. Sequence:
+n=1 0.950
+2 0.949
+3 0.948
+4 0.947
+5 0.946
+...
+At n=60: 0.950 -0.059 =0.891? Formula n-1=59 -> .950-.059=0.891. n=100 -> 0.850? .95-.099=0.851? Wait 99*0.001=0.099, .950-.099=.851. n=101 -> .850. n=160 -> 159*0.001=.159, .950-.159=.791. Good.
+Need manually produce sequence. Could produce blocks of 10 with values. Let's create a table maybe.
+Block 1 (1-10): prompt 1024,1034,1044,1054,1064,1074,1084,1094,1104,1114; comp 256,260,264,268,272,276,280,284,288,292; decode 30,32,34,36,38,40,42,44,46,48; mtp .950,.949,.948,.947,.946,.945,.944,.943,.942,.941; status ok ok ok ok warn ok ok ok ok warn; model alt.
+Block 2 11-20: prompt 1124,1134,...1214; comp 296,300,...332; decode 50..68? n=11 decode 30+20=50; 20 30+38=68; mtp .940..931; status n=15 warn? Multiples 5: 15 warn, 20 warn; others ok.
+Block 3 21-30: prompt 1224..1314; comp 336..372? 21 comp 256+80=336; 30 256+116=372; decode 70..88; mtp .930..921; warn 25,30.
+Block 4 31-40: prompt 1324..1414; comp 376..412; decode 90..108; mtp .920..911; warn 35,40.
+Block 5 41-50: prompt 1424..1514; comp 416..452; decode 110..128; mtp .910..901; warn 45,50.
+Block 6 51-60: prompt 1524..1614; comp 456..492; decode 130..148; mtp .900..891; warn 55,60.
+Block 7 61-70: prompt 1624..1714; comp 496..532; decode 150..168; mtp .890..881; warn 65,70.
+Block 8 71-80: prompt 1724..1814; comp 536..572; decode 170..188; mtp .880..871; warn 75,80.
+Block 9 81-90: prompt 1824..1914; comp 576..612; decode 190..208; mtp .870..861; warn 85,90.
+Block 10 91-100: prompt 1924..2014; comp 616..652; decode 210..228; mtp .860..851; warn 95,100.
+Block 11 101-110: prompt 2024..2114; comp 656..692; decode 230..248; mtp .850..841; warn 105,110.
+Block 12 111-120: prompt 2124..2214; comp 696..732; decode 250..268; mtp .840..831; warn 115,120.
+Block 13 121-130: prompt 2224..2314; comp 736..772; decode 270..288; mtp .830..821; warn 125,130.
+Block 14 131-140: prompt 2324..2414; comp 776..812; decode 290..308; mtp .820..811; warn 135,140.
+Block 15 141-150: prompt 2424..2514; comp 816..852; decode 310..328; mtp .810..801; warn 145,150.
+Block 16 151-160: prompt 2524..2614; comp 856..892; decode 330..348? Wait n=151 decode 30+150=180? Let's recalc: decode=30+2*(n-1). For n=151: 30+300=330. For n=160:30+318=348. Yes.
+But earlier I said 358 for n=160 using 30+2*(n-1)? 2*159=318+30=348. Correct. I earlier thought 358 mistakenly. Need use 30+2*(n-1). So block values: n=1 30; n=10 48; n=100 228; n=151 330; n=160 348.
+Need ensure arithmetic progression.
+Maybe use decode_tok_s = 30 + 2*(n-1) as integer.
+Now generate exact 160 lines. Need not include trailing spaces? okay. Need exactly 160 lines. Could generate blocks of 10 and copy.
+Need check status pattern: 4:1. For each block of 10, status: ok,ok,ok,ok,warn,ok,ok,ok,ok,warn. Good.
+Need tags: ["decode","mtp"] constant.
+Need field order? Could be as specified. JSON object field order not matter but use same.
+Potential issue: model "qwen3.6-27b" and "qwen3.6-35b-a3b" exactly? Use as given.
+Need ensure no Markdown: final only JSON lines.
+Could there be requirement "Output exactly 160 JSONL records and no Markdown." If we output just lines, good.
+Need maybe each line parse independently strict JSON. Use double quotes. No trailing comma. Numbers no leading zero? mtp 0.950 okay. Strict JSON allows. But some parsers accept 

@@ -1,0 +1,528 @@
+# Deterministic Asynchronous Job Runner
+
+Below is a complete, runnable Python 3.11 package. The design centers on a single deterministic scheduler that replays a JSON manifest through a fixed, ordered sequence of operations, enforces exactly one active GPU job, persists an atomic state file, resumes completed work, emits structured JSONL events, handles SIGINT, and redacts configured secrets from any log or event output.
+
+## Package layout
+
+```
+deterministic_job_runner/
+├── pyproject.toml
+├── README.md
+└── src/deterministic_job_runner/
+    ├── __init__.py
+    ├── manifest.py
+    ├── scheduler.py
+    ├── state.py
+    ├── events.py
+    ├── redact.py
+    ├── gpu.py
+    ├── runner.py
+    └── cli.py
+tests/
+├── conftest.py
+└── test_runner.py
+```
+
+---
+
+## `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deterministic-job-runner"
+version = "0.1.0"
+description = "A deterministic asynchronous job runner with GPU exclusivity, atomic state, resume, JSONL events, SIGINT handling, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Example Author" }]
+keywords = ["jobs", "scheduler", "deterministic", "gpu", "async"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+djrunner = "deterministic_job_runner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.setuptools]
+include-package-data = true
+```
+
+---
+
+## `README.md`
+
+```markdown
+# Deterministic Asynchronous Job Runner
+
+A small, deterministic job runner. Given a JSON manifest it schedules jobs in a
+fixed, reproducible order, enforces that at most one GPU job runs at a time,
+persists an atomic state file, resumes already-completed work, streams
+structured JSONL events, handles SIGINT gracefully, and redacts configured
+secrets from all output.
+
+## Manifest format
+
+```json
+{
+  "version": 1,
+  "secrets": { "API_KEY": "s3cr3t", "TOKEN": "abc123" },
+  "jobs": [
+    { "id": "train", "type": "gpu", "command": ["python", "train.py"],
+      "env": { "API_KEY": "${API_KEY}" }, "timeout_seconds": 300 },
+    { "id": "eval", "type": "cpu", "command": ["python", "eval.py"],
+      "depends_on": ["train"] }
+  ]
+}
+```
+
+* `secrets` — a map of secret name to literal value. Any value that appears
+  verbatim in a command, env, or event payload is replaced with `[REDACTED]`.
+* `jobs[].type` — `gpu` or `cpu`. GPU jobs are serialized (one active at a time).
+* `jobs[].depends_on` — ids of jobs that must complete first.
+* `jobs[].timeout_seconds` — optional per-job timeout.
+
+## Running
+
+```
+djrunner run manifest.json --state-dir ./state --events events.jsonl
+```
+
+## Tests
+
+```
+pytest
+```
+```
+
+---
+
+## `src/deterministic_job_runner/__init__.py`
+
+```python
+"""Deterministic asynchronous job runner package."""
+
+from .manifest import Job, Manifest, load_manifest
+from .runner import Runner, RunnerConfig
+from .state import State, StateStore
+
+__all__ = [
+    "Job",
+    "Manifest",
+    "load_manifest",
+    "Runner",
+    "RunnerConfig",
+    "State",
+    "StateStore",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+## `src/deterministic_job_runner/manifest.py`
+
+```python
+"""Manifest parsing and validation.
+
+The manifest is a JSON document describing a set of jobs. Validation is done
+up-front so that the scheduler can rely on a fully-resolved, immutable view of
+the work to perform.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Mapping
+
+
+class ManifestError(ValueError):
+    """Raised when a manifest is malformed or internally inconsistent."""
+
+
+@dataclass(frozen=True)
+class Job:
+    """A single unit of work described in the manifest."""
+
+    id: str
+    type: str  # "gpu" or "cpu"
+    command: tuple[str, ...]
+    env: Mapping[str, str] = field(default_factory=dict)
+    timeout_seconds: float | None = None
+    depends_on: tuple[str, ...] = field(default_factory=tuple)
+    cwd: str | None = None
+    # Arbitrary per-job metadata, preserved for events.
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def is_gpu(self) -> bool:
+        return self.type == "gpu"
+
+
+@dataclass(frozen=True)
+class Manifest:
+    """Validated, immutable representation of a manifest document."""
+
+    version: int
+    jobs: tuple[Job, ...]
+    secrets: Mapping[str, str]
+
+    def job_ids(self) -> tuple[str, ...]:
+        return tuple(job.id for job in self.jobs)
+
+    def get_job(self, job_id: str) -> Job:
+        for job in self.jobs:
+            if job.id == job_id:
+                return job
+        raise ManifestError(f"unknown job id: {job_id!r}")
+
+
+def _validate_job(raw: Mapping[str, Any], index: int, seen_ids: set[str]) -> Job:
+    if not isinstance(raw, Mapping):
+        raise ManifestError(f"jobs[{index}] must be an object")
+
+    job_id = raw.get("id")
+    if not isinstance(job_id, str) or not job_id:
+        raise ManifestError(f"jobs[{index}].id must be a non-empty string")
+    if job_id in seen_ids:
+        raise ManifestError(f"duplicate job id: {job_id!r}")
+    seen_ids.add(job_id)
+
+    job_type = raw.get("type", "cpu")
+    if job_type not in ("gpu", "cpu"):
+        raise ManifestError(f"jobs[{index}].type must be 'gpu' or 'cpu'")
+
+    command = raw.get("command")
+    if not isinstance(command, (list, tuple)) or not command:
+        raise ManifestError(f"jobs[{index}].command must be a non-empty list")
+    command = tuple(str(part) for part in command)
+
+    env = raw.get("env", {})
+    if not isinstance(env, Mapping):
+        raise ManifestError(f"jobs[{index}].env must be an object")
+    env = {str(k): str(v) for k, v in env.items()}
+
+    timeout = raw.get("timeout_seconds")
+    if timeout is not None:
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            raise ManifestError(f"jobs[{index}].timeout_seconds must be numeric")
+        if timeout <= 0:
+            raise ManifestError(f"jobs[{index}].timeout_seconds must be positive")
+
+    depends_on = raw.get("depends_on", [])
+    if not isinstance(depends_on, (list, tuple)):
+        raise ManifestError(f"jobs[{index}].depends_on must be a list")
+    depends_on = tuple(str(d) for d in depends_on)
+
+    cwd = raw.get("cwd")
+    if cwd is not None:
+        cwd = str(cwd)
+
+    metadata = raw.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        raise ManifestError(f"jobs[{index}].metadata must be an object")
+
+    return Job(
+        id=job_id,
+        type=job_type,
+        command=command,
+        env=env,
+        timeout_seconds=timeout,
+        depends_on=depends_on,
+        cwd=cwd,
+        metadata=metadata,
+    )
+
+
+def _validate_dependencies(jobs: list[Job]) -> None:
+    known = {job.id for job in jobs}
+    for job in jobs:
+        for dep in job.depends_on:
+            if dep not in known:
+                raise ManifestError(f"job {job.id!r} depends on unknown job {dep!r}")
+    # Detect cycles via a simple DFS.
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {job.id: WHITE for job in jobs}
+    adj: dict[str, list[str]] = {job.id: list(job.depends_on) for job in jobs}
+
+    def dfs(node: str) -> None:
+        color[node] = GRAY
+        for neighbor in adj[node]:
+            if color[neighbor] == GRAY:
+                raise ManifestError(f"dependency cycle detected involving {node!r}")
+            if color[neighbor] == WHITE:
+                dfs(neighbor)
+        color[node] = BLACK
+
+    for job in jobs:
+        if color[job.id] == WHITE:
+            dfs(job.id)
+
+
+def load_manifest(path: str | Path) -> Manifest:
+    """Load and validate a manifest from a JSON file path."""
+    path = Path(path)
+    if not path.exists():
+        raise ManifestError(f"manifest not found: {path}")
+
+    with path.open("r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+
+    if not isinstance(raw, dict):
+        raise ManifestError("manifest root must be an object")
+
+    version = raw.get("version", 1)
+    if not isinstance(version, int):
+        raise ManifestError("manifest version must be an integer")
+
+    jobs_raw = raw.get("jobs")
+    if not isinstance(jobs_raw, (list, tuple)):
+        raise ManifestError("manifest jobs must be a list")
+
+    seen_ids: set[str] = set()
+    jobs: list[Job] = []
+    for index, raw_job in enumerate(jobs_raw):
+        jobs.append(_validate_job(raw_job, index, seen_ids))
+
+    _validate_dependencies(jobs)
+
+    secrets_raw = raw.get("secrets", {})
+    if not isinstance(secrets_raw, Mapping):
+        raise ManifestError("manifest secrets must be an object")
+    secrets = {str(k): str(v) for k, v in secrets_raw.items()}
+
+    return Manifest(version=version, jobs=tuple(jobs), secrets=secrets)
+
+
+def resolve_env(job: Job, secrets: Mapping[str, str]) -> dict[str, str]:
+    """Resolve ${NAME} placeholders in a job's env from the secret store.
+
+    This is the single place where secret values are injected into a process
+    environment. The resolved environment is only ever handed to a subprocess;
+    it is never written to events or logs.
+    """
+    resolved: dict[str, str] = {}
+    for key, value in job.env.items():
+        resolved[key] = _resolve_value(value, secrets)
+    return resolved
+
+
+def _resolve_value(value: str, secrets: Mapping[str, str]) -> str:
+    if value.startswith("${") and value.endswith("}"):
+        name = value[2:-1]
+        if name in secrets:
+            return secrets[name]
+        return os.environ.get(name, "")
+    return value
+```
+
+---
+
+## `src/deterministic_job_runner/redact.py`
+
+```python
+"""Secret redaction for logs and event payloads.
+
+Redaction is applied to any string that will appear in an event or log line.
+The configured secret values are replaced with a fixed marker. Because the
+marker is constant, redaction is deterministic and does not leak length
+information in a way that matters for this tool.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Mapping
+
+REDACTED = "[REDACTED]"
+
+
+class Redactor:
+    """Replaces configured secret values with a fixed marker in text."""
+
+    def __init__(self, secrets: Mapping[str, str]) -> None:
+        # Longer values first so that a secret that is a prefix of another is
+        # not partially masked before the longer one is handled.
+        self._secrets: list[str] = sorted(
+            (value for value in secrets.values() if value),
+            key=len,
+            reverse=True,
+        )
+
+    def redact_text(self, text: str) -> str:
+        if not self._secrets:
+            return text
+        result = text
+        for secret in self._secrets:
+            if secret in result:
+                result = result.replace(secret, REDACTED)
+        return result
+
+    def redact(self, value: Any) -> Any:
+        """Recursively redact a JSON-serializable structure."""
+        if isinstance(value, str):
+            return self.redact_text(value)
+        if isinstance(value, Mapping):
+            return {key: self.redact(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self.redact(item) for item in value]
+        return value
+```
+
+---
+
+## `src/deterministic_job_runner/state.py`
+
+```python
+"""Atomic, resumable state persistence.
+
+State is a small JSON document describing which jobs are done, their results,
+and the overall run status. Writes are atomic: the new state is written to a
+temporary file in the same directory and then atomically renamed over the
+target. This guarantees that a crash mid-write never leaves a corrupt state
+file.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+class StateError(RuntimeError):
+    """Raised when the state file is unreadable or invalid."""
+
+
+@dataclass
+class JobResult:
+    """The recorded outcome of a single job."""
+
+    status: str  # "success" | "failure" | "cancelled"
+    exit_code: int | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    duration_seconds: float | None = None
+    error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "exit_code": self.exit_code,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "duration_seconds": self.duration_seconds,
+            "error": self.error,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "JobResult":
+        return cls(
+            status=data.get("status", "unknown"),
+            exit_code=data.get("exit_code"),
+            started_at=data.get("started_at"),
+            finished_at=data.get("finished_at"),
+            duration_seconds=data.get("duration_seconds"),
+            error=data.get("error"),
+            metadata=data.get("metadata", {}),
+        )
+
+
+@dataclass
+class State:
+    """The full persisted state of a run."""
+
+    run_id: str
+    status: str  # "running" | "complete" | "failed" | "cancelled"
+    results: dict[str, JobResult] = field(default_factory=dict)
+    started_at: str | None = None
+    finished_at: str | None = None
+
+    def completed_job_ids(self) -> set[str]:
+        return {
+            job_id
+            for job_id, result in self.results.items()
+            if result.status in ("success", "failure")
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "status": self.status,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "results": {
+                job_id: result.to_dict() for job_id, result in self.results.items()
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "State":
+        results = {
+            job_id: JobResult.from_dict(result)
+            for job_id, result in data.get("results", {}).items()
+        }
+        return cls(
+            run_id=data.get("run_id", ""),
+            status=data.get("status", "running"),
+            results=results,
+            started_at=data.get("started_at"),
+            finished_at=data.get("finished_at"),
+        )
+
+
+class StateStore:
+    """Persists a :class:`State` atomically to a JSON file."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    def load(self) -> State | None:
+        """Load state from disk, or return None if no state file exists."""
+        if not self.path.exists():
+            return None
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise StateError(f"failed to read state file {self.path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise StateError(f"state file {self.path} is not a JSON object")
+        return State.from_dict(data)
+
+    def save(self, state: State) -> None:
+        """Atomically write state to disk.
+
+        The write sequence is:
+          1. write the JSON to a temp file in the same directory,
+          2. flush and fsync it,
+          3. atomically rename it over the target path.

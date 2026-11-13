@@ -1,0 +1,15 @@
+label ignis_v096  model qwen3.8-27b  temperature 0.00
+cat         fixture                            mean      min      max   ntok
+code        scenario_code_cuda                278.7    278.6    278.8   4096
+code        scenario_code_python              382.0    382.0    382.0   4096
+code        scenario_code_typescript          592.0    591.9    592.0    199
+story       scenario_story_zh_scifi           134.2    134.2    134.2   3411
+story       scenario_story_en_mystery         219.9    219.9    219.9   4096
+story       scenario_story_zh_dialogue        147.3    147.2    147.4   3744
+translation scenario_translation_zh_en        388.5    388.4    388.5    819
+translation scenario_translation_en_zh        279.6    279.6    279.7    653
+translation scenario_translation_markdown     226.2    226.2    226.2    801
+structured  scenario_structured_jsonl         516.4    516.1    516.8   4096
+structured  scenario_structured_csv           367.9    367.8    368.0   4096
+structured  scenario_structured_sql           433.2    433.2    433.2   4096
+per category (mean of runs): code 417.6, story 167.1, translation 298.1, structured 439.2

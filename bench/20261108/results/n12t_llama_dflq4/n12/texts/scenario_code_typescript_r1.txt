@@ -1,0 +1,118 @@
+I will create the following:
+
+1. package.json
+2. tsconfig.json
+3. src/types.ts
+4. src/validate.ts
+5. src/aggregate.ts
+6. src/store.ts
+7. src/service.ts
+8. src/server.ts
+9. src/index.ts (bootstrap)
+10. test/metrics.test.ts
+11. README.md (operations guide)
+
+I'll proceed carefully so that the code compiles with TypeScript 5 and Node 18.
+
+Key design:
+
+- Record schema (no third-party schema library):
+  - runId: string — non-empty, matches /^[A-Za-z0-9_-]{1,64}$/
+  - model: string — non-empty, matches the same pattern
+  - fixture: string — same pattern
+  - epochMs: number (integer) — 0 <= epochMs <= 8.64e15 (year 275760) — use Number.isSafeInteger
+  - durationMs: number — positive, finite, <= MAX_DURATION_MS (86_400_000). Allow decimals (e.g., 12.5ms) but <= 1e7? Let's say 0 < durationMs <= 86_400_000.
+  - status: "ok" | "error"
+  - latencyMs: number — 0 <= latencyMs <= 86_400_000
+  - tokensIn: integer >= 0, <= 1e8
+  - tokensOut: integer >= 0, <= 1e8
+  - temperature: number — 0 <= t <= 2
+  - attempts: integer >= 1 <= 100? Hmm, let's keep it.
+
+  Which are required? All of them. Unknown keys: reject? Better to be strict: reject unknown keys (malformed input). This is a nice "strictness" point. But could be lenient? Requirement: malformed-input errors. Rejecting unknown fields is a nice strictness point.
+
+  Actually, let's include the fields we'll use to keep it manageable but still substantial: runId, model, fixture, status, epochMs, durationMs, latencyMs, tokensIn, tokensOut. temperature might be dropped to trim the tests. Keep 9 fields.
+
+- Validation produces a ValidationError with field-level issues: { field: string, message: string }[]. MalformedInputError extends Error with a statusCode 400 and issues[].
+
+- Line parsing: incremental — a byte buffer accumulates; split on \n (0x0a), handle a trailing partial line; if a line exceeds MAX_LINE_BYTES (e.g., 64 KiB) → MalformedInputError / 413? Malformed input — emit 400 with "line too long" and discard the line. Also enforce a maximum number of pending lines.
+
+  UTF-8 handling: split at \n and decode each complete line — a \n byte will never appear inside a UTF-8 sequence so this is safe.
+
+- Store: Map<string, Run>, Map<string, GroupKey, Group>, where GroupKey = `${model}\u0000${fixture}`. Each group holds Welford state for durationMs and latencyMs, counts, sum of tokens, and status counts. Bounded: MAX_RUNS and MAX_GROUPS; on overflow: reject new records of a new run with a 429? Or drop the oldest (evict the LRU). Bounded memory with eviction is good: keep a recency order (Map is insertion-ordered; move to tail on touch). Evict the oldest run when capacity is exceeded. Deterministic and testable. Implement an LRU with a simple doubly-linked list? Simpler: keep a Map, delete first key on overflow. Map iteration order = insertion order; on update, delete + re-set to bump to the end.
+
+- Endpoints:
+  - GET /health → { status: "ok", uptimeMs, received, rejected, runs, groups, memoryUsed (process.memoryUsage().heapUsed) }
+  - POST /ingest → body is text (application/x-ndjson or text/plain), validate content-length limit; incremental parse line by line; per-line errors are collected (line number, error) but the batch continues; response 200 { accepted, rejected, errors: first N errors } — hmm, "malformed-input errors": if the body itself is structurally broken (oversized), 400. Per-line errors: report but continue (metrics-ingest semantics). Or 400 if any line is malformed? I think continue with per-line error reporting is better operationally; the guide will document it. Actually, the spec says "malformed-input errors" — let's do this: line-level validation errors are collected, response is 202 if there's at least 1 accepted, 400 if all lines rejected? That's confusing. Let me define:
+    - 200: { accepted: n, rejected: m, errors: [...] (up to 10) } — always 200 unless the transport-level error (too large → 413).
+    Hmm. Many ingest APIs return 200/207. Let me keep it simple: 200 with a per-line breakdown. 400 only for body-level problems (empty, non-text, oversize). Document it.
+  - GET /summary → overall + per (model, fixture) groups: count, meanDurationMs, medianDurationMs, sampleStdDevDurationMs (null when count<2), meanLatencyMs, median, sampleStdDev, okCount, errorCount, totalTokensIn, totalTokensOut, firstSeenMs, lastSeenMs.
+  - GET /runs/:id → 404 if unknown; run detail: runId, counts, groups per model/fixture (same stats), time range.
+
+- median: computed from stored samples. Memory bound: cap samples per group at, say, 4096 and when exceeded sample by reservoir sampling? Reservoir sampling changes the median semantics. Alternative: store min/max? Hmm. To guarantee bounded memory and keep the median accurate: cap stored samples per group at SAMPLE_CAP (e.g., 8192) and if exceeded sample by reservoir sampling (each new element replaces a random existing with probability cap/n). Document the median as exact when count ≤ cap, approximate via reservoir beyond that. This is defensible and testable (seedable RNG for tests). Inject RNG for test determinism.
+
+  Reservoir sampling (Algorithm R): for item i (1-indexed) with reservoir size k: if i <= k, store; else j = floor(rng * i); if j < k, replace reservoir[j].
+
+- Stats: Welford online mean/variance:
+  count n, mean, M2. sample variance = M2/(n-1) when n>=2, otherwise null.
+
+- Service interface for testability: no port:
+  interface MetricsService { ingest(chunk: Uint8Array, source?: string): IngestResult; health(): HealthResponse; summary(): SummaryResponse; run(id: string): RunResponse | null; }
+  HTTP adapter maps to HTTP.
+
+- Server: plain node:http. Routes:
+  - GET /health
+  - POST /ingest
+  - GET /summary
+  - GET /runs/:runId (validated by pattern)
+  - otherwise 404
+  - JSON body read with limit (MAX_BODY_BYTES = 1 MiB).
+  - request timeout / keep-alive defaults.
+
+- Types: strict: exactOptionalPropertyTypes, noUncheckedIndexedAccess, noImplicitOverride, verbatimModuleSyntax? verbatimModuleSyntax requires NodeNext or ESNext for ESM... If module is "commonjs", does verbatimModuleSyntax error? Does verbatimModuleSyntax with CommonJS complain about `import type` usage? It's mainly for ESM. For safety, use module: "NodeNext" and package.json "type": "module", write .ts with import.meta. Node 18 supports ESM without issue. But TS ESM requires .js extension on relative imports (NodeNext). That's fine: `import { x } from './foo.js'`. For test runner node --test, ESM test files with imports with .js extension — works (Node 18.17+ runs TS? No — Node 18 can't run TS). Use tsx? Third-party dev dep is allowed ("no third-party schema libraries" — only schema libs forbidden). But to minimize deps, compile with tsc and run tests with node --test against dist/test. Node 18's --test works with .js files. But with package.json type module and module NodeNext, dist test files need to import with .js. And node --test dist/test/*.test.js — does Node 18's test runner run files matching *.test.js when given a directory? `node --test dist/test` runs files in the directory matching test patterns (does it recurse? Node 18: does --test run files in the directory? Actually, in 18 the --test flag runs the files passed; passing a directory was supported from 18.13? There were changes. Safer: explicitly enumerate test files in the npm test script: node --test dist/test/validate.test.js dist/test/... Let me enumerate.
+
+  Alternatively, use module: "commonjs" to avoid ESM import-extension headaches, with ESM syntax in source that gets compiled to CJS. This is simplest and most robust on Node 18: tsconfig module commonjs, target ES2022, esModuleInterop. Tests import from '../src/...'. node:test works fine with CJS too. Let's go CommonJS to reduce failure risk. TS5 with module: "commonjs" allows import syntax. Good.
+
+  Wait: with CJS, `import.meta` is unavailable; we don't need it.
+
+- tsconfig: target ES2022, module commonjs, strict true, noUncheckedIndexedAccess true, exactOptionalPropertyTypes true, noImplicitReturns, noFallthroughCasesInSwitch, forceConsistentCasingInFileNames, declaration true? Not needed. outDir dist, rootDir src? But tests are in test/ so rootDir "." so dist mirrors. Include src and test. types: ["node"]. lib ES2022.
+
+  exactOptionalPropertyTypes: care when assigning optional properties — e.g., a response with sampleStdDev?: number | null. To avoid the pain, make optional fields be `| null` always present (no exactOptional mismatch). exactOptionalPropertyTypes errors when you assign undefined to an optional prop; just use null instead.
+
+  noUncheckedIndexedAccess: array indexing returns T | undefined — must guard everywhere. Manageable.
+
+- Unit tests:
+  - validate: happy path, each malformed variant (bad type, out of range, unknown keys, empty, duplicate keys (JSON.parse drops duplicates... detecting duplicates requires a custom check; maybe skip), non-object, missing fields, bad status enum).
+  - LineSplitter: chunked input across boundaries, \r\n, trailing partial, oversized line.
+  - Reservoir sampling with seeded RNG: deterministic; median on small set is exact.
+  - Welford: known dataset mean/std (e.g., [2,4,4,4,5,5,7,9]: mean 5, sample variance 32/7 ≈ 4.571, sd ≈ 2.138; confirm: values 2,4,4,4,5,5,7,9; mean=40/8=5; squared deviations: 9,1,1,1,0,0,4,16 sum=32; sample variance 32/7).
+  - Service: ingest a stream of chunks → summary stats match expected; run eviction with maxRuns; group cap; run endpoint 404; malformed lines reported with line numbers.
+  - HTTP: start server on ephemeral port, fetch (Node 18 global fetch) GET /health, POST /ingest, GET /summary, GET /runs/:id, 404, 413 for oversize, invalid JSON body → 400.
+
+  Use node:assert/strict.
+
+- Deterministic RNG: mulberry32 seed parameter, default is a random seed from crypto? For production, Math.random is fine but inject for tests.
+
+- Bounded memory constants:
+  MAX_LINE_BYTES = 64 * 1024
+  MAX_BODY_BYTES = 1 MiB (1024*1024)
+  MAX_RUNS = 1024
+  MAX_GROUPS = 4096
+  MAX_SAMPLES_PER_GROUP = 8192
+  MAX_INFLIGHT_BYTES = 1 MiB pending buffer
+
+  Group count bounded; on new group when at cap → reject the record (error "group capacity exceeded")? Or evict oldest group — but groups span multiple runs; evicting a group loses stats for runs still present. Simpler: reject records that would create a new group beyond cap. Hmm, but a record for an existing group is still fine. Do we also cap samples per run? Samples are stored per group; the run view aggregates from groups. Run eviction also drops the group's run mapping — but the group stats are at group level and shared across runs. If a run is evicted, we should decrement? The group's counts include records of that run — we can't easily attribute per run unless we store a per-run per-group breakdown. Hmm.
+
+  Design decision: store stats per (run, model, fixture) triple? Then /summary aggregates across runs per (model, fixture) — but aggregating Welford state across runs is possible (merge Welford: combine n, mean, M2: n2=n1+n2, delta = mean2-mean1, mean = mean1 + delta*n2/n2total, M2 = M1 + M2 + delta^2*n1*n2/n). Reservoirs also mergeable (union up to cap... reservoir union is tricky).
+
+  Simpler alternative: per-run stats only. Group by model+fixture is done at query time by aggregating per-run data for that (model, fixture). But the median across runs requires merged samples — reservoirs per (run, model, fixture), and at summary time we merge reservoirs of all runs of that group → up to cap*runs samples... bounded memory: sample cap per (run, model, fixture) = SAMPLE_CAP, and number of groups per run also bounded (MAX_GROUP_KEYS_PER_RUN = 256?). Summary merges: to keep it bounded, cap merged samples at cap using reservoir union? This is getting complex.
+
+  Let me rethink: the requirement is "group records by model and fixture, compute mean/median/sample standard deviation". It doesn't say per-run. /runs/:id returns run details. Cleanest, consistent model:
+
+  - Primary storage: groups keyed by `${model}\u0000${fixture}`. Group stores Welford (duration, latency), reservoir of durations (for median) and latencies, count, ok/error counts, tokens totals, firstSeen, lastSeen, set of runs seen? Set of runs per group is unbounded — cap: if a group sees more than MAX_RUNS_PER_GROUP (e.g., 256) runs, drop run attribution for that group (the group's summary remains exact; per-run run endpoint data is...).
+
+  - Runs: runId → Run { firstSeen, lastSeen, count, groups: Map<groupKey, RunGroup> }, where RunGroup has its own Welford + counts + reservoir? That duplicates the per-group storage. Memory: total samples stored = sum over run groups of cap. Bounded by MAX_RUNS * MAX_GROUPS_PER_RUN * SAMPLE_CAP — could be huge (1024*256*8192 — no). Need a global sample budget: total samples across all run groups bounded by e.g. 256 Ki (262144) — track a global counter; when adding a sample, if budget exceeded and reservoir already at cap → replace randomly (reservoir). Global budget across reservoirs complicates reservoir correctness but is an approximation anyway.
+
+  Alternative cleaner: **run-level storage only**, and /summary computes cross-run aggregates by merging per-run group states (Welford merge is exact; median from merged reservoirs capped at SUMMARY_SAMPLE_CAP via reservoir-style merge). Runs: Map runId → { stats: Map<model, Map<fixture, RunGroupStats>> } — flat key model\0fixture → RunGroupStats { n, Welford×2, reservoir durations, reservoir latencies, ok, error, tokens, firstSeen, lastSeen }. Bounded: MAX_RUNS; per-run groups capped at MAX_KEYS_PER_RUN (say 512); global sample budget MAX_TOTAL_SAMPLES (say 512_000) enforced per reservoir (when global counter exceeds budget, reservoir only replaces via reservoir sampling instead of growing). Since reservoirs are capped at SAMPLE_CAP per key, memory is bounded by worst case MAX_KEYS_PER_RUN * SAMPLE_CAP * 2 * runs? No — the global budget prevents total growth past the budget: each reservoir only grows up to the global counter, so total samples ≤ budget + number of keys (each new key adds 1 sample, increments counter). So memory bounded by budget (~512k numbers) + Welford state per key (bounded by MAX_RUNS * MAX_KEYS_PER_RUN = 1024*512 = 524k keys worst — too many; but keys only exist when a record arrives; each record adds ≥1 sample, so #keys ≤ #records ingested ≤ budget+? Hmm, records can arrive for many keys each with 1 sample: #keys ≤ total records. Total records unbounded in time (streaming service). But eviction: when a run is evicted (LRU at MAX_RUNS), all its keys go away. Worst case steady state: MAX_RUNS runs × MAX_KEYS_PER_RUN keys × ~small samples = 1024×512 = 524k Welford states ≈ manageable (a few hundred MB? each state ~200 bytes → ~100MB, high but ok; let's reduce: MAX_RUNS=512, MAX_KEYS_PER_RUN=256 → 131k keys fine).
+
+  /summary: aggregate all runs per (model, fixture): Welford merge (exact mean/sd), median from merged reservoirs (cap the merge at SUMMARY_SAMPLE_CAP=65536 via reservoir merge? Simpler: concatenate all reservoir arrays of a key, then if length > cap, downsample deterministically with reservoir? For simplicity and determinism: sort? Sorting 500k per query is a bit heavy but ok for a service. Better

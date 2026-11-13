@@ -1,0 +1,11 @@
+# Notes on the server settings (2026-10-18)
+# Long-input test (41K-token prompt): SGLang --context-length 49152 (DSpark also --max-total-tokens 49152); vLLM --max-model-len 49152.
+# vLLM DFlash 2 and DSpark were re-run with --no-enable-prefix-caching: the second request with the same 41K prompt crashed the engine
+#   ("CUDA error: an illegal memory access") when the prefix cache hit. This only changes the prompt reading; answer writing is the same work.
+# SGLang official 5090 recipe (nvidia NVFP4 + DFlash 2) refuses the 41K prompt on one RTX 5090 (its KV pool holds 35,067 tokens),
+#   so the SGLang long-input number comes from its other settings.
+# SGLang 0.5.22 with DFlash and one request needs --disable-radix-cache (already in the scripts). Radix cache on or off gave the same
+#   answer-writing speed (136.0 / 136.0 on the prose test).
+# TensorRT-LLM 1.3.0rc29: with MTP, the TRTLLM attention backend fails in its XQA NVRTC JIT ("NVRTC Internal Error") and the FLASHINFER
+#   backend refuses MTP ("not qualified for MTP_EAGLE_ONE_MODEL"), so it was not measured.
+# FlashInfer needs nvcc on PATH for vLLM; building its kernels with 16 parallel jobs crashed the WSL VM, MAX_JOBS=4 fixed it.

@@ -1,0 +1,519 @@
+Below is a complete, runnable Python 3.11 package. Every file is in its own fenced block with its path. The package is named `djr` (deterministic job runner).
+
+**Architecture overview**
+
+- **Manifest** (`manifest.json`): lists jobs, each with `id`, `command`, `gpu` flag, `secrets` (name → env-var source), `timeout_s`, and `max_retries`.
+- **Determinism**: jobs run in manifest order; a GPU job blocks all others; non-GPU jobs run concurrently up to `max_workers`.
+- **State**: single JSON file, updated with `os.replace` (atomic), and *only* after the child process exits (so a crash never loses an in-flight job).
+- **Events**: `events.jsonl` is opened in append mode and flushed per line, so a crash preserves every completed event.
+- **Redaction**: `redact_secrets` is a single source of truth for both the event stream and the persisted state.
+
+---
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "djr"
+version = "0.1.0"
+description = "Deterministic asynchronous job runner with GPU serialization, atomic state, resume, JSONL events, SIGINT handling and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "djr" }]
+keywords = ["jobs", "runner", "async", "deterministic", "gpu"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.scripts]
+djr = "djr.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.setuptools]
+packages = ["djr"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+```
+
+---
+
+### `djr/__init__.py`
+
+```python
+"""Deterministic asynchronous job runner (djr)."""
+
+from djr.runner import JobRunner
+from djr.state import JobState
+from djr.manifest import Manifest, JobSpec, ManifestError
+
+__all__ = ["JobRunner", "JobState", "Manifest", "JobSpec", "ManifestError"]
+__version__ = "0.1.0"
+```
+
+---
+
+### `djr/manifest.py`
+
+```python
+"""Manifest parsing and validation.
+
+The manifest is a JSON document:
+
+    {
+      "max_workers": 4,
+      "jobs": [
+        {"id": "train", "command": ["python", "train.py"], "gpu": true,
+         "secrets": {"API_KEY": "API_KEY"}, "timeout_s": 60, "max_retries": 2},
+        ...
+      ]
+    }
+
+Jobs are executed in manifest order. A ``gpu: true`` job must run alone
+(see :mod:`djr.runner`).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Mapping
+
+
+class ManifestError(ValueError):
+    """Raised when a manifest is missing, unreadable, or invalid."""
+
+
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    """A single job declaration from the manifest."""
+
+    id: str
+    command: list[str]
+    gpu: bool = False
+    secrets: dict[str, str] = field(default_factory=dict)
+    timeout_s: float = 300.0
+    max_retries: int = 0
+
+    def __post_init__(self) -> None:
+        if not _IDENT.match(self.id):
+            raise ManifestError(f"job id {self.id!r} is not a valid identifier")
+        if not self.command:
+            raise ManifestError(f"job {self.id!r} has an empty command")
+        for part in self.command:
+            if not isinstance(part, str) or not part:
+                raise ManifestError(f"job {self.id!r} has a non-string command part")
+        if self.timeout_s <= 0:
+            raise ManifestError(f"job {self.id!r} has a non-positive timeout")
+        if self.max_retries < 0:
+            raise ManifestError(f"job {self.id!r} has a negative max_retries")
+
+
+@dataclass
+class Manifest:
+    """Validated manifest contents."""
+
+    jobs: list[JobSpec]
+    max_workers: int = 4
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "Manifest":
+        p = Path(path)
+        if not p.is_file():
+            raise ManifestError(f"manifest not found: {p}")
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ManifestError(f"could not read manifest {p}: {exc}") from exc
+        return cls.from_dict(raw)
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "Manifest":
+        if not isinstance(raw, dict):
+            raise ManifestError("manifest root must be an object")
+        jobs_raw = raw.get("jobs")
+        if not isinstance(jobs_raw, list) or not jobs_raw:
+            raise ManifestError("manifest must contain a non-empty 'jobs' list")
+
+        max_workers = raw.get("max_workers", 4)
+        if not isinstance(max_workers, int) or max_workers < 1:
+            raise ManifestError("'max_workers' must be a positive integer")
+
+        jobs: list[JobSpec] = []
+        seen: set[str] = set()
+        for i, j in enumerate(jobs_raw):
+            if not isinstance(j, dict):
+                raise ManifestError(f"job #{i} must be an object")
+            jid = j.get("id")
+            if not isinstance(jid, str) or not _IDENT.match(jid):
+                raise ManifestError(f"job #{i} has an invalid 'id': {jid!r}")
+            if jid in seen:
+                raise ManifestError(f"duplicate job id {jid!r}")
+            seen.add(jid)
+
+            command = j.get("command")
+            if not isinstance(command, list) or not command:
+                raise ManifestError(f"job {jid!r} must have a non-empty 'command' list")
+            command = [str(c) for c in command]
+
+            gpu = j.get("gpu", False)
+            if not isinstance(gpu, bool):
+                raise ManifestError(f"job {jid!r} 'gpu' must be a boolean")
+
+            secrets = j.get("secrets", {})
+            if not isinstance(secrets, dict):
+                raise ManifestError(f"job {jid!r} 'secrets' must be an object")
+            secrets = {str(k): str(v) for k, v in secrets.items()}
+
+            timeout_s = j.get("timeout_s", 300.0)
+            if not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
+                raise ManifestError(f"job {jid!r} 'timeout_s' must be a positive number")
+
+            max_retries = j.get("max_retries", 0)
+            if not isinstance(max_retries, int) or max_retries < 0:
+                raise ManifestError(f"job {jid!r} 'max_retries' must be a non-negative integer")
+
+            jobs.append(
+                JobSpec(
+                    id=jid,
+                    command=command,
+                    gpu=gpu,
+                    secrets=secrets,
+                    timeout_s=float(timeout_s),
+                    max_retries=max_retries,
+                )
+            )
+
+        return Manifest(jobs=jobs, max_workers=max_workers)
+```
+
+---
+
+### `djr/state.py`
+
+```python
+"""Atomic, resumable job state.
+
+State is a single JSON file. Updates are written to a temp file in the same
+directory and moved into place with :func:`os.replace` (atomic on POSIX and
+Windows). The file is only rewritten after a child process has fully exited,
+so a crash mid-job never loses an in-flight job.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Mapping
+
+# Job status values.
+PENDING = "pending"
+RUNNING = "running"
+SUCCEEDED = "succeeded"
+FAILED = "failed"
+CANCELED = "canceled"
+SKIPPED = "skipped"
+
+_TERMINAL = (SUCCEEDED, FAILED, CANCELED, SKIPPED)
+
+
+@dataclass
+class JobState:
+    """Per-job mutable state, mirroring the persisted JSON."""
+
+    id: str
+    status: str = PENDING
+    attempts: int = 0
+    exit_code: int | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    duration_s: float | None = None
+    stderr_tail: str | None = None
+    error: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def is_terminal(self) -> bool:
+        return self.status in _TERMINAL
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "status": self.status,
+            "attempts": self.attempts,
+            "exit_code": self.exit_code,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "duration_s": self.duration_s,
+            "stderr_tail": self.stderr_tail,
+            "error": self.error,
+            "extra": self.extra,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "JobState":
+        return cls(
+            id=str(data["id"]),
+            status=str(data.get("status", PENDING)),
+            attempts=int(data.get("attempts", 0)),
+            exit_code=data.get("exit_code"),
+            started_at=data.get("started_at"),
+            finished_at=data.get("finished_at"),
+            duration_s=data.get("duration_s"),
+            stderr_tail=data.get("stderr_tail"),
+            error=data.get("error"),
+            extra=dict(data.get("extra", {})),
+        )
+
+
+class StateStore:
+    """Loads and atomically persists the whole state file."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._dir = self.path.parent
+
+    def load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"could not load state file {self.path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"state file {self.path} is not a JSON object")
+        return data
+
+    def save(self, jobs: Mapping[str, JobState]) -> None:
+        """Atomically write ``jobs`` to the state file."""
+        self._dir.mkdir(parents=True, exist_ok=True)
+        payload = {jid: js.to_dict() for jid, js in jobs.items()}
+        fd, tmp = tempfile.mkstemp(dir=str(self._dir), prefix=".state-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, str(self.path))
+        except BaseException:
+            # Best-effort cleanup of the temp file on failure.
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+```
+
+---
+
+### `djr/events.py`
+
+```python
+"""Structured JSONL event stream.
+
+The event file is opened in append mode and flushed after every line, so a
+crash preserves every event that was already emitted.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+
+class EventLog:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "a", encoding="utf-8")
+
+    def emit(self, event_type: str, **fields: Any) -> None:
+        record = {
+            "ts": time.time(),
+            "type": event_type,
+            **fields,
+        }
+        line = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        self._fh.write(line + "\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "EventLog":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+```
+
+---
+
+### `djr/redact.py`
+
+```python
+"""Secret redaction.
+
+``redact_secrets`` is the single source of truth for scrubbing secret values
+from both the event stream and the persisted state.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+MASK = "***"
+
+
+def _is_secret_value(value: Any) -> bool:
+    return isinstance(value, str) and len(value) > 0
+
+
+def redact_secrets(obj: Any, secrets: dict[str, str]) -> Any:
+    """Return ``obj`` with any occurrence of a secret value replaced by ``MASK``.
+
+    Works recursively over nested dicts, lists, and strings. A secret value is
+    replaced wherever it appears (including as a substring of a larger string,
+    e.g. inside a captured stderr tail).
+    """
+    if not secrets:
+        return obj
+
+    secret_values = [v for v in secrets.values() if _is_secret_value(v)]
+    if not secret_values:
+        return obj
+
+    return _redact(obj, secret_values)
+
+
+def _redact(obj: Any, secret_values: list[str]) -> Any:
+    if isinstance(obj, str):
+        out = obj
+        for sv in secret_values:
+            out = out.replace(sv, MASK)
+        return out
+    if isinstance(obj, dict):
+        return {k: _redact(v, secret_values) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        redacted = [_redact(v, secret_values) for v in obj]
+        return type(obj)(redacted)
+    return obj
+```
+
+---
+
+### `djr/runner.py`
+
+```python
+"""The deterministic asynchronous job runner.
+
+Execution model
+---------------
+* Jobs run in manifest order.
+* A job with ``gpu: true`` must run alone: no other job (GPU or not) may be
+  active while a GPU job is active, and a GPU job will not start while any
+  other job is active.
+* Non-GPU jobs run concurrently, up to ``max_workers``.
+* A job that fails is retried up to ``max_retries`` times.
+* SIGINT triggers a clean shutdown: running jobs are cancelled (killed),
+  pending jobs are marked canceled, and the final state is persisted.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import signal
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from djr.events import EventLog
+from djr.manifest import JobSpec, Manifest
+from djr.redact import redact_secrets
+from djr.state import (
+    CANCELED,
+    FAILED,
+    PENDING,
+    RUNNING,
+    SKIPPED,
+    SUCCEEDED,
+    JobState,
+    StateStore,
+)
+
+_STDERR_TAIL_CHARS = 4000
+
+
+@dataclass
+class RunResult:
+    """Summary of a full run."""
+
+    succeeded: int
+    failed: int
+    canceled: int
+    skipped: int
+    exit_code: int
+
+
+class JobRunner:
+    def __init__(
+        self,
+        manifest: Manifest,
+        workdir: str | Path,
+        *,
+        env: dict[str, str] | None = None,
+        state_path: str | Path | None = None,
+        events_path: str | Path | None = None,
+        clock=time.time,
+        now=time.time,
+        spawn: Any = None,
+    ) -> None:
+        self.manifest = manifest
+        self.workdir = Path(workdir)
+        self._env = dict(env) if env is not None else dict(os.environ)
+        self._state_path = Path(state_path) if state_path else self.workdir / "state.json"
+        self._events_path = Path(events_path) if events_path else self.workdir / "events.jsonl"
+        self._clock = clock
+        self._now = now
+        self._spawn = spawn
+
+        self._store = StateStore(self._state_path)
+        self._jobs: dict[str, JobState] = {}
+        self._order: list[str] = []
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._active: dict[str, asyncio.Task] = {}
+        self._secrets: dict[str, str] = {}
+        self._stop = asyncio.Event()
+        self._sigint = False
+        self._lock = asyncio.Lock()
+        self._events: EventLog | None = None

@@ -1,0 +1,36 @@
+{
+ "kind": "gpu_consistency",
+ "session": "2026-11-10 09:15:32",
+ "torch": "2.10.0+cu128",
+ "cuda": "12.8",
+ "parts": {
+  "A_matmul_float32": {
+   "repeats": 29640,
+   "mismatches": 0,
+   "first_mismatch": null,
+   "seconds": 70.0
+  },
+  "B_elementwise_float32": {
+   "repeats": 33111,
+   "mismatches": 0,
+   "first_mismatch": null,
+   "seconds": 70.0
+  },
+  "C_integer_int64": {
+   "repeats": 9839,
+   "mismatches": 0,
+   "first_mismatch": null,
+   "seconds": 70.0
+  },
+  "D_vram_reread": {
+   "gib": 12,
+   "rounds": 12,
+   "checks": 144,
+   "mismatches": 0,
+   "chunks_with_mismatch": [],
+   "seconds": 12.7
+  }
+ },
+ "gpu": "NVIDIA GeForce RTX 5090",
+ "total_mismatches": 0
+}

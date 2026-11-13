@@ -1,0 +1,14 @@
+[14:31:48] server http://127.0.0.1:8097/v1 model qwen3.8-27b
+[14:31:49] warm-up done
+[14:31:53] code        scenario_code_cuda             r0:   467.9 tok/s,  2000 tokens in    4.27 s (length), ttft 0.06, 2000 chunks
+[14:31:58] code        scenario_code_cuda             r1:   438.0 tok/s,  2000 tokens in    4.56 s (length), ttft 0.04, 2000 chunks
+[14:32:02] code        scenario_code_python           r0:   490.2 tok/s,  2000 tokens in    4.08 s (length), ttft 0.05, 2000 chunks
+[14:32:07] code        scenario_code_python           r1:   406.3 tok/s,  2000 tokens in    4.92 s (length), ttft 0.03, 2000 chunks
+[14:32:07] code        scenario_code_typescript       r0:  4560.5 tok/s,   200 tokens in    0.04 s (tool_calls), ttft 0.05, 17 chunks
+[14:32:11] code        scenario_code_typescript       r1:   514.5 tok/s,  2000 tokens in    3.89 s (length), ttft 0.02, 2000 chunks
+label mc_tiny_kv88_code2000  model qwen3.8-27b  temperature 0.00
+cat         fixture                            mean      min      max   ntok
+code        scenario_code_cuda                453.0    438.0    467.9   2000
+code        scenario_code_python              448.3    406.3    490.2   2000
+code        scenario_code_typescript         2537.5    514.5   4560.5   1100
+per category (mean of runs): code 1146.2

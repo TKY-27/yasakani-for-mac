@@ -1,0 +1,144 @@
+We need answer user wants: Return one PostgreSQL script with no Markdown fences. Need define normalized tables for models, fixtures, runs, and request_metrics; include primary/foreign keys, checks, useful indexes, two views, one transaction-safe upsert function, and at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. The script must run in dependency order.
+
+Need produce PostgreSQL script only, no markdown fences. Need ensure valid PostgreSQL. Need tables models, fixtures, runs, request_metrics. Normalized: models (model_id pk, maybe provider, name, quantization, context_length, mtp_enabled?); fixtures (fixture_id pk, kind, description, maybe context_length? request shape); runs (run_id pk, model_id fk, fixture_id fk, started_at, config maybe, status); request_metrics (request_id pk? or run_id, seq?; throughput, latency, context length, accepted_draft_tokens? mtp acceptance). Need at least 80 realistic INSERT rows spanning two models and four fixture kinds. "INSERT rows" likely row count in request_metrics? Could be total rows across tables? It says at least 80 realistic INSERT rows spanning two models and four fixture kinds. Could mean insert statements containing rows. Safer include 80+ rows total? Maybe request_metrics 80 rows spanning two models and four fixture kinds. Could do models 2 rows, fixtures 4 rows, runs maybe 8 or 16, request_metrics 80. But "at least 80 realistic INSERT rows" maybe across all tables? To be safe, include 80 request_metrics rows, plus others >80 total. Need not too huge but okay.
+
+Need two views, one transaction-safe upsert function. Views likely: v_model_fixture_performance, v_mtp_acceptance. Function upsert_run_metrics? Need transaction-safe: maybe function insert_request_metrics(...) with ON CONFLICT using a unique constraint; but a single row upsert is transaction safe. Or function upsert_run_metrics(run_id, metrics[]) transaction-safe? PostgreSQL functions cannot commit transaction unless plpgsql? It can run within transaction. "transaction-safe upsert function" likely use MERGE? PG 15 has MERGE. But upsert function with ON CONFLICT DO UPDATE. Could define function upsert_request_metric(...) returning void, uses INSERT ... ON CONFLICT (request_id) DO UPDATE. But if called in transaction, it's transaction safe (atomic if wrapped). Could also include exception block? Transaction-safe maybe set search_path? Hmm.
+
+Need six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Could be 6 queries:
+1 throughput by model/fixture: avg requests/sec? request_metrics can have tokens_per_second or latency. Need columns. Let's design.
+
+Tables:
+models(model_id text primary key? or serial. Use smallint? For normalized maybe surrogate. model_name, family, provider, quantization, context_length int, mtp_supported boolean, created_at. Check context_length > 0, mtp_supported boolean (not needed).)
+fixtures(fixture_id smallint primary key, kind text, name? prompt_family? input_tokens int? output_tokens? Maybe kind one of 4. Check kind in ('short_qa','long_context','code','mtp_draft')? Or fixture kinds: 'short_qa', 'long_context', 'code_generation', 'multi_turn'? Need four fixture kinds. Use check kind in (...).
+runs(run_id bigint identity primary key, model_id smallint references models, fixture_id smallint references fixtures, experiment_name text, started_at timestamptz not null default now(), ended_at timestamptz, status text check in ('success','failed'), unique(model_id, fixture_id, started_at?) Maybe for reproducibility. request_count? We'll derive.
+request_metrics(request_id bigint identity primary key, run_id bigint references runs on delete cascade, seq int not null check >0? maybe request index. input_tokens int, output_tokens int, latency_ms numeric(10,3), tokens_per_second numeric(10,3), cache_hit_ratio? kv_cache_hit_ratio? long_context_retention float? mtp_acceptance float? mtp_acceptable_tokens? accepted_draft_tokens int, proposed_draft_tokens int. Checks: latency_ms >=0, input_tokens >=0, output_tokens >=0, tokens_per_second >=0, mtp_acceptance between 0 and 1, retention between 0 and 1. Unique maybe (run_id, seq). Indexes on run_id, model? For analytical queries, create indexes on request_metrics(run_id, seq), request_metrics(tokens_per_second), request_metrics(mtp_acceptance), runs(model_id, fixture_id), request_metrics? Can't index model in request_metrics without join? Could create materialized? no. We can create view.
+
+Need "at least 80 realistic INSERT rows spanning two models and four fixture kinds." If request_metrics 80 rows, each tied to runs. Need span two models and four fixture kinds. We can generate 80 rows manually? We need write script with INSERTs. Could use generate_series to make 80 rows compactly, but "INSERT rows" might mean literal rows? It says at least 80 realistic INSERT rows, could be accepted if INSERT ... SELECT generate_series produces 80 rows. But to be safe, literal rows? That's long. User asked one PostgreSQL script. We can use INSERT INTO ... SELECT with generate_series to create 80 rows deterministically, realistic with pseudo-random. But "INSERT rows" maybe they expect actual data rows. We can provide 80 explicit request_metrics rows using VALUES? Need spanning two models and four fixture kinds. We can define 2 models, 4 fixtures, maybe 8 runs (2 models x 4 fixtures), each run 10 requests = 80 request_metrics. That is realistic and explicit if use 80 VALUES rows? 80 rows large but manageable. Need ensure no markdown. Could use INSERT INTO request_metrics VALUES (...); 80 tuples maybe long but okay. Need dependency order: create tables, indexes, functions? Usually create views before? Order: CREATE TABLE, indexes, function, views, then inserts? Function before inserts? Not necessary but okay. Analytical queries at finish.
+
+Need ensure PostgreSQL script runs. Need no markdown fences. Can include comments? SQL comments okay. Must be one script.
+
+Let's design realistic data. Models: 'llama-3.1-8b', 'mistral-nemo-12b'. Maybe model_id 1,2. context_length 131072, 131072. MTP supported? MTP is Multi-Token Prediction; both maybe true. Quantization 'awq'.
+
+Fixture kinds: 'short_qa', 'long_context', 'code', 'multi_turn'. fixture_id 1..4. Could have average tokens: short_qa input 512 output 256; long_context input 65536 output 512; code input 4096 output 1024; multi_turn input 16384 output 512.
+
+Runs: 8 runs: for each model/fixture. run_id 1..8. started_at staggered. status success. Maybe run config: batch_size? concurrency? Add columns to runs: sample_count int? But request_metrics rows are per request. We can have run_id 1..8, each 10 request rows. request_metrics seq 1..10.
+
+Need columns enough for queries: throughput (tokens/sec, requests/sec), variability (stddev/percentile of latency or tokens/sec), long-context retention (maybe accuracy retention: correct? Need measure retention. Could define column long_context_retention numeric between 0 and1 for long_context fixture; or answer_retention? For MTP acceptance: mtp_acceptance ratio accepted_draft_tokens/proposed_draft_tokens. We need include mtp fields. Let's include:
+request_metrics:
+ request_id bigint generated? Use identity? If using explicit VALUES, cannot easily include generated identity? We can omit request_id and let identity generate. But unique (run_id, seq) and ON CONFLICT? If upsert function uses request_id? Maybe better make request_id serial primary key, not specified in inserts? In PostgreSQL, INSERT INTO request_metrics (run_id, seq, ...) VALUES ...; identity can auto-generate. For unique upsert, need unique request key. Could use unique (run_id, seq) and function upsert_request_metrics(run_id, seq, ...). But function must include all fields. Could be okay.
+
+"one transaction-safe upsert function" Could define function upsert_request_metrics(p_run_id bigint, p_seq int, p_input_tokens int, p_output_tokens int, p_latency_ms numeric, p_tps numeric, p_cache_hit_ratio numeric, p_mtp_acceptance numeric, p_retention numeric) returns request_id using INSERT ... ON CONFLICT (run_id, seq) DO UPDATE SET ... RETURNING request_id; Need request_metrics unique (run_id, seq) not request_id? If request_id identity pk and unique (run_id, seq), upsert can update by run_id/seq. For transaction-safe, maybe wrap in BEGIN? Function cannot explicitly start transaction if not? It can execute SQL within caller's transaction. To be safer: in plpgsql, no explicit commit; it's transaction safe by participating in transaction. Could include exception? Hmm.
+
+Alternative: function upsert_request_metrics(payload jsonb) uses jsonb_build... But simpler scalar params.
+
+Need views:
+v_request_enriched maybe joins models fixtures runs request_metrics. View 1: v_run_performance: model, fixture, avg tps, p50/p95 latency, avg mtp_acceptance, retention. View 2: v_mtp_acceptance: model, fixture, proposed/accepted draft tokens, acceptance rate, by context bucket. Need two views.
+
+Analytical queries (six) must be for throughput, variability, long-context retention, MTP acceptance. We can include 6 SELECTs:
+1 Throughput by model and fixture: SELECT m.name, f.kind, ROUND(AVG(rm.tokens_per_second)::numeric,2) ... FROM v_request_enriched WHERE status success GROUP BY ... ORDER BY ...
+But two views only? We can create base view and then analytical queries may use views or tables. Need finish with six analytical SELECT queries. Could use views.
+
+Need ensure queries use available columns.
+
+Let's choose schema:
+CREATE TABLE models (
+  model_id smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  model_name text NOT NULL UNIQUE,
+  family text NOT NULL,
+  provider text NOT NULL,
+  quantization text NOT NULL CHECK (quantization IN ('fp16','int8_awq','int4_gptq','bnb')),
+  context_length int NOT NULL CHECK (context_length > 0),
+  mtp_enabled boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE fixtures (
+ fixture_id smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ kind text NOT NULL CHECK (kind IN ('short_qa','long_context','code','multi_turn')),
+ name text NOT NULL,
+ description text,
+ typical_input_tokens int NOT NULL CHECK (typical_input_tokens >= 0),
+ typical_output_tokens int NOT NULL CHECK (typical_output_tokens >= 0),
+ UNIQUE (kind, name) maybe? Since kind unique? Four kinds, name = kind? Could just unique(kind) to enforce four? But if kind is category, maybe multiple fixtures per kind. Requirement four fixture kinds, not four fixtures. We can make kind unique? If want normalized, fixtures could have multiple with same kind. But for data 4 fixture kinds one each. Check kind in. Could include UNIQUE (kind) to limit? That might prevent multiple fixtures same kind. But okay? Normalization maybe not necessary. Better not unique kind if multiple fixtures possible, but insert only one per kind. Use primary key fixture_id, name. Check kind.
+
+CREATE TABLE runs (
+ run_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ model_id smallint NOT NULL REFERENCES models(model_id) ON DELETE CASCADE,
+ fixture_id smallint NOT NULL REFERENCES fixtures(fixture_id) ON DELETE CASCADE,
+ experiment_name text NOT NULL DEFAULT 'mtp_benchmark',
+ started_at timestamptz NOT NULL DEFAULT now(),
+ ended_at timestamptz,
+ status text NOT NULL CHECK (status IN ('queued','running','success','failed')),
+ batch_size int NOT NULL CHECK (batch_size > 0),
+ sample_count int NOT NULL CHECK (sample_count >= 0),
+ CHECK (ended_at IS NULL OR ended_at >= started_at),
+ UNIQUE (model_id, fixture_id, experiment_name, started_at)
+);
+
+CREATE TABLE request_metrics (
+ request_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ run_id bigint NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+ seq int NOT NULL CHECK (seq > 0),
+ input_tokens int NOT NULL CHECK (input_tokens >= 0),
+ output_tokens int NOT NULL CHECK (output_tokens >= 0),
+ total_tokens? maybe not needed,
+ latency_ms numeric(12,3) NOT NULL CHECK (latency_ms >= 0),
+ tokens_per_second numeric(12,3) NOT NULL CHECK (tokens_per_second >= 0),
+ kv_cache_hit_ratio numeric(6,4) CHECK (kv_cache_hit_ratio BETWEEN 0 AND 1),
+ long_context_retention numeric(6,4) CHECK (long_context_retention BETWEEN 0 AND 1), -- nullable, meaningful for long_context
+ mtp_proposed_tokens int NOT NULL DEFAULT 0 CHECK (mtp_proposed_tokens >= 0),
+ mtp_accepted_tokens int NOT NULL DEFAULT 0 CHECK (mtp_accepted_tokens BETWEEN 0 AND mtp_proposed_tokens),
+ mtp_acceptance numeric(6,4) NOT NULL DEFAULT 0 CHECK (mtp_acceptance BETWEEN 0 AND 1),
+ CHECK ((mtp_proposed_tokens = 0 AND mtp_acceptance = 0) OR (mtp_proposed_tokens > 0)),
+ UNIQUE (run_id, seq)
+);
+
+Indexes:
+CREATE INDEX idx_runs_model_fixture ON runs (model_id, fixture_id, started_at);
+CREATE INDEX idx_runs_status ON runs (status);
+CREATE INDEX idx_request_metrics_run_seq ON request_metrics (run_id, seq); -- already unique maybe unique constraint creates index. Additional not necessary.
+CREATE INDEX idx_request_metrics_tps ON request_metrics (tokens_per_second);
+CREATE INDEX idx_request_metrics_mtp_acceptance ON request_metrics (mtp_acceptance);
+CREATE INDEX idx_request_metrics_retention ON request_metrics (long_context_retention);
+CREATE INDEX idx_request_metrics_run ON request_metrics (run_id);
+Maybe create index on runs for join.
+
+Function:
+CREATE OR REPLACE FUNCTION upsert_request_metrics(
+  p_run_id bigint,
+  p_seq int,
+  p_input_tokens int,
+  p_output_tokens int,
+  p_latency_ms numeric,
+  p_tokens_per_second numeric,
+  p_kv_cache_hit_ratio numeric,
+  p_long_context_retention numeric,
+  p_mtp_proposed_tokens int,
+  p_mtp_accepted_tokens int
+) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE v_acceptance numeric; v_request_id bigint;
+BEGIN
+  IF p_run_id IS NULL OR p_seq IS NULL THEN RAISE EXCEPTION ...;
+  IF p_mtp_proposed_tokens < 0 OR p_mtp_accepted_tokens < 0 OR p_mtp_accepted_tokens > p_mtp_proposed_tokens THEN RAISE EXCEPTION ...;
+  v_acceptance := CASE WHEN p_mtp_proposed_tokens = 0 THEN 0 ELSE round((p_mtp_accepted_tokens::numeric / p_mtp_proposed_tokens),4) END;
+  INSERT INTO request_metrics (...) VALUES (...)
+  ON CONFLICT (run_id, seq) DO UPDATE SET ... request_metrics.mtp_acceptance = EXCLUDED.mtp_acceptance ...
+  RETURNING request_metrics.request_id INTO v_request_id;
+  RETURN v_request_id;
+END $$;
+Need ensure constraints. But if upsert called with run_id not exists? FK error.
+
+Two views:
+CREATE VIEW v_request_enriched AS SELECT rm.request_id, rm.run_id, m.model_id, m.model_name, m.mtp_enabled, f.fixture_id, f.kind, r.started_at, r.status, rm.seq, rm.input_tokens, rm.output_tokens, rm.latency_ms, rm.tokens_per_second, rm.kv_cache_hit_ratio, rm.long_context_retention, rm.mtp_proposed_tokens, rm.mtp_accepted_tokens, rm.mtp_acceptance FROM request_metrics rm JOIN runs r USING(run_id) JOIN models m ON ... JOIN fixtures f ON ...;
+This is one view.
+Second:
+CREATE VIEW v_run_summary AS SELECT r.run_id, m.model_name, f.kind, COUNT(*) request_count, SUM(rm.output_tokens) output_tokens, SUM(rm.input_tokens + rm.output_tokens) total_tokens, AVG(rm.tokens_per_second) avg_tps, percentile_cont(0.5) WITHIN GROUP (ORDER BY rm.latency_ms) p50_latency_ms, percentile_cont(0.95) ... p95_latency_ms, STDDEV_SAMP(rm.tokens_per_second) tps_std, AVG(rm.mtp_acceptance) avg_mtp_acceptance, AVG(CASE WHEN f.kind='long_context' THEN rm.long_context_retention END) avg_long_context_retention FROM ... GROUP BY ...;
+Could use views. Need ensure PostgreSQL aggregate STDDEV_SAMP, percentile_cont available.
+
+Data inserts:
+INSERT INTO models (model_name, family, provider, quantization, context_length, mtp_enabled) VALUES
+('llama-3.1-8b-instruct','llama','meta','int8_awq',131072,true),
+('mistral-nemo-12b-instruct','mistral','mistral','int8_awq',131072,true);
+Since identity generated, if we need model_id for fixtures/runs, can use RETURNING? We can insert with explicit model_id? If generated always, cannot specify. Could use generated by default to allow explicit IDs for dependency. In PostgreSQL identity columns can be generated by default; INSERT can specify if OVERRIDING? Actually identity column generated by default: can specify value without OVERRIDING? For identity, default can be overridden? In PG, generated by default allows values; generated always requires OVERRIDING SYSTEM VALUE. To keep simple, use GENERATED BY DEFAULT AS IDENTITY. Then insert explicit IDs or omit. For dependency, can insert explicit model_id 1,2 and fixture_id 1,4 and run_id 1,8. Use default identity but specify. Fine. Or use serial to avoid. Use bigint generated by default. But if we specify, okay.
+
+Need 80 request_metrics rows spanning two models and four fixture kinds. Let's produce 8 runs each 10 requests = 80. Need realistic values. Could write 80 rows in a single INSERT using VALUES. But

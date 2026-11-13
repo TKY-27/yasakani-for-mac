@@ -1,0 +1,545 @@
+Below is a complete, self-contained Python 3.11 package. It is deterministic (no wall-clock timestamps, no randomness, no real GPU), reads a JSON manifest, enforces one active GPU job, persists state atomically, resumes completed work, streams structured JSONL events, handles SIGINT, and redacts configured secrets.
+
+Design notes:
+- "GPU" is a deterministic in-process simulator (a `FakeGPU` with a single slot) so the package runs anywhere and is fully testable.
+- Determinism: all event/state timestamps are a monotonically increasing logical counter; job order is the manifest order; no `random`/`time`/`uuid`.
+- Atomic persistence: write to a temp file in the same directory, `fsync`, then `os.replace`.
+- Resume: completed jobs are skipped; a job that was `running` at shutdown is re-queued (idempotent jobs are safe to re-run).
+- Secrets: values listed in `manifest.secrets` are redacted in every emitted event and in the persisted state.
+
+---
+
+`pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deterministic-job-runner"
+version = "0.1.0"
+description = "Deterministic asynchronous job runner with atomic state, resume, JSONL events, SIGINT handling, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Deterministic Job Runner" }]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7.4"]
+
+[project.scripts]
+job-runner = "job_runner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["job_runner*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+```
+
+---
+
+`job_runner/__init__.py`
+
+```python
+"""Deterministic asynchronous job runner.
+
+Public API:
+    JobRunner, Job, JobStatus, JobResult, JobError,
+    load_manifest, Manifest,
+    FakeGPU,
+    redact,
+    run_manifest,
+    main
+"""
+
+from .manifest import Manifest, Job, JobStatus, JobResult, JobError, load_manifest
+from .gpu import FakeGPU
+from .redaction import redact
+from .runner import JobRunner, run_manifest
+from .cli import main
+
+__all__ = [
+    "Manifest",
+    "Job",
+    "JobStatus",
+    "JobResult",
+    "JobError",
+    "load_manifest",
+    "FakeGPU",
+    "redact",
+    "JobRunner",
+    "run_manifest",
+    "main",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+`job_runner/manifest.py`
+
+```python
+"""Manifest and job data model plus JSON loading/validation."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+
+
+@dataclass
+class Job:
+    id: str
+    name: str
+    command: str
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    gpu: bool = True
+    timeout: float | None = None
+    idempotent: bool = True
+    # Runtime state (not part of the manifest, but persisted).
+    status: JobStatus = JobStatus.PENDING
+    attempts: int = 0
+    result: JobResult | None = None
+    error: str | None = None
+    started_at: int | None = None
+    finished_at: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "command": self.command,
+            "args": list(self.args),
+            "env": dict(self.env),
+            "gpu": self.gpu,
+            "timeout": self.timeout,
+            "idempotent": self.idempotent,
+            "status": self.status.value,
+            "attempts": self.attempts,
+            "result": self.result.to_dict() if self.result else None,
+            "error": self.error,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Job":
+        result = data.get("result")
+        return cls(
+            id=data["id"],
+            name=data.get("name", data["id"]),
+            command=data.get("command", ""),
+            args=list(data.get("args", [])),
+            env=dict(data.get("env", {})),
+            gpu=bool(data.get("gpu", True)),
+            timeout=data.get("timeout"),
+            idempotent=bool(data.get("idempotent", True)),
+            status=JobStatus(data.get("status", JobStatus.PENDING.value)),
+            attempts=int(data.get("attempts", 0)),
+            result=JobResult.from_dict(result) if result else None,
+            error=data.get("error"),
+            started_at=data.get("started_at"),
+            finished_at=data.get("finished_at"),
+        )
+
+
+@dataclass
+class JobResult:
+    exit_code: int
+    stdout: str = ""
+    stderr: str = ""
+    output: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "exit_code": self.exit_code,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "output": dict(self.output),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "JobResult":
+        return cls(
+            exit_code=int(data.get("exit_code", 0)),
+            stdout=data.get("stdout", ""),
+            stderr=data.get("stderr", ""),
+            output=dict(data.get("output", {})),
+        )
+
+
+@dataclass
+class Manifest:
+    version: int
+    jobs: list[Job]
+    secrets: list[str] = field(default_factory=list)
+    max_attempts: int = 1
+    gpu: dict[str, Any] = field(default_factory=dict)
+
+    def job_ids(self) -> list[str]:
+        return [j.id for j in self.jobs]
+
+    def get(self, job_id: str) -> Job | None:
+        for j in self.jobs:
+            if j.id == job_id:
+                return j
+        return None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "jobs": [j.to_dict() for j in self.jobs],
+            "secrets": list(self.secrets),
+            "max_attempts": self.max_attempts,
+            "gpu": dict(self.gpu),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Manifest":
+        jobs = [Job.from_dict(j) for j in data.get("jobs", [])]
+        return cls(
+            version=int(data.get("version", 1)),
+            jobs=jobs,
+            secrets=list(data.get("secrets", [])),
+            max_attempts=int(data.get("max_attempts", 1)),
+            gpu=dict(data.get("gpu", {})),
+        )
+
+
+def load_manifest(path: str) -> Manifest:
+    """Load and validate a JSON manifest from disk."""
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    return _validate(data)
+
+
+def _validate(data: dict[str, Any]) -> Manifest:
+    if not isinstance(data, dict):
+        raise ValueError("manifest must be a JSON object")
+    if "jobs" not in data or not isinstance(data["jobs"], list):
+        raise ValueError("manifest must contain a 'jobs' list")
+
+    seen: set[str] = set()
+    jobs: list[Job] = []
+    for i, raw in enumerate(data["jobs"]):
+        if not isinstance(raw, dict):
+            raise ValueError(f"job #{i} must be an object")
+        if "id" not in raw or not isinstance(raw["id"], str) or not raw["id"]:
+            raise ValueError(f"job #{i} is missing a non-empty string 'id'")
+        if raw["id"] in seen:
+            raise ValueError(f"duplicate job id: {raw['id']!r}")
+        seen.add(raw["id"])
+        jobs.append(
+            Job(
+                id=raw["id"],
+                name=raw.get("name", raw["id"]),
+                command=raw.get("command", ""),
+                args=list(raw.get("args", [])),
+                env=dict(raw.get("env", {})),
+                gpu=bool(raw.get("gpu", True)),
+                timeout=raw.get("timeout"),
+                idempotent=bool(raw.get("idempotent", True)),
+            )
+        )
+
+    secrets = data.get("secrets", [])
+    if not isinstance(secrets, list) or not all(isinstance(s, str) for s in secrets):
+        raise ValueError("'secrets' must be a list of strings")
+
+    max_attempts = int(data.get("max_attempts", 1))
+    if max_attempts < 1:
+        raise ValueError("'max_attempts' must be >= 1")
+
+    gpu = data.get("gpu", {})
+    if not isinstance(gpu, dict):
+        raise ValueError("'gpu' must be an object")
+
+    return Manifest(
+        version=int(data.get("version", 1)),
+        jobs=jobs,
+        secrets=list(secrets),
+        max_attempts=max_attempts,
+        gpu=gpu,
+    )
+```
+
+---
+
+`job_runner/gpu.py`
+
+```python
+"""Deterministic in-process GPU simulator.
+
+A real runner would allocate a physical GPU. To keep this package runnable and
+deterministic everywhere, we model a single-slot GPU. The slot is the resource
+that enforces "one active GPU job".
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class FakeGPU:
+    name: str = "gpu0"
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _active: str | None = None
+    _acquired: int = 0
+    _released: int = 0
+
+    @property
+    def active(self) -> str | None:
+        return self._active
+
+    @property
+    def busy(self) -> bool:
+        return self._active is not None
+
+    async def acquire(self, job_id: str) -> None:
+        """Acquire the single GPU slot. Blocks until free.
+
+        Raises RuntimeError if the slot is already held by a *different* job,
+        which would indicate a bug (we always release before re-acquiring).
+        """
+        async with self._lock:
+            if self._active is not None and self._active != job_id:
+                raise RuntimeError(
+                    f"GPU {self.name} is busy with {self._active!r}; "
+                    f"cannot start {job_id!r}"
+                )
+            self._active = job_id
+            self._acquired += 1
+
+    async def release(self, job_id: str) -> None:
+        async with self._lock:
+            if self._active == job_id:
+                self._active = None
+                self._released += 1
+            # If it was already released by someone else, ignore.
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "active": self._active,
+            "acquired": self._acquired,
+            "released": self._released,
+        }
+```
+
+---
+
+`job_runner/redaction.py`
+
+```python
+"""Secret redaction.
+
+Given a set of secret *values*, recursively replace any occurrence of those
+values inside strings with a redaction token. This is value-based (not
+key-based) so it works regardless of where a secret appears (env, args,
+stdout, error messages, etc.).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+REDACTED = "***REDACTED***"
+
+
+def redact(value: Any, secrets: list[str]) -> Any:
+    """Return a copy of ``value`` with all secret values replaced."""
+    if not secrets:
+        return value
+    # Only redact non-empty secrets to avoid replacing every empty string.
+    active = [s for s in secrets if s]
+    if not active:
+        return value
+    return _redact(value, active)
+
+
+def _redact(value: Any, secrets: list[str]) -> Any:
+    if isinstance(value, str):
+        out = value
+        for s in secrets:
+            if s in out:
+                out = out.replace(s, REDACTED)
+        return out
+    if isinstance(value, dict):
+        return {k: _redact(v, secrets) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact(v, secrets) for v in value]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    # Fallback: stringify and redact.
+    return _redact(repr(value), secrets)
+```
+
+---
+
+`job_runner/state.py`
+
+```python
+"""Atomic, resumable state persistence.
+
+State is a JSON document. Writes are atomic: serialize to a temp file in the
+same directory, fsync, then os.replace over the target. Reads tolerate a
+missing file (first run) and a partially-written file (should not happen with
+atomic replace, but we fail loudly rather than corrupt).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from typing import Any
+
+
+class StateStore:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._dir = os.path.dirname(os.path.abspath(path)) or "."
+
+    def load(self) -> dict[str, Any] | None:
+        if not os.path.exists(self.path):
+            return None
+        with open(self.path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def save(self, data: dict[str, Any]) -> None:
+        os.makedirs(self._dir, exist_ok=True)
+        payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
+        fd, tmp = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=self._dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+```
+
+---
+
+`job_runner/events.py`
+
+```python
+"""Structured JSONL event stream.
+
+Each event is a single JSON object on one line. Events carry a monotonically
+increasing logical ``seq`` and a logical ``ts`` (a counter, not wall-clock) so
+the stream is fully deterministic.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any, TextIO
+
+
+class EventStream:
+    def __init__(self, sink: TextIO) -> None:
+        self._sink = sink
+        self._seq = 0
+        self._ts = 0
+
+    def _next(self) -> tuple[int, int]:
+        self._seq += 1
+        self._ts += 1
+        return self._seq, self._ts
+
+    def emit(self, event: str, **fields: Any) -> dict[str, Any]:
+        seq, ts = self._next()
+        record = {"seq": seq, "ts": ts, "event": event, **fields}
+        line = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        self._sink.write(line + "\n")
+        self._sink.flush()
+        return record
+
+    def close(self) -> None:
+        try:
+            self._sink.flush()
+        except Exception:
+            pass
+```
+
+---
+
+`job_runner/runner.py`
+
+```python
+"""The asynchronous job runner.
+
+Responsibilities:
+  * Read a manifest (or resume from persisted state).
+  * Enforce exactly one active GPU job at a time.
+  * Persist state atomically after every transition.
+  * Resume: skip completed jobs, re-queue jobs that were running.
+  * Stream structured JSONL events (redacted).
+  * Handle SIGINT: cancel the active job, mark pending jobs cancelled, persist.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import signal
+from typing import Any, TextIO
+
+from .events import EventStream
+from .gpu import FakeGPU
+from .manifest import Job, JobResult, JobStatus, Manifest, load_manifest
+from .redaction import redact
+from .state import StateStore
+
+
+class JobRunner:
+    def __init__(
+        self,
+        manifest: Manifest,
+        state_path: str,
+        event_sink: TextIO,
+        gpu: FakeGPU | None = None,
+    ) -> None:
+        self.manifest = manifest
+        self.gpu = gpu or FakeGPU()
+        self.state = StateStore(state_path)
+        self.events = EventStream(event_sink)
+        self._cancel_requested = False
+        self._cancel_event = asyncio.Event()
+        self._active_job: Job | None = None
+        self._active_task: asyncio.Task | None = None
+        self._install_signal_handlers()
+
+    # ------------------------------------------------------------------ #
+    # Signal

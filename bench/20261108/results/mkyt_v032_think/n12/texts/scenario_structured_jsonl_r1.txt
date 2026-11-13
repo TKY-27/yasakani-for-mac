@@ -1,0 +1,148 @@
+We need answer user's request. Need output exactly 160 JSONL records no Markdown. Need deterministic arithmetic progressions. Fields id RUN-0001 through RUN-0160, model alternating qwen3.6-27b and qwen3.6-35b-a3b, prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance, status, tags. status ok/warn 4:1 pattern. two tags per record. Every line strict JSON.
+
+Need think carefully. Need produce 160 lines. Need deterministic arithmetic progressions. Which fields? prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance maybe arithmetic progressions. Need ensure valid JSON. Could be numbers. Maybe id string. model alternating. status 4:1 pattern likely ok ok ok ok warn repeated? 160 is multiple of 5, 4:1 pattern means 4 ok then 1 warn? 160/5=32, so ok count 128, warn 32. Good.
+
+Need two tags per record. Could use arrays of strings. Maybe tags deterministic. Could be ["alpha","beta"] alternating? Need exactly two tags per record. Could vary by index: ["t0","t1"]? deterministic. But maybe better: tags: ["gen", "mtp"]? But two tags per record okay. Could be [tagA, tagB]. If constant, fine. But maybe need tags meaningful. Could do ["run","<id suffix>"]? But no requirement to be unique. Need ensure every line parse independent strict JSON. No trailing commas.
+
+Need arithmetic progressions. Could define:
+prompt_tokens: 1000 + 10*i? For i from 0 to 159: 1000 to 2590 step10.
+completion_tokens: 200 + 5*i? 200 to 995 step5.
+decode_tok_s: 50 + i? 50 to 169 step1.
+mtp_acceptance: 0.7 + 0.001*i? 0.7 to 0.859 step0.001. Need strict JSON numbers. Floating. Could be exact? JSON numbers okay. Maybe use 0.700, 0.701 ... but JSON with leading zeros? 0.700 valid? yes. But maybe avoid many decimals. Could use integer? acceptance likely 0-1. Arithmetic progression with step 1/1000. If output decimals with 3 decimals, deterministic. 0.7 + i*0.001, for i 159 -> 0.859. Good. But JSON numbers can have 0.700. It parses to 0.7. Fine.
+
+Need status 4:1 pattern. Could use i%5==4 warn else ok. That yields RUN-0005 warn, 0010 warn, etc. 4:1 pattern. Good.
+
+Need model alternating qwen3.6-27b and qwen3.6-35b-a3b. Could i even: qwen3.6-27b, odd: qwen3.6-35b-a3b. id RUN-0001 first maybe even? yes.
+
+Need 160 lines. Need ensure no Markdown. We can generate mentally? Need produce 160 JSON lines. That's long. We can programmatically in analysis? We need final output exact. Need be careful. We can construct all 160 lines systematically. Need avoid errors.
+
+Maybe can create concise lines. Need count. We can use deterministic formulas and write 160 lines. Let's plan.
+
+Line i 1..160. index n = i-1 0..159.
+id: "RUN-" + 4-digit i (0001..0160).
+model: if i odd -> "qwen3.6-27b" else "qwen3.6-35b-a3b" (alternating starting with 27b). 
+prompt_tokens: 1000 + 10*n (i=1:1000, i=160:2590)
+completion_tokens: 200 + 5*n (200..995)
+decode_tok_s: 50 + n (50..169)
+mtp_acceptance: 0.700 + 0.001*n. For n=0 0.7, maybe output 0.7. For n=1 0.701, etc. Need consistent? Could output 0.7, 0.701... JSON. But for arithmetic progression, 0.701 is 0.701, 0.700 could be 0.7. If output 0.7 for first, 0.701 etc. It's okay. But strict JSON number 0.701. For n=10 -> 0.71? If step 0.001, n=10 -> 0.710. If output 0.71, fine. Could use 3 decimals: 0.700, 0.701,... 0.859. JSON allows leading zeros after decimal. 0.700 valid. Need ensure no NaN. Good. We can output 0.700 to 0.859 with 3 decimal places. For n=0: 0.700. JSON number 0.700. Valid. Strict? Yes.
+status: if i % 5 == 0 -> warn else ok.
+tags: two tags per record. Could be ["run","seq"?]. To make deterministic and simple: ["seq","<id>"]? But id already. Maybe tags must be two tags; can be ["a","b"]. But maybe use index-based two tags? Could use ["t" + ((n % 8)+1), "x" + ((n % 5)+1)] but then strings. Simpler: tags: ["batch", "mtp"] constant. That's two tags. But perhaps "two tags per record" doesn't require variation. Constant okay. Could use ["run", "ok/warn"]? status maybe. But tags should be strings. Could have ["run","mtp"].
+
+Need every line strict JSON. If tags constant: ["run","mtp"]. Good.
+
+Potential issue: field order? not matter. Need fields exactly? object with fields id, model, prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance, status, tags. Could include only those. Good.
+
+Need output exactly 160 records and no Markdown. So final should be just lines. Need count. Let's produce manually with pattern. Need avoid mistakes in arithmetic.
+
+We can generate line template:
+{"id":"RUN-0001","model":"qwen3.6-27b","prompt_tokens":1000,"completion_tokens":200,"decode_tok_s":50,"mtp_acceptance":0.700,"status":"ok","tags":["run","mtp"]}
+i=2: model other, prompt 1010, comp 205, decode 51, mtp 0.701, status ok.
+...
+i=5 status warn, prompt 1040, comp 220, decode 54, mtp 0.704.
+i=10 warn, prompt 1090, comp 245, decode 59, mtp 0.709.
+...
+i=159? n=158 prompt 2580, comp 990, decode 168, mtp 0.858, model? i=159 odd -> 27b.
+i=160 n=159 prompt 2590, comp 995, decode 169, mtp 0.859, model 35b, status? 160%5=0 warn.
+
+Need generate 160 lines. Need ensure all numbers correct. Could create in analysis by chunks. Let's make a table perhaps. Need final not too huge but okay. Let's systematically list 160.
+
+Maybe can reduce tags to ["r","m"] to make shorter. But two tags. Use ["run","mtp"].
+
+Let's create lines by 10s, check status every 5.
+
+Formula:
+i: n=i-1
+prompt = 1000+10n = 1000 + 10(i-1) = 100i? wait 10i+990? For i=1 1000; i=2 1010.
+completion=200+5n=200+5i-5=5i+195. i=1 200; 160 995.
+decode=50+n=49+i.
+mtp=0.700+0.001n = 0.699 + 0.001i? i=1 0.700. Could calculate as 0.700 + (i-1)/1000. 3 decimals: 0.700 + 0.001*(i-1). We can list 0.700,0.701,...,0.859.
+status ok except multiples 5 warn.
+model: odd 27b, even 35b.
+
+Let's generate 1-10:
+1 ok 27b p1000 c200 d50 a0.700
+2 ok 35b p1010 c205 d51 a0.701
+3 ok 27b p1020 c210 d52 a0.702
+4 ok 35b p1030 c215 d53 a0.703
+5 warn 27b p1040 c220 d54 a0.704
+6 ok 35b p1050 c225 d55 a0.705
+7 ok 27b p1060 c230 d56 a0.706
+8 ok 35b p1070 c235 d57 a0.707
+9 ok 27b p1080 c240 d58 a0.708
+10 warn 35b p1090 c245 d59 a0.709
+
+11-20:
+11 ok 27b p1100 c250 d60 a0.710
+12 ok 35b p1110 c255 d61 a0.711
+13 ok 27b p1120 c260 d62 a0.712
+14 ok 35b p1130 c265 d63 a0.713
+15 warn 27b p1140 c270 d64 a0.714
+16 ok 35b p1150 c275 d65 a0.715
+17 ok 27b p1160 c280 d66 a0.716
+18 ok 35b p1170 c285 d67 a0.717
+19 ok 27b p1180 c290 d68 a0.718
+20 warn 35b p1190 c295 d69 a0.719
+
+21-30:
+21 ok 27b 1200 300 70 0.720
+22 ok 35b 1210 305 71 0.721
+23 ok 27b 1220 310 72 0.722
+24 ok 35b 1230 315 73 0.723
+25 warn 27b 1240 320 74 0.724
+26 ok 35b 1250 325 75 0.725
+27 ok 27b 1260 330 76 0.726
+28 ok 35b 1270 335 77 0.727
+29 ok 27b 1280 340 78 0.728
+30 warn 35b 1290 345 79 0.729
+
+31-40:
+31 ok 27b 1300 350 80 0.730
+32 ok 35b 1310 355 81 0.731
+33 ok 27b 1320 360 82 0.732
+34 ok 35b 1330 365 83 0.733
+35 warn 27b 1340 370 84 0.734
+36 ok 35b 1350 375 85 0.735
+37 ok 27b 1360 380 86 0.736
+38 ok 35b 1370 385 87 0.737
+39 ok 27b 1380 390 88 0.738
+40 warn 35b 1390 395 89 0.739
+
+41-50:
+41 ok 27b 1400 400 90 0.740
+42 ok 35b 1410 405 91 0.741
+43 ok 27b 1420 410 92 0.742
+44 ok 35b 1430 415 93 0.743
+45 warn 27b 1440 420 94 0.744
+46 ok 35b 1450 425 95 0.745
+47 ok 27b 1460 430 96 0.746
+48 ok 35b 1470 435 97 0.747
+49 ok 27b 1480 440 98 0.748
+50 warn 35b 1490 445 99 0.749
+
+51-60:
+51 ok 27b 1500 450 100 0.750
+52 ok 35b 1510 455 101 0.751
+53 ok 27b 1520 460 102 0.752
+54 ok 35b 1530 465 103 0.753
+55 warn 27b 1540 470 104 0.754
+56 ok 35b 1550 475 105 0.755
+57 ok 27b 1560 480 106 0.756
+58 ok 35b 1570 485 107 0.757
+59 ok 27b 1580 490 108 0.758
+60 warn 35b 1590 495 109 0.759
+
+61-70:
+61 ok 27b 1600 500 110 0.760
+62 ok 35b 1610 505 111 0.761
+63 ok 27b 1620 510 112 0.762
+64 ok 35b 1630 515 113 0.763
+65 warn 27b 1640 520 114 0.764
+66 ok 35b 1650 525 115 0.765
+67 ok 27b 1660 530 116 0.766
+68 ok 35b 1670 535 117 0.767
+69 ok 27b 1680 540 118 0.768
+70 warn 35b 1690 545 119 0.769
+
+71-80:
+71 ok 27b 1700 550 120 0.770
+72 ok 35b 171

@@ -1,0 +1,50 @@
+**Part 1: Operational Boundaries.** The system services only one active request at a time, with all model state exclusively owned by a single execution thread. This constraint is not a temporary flaw but a deliberate product decision tailored for single-GPU local inference. It enables the memory planner to pre-determine workspace, cache, and graph execution addresses, and simplifies the verification of state transitions for cancellation, failure, and recovery.
+
+**Part 2: Prefill.** Inputs first undergo template rendering and tokenization, then enter the model in fixed-size blocks. Each block reads previously committed state and atomically advances the frontier. Timing must distinguish between host preparation, visual preprocessing, text prefill, and the first output token; file reading or model loading must not be conflated with throughput.
+
+**Part 3: Decoding.** Standard decoding commits one token per round, whereas speculative decoding can verify multiple candidates and commit a contiguous prefix. Regardless of how many candidates are accepted, the public output, KV cache, loop state, and counters must all correspond to the same committed position, leaving no partially updated state.
+
+**Part 4: Long Context.** As context grows, latency is jointly determined by fixed weight reads and the continuously growing attention cache reads. Reports should provide both absolute speed and relative retention rate, alongside the actual prompt token count, and document the cache format, maximum capacity, sampler, and graph execution status.
+
+**Part 5: Reproducibility.** Stable inputs must be saved as the actual message files sent, with their source and token count recorded. Formal runs must not involve temporary web downloads, random question selection, or the exclusion of slower samples. Every reported number must be traceable back to a specific model, command, input, and service log.
+
+**Part 6: Interpretation of Results.** A single isolated fastest run cannot prove stable performance, and a single high acceptance-rate text cannot represent all output scenarios. Code, narrative, translation, and structured content have different token distributions and should be presented separately, rather than mixed into a meaningless overall average.
+
+***
+
+**Chinese-English Glossary**
+
+1.  **运行边界** (Yíngxíng biānjiè) – Operational Boundaries
+2.  **活动请求** (Huódòng qǐngqiú) – Active Request
+3.  **模型状态** (Móxíng zhuàngtài) – Model State
+4.  **执行程序** (Zhíxíng chéngxù) – Execution Thread/Program
+5.  **独占** (Dúzhàn) – Exclusive/Exclusively owned
+6.  **单卡** (Dān kǎ) – Single-GPU / Single Card
+7.  **本地推理** (Běndì tuīlǐ) – Local Inference
+8.  **内存规划器** (Nèicún guīhuàqì) – Memory Planner
+9.  **工作区** (Gōngzuòqū) – Workspace
+10. **缓存** (Huǎncún) – Cache
+11. **图执行** (Tú zhíxíng) – Graph Execution
+12. **状态转换** (Zhuàngtài zhuǎnhuàn) – State Transition
+13. **预填充** (Yù tiánchōng) – Prefill
+14. **模板渲染** (Múbǎn rǎnrèn) – Template Rendering
+15. **分词** (Fēncí) – Tokenization
+16. **前沿** (Qiányán) – Frontier
+17. **视觉预处理** (Shìjué yù chǔlǐ) – Visual Preprocessing
+18. **吞吐量** (Tōngshùliàng) – Throughput
+19. **解码** (Jiěmǎ) – Decoding
+20. **推测解码** (Tuīcè jiěmǎ) – Speculative Decoding
+21. **候选** (Hòuxuǎn) – Candidate
+22. **连续前缀** (Liánxù qiánzhuì) – Contiguous Prefix
+23. **KV 缓存** (KV huǎncún) – KV Cache (Key-Value Cache)
+24. **长上下文** (Cháng shàngxiàwén) – Long Context
+25. **权重读取** (Quánzhòng dúqǔ) – Weight Reads
+26. **注意力缓存** (Zhùyìlì huǎncún) – Attention Cache
+27. **延迟** (Yánchí) – Latency
+28. **相对保留率** (Xiāngduì bǎoliú lǜ) – Relative Retention Rate
+29. **采样器** (Cǎiyàngqì) – Sampler
+30. **可复现性** (Kě fùxiàn xìng) – Reproducibility
+31. **正式运行** (Zhèngshì yùnxíng) – Formal Run
+32. **结果解释** (Jiéguǒ jiěshì) – Interpretation of Results
+33. **token 分布** (token fēnbù) – Token Distribution
+34. **总平均值** (Zǒng píngjūn zhí) – Overall Average<|im_end|>

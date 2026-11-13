@@ -1,0 +1,136 @@
+We need respond to user: "Write a complete Python 3.11 package for a deterministic asynchronous job runner. It must read a JSON manifest, enforce one active GPU job, persist atomic state, resume completed work, stream structured JSONL events, handle SIGINT, redact configured secrets, and include pytest tests for success, failure, cancellation, and resume. Present every source file in a separate fenced block with its path and include pyproject.toml."
+
+Need produce final answer with every source file in separate fenced block with path, including pyproject.toml. Need complete runnable Python 3.11 package. Need design.
+
+Requirements:
+- deterministic asynchronous job runner
+- read JSON manifest
+- enforce one active GPU job
+- persist atomic state
+- resume completed work
+- stream structured JSONL events
+- handle SIGINT
+- redact configured secrets
+- include pytest tests for success, failure, cancellation, and resume
+- present every source file in separate fenced block with its path and include pyproject.toml
+
+Need create package files. Need ensure code is complete and consistent. Need likely use asyncio, JSON manifest, events JSONL. Deterministic: scheduler by manifest order, fixed concurrency? Enforce one active GPU job. CPU jobs maybe can run? It says job runner for deterministic asynchronous job runner. Could support job types: "gpu" and "cpu"? Or all jobs GPU? Enforce one active GPU job. If manifest includes GPU jobs only, one at a time. Could have GPU job and CPU job. But tests should cover success, failure, cancellation, resume.
+
+Need package layout:
+pyproject.toml
+src/deterministic_job_runner/__init__.py
+src/deterministic_job_runner/__main__.py
+src/deterministic_job_runner/manifest.py
+src/deterministic_job_runner/state.py
+src/deterministic_job_runner/runner.py
+src/deterministic_job_runner/events.py
+src/deterministic_job_runner/redaction.py
+src/deterministic_job_runner/cli.py maybe
+src/deterministic_job_runner/scheduler? Could combine.
+tests/test_runner.py
+
+Need ensure tests can run pytest. Use tmp_path, monkeypatch.
+
+Need atomic state persist: state file JSON with tmp file + os.replace. Also event stream JSONL: append-only, maybe fsync.
+
+Redact configured secrets: manifest may include secrets: list of strings? Or env values? Need redact in emitted events and state? Requirement: redact configured secrets. We can implement Redactor with patterns: exact secret values or prefixes? For deterministic and safe, manifest includes "redact": ["API_KEY", "token=..."]? Or "secrets": {"ENV_VAR": true}. Simpler: Manifest has "redactions": list of strings, redactor replaces exact strings in all strings in event payload with [REDACTED]. Also env variable names? Need "configured secrets" maybe secrets as values. Could support both: exact values and env variable names by reading env and redacting values. But must avoid leaking. Implement redaction in event writer.
+
+Need deterministic async job runner: no random, no timing except sleeps? Jobs can have "sleep_ms" or "command"? For tests, avoid real GPU; simulate jobs with "sleep_seconds" and optional "fail". But deterministic means order based on manifest. Could support "executable"? For portability, use "sleep" or "script"? Better: job definitions with "type": "gpu"|"cpu", "payload" e.g. {"sleep_seconds": 0.01, "fail": true}. Runner can execute via async functions? In package, user can register custom job handlers by name. To be complete, include built-in handlers: "sleep", "echo", "fail". GPU enforcement based on job type.
+
+Manifest schema:
+{
+  "version": 1,
+  "jobs": [
+    {"id": "job1", "type": "gpu", "handler": "sleep", "parameters": {"seconds": 0.01}},
+    {"id": "job2", "type": "cpu", ...}
+  ],
+  "redactions": ["s3cret"],
+  "redact_env": ["API_TOKEN"] maybe
+}
+
+Need state:
+{
+  "schema_version": 1,
+  "manifest_hash": sha256 of canonical manifest JSON? But manifest includes secrets maybe redact before? For resume, need identify completed work. Use job ids. State:
+  "completed_jobs": ["job1"],
+  "failed_jobs": ["job2"]? Or statuses per job: {"job1": "completed", ...}
+  "attempts": {...}, maybe.
+  "next_index"? Deterministic order.
+}
+Resume completed work: if state has job completed, runner skips those and continues. If job failed? Could allow re-run failed? Requirement says resume completed work, not failed. For tests, cancellation: SIGINT graceful: stop accepting new jobs, maybe wait active? Need tests for cancellation.
+
+Event JSONL: event types: runner_started, job_started, job_completed, job_failed, job_skipped, runner_completed, runner_cancelled, maybe state_saved. Each event: {"timestamp": iso? deterministic? If include timestamp, output not deterministic. Requirement deterministic runner maybe scheduling deterministic, but events can include sequence number and maybe no timestamp? To be safe, include "sequence" and "occurred_at"? Structured JSONL events may include timestamp but deterministic? Could omit timestamp or make it monotonic counter. But event streams typically include time. Deterministic package maybe deterministic order; can include sequence for determinism. Maybe include "ts" as logical counter. But user may expect timestamps. Could include optional "wall_time" only if not in tests? Hmm.
+
+Need handle SIGINT: runner.run() catches KeyboardInterrupt? In asyncio, signal handler. Could use loop.add_signal_handler(SIGINT, ...) to set cancellation. Or catch KeyboardInterrupt in CLI. For tests, send SIGINT to process? Hard. Could test by invoking Runner with a fake signal or by raising asyncio.CancelledError? Requirement handle SIGINT. In tests, can use monkeypatch to simulate SIGINT by sending os.kill(os.getpid(), SIGINT)? In pytest, default SIGINT may kill? asyncio loop adds handler; can test by sending SIGINT via signal.raise_signal? Need careful. We can design Runner with method `run` that installs SIGINT handler if running in main thread and in event loop. It converts first SIGINT to cancel pending tasks, second to force? Or just graceful: on SIGINT set `self._cancel_requested`, stops starting new jobs, waits for active to complete? Cancellation test could assert events include runner_cancelled and state persisted, and no new jobs after signal.
+
+But in tests, sending SIGINT may be tricky because pytest captures? `signal.raise_signal(signal.SIGINT)` works if handler installed. In asyncio, `loop.add_signal_handler(signal.SIGINT, ...)` only on Unix. CI likely Linux. But Python 3.11. Could avoid actual signal in tests by testing `Runner._handle_sigint` or inject a `signal_sender`. But requirement include tests for cancellation; better simulate via a manifest job that after started triggers signal? Or use `signal.raise_signal`.
+
+Need ensure tests deterministic and no sleep too long. Use tiny sleeps.
+
+Atomic state: `StateStore` writes JSON to tmp then `os.replace`; fsync file and dir maybe. Events: append JSON line, flush/fsync. Could also write events atomically? Stream append.
+
+One active GPU job: Need semaphore? Use `asyncio.Semaphore(1)` for GPU, CPU unlimited? But deterministic concurrency: if CPU jobs can run concurrently, nondeterministic completion order? We need deterministic async job runner. Could enforce global concurrency of 1 for all jobs? But enforce one active GPU job specifically. If CPU jobs can be concurrent, events may be nondeterministic due to scheduling. To be deterministic, maybe run all jobs sequentially in manifest order, but GPU jobs only one at a time trivially. But asynchronous? Could allow CPU parallel but deterministic by scheduling all ready in order? Let's think.
+
+"one active GPU job" implies there may be multiple GPUs? No, enforce one active GPU job. If jobs are GPU only, one active means sequential. But async runner can still use tasks and semaphore. Deterministic if all jobs are GPU and semaphore 1 -> sequential. If CPU jobs allowed, deterministic event order? If CPU jobs run concurrently, order of completion depends on timing. Could enforce a single worker globally? But then one active GPU is trivial. Yet requirement specifically GPU suggests support job resource types.
+
+We can make runner deterministic by executing jobs in topological/order sequence with a scheduler that only starts a job when its dependencies completed? Manifest can have no dependencies. If we have a fixed maximum concurrency (e.g. CPU 4, GPU 1), completion order can vary. But event order can be deterministic if we order events by sequence assigned at job start? JSONL append order may still vary. To be fully deterministic, we can make all jobs sequential in manifest order; GPU semaphore still enforces one. But "asynchronous" can mean non-blocking IO. Simpler and robust. But then why GPU? Could be manifest type: gpu/cpu but scheduler runs sequentially, so one active GPU always. But "asynchronous job runner" suggests parallel. We can define deterministic policy: jobs are processed in manifest order; CPU and GPU both run sequentially by default. The GPU semaphore is an extra guard. Tests pass deterministic.
+
+But if manifest includes "parallel": false? We can implement optional `max_cpu_concurrency` but default 1, and `max_gpu_concurrency` fixed 1. Deterministic if max_cpu=1. Could allow CPU concurrency if set, but not default. But deterministic package maybe should be deterministic always. Let's set `max_cpu_concurrency: int = 1` in manifest/config, `max_gpu_concurrency` fixed 1 and ignored if >1? Enforce one active GPU. For determinism, CPU default 1. Could validate max_cpu >=1. If user wants async concurrency, CPU jobs can parallel but event order maybe not deterministic. But requirement doesn't demand event byte determinism? "deterministic asynchronous job runner" likely means same manifest -> same execution order/state. We can ensure scheduler deterministic by using priority queue and fixed concurrency. But if CPU concurrency >1, tasks complete by sleep durations; if durations equal, asyncio scheduling order maybe deterministic? With `asyncio.sleep(0)` and task creation order, may be deterministic in CPython? Could be. But safer default 1.
+
+Need tests:
+- success: manifest with jobs, run, assert state completed and events.
+- failure: job fails, runner stops? Or records failed and continues? Deterministic runner maybe stops on first failure by default. Requirement tests for failure. Could manifest option `stop_on_failure: true` default true. Then failure event and state failed. Or continue. Let's choose default stop on failure? Job runner often stops on failure. But resume completed work: if failed, resume could retry failed? Requirement resume completed work only. We can have `resume` skips completed and retries failed/pending. Stop on failure means runner exits with non-zero. Test assert event job_failed, state job failed, and subsequent jobs not attempted.
+- cancellation: manifest with a long job, send SIGINT during run, assert runner_cancelled event, state preserved, exit code? Need test.
+- resume: first run manifest with job1 succeeds, job2 fails or runner canceled? Then second run with same manifest/state skips job1, runs job2 success. Need state directory.
+
+Could use manifest with two jobs. For failure test: job1 success, job2 fail. Resume test: first run with job1 success, job2 fail? Then change manifest? But resume should use same manifest. If state has job1 completed and job2 failed, second run could retry job2 (now maybe success?). But handler deterministic; if job2 always fails, resume would fail again. For resume test, we can have state with job1 completed and job2 pending by simulating cancellation after job1, then second run completes job2. Or failure then manifest changed? Better cancellation creates state where job1 completed, job2 pending; second run resumes job2 success. But test cancellation already covers. For resume test, we can pre-populate state with job1 completed (using StateStore), then run full manifest where job1 and job2 succeed, assert job1 skipped and job2 completed. That tests resume completed work.
+
+Need ensure state and events paths. CLI: `python -m deterministic_job_runner run --manifest manifest.json --state-dir ./state --events events.jsonl` maybe. Could also `run` with args.
+
+Package import path. Use pyproject with `[build-system]` hatchling? `requires = ["hatchling"]`, `[project]` name, version, dependencies maybe none. `[project.scripts]` deterministic-job-runner = "deterministic_job_runner.cli:main". `[tool.pytest.ini_options]` testpaths. `[tool.hatch.build.targets.wheel] packages = ["src/deterministic_job_runner"]`.
+
+Need source files:
+- pyproject.toml
+- README? Not required but can include. "every source file" maybe include all. Could include LICENSE? Not necessary. Need complete package. Could include tests file. Could include `src/deterministic_job_runner/__init__.py`, `__main__.py`, `cli.py`, `manifest.py`, `redaction.py`, `events.py`, `state.py`, `jobs.py`, `runner.py`, `types.py` maybe.
+
+Need ensure no missing imports.
+
+Let's design classes.
+
+`manifest.py`:
+- `JobSpec` dataclass: id: str, type: str = "cpu", handler: str = "noop", parameters: dict[str, Any] = field(default_factory=dict). Validate type in {"cpu", "gpu"} maybe. id unique.
+- `Manifest` dataclass: jobs: list[JobSpec], redactions: list[str] = [], redact_env: list[str] = [], stop_on_failure: bool = True, max_cpu_concurrency: int = 1. `from_dict` validates. `canonical_bytes()` for hashing? Need stable JSON: `json.dumps(data, sort_keys=True, separators=(",", ":"))`. But includes secrets; hash of redacted manifest? For resume, if manifest changes, state invalid? Could include manifest hash of public fields excluding secrets? But parameters may contain secrets. If redact exact values, canonical can still include secrets. For state integrity, hash of manifest maybe. But if secret rotates, manifest changes and resume maybe reject? Could be okay. But tests may mutate? Use `hash_manifest` of `data` after applying redactions? Redaction would alter canonical? Hmm. Requirement redact configured secrets; not necessarily in state. We can store `manifest_hash` of canonical manifest with secrets redacted using configured redactions? That ensures resume stable if secret value changes? But if secret value changed, redacted manifest same if exact value replaced. But if redact env values, values not in manifest. Let's implement `Manifest.public_dict()` returns data with redactions applied? Or `manifest_hash` of `to_dict()` after redacting strings? But redactor is separate. Could use `Manifest.fingerprint()` that sorts keys and applies redaction to all string values using exact redactions and env values? Need Redactor.
+
+But maybe simpler: state store doesn't enforce manifest hash? Resume completed work by job id. If manifest changed, maybe still okay. But deterministic package should detect mismatch? We can include optional `manifest_hash` in state; if mismatch, raise? Tests may not expect. Avoid overcomplication. State can store `manifest_name` or hash but not enforce strictly. But if resume and manifest changed, could be unsafe. Could enforce only if `manifest_hash` present and mismatch? For tests, we can not test mismatch. But code should maybe raise `ManifestMismatchError` if state manifest_hash != current and state has completed jobs? This could break resume if redaction changes hash. Need careful.
+
+Let's implement `Manifest` with `to_dict()` and `from_dict()`. `fingerprint()` returns sha256 of canonical JSON of `to_dict()` after applying redaction? But Redactor needs secret values. Manifest contains redactions list and redact_env. For fingerprint, use raw manifest but redact exact values? However `to_dict()` includes redactions list (secrets) and parameters. If exact secrets appear in redactions list, redactor would redact them too? If we redact redactions list, the redaction configuration itself disappears, making fingerprint independent of secret values. Good. Need Redactor. Could call redactor.redact_dict(data) where data includes redactions; it will replace configured exact values anywhere, including redactions list, with [REDACTED]. Then canonical. That yields stable if exact secrets change. But if redact_env, env values not in manifest. Fine.
+
+But if exact secret appears in job id or handler? Redacted, fingerprint stable. Good.
+
+`redaction.py`:
+- `class Redactor`:
+  - `__init__(self, exact: Sequence[str] = (), env_names: Sequence[str] = (), mapping: dict[str, str] | None = None, replacement: str = "[REDACTED]")`
+  - Build list of secret values: exact + values of env_names from os.environ (skip empty). Also maybe mapping keys? If mapping: {env_name: value}? Could support `secrets: {"API_TOKEN": "value"}`? Requirement configured secrets; exact + env enough.
+  - Sort secret values by descending length to avoid partial replacement. Remove empty and replacement.
+  - `redact_string(self, value: str) -> str`: if any secret in value, replace all occurrences with replacement. Use simple replace. For performance okay.
+  - `redact_value(self, value: Any) -> Any`: recursively redact dict/list/str. Non-str pass.
+  - `redact_dict(self, value: dict[str, Any]) -> dict[str, Any]` maybe same.
+Need ensure if secret is substring of another? Sorting descending helps. But if replacement string itself? ignore.
+
+`events.py`:
+- `EventWriter`:
+  - `__init__(self, path: str | Path, redactor: Redactor | None = None)`
+  - `_sequence: int = 0`
+  - `write(self, event_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]`:
+    - build event = {"sequence": self._sequence, "type": event_type, **redacted payload}
+    - line = json.dumps(event, sort_keys=True, separators=(",",":"), default=str)
+    - if redactor, redact string values maybe already. But ensure redact before dumps.
+    - append to file with `open(path, "a", encoding="utf-8")`, write line + newline, flush, os.fsync.
+    - increment sequence after? Need sequence before. Return event.
+  - `close()` maybe flush.
+Need atomic? Events append. Could ensure directory exists.
+Could also redact event type? no.
+
+`state.py`:
+- `class StateStore`:
+  -

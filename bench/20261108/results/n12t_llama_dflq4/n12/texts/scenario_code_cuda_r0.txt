@@ -1,0 +1,82 @@
+We need answer user: Implement complete CUDA 13.1/C++20 CLI program that normalizes large BF16 matrix row by row on sm_120a GPU. Include argument parsing, RAII device buffers, numerically stable FP32 reference, vectorized CUDA kernel, warm-up, CUDA-event timing, deterministic input generation, error checking, tolerance-based verification, and CMakeLists.txt. Explain memory layout and launch geometry after code. Do not omit implementations or replace sections with comments.
+
+Need produce final code complete runnable. Need think deeply. CUDA 13.1? There is no CUDA 13.1? Maybe hypothetical. sm_120a. Need target architecture. Need BF16. Use __nv_bfloat16 / __nv_bfloat162 maybe CUDA 11.8+. Vectorized kernel: process 8 bf16 per 64-bit? For sm_120a maybe use cuda_bf16x2? We can use __nv_bfloat16, __nv_bfloat162, uint4 loads/stores 16 bytes = 8 bf16. Need row-wise normalization. What normalization? Probably normalize each row to unit L2 norm? Or maybe normalize by max/sum? Need define. User says normalizes a large BF16 matrix row by row. Likely divide each row by its L2 norm. Implement stable FP32 reference. Need deterministic input generation. Arguments: rows, cols, seed, iterations? maybe tolerance? Need parse. Need RAII device buffers. CUDA event timing. Warm-up. Error checking. CMakeLists for CUDA 13.1 C++20 sm_120a.
+
+Need ensure compile. We can use <cuda_bf16.h>. Need maybe use #include <cuda_runtime.h> and <cuda_fp16.h>? For bf16, #include <cuda_bf16.h> provides __nv_bfloat16, __float2bfloat16_rn, __bfloat162float. There is also __nv_bfloat162 for vector. Use float2bfloat162_rn? Maybe functions: __float2bfloat162_rn(float2) returns __nv_bfloat162? In CUDA bf16 API: __nv_bfloat162 float2bfloat162(float2 x); There are _rn? For float2 to bfloat162: __nv_bfloat162 float2bfloat162_rn(float2)? Need exact names. Let's recall CUDA bf16 API:
+
+#include <cuda_bf16.h>
+typedef struct { __nv_bfloat16 x, y; } __nv_bfloat162;
+__host__ __device__ __forceinline__ __nv_bfloat16 __float2bfloat16(float a);
+__host__ __device__ __forceinline__ __nv_bfloat16 __float2bfloat16_rn(float a);
+__host__ __device__ __forceinline__ float __bfloat162float(__nv_bfloat16 a);
+__host__ __device__ __forceinline__ __nv_bfloat162 __floats2bfloat162_rn(float a, float b);
+__host__ __device__ __forceinline__ __nv_bfloat162 __float2bfloat162_rn(float2 a);
+__host__ __device__ __forceinline__ float2 __bfloat1622float2(__nv_bfloat162 a);
+Maybe yes. Also __nv_bfloat162 __bfloat162bfloat162_rn? No.
+
+Need vectorized loads/stores. We can use uint4 (16 bytes) representing 8 bf16. Need convert to float array. Could reinterpret as __nv_bfloat162[4], convert each to float2. Need ensure 16-byte alignment. For row length multiple of 8? We can require cols multiple of 8 or handle tail scalar. Better make input generation with cols multiple of 8 to avoid tail? But robust handle tail. Could have vectorized main loop for n8 = cols/8, tail scalar. Need normalization row by row. Approach: one block per row? For large matrix, row length may be large. Better process each row by a block with 256 threads. Each row is normalized: compute sum of squares in FP32? Numerically stable: use FP32 sum? They ask numerically stable FP32 reference. Maybe use compensated summation (Kahan) or two-pass? For BF16 to FP32, sum squares can overflow? If values generated moderate. To be stable, use Welford? For sum of squares, Kahan. Or use FP64 reference? They specifically FP32 reference, numerically stable. We can use Kahan compensation in FP32, or pairwise reduction. We'll implement reference host using FP32 with Kahan sum and maybe sqrtf, division. For each row, compute squared norm with Kahan. Normalize by dividing by sqrt(sum). Need handle zero row: leave as zero? Avoid division by zero. If norm=0, output zeros. In kernel, do same.
+
+But if using BF16 output normalized: need convert float to bf16 with rounding. Use __float2bfloat16_rn.
+
+Need deterministic input generation. Use std::mt19937_64 seed, maybe deterministic based on --seed. Fill host FP32 matrix then convert to BF16? Need input BF16. Could generate host vector<__nv_bfloat16> directly using float then convert. Need same for reference: reference should use the exact BF16 input values converted to FP32, not original FP32 before rounding. Important. So generate BF16 first, then reference reads BF16 -> float. Or generate float, convert to bf16, then reference from bf16. Good.
+
+Large matrix. Memory size rows*cols*2 bytes. Need allocate RAII device buffer. Could template DeviceBuffer<T> with cudaMalloc/cudaFree, data(), size. Also host buffer? We can allocate host for input and output reference? Need avoid huge host memory? We can stream row by row for reference to limit memory, but need verify device output vs reference. Could allocate device input/output BF16, host output for reference row by row and compare to device output row by row? For large matrix, we can compute reference per row and compare with device output for that row. Need read device output row into host temporary vector<bf16> size cols. Or compare kernel? Simpler: after full kernel, for each row copy device output row to host, compute reference row from host input row, compare. This copies output twice if already? Could compute reference before kernel from host input row and store expected? But large. Row streaming works.
+
+We have host input vector<__nv_bfloat16> total. For each row, fill temp output_ref vector<float> or bf16. Compute reference. Then cudaMemcpy temp_dev_out row from device? If device output total, copy row. Compare. Need error tolerance.
+
+Tolerance-based verification: BF16 has ~3 decimal digits, 8-bit mantissa. Relative/absolute tolerance. Use per element: diff <= atol + rtol*max(|ref|, |out|). Choose default atol=4e-2? Let's analyze. BF16 ULP near 1 is 2^-7=0.0078125. Division and conversion errors maybe few ulps. Use rtol=1e-2? atol=1e-2 maybe. But to verify deterministic stable maybe use 0.02 absolute, 0.02 relative. Could allow --atol --rtol. If row norm very small, normalized values can be large? If input values around N(0,1) / sqrt(norm) ~ 1/sqrt(cols). For large cols, output magnitudes small. Absolute tolerance should scale. Use rtol=1e-2, atol=1e-3? For small values, relative to ref. But if ref zero, atol. BF16 quantization near 1e-3: ulp? bf16 range with 8 bit mantissa: spacing near 0.001 is ~ 2^-? exponent -10? Mantissa 7 => ulp ~ 2^-17? 7.6e-6. OK. Use default atol=1e-3, rtol=1e-2. Could provide --atol 1e-2 --rtol 1e-2. Better: bf16 relative precision 2^-8 ≈ 0.0039, plus operations; 1e-2 safe. But if tests expect correctness, too loose? Maybe 1e-2 okay. Could use 0.02? We can choose default --atol=1e-2 --rtol=1e-2. Need tolerance-based verification function.
+
+Argument parsing: simple manual parser. Options: --rows, --cols, --seed, --iterations, --warmups, --atol, --rtol, --block-size? maybe --no-verify? Need complete. We can require positive dims. Maybe rows, cols up to size_t. cols not necessarily multiple 8; kernel handles tail. But vectorized alignment: input device buffer allocated by cudaMalloc is 256-byte aligned. Row stride = cols * 2. For row base pointer alignment = row*cols*2. If cols not multiple of 8, row base may not be 16-byte aligned for subsequent rows? E.g. cols=10, row stride=20 bytes not multiple 16, row 1 base offset 20 not aligned. Vectorized 16-byte load misaligned. To support arbitrary cols with 16B vector loads per row, need either require cols multiple of 8, or pad row stride to 16-byte multiple. Better implement memory layout with padded columns: allocate rows * padded_cols * 2 where padded_cols = round_up(cols, 8). But reference and copy need account padding. Or simpler require cols multiple of 8. But user says large BF16 matrix row by row; could enforce cols % 8 == 0. For general, we can support any cols but launch geometry uses per-row blocks with vector loads from row start. If row stride not aligned, vector loads unsafe. Could do per row copy? We can instead allocate flat matrix with row stride aligned to 8, and pass cols, stride_cols. Input generation and reference use stride. Kernel uses in_stride, out_stride. Then vectorized loads within each row use n8 = cols/8 and tail. Row base pointer always aligned because stride_cols multiple 8 => byte stride multiple 16. This is robust and efficient. Good.
+
+Memory layout: device buffer of rows * stride_cols * 2 bytes. stride_cols = (cols + 7)/8*8. Each row has cols valid BF16 followed by padding to 8. Kernel only reads/writes valid cols; tail padding uninitialized maybe not matter. For output, padding can be uninitialized. Reference uses valid cols. Good.
+
+Launch geometry: Need normalize each row. Options:
+1. One block per row. block 256 threads. Each thread processes multiple vector chunks across row. For row length huge (e.g. 1M), one block 256 threads can process many chunks. Need compute row sum of squares. Approach: each block handles one row, use shared memory reduction for sum. Each thread accumulates local Kahan sum over its elements, then reduce in shared, then normalize. Since block per row, no inter-block. Good for large rows. For very large rows, one block may be bottleneck but okay. If rows huge, grid = rows. Max grid dim? x can be up to 2^31-1, rows size_t maybe >? Use blockIdx.x int. Could if rows > INT_MAX error. We can cap or use 1D grid with uint? blockIdx.x unsigned int? CUDA blockIdx.x is unsigned int. grid.x max 2^31-1 for 1D? Actually max x 2^31-1? Use if rows > 2147483647 error. Could use 2D grid? rows can be large but memory limits. For practical. Could use gridDim.x = rows (size_t to unsigned int check). Or if rows large, use grid 2D x,y to exceed? Max 1D x 2^31-1 ~2.1B; memory impossible. Fine.
+
+But one block per row and block 256. For each row, total chunks = ceil(cols / 8). Each thread processes chunks with stride blockDim.x. Need reduce sum. Kahan per thread. Then block reduction. Need implement careful.
+
+Potential issue: row length small (cols < 8). We handle n8=0, tail. Thread only if global < cols. For sum reduction, only active threads may contribute; inactive zero. Need reduction across blockDim. Shared float sums[256], comp[256]. Set to local. Synchronize. Warp shuffles? Since block <=1024. We can do simple loop for stride = blockDim/2. But Kahan compensation combine? Need combine sums. Could just sum all local compensated sums? We want numerically stable. If each thread Kahan over its elements, final sum of thread sums may introduce error. Could reduce pairwise with Kahan? Simpler: after per-thread Kahan, do standard block sum of partial sums in FP32. For numerical stability, maybe enough? Or use compensated summation in reduction. Could implement combine two (sum, comp) values using Neumaier? Let's think.
+
+Reference uses Kahan over row sequential in FP32. Kernel: each thread Kahan over assigned elements, then partial sums. To be stable, combine partial sums using Kahan-like. But block reduction order differs. Need tolerance covers. Could instead use two-pass? Pass 1 compute sum via per-thread Kahan, reduce with shared using a compensated summation: accumulate a block_sum with compensation by iterating thread indices. But reduction tree may be less stable. Could simply assign one thread to sequentially sum all partial sums with Kahan after all threads write partial sums to shared. That is O(blockSize) and stable. Then broadcast. For block 256, fine.
+
+Kernel design:
+__global__ void normalize_rows_bf16(const __nv_bfloat16* __restrict__ in, __nv_bfloat16* __restrict__ out, int rows, int cols, int stride_cols)
+{
+  int row = blockIdx.x;
+  if (row >= rows) return;
+  const __nv_bfloat16* in_row = in + (size_t)row * stride_cols;
+  __nv_bfloat16* out_row = out + (size_t)row * stride_cols;
+  float s = 0.0f, c = 0.0f;
+  int nvec = cols >> 3;
+  for (int v = threadIdx.x; v < nvec; v += blockDim.x) {
+     uint4 raw = reinterpret_cast<const uint4*>(in_row)[v];
+     __nv_bfloat162 h2[4]; memcpy? We can union? Need portable.
+     __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(&raw); // raw 16 bytes. OK if alignment.
+     for i 0..3:
+       float2 f2 = __bfloat1622float2(h[i]);
+       // Kahan add f2.x*f2.x and f2.y*f2.y
+  }
+  // tail:
+  for (int i = nvec*8 + threadIdx.x; i < cols; i += blockDim.x) { float f = __bfloat162float(in_row[i]); kahan add }
+  // write partial sums and comps? We need reduce sums. Maybe just partial sums (with compensation? local sum already includes compensation? Kahan sum stored s; c is compensation not needed for combining? If combine sums sequentially with Kahan, okay.)
+  __shared__ float sbuf[1024]; // max block 1024. But if compile with 256 only, can use 1024.
+  sbuf[threadIdx.x] = s;
+  __syncthreads();
+  float total = 0.0f, comp = 0.0f;
+  for (int i=0; i<blockDim.x; ++i) { kahan_add(total, comp, sbuf[i]); }
+  // Could parallel reduce first then final stable? Sequential 1024 is okay.
+  // broadcast? all threads compute total same.
+  float norm = sqrtf(total);
+  float inv = (norm > 0.0f) ? 1.0f / norm : 0.0f;
+  // normalize and store vectorized
+  for v...
+    uint4 raw = ...;
+    __nv_bfloat162* h = ...;
+    for i: float2 f = __bfloat1622float2(h[i]); f.x *= inv; f.y *= inv; h[i] = __floats2bfloat162_rn(f.x, f.y); // or __float2bfloat162_rn(f)
+    reinterpret_cast<uint4*>(out_row)[v] = raw;
+  tail similar.
+}
+
+Need ensure uint4 load from const pointer. reinterpret_cast<const uint4*> requires 16-byte aligned. Row base aligned, each vector offset 16 bytes, OK.
+
+But using reinterpret_cast<__nv_bfloat162*>(&raw) where raw is local uint4. Is it OK? uint4 has four unsigned ints, 16 bytes. __nv_bfloat162 is two bf16. Alignment of raw? local variable may have 4-byte alignment, not 16. reinterpret_cast to __nv_bfloat162* may violate strict aliasing/alignment? In CUDA, __nv_bfloat162 likely 2-byte aligned? Actually struct of two bf16 maybe 2-byte? It may be 2 bytes? Wait __nv_bfloat16 is typedef unsigned short? 2 bytes. __nv_bfloat162 is struct { __nv_bfloat16 x,y; } size 4? Let's check. BF16 is 16-bit, pair maybe 32-bit. So alignment 2. Reinterpret local uint4 to __nv_bfloat162* is okay size 16, alignment 2? But raw as uint4 might be 16-byte alignment? local may not, but access elements through pointer with 2-byte alignment okay if each element offset even. But strict

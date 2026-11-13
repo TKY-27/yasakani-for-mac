@@ -1,0 +1,129 @@
+We need answer user's request. Need output exactly 160 JSONL records, no Markdown. Each line object fields id RUN-0001 through RUN-0160, model alternating qwen3.6-27b and qwen3.6-35b-a3b. prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance, status, tags. Deterministic arithmetic progressions, status values ok/warn in 4:1 pattern, two tags per record. Every line parse as strict JSON.
+
+Need craft 160 lines. Need likely arithmetic progressions for numeric fields. Need decide formulas. IDs sequential. Model alternating: maybe odd i qwen3.6-27b, even i qwen3.6-35b-a3b.
+Prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance deterministic arithmetic progressions. Need likely all fields as numbers? decode_tok_s numeric, mtp_acceptance maybe probability 0..1. Arithmetic progressions: e.g. prompt_tokens = 1024 + (n-1)*64? completion_tokens = 256 + (n-1)*8? decode_tok_s = 30 + (n-1)*0.01? mtp_acceptance = 0.5 + (n-1)*0.001? Need ensure valid JSON numbers. Could be decimals. Strict JSON allows. Need exactly 160.
+Status ok/warn in 4:1 pattern: 4 ok then 1 warn repeating? 160 divisible by 5 => 128 ok, 32 warn. Pattern positions n mod 5: 0,1,2,3 ok? Let's define if (n-1)%5==4 warn else ok. Two tags per record. Need tags deterministic maybe ["gen","mtp"] but could vary? Requirement two tags per record. Could be constant. But maybe better deterministic tags from model/status? Each line has two tags. Use ["qwen3.6","mtp"]? Or based on model and status: e.g. ["qwen3.6-27b","ok"] but tags per record two. Need ensure no special chars. Strict JSON.
+
+Need output no markdown. Need maybe produce 160 lines. Could manually generate? Need be careful count. Could use mental generation or create pattern. We can't run code. But can construct using formulas and list all 160. Need exact 160. Could possibly output using repeated pattern? Need no markdown. We can generate in final by writing all lines. Need ensure no mistakes. Could maybe use concise fields. We need 160 JSON objects. We can make formulas simple and manually enumerate. To reduce errors, choose formulas that allow simple numbers maybe integer increments. Need prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance arithmetic progressions. If all integers? decode_tok_s integer? "decode_tok_s" maybe tokens/sec, can be integer. mtp_acceptance integer? acceptance maybe 0-1, but arithmetic progression can be integer e.g. 50 + n? not probability. Could be "mtp_acceptance" as percent? It says mtp_acceptance likely value maybe 0.0-1.0, but not specified. Arithmetic progression can be integers too? Better to have decimal probability. But decimal enumeration 160 values could be error prone. Could choose mtp_acceptance as integer? Might be acceptable? Field name no units. Maybe deterministic arithmetic progressions, no constraint. Could make mtp_acceptance integer from 1 to 160? But acceptance usually ratio. Could be percent? To be safe, use decimal but simple: 0.5000, 0.5001 etc. 160 values with 4 decimals. Need enumerate. Could avoid decimals by using mtp_acceptance as integer percentage? But name acceptance maybe could be 50, 51... It's ambiguous. Strict JSON okay. The user likely expects deterministic arithmetic progressions for numeric fields. Could use integer for all: prompt_tokens=100+n, completion_tokens=10+n, decode_tok_s=100+n, mtp_acceptance=50+n (percent). But mtp_acceptance not percent? Hmm.
+
+Maybe use "mtp_acceptance" as 0.5 + 0.0001*(n-1) to be probability. But 160 enumeration with four decimals doable but risk. Could use 3 decimals: 0.500 to 0.659? Step 0.001. Then 160 values: 0.500, 0.501, ..., 0.659. Easy. Arithmetic progression. Use 3 decimal places. JSON number can have trailing zeros? yes 0.500 valid. Need ensure numbers parse. For prompt_tokens/completion_tokens/decode_tok_s use integers simple.
+
+Need status pattern. Tags two per record. Could use constant ["arith","deterministic"]? That's two tags. But maybe more meaningful. Need exact.
+
+Need generate 160 lines. To ensure count, can group by 10 or 20. Let's plan lines:
+For n from 1 to 160:
+id: RUN-0001...
+model: if n odd qwen3.6-27b else qwen3.6-35b-a3b.
+prompt_tokens = 1024 + (n-1)*64? For n=1 1024, n=160 1024+159*64=1024+10176=11200. Good.
+completion_tokens = 256 + (n-1)*8? n=160 256+1272=1528. Good.
+decode_tok_s = 3000 + (n-1)*10? n=160 5090. Good.
+mtp_acceptance = 0.500 + (n-1)*0.001 => 0.500 to 0.659. Good. Need format exactly 3 decimals? JSON number can be 0.5? To be consistent arithmetic progression visible, use 0.500, 0.501, ... 0.659. JSON strict allows leading zeros after decimal. Good.
+status: warn if (n-1)%5==4, i.e. n mod5=0 => n=5,10,...160 warn, others ok. That's 4 ok then 1 warn pattern. Good.
+tags: Need two tags per record. Could vary deterministic: maybe ["qwen3.6","mtp"] constant. Or include model? two tags: first model? But model field already. Tags could be ["arithmetic","ok/warn"]? The requirement just two tags per record. Use constant ["run","mtp"]? Better maybe ["decode","mtp"] constant. Need no duplicates? two tags can be same? Better two distinct. Use ["qwen3.6","mtp"] for all. That's two. Is that too generic? Fine. But maybe tags should be strings. Could be ["bench","mtp"].
+
+Need exact 160 lines. We can generate systematically. To avoid manual 160 lines error, maybe create pattern in final with all lines. Need count carefully.
+
+Let's define line template:
+{"id":"RUN-XXXX","model":"...","prompt_tokens":P,"completion_tokens":C,"decode_tok_s":D,"mtp_acceptance":A,"status":"S","tags":["qwen3.6","mtp"]}
+
+Need compute values for each n. Could group by 10. We can enumerate 1-160. Let's make table.
+
+Formulas:
+n: P=1024+64*(n-1)
+C=256+8*(n-1)
+D=3000+10*(n-1)
+A=0.500+0.001*(n-1)
+status: n%5==0 warn else ok
+model: odd q27, even q35.
+
+Let's list n and values.
+n=1: P1024 C256 D3000 A0.500 status ok model odd q27
+2: P1088 C264 D3010 A0.501 warn? n=2 no ok; model even q35
+3: P1152 C272 D3020 A0.502 ok q27
+4: P1216 C280 D3030 A0.503 ok q35
+5: P1280 C288 D3040 A0.504 warn q27
+6: P1344 C296 D3050 A0.505 ok q35
+7: P1408 C304 D3060 A0.506 ok q27
+8: P1472 C312 D3070 A0.507 ok q35
+9: P1536 C320 D3080 A0.508 ok q27
+10: P1600 C328 D3090 A0.509 warn q35
+Good.
+
+11: P1664 C336 D3100 A0.510 ok q27
+12: P1728 C344 D3110 A0.511 ok q35
+13: P1792 C352 D3120 A0.512 ok q27
+14: P1856 C360 D3130 A0.513 ok q35
+15: P1920 C368 D3140 A0.514 warn q27
+16: P1984 C376 D3150 A0.515 ok q35
+17: P2048 C384 D3160 A0.516 ok q27
+18: P2112 C392 D3170 A0.517 ok q35
+19: P2176 C400 D3180 A0.518 ok q27
+20: P2240 C408 D3190 A0.519 warn q35
+
+21: P2304 C416 D3200 A0.520 ok q27
+22: P2368 C424 D3210 A0.521 ok q35
+23: P2432 C432 D3220 A0.522 ok q27
+24: P2496 C440 D3230 A0.523 ok q35
+25: P2560 C448 D3240 A0.524 warn q27
+26: P2624 C456 D3250 A0.525 ok q35
+27: P2688 C464 D3260 A0.526 ok q27
+28: P2752 C472 D3270 A0.527 ok q35
+29: P2816 C480 D3280 A0.528 ok q27
+30: P2880 C488 D3290 A0.529 warn q35
+
+31: P2944 C496 D3300 A0.530 ok q27
+32: P3008 C504 D3310 A0.531 ok q35
+33: P3072 C512 D3320 A0.532 ok q27
+34: P3136 C520 D3330 A0.533 ok q35
+35: P3200 C528 D3340 A0.534 warn q27
+36: P3264 C536 D3350 A0.535 ok q35
+37: P3328 C544 D3360 A0.536 ok q27
+38: P3392 C552 D3370 A0.537 ok q35
+39: P3456 C560 D3380 A0.538 ok q27
+40: P3520 C568 D3390 A0.539 warn q35
+
+41: P3584 C576 D3400 A0.540 ok q27
+42: P3648 C584 D3410 A0.541 ok q35
+43: P3712 C592 D3420 A0.542 ok q27
+44: P3776 C600 D3430 A0.543 ok q35
+45: P3840 C608 D3440 A0.544 warn q27
+46: P3904 C616 D3450 A0.545 ok q35
+47: P3968 C624 D3460 A0.546 ok q27
+48: P4032 C632 D3470 A0.547 ok q35
+49: P4096 C640 D3480 A0.548 ok q27
+50: P4160 C648 D3490 A0.549 warn q35
+
+51: P4224 C656 D3500 A0.550 ok q27
+52: P4288 C664 D3510 A0.551 ok q35
+53: P4352 C672 D3520 A0.552 ok q27
+54: P4416 C680 D3530 A0.553 ok q35
+55: P4480 C688 D3540 A0.554 warn q27
+56: P4544 C696 D3550 A0.555 ok q35
+57: P4608 C704 D3560 A0.556 ok q27
+58: P4672 C712 D3570 A0.557 ok q35
+59: P4736 C720 D3580 A0.558 ok q27
+60: P4800 C728 D3590 A0.559 warn q35
+
+61: P4864 C736 D3600 A0.560 ok q27
+62: P4928 C744 D3610 A0.561 ok q35
+63: P4992 C752 D3620 A0.562 ok q27
+64: P5056 C760 D3630 A0.563 ok q35
+65: P5120 C768 D3640 A0.564 warn q27
+66: P5184 C776 D3650 A0.565 ok q35
+67: P5248 C784 D3660 A0.566 ok q27
+68: P5312 C792 D3670 A0.567 ok q35
+69: P5376 C800 D3680 A0.568 ok q27
+70: P5440 C808 D3690 A0.569 warn q35
+
+71: P5504 C816 D3700 A0.570 ok q27
+72: P5568 C824 D3710 A0.571 ok q35
+73: P5632 C832 D3720 A0.572 ok q27
+74: P5696 C840 D3730 A0.573 ok q35
+75: P5760 C848 D3740 A0.574 warn q27
+76: P5824 C856 D3750 A0.575 ok q35
+77: P5888 C864 D3760 A0.576 ok q27
+78: P5952 C872 D3770 A0.577 ok q35
+79: P6016 C880 D3780 A0.578 ok q27
+80: P6080 C888 D3790 A0.579 warn q35
+
+81: P6144 C896 D3800 A0.580

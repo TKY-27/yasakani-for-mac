@@ -1,0 +1,43 @@
+# 发布流程
+
+发布负责人必须严格保留诸如 `request_id`、`max_context`、`kv_dtype` 和 `mtp_rounds` 等标识符。请将正文翻译为中文，但不要翻译代码、JSON 键、命令行标志、文件名或表格中的值。
+
+| Phase | Required evidence | Failure action |
+|---|---|---|
+| prepare | fixture hash and prompt-token count | stop before generation |
+| warmup | one successful unmeasured request | restart the service |
+| measure | five sequential responses | invalidate the complete block |
+| publish | summary plus per-request rows | withhold the headline |
+
+```json
+{"model":"qwen3.6-35b-a3b","max_completion_tokens":1024,"seed":42,"stream":false}
+```
+
+## 备注
+
+操作员需检查前缀重用是否已禁用，缓存命中计数是否为零，以及是否有无关的 GPU 进程正在运行。自然停止的响应仍被视为有效观察；因客户端断开连接而丢失的响应则不是。报告区分了服务器内部 TTFT 和网络观测时间，并解释首个生成的 token 被分配给 prefill 阶段。
+
+---
+
+### 双语术语表 (Bilingual Glossary)
+
+1. **Release owner** (发布负责人): 负责监督整个发布流程并确保合规性的主要人员。
+2. **Identifier** (标识符): 用于唯一识别系统内特定对象或参数的代码或名称。
+3. **Prose** (正文/散文): 文档中非代码、非结构化的叙述性文本部分。
+4. **JSON key** (JSON 键): JSON 对象中用于映射到特定值的字符串名称。
+5. **Command-line flag** (命令行标志): 在终端命令中用于修改程序行为的参数前缀（如 -v, --debug）。
+6. **Filename** (文件名): 用于标识存储设备上文件或目录的名称。
+7. **Phase** (阶段): 发布或测试流程中的一个特定步骤或时期。
+8. **Required evidence** (所需证据): 证明某个阶段成功完成所必须提供的数据或日志。
+9. **Failure action** (失败操作): 当某个阶段未满足要求时系统或人员应采取的补救措施。
+10. **Fixture hash** (测试夹具哈希): 用于验证测试数据完整性的哈希值。
+11. **Prompt-token count** (提示词令牌数): 输入提示词经过分词器处理后生成的 token 数量。
+12. **Unmeasured request** (未测量请求): 用于预热但不计入性能统计的请求。
+13. **Sequential responses** (顺序响应): 按时间顺序依次返回的多个结果。
+14. **Invalidate** (使无效): 标记数据或结果不可用，通常因为测试条件被破坏。
+15. **Headline** (标题/头条): 报告中总结主要结论或关键指标的部分。
+16. **Prefix reuse** (前缀重用): 利用之前计算过的相同前缀的 KV 缓存以加速推理的技术。
+17. **Cache-hit count** (缓存命中计数): 成功从缓存中获取数据而非重新计算的次数。
+18. **GPU process** (GPU 进程): 正在使用图形处理单元进行计算的操作系统进程。
+19. **TTFT** (Time To First Token): 从发送请求到收到第一个生成 token 的时间间隔。
+20. **Prefill** (预填充): 大语言模型处理输入提示词并生成初始 KV 缓存的阶段。

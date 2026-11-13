@@ -1,0 +1,15 @@
+label llama_mtp2  model <gguf_dir>/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf  temperature 1.00
+cat         fixture                            mean      min      max   ntok
+code        scenario_code_cuda                133.3    131.7    135.0   4096
+code        scenario_code_python              138.6    129.7    147.5   4096
+code        scenario_code_typescript          137.4    136.0    138.8   4096
+story       scenario_story_zh_scifi           123.2    122.1    124.4   4096
+story       scenario_story_en_mystery         119.6    119.6    119.6   4096
+story       scenario_story_zh_dialogue        121.9    121.7    122.1   4096
+translation scenario_translation_zh_en        162.5    162.1    162.8   4096
+translation scenario_translation_en_zh        155.4    154.6    156.2   4096
+translation scenario_translation_markdown     149.5    149.5    149.6   4096
+structured  scenario_structured_jsonl         165.7    162.2    169.2   4096
+structured  scenario_structured_csv           150.9    149.0    152.8   4096
+structured  scenario_structured_sql           137.7    133.7    141.7   4096
+per category (mean of runs): code 136.4, story 121.6, translation 155.8, structured 151.4

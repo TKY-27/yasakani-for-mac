@@ -1,0 +1,26 @@
+Traceback (most recent call last):
+  File "<work_dir>\stream_capture.py", line 85, in <module>
+    main()
+    ~~~~^^
+  File "<work_dir>\stream_capture.py", line 63, in main
+    capture(a.base, body_for([{"role": "user", "content": "Write the numbers 1 to 40 as a JSON list."}], 160))
+    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<work_dir>\stream_capture.py", line 22, in capture
+    with urllib.request.urlopen(req, timeout=1800) as r:
+         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "<python_dir>\Lib\urllib\request.py", line 187, in urlopen
+    return opener.open(url, data, timeout)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "<python_dir>\Lib\urllib\request.py", line 493, in open
+    response = meth(req, response)
+  File "<python_dir>\Lib\urllib\request.py", line 602, in http_response
+    response = self.parent.error(
+        'http', request, response, code, msg, hdrs)
+  File "<python_dir>\Lib\urllib\request.py", line 531, in error
+    return self._call_chain(*args)
+           ~~~~~~~~~~~~~~~~^^^^^^^
+  File "<python_dir>\Lib\urllib\request.py", line 464, in _call_chain
+    result = func(*args)
+  File "<python_dir>\Lib\urllib\request.py", line 611, in http_error_default
+    raise HTTPError(req.full_url, code, msg, hdrs, fp)
+urllib.error.HTTPError: HTTP Error 503: Service Unavailable

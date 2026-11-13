@@ -1,0 +1,41 @@
+# 发布流程
+
+发布负责人必须严格保留诸如 `request_id`、`max_context`、`kv_dtype` 和 `mtp_rounds` 等标识符。将正文翻译为中文，但不要翻译代码、JSON 键、命令行标志、文件名或表格中的值。
+
+| Phase | Required evidence | Failure action |
+|---|---|---|
+| prepare | fixture hash and prompt-token count | stop before generation |
+| warmup | one successful unmeasured request | restart the service |
+| measure | five sequential responses | invalidate the complete block |
+| publish | summary plus per-request rows | withhold the headline |
+
+```json
+{"model":"qwen3.6-35b-a3b","seed":42,"stream":false}
+```
+
+## 注意事项
+
+操作员需检查前缀复用已禁用，缓存命中计数为零，且没有无关的 GPU 进程处于活动状态。自然停止的响应仍视为有效观测；因客户端断开连接而丢失的响应则不视为有效。报告区分了服务器内部 TTFT 和网络观测时间，并解释首个生成的 token 归属于 prefill 阶段。
+
+### 双语术语表
+
+1. **Release procedure / 发布流程**: 软件版本从开发到正式发布的标准化步骤。
+2. **Request ID / 请求标识符**: 用于唯一标识单次 API 调用的字符串，便于追踪和调试。
+3. **Max Context / 最大上下文**: 模型在处理输入时允许的最大 token 数量限制。
+4. **KV Dtype / KV 数据类型**: 键值缓存（Key-Value Cache）中存储数据的数据类型（如 float16, bfloat16）。
+5. **MTP Rounds / MTP 轮次**: 多 token 预测（Multi-Token Prediction）中并行生成的 token 轮数。
+6. **Fixture Hash / 测试夹具哈希**: 用于验证测试数据完整性的哈希值，确保输入一致性。
+7. **Prompt Token Count / 提示词 Token 数**: 输入提示词经过分词器处理后的 token 总数。
+8. **Warmup / 预热**: 正式测量前进行的非计时请求，用于初始化缓存和 JIT 编译。
+9. **Unmeasured Request / 未测量请求**: 不计入性能统计数据的请求，通常用于预热。
+10. **Sequential Responses / 顺序响应**: 按时间顺序依次生成并记录的多个响应结果。
+11. **Invalidate Block / 使块失效**: 当数据不一致时，丢弃整个测试块的数据以确保有效性。
+12. **Withhold Headline / 保留标题结论**: 在数据不完整或异常时，暂不发布主要性能结论。
+13. **Prefix Reuse / 前缀复用**: 利用相同前缀的缓存来加速后续请求的技术。
+14. **Cache Hit Count / 缓存命中计数**: 记录请求成功命中缓存的次数，用于评估缓存效率。
+15. **GPU Process / GPU 进程**: 占用 GPU 资源的操作系统进程，可能影响性能测试的纯净性。
+16. **Natural Stop / 自然停止**: 模型生成结束符（EOS）或达到最大长度而正常结束。
+17. **Client Disconnection / 客户端断开**: 客户端主动或意外终止连接，导致响应丢失。
+18. **TTFT / 首字延迟**: Time To First Token，从请求发出到收到第一个生成 token 的时间。
+19. **Network Observed Time / 网络观测时间**: 从客户端视角测量到的端到端延迟，包含网络开销。
+20. **Prefill / 预填充**: 模型处理输入提示词并生成初始 KV 缓存的阶段。

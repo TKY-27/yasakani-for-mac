@@ -1,0 +1,173 @@
+We need answer user's request: write complete Python 3.11 package for deterministic asynchronous job runner. Need read JSON manifest, enforce one active GPU job, persist atomic state, resume completed work, stream structured JSONL events, handle SIGINT, redact configured secrets, include pytest tests for success, failure, cancellation, resume. Present every source file in separate fenced block with path and include pyproject.toml.
+
+Need produce final with many fenced code blocks. Need design robust. Let's reason extensively.
+
+Requirements:
+- deterministic asynchronous job runner.
+- reads JSON manifest.
+- enforce one active GPU job.
+- persist atomic state.
+- resume completed work.
+- stream structured JSONL events.
+- handle SIGINT.
+- redact configured secrets.
+- include pytest tests for success, failure, cancellation, resume.
+- Present every source file in separate fenced block with its path.
+- include pyproject.toml.
+
+Need package complete runnable. Need likely modules:
+- pyproject.toml
+- src? choose layout. Maybe package name `async_job_runner` with src/async_job_runner/__init__.py, models.py, manifest.py, state.py, events.py, secrets.py, runner.py, scheduler.py? CLI.py, __main__.py.
+- tests: test_success.py, test_failure.py, test_cancellation.py, test_resume.py, maybe conftest.py.
+
+Need deterministic: avoid timestamps? deterministic order, maybe include monotonic event ids and deterministic seed? Use asyncio. For GPU job enforcement: scheduler ensures only one job with resource 'gpu' at a time. Could have jobs in manifest with `resources: {"gpu": 1}` or `gpu: true`. Need one active GPU job.
+
+Need persistent atomic state: use tempfile + os.replace. State file JSON with completed job ids, cancelled? interrupted? events? deterministic? For resume completed work: skip completed jobs.
+
+Streaming structured JSONL events: event log file or stdout? Need stream to file and maybe callback. Event objects: type, id, job_id, status, data, seq. Redact secrets before writing/streaming.
+
+Handle SIGINT: register signal handler, set cancel event, stop active job, persist state, exit with code? In tests can call cancel.
+
+Redact configured secrets: config has secrets list or values? "configured secrets" likely secrets in manifest or environment? Need redact configured secrets from events/state. Implement `Redactor` with patterns: list of literal secrets or names. Could support `secrets: ["secret_value1", "secret_value2"]` or environment variable names? Simpler: config `redact_secrets`: list of strings; all event serialization passes through redactor replacing with `[REDACTED]`. But if secret values unknown? Could also read from environment names. Let's design: manifest has optional `secrets` as list of strings or object mapping name->value? Or config `secret_env_vars`: names. Need redact configured secrets. We can have `SecretsConfig` with literals and env names. In manifest: `"redaction": {"literals": ["abc"], "env": ["API_KEY"]}`. The runner redacts in event payloads and state? State can store sanitized? To keep deterministic, maybe store no secrets. But manifest may contain secrets in parameters. Need redact before events and maybe state.
+
+Need deterministic asynchronous job runner: jobs have duration? We need simulate GPU jobs. Could use `command`? Maybe deterministic: no actual GPU, jobs declare `duration` in seconds and `fail` maybe? For tests, use small durations and fake. Need deterministic order: sort by `priority` then `id`. Use asyncio.sleep? Sleep introduces nondeterminism if real time but deterministic sequence if event loop? For tests, could monkeypatch sleep? Better implement jobs as async function based on manifest: `steps` or `duration`? Need runner can execute arbitrary? But package should be generic? Maybe manifest entries specify `action` and `params`, runner has built-in actions `sleep`, `fail`, `echo`? Tests can use sleep/fail. Deterministic asynchronous job runner maybe just scheduler for jobs with simulated work. Could allow `run`: function reference? But for tests and package, simpler: manifest job has `duration` (float seconds) and optional `fail_after` or `fail`. To be complete and runnable, include built-in `simulate` action. But user likely expects code not real GPU. We can state GPU job is represented by resource requirement.
+
+Need complete Python 3.11 package. We can choose structure:
+
+Package name: `deterministic_async_job_runner`? Maybe `jobrunner`. Need pyproject. Let's choose `asyncjobrunner` or `deterministic_job_runner`. Use src layout: `src/deterministic_job_runner`.
+
+Files:
+- pyproject.toml
+- src/deterministic_job_runner/__init__.py
+- src/deterministic_job_runner/exceptions.py
+- src/deterministic_job_runner/models.py
+- src/deterministic_job_runner/manifest.py
+- src/deterministic_job_runner/redaction.py
+- src/deterministic_job_runner/state.py
+- src/deterministic_job_runner/events.py
+- src/deterministic_job_runner/scheduler.py
+- src/deterministic_job_runner/runner.py
+- src/deterministic_job_runner/cli.py
+- src/deterministic_job_runner/__main__.py
+- tests/conftest.py
+- tests/test_success.py
+- tests/test_failure.py
+- tests/test_cancellation.py
+- tests/test_resume.py
+- maybe README? Not required, but can include.
+
+Need ensure tests pass. Need design details.
+
+Manifest schema:
+```
+{
+  "name": "demo",
+  "secrets": {
+    "literals": ["s3cr3t"],
+    "env": ["API_KEY"]
+  },
+  "jobs": [
+    {"id": "j1", "gpu": true, "duration": 0.01, "params": {"key": "s3cr3t"}},
+    {"id": "j2", "gpu": true, "duration": 0.01, "fail": true, "params": {"key": "s3cr3t"}}
+  ]
+}
+```
+Maybe `resources: {"gpu": 1}`. Simpler: `gpu: true`. But enforce one active GPU job. Could support `resources` dict with `"gpu": 1`. Need one active GPU job: if resource gpu requested > 0, scheduler ensures no concurrent gpu job.
+
+Deterministic scheduling:
+- Sort jobs by `priority` ascending, then `id` lexicographic. But if GPU constraints, first ready job.
+- Each job has `duration` simulated with `await asyncio.sleep(duration)` but to make tests deterministic maybe use `asyncio.sleep(0)` and `duration` ignored? Need asynchronous job runner; could use `await asyncio.sleep(job.duration)` but tests can monkeypatch or set small durations. Deterministic in sense scheduling order, not wall time? If using sleep, order deterministic but time not. For tests success/failure/cancel, small durations okay. But cancellation test: need cancel active job while sleeping. Signal handler will set cancellation. In tests, can start runner task and send SIGINT? Hard in pytest cross-platform. Better expose `runner.request_cancel()` and also handle SIGINT in CLI. For test cancellation, start runner with a long job, call `cancel_event.set()`, assert interrupted. For SIGINT handling, include code and maybe test handler via `signal.signal`? Could test `install_signal_handler` by sending SIGINT in same process? Risk. Could unit test `_handle_sigint` sets event.
+
+Need "handle SIGINT" requirement. We can implement `Runner.install_signal_handlers()` that calls `signal.set_wakeup_fd`? For asyncio, use `loop.add_signal_handler(SIGINT, cancel_event.set)` if supported; fallback signal.signal. In CLI `main` calls. For tests, test `runner.request_cancel()` and maybe `install_signal_handlers` monkeypatch? Need not test SIGINT directly but cancellation test covers. But user asked include tests for cancellation, not specifically SIGINT. Good.
+
+Persistent atomic state:
+- State file JSON: `{"version": 1, "manifest_hash": ..., "completed": [...], "failed": [...], "interrupted": [], "event_seq": n, "started_jobs": ...?}`.
+- Atomic write: write to temp in same dir, fsync, os.replace.
+- State updated after each event? We can persist after each job status and at startup/cancel. Also event log JSONL append? Need atomic state but event log can append line by line. To make deterministic, event seq increments.
+
+Resume completed work:
+- At start, load state. If state's manifest_hash matches, completed jobs skipped. Event log may resume with offset? We can append new events with seq from state. Completed jobs emit `resume_skipped` event? Need stream structured events. For each completed job from state, emit `job_skipped` with reason `completed` maybe. Then run remaining.
+
+Events:
+Types:
+- `run_started`
+- `job_queued`
+- `job_started`
+- `job_succeeded`
+- `job_failed`
+- `job_cancelled`
+- `job_skipped`
+- `run_finished`
+- `redaction_applied`? maybe not.
+Each event: `{"seq": int, "type": str, "job_id": str|None, "status": str|None, "ts": deterministic?}`. Timestamps nondeterministic. For deterministic, maybe omit wall timestamp or use logical counter. Could include `clock` from simulated logical clock, not real time. For structured JSONL, no timestamps needed. Use `seq` and `phase`. If need time, use `event_clock` increments. So deterministic JSONL.
+- Event log line: JSON string with redacted payload.
+
+Redaction:
+- `Redactor` with literals and env values. Need handle nested dicts/lists/strings. Replace occurrences in strings. For exact match? Could replace any occurrence of literal in string with `[REDACTED]`. If secret not found, no change. Also if secret appears as key? We can redact values if key in secret env names? Maybe not. Simpler: string substitution for all secrets. But if secret is JSON with braces? Literal substitution fine.
+- For env vars: `os.environ.get(name)` if set, add to literals. Need handle empty? skip.
+- Configured secrets: manifest `redaction` with `literals`, `env`. Also state? Use manifest.
+- Need redact before writing events and state? State includes `params`? We may not store params except job id and result. To be safe, store sanitized job summary. But for resume, only need completed ids. So no secrets in state. But event data includes params? We can include job spec summary with `gpu`, `duration`, redacted params. Need redact.
+
+Job execution:
+- Need deterministic and testable. Maybe use `JobSpec.duration` and `JobSpec.fail`. Execution:
+```
+async def execute(spec, cancel_event):
+   emit job_started
+   if spec.fail:
+      await _maybe_cancelable_sleep(spec.fail_after or 0.01, cancel_event)
+      emit job_failed; raise JobFailed
+   else:
+      await _maybe_cancelable_sleep(spec.duration, cancel_event)
+      emit job_succeeded
+```
+But if cancel occurs during sleep, `asyncio.CancelledError` or custom `JobCancelled`. Need handle SIGINT: cancel_event set; sleep wrapper polls? Better use `asyncio.wait` with sleep and cancel event: `done, pending = await asyncio.wait({asyncio.sleep(duration), cancel_event.wait()}, return_when=FIRST_COMPLETED)`. If cancel event done, raise `JobCancelled`. This is cancellable quickly without cancelling task. But if actual task cancellation (CancelledError) should propagate. Use `cancel_event.wait()` as future. For duration=0, sleep done immediately. But `asyncio.sleep(0)` and cancel event wait: if cancel event already set, wait returns immediately. Good.
+- To make deterministic without real sleep? `asyncio.sleep` with small duration. Tests can set `duration=0` to avoid time. But cancellation test needs active sleep; can set duration=0.1 and monkeypatch? We can use `cancel_event.set()` before starting? If cancel already set, job should be cancelled before starting? Need enforce? For cancellation, we can start job, then set cancel event. With `duration=0.1`, real wait small. But to avoid flaky, maybe use event: `await asyncio.wait_for(cancel_event.wait(), timeout=duration)`? If duration=0.1, test can set after small sleep. Could be flaky. Better implement simulated deterministic time? Hmm.
+
+Alternative: jobs use `steps` and runner can execute `await asyncio.sleep(0)` loops, cancellation checked each step. For cancellation test, we can make job with many steps and call cancel after some steps via event loop? Need synchronize. We can use asyncio.Event `job_started_event` to signal test when job started, then set cancel. With `duration=0.5` but monkeypatch time? Could use `asyncio.sleep(0.5)`; test can set cancel immediately after started; wrapper sees cancel event via wait. No flaky because if cancel set before wait returns, wait returns cancel. The wait may still be pending; we don't need actual duration. Good. For success, duration=0. For failure, fail_after=0. For cancellation, duration=1 and after started set cancel, wait returns immediately. Real sleep may still be pending but we don't care; asyncio.wait cancels pending sleep? `asyncio.wait` with `return_when=FIRST_COMPLETED` does not cancel pending? It leaves? Actually `asyncio.wait` in Python 3.11 cancels? It wraps futures and waits; when return, it cancels? I think it cancels? Need ensure no pending sleep remains. `asyncio.wait` does not cancel? It collects; I think it cancels? Let's check: `asyncio.wait` returns after first completed; it may cancel remaining? The docs: "If return_when is FIRST_COMPLETED, the function returns as soon as one future finishes. The remaining futures are not cancelled." Hmm maybe not. In 3.11, `wait` returns when condition; it doesn't cancel. But `asyncio.sleep` future pending; if not cancelled, it will continue in event loop and cause RuntimeWarning? It will complete later. Could be okay but better cancel. We can create `sleep_task = asyncio.create_task(asyncio.sleep(duration))`, `cancel_task = asyncio.create_task(cancel_event.wait())`, use `asyncio.wait`, then cancel both not done. That cleans. Or simpler: use `asyncio.wait_for(cancel_event.wait(), timeout=duration)`. If timeout, succeeds; if cancel event set, returns (because future done) and we can detect. `wait_for` cancels the inner future if timeout, but not if event future done? If event future already done, wait_for returns immediately. If timeout, it cancels event wait? `wait_for` cancels future on timeout. Good. But if cancel event is not set, timeout cancels wait future. Good. If cancel set before timeout, event future done, returns; no pending sleep. This is simpler:
+```
+try:
+    await asyncio.wait_for(cancel_event.wait(), timeout=spec.duration)
+except asyncio.TimeoutError:
+    return
+raise JobCancelled()
+```
+But if cancel_event is set, `wait_for` returns immediately; if timeout, raises TimeoutError. This means duration is maximum. For success, wait_for with timeout=0? If timeout=0 and cancel not set, `wait_for` may return future if done? If not done, raises TimeoutError after 0? It will schedule. Good. But if duration=0 and cancel set before, returns cancel.
+Need differentiate cancel before start? If cancel_event already set when job starts, we can either skip/cancel. In scheduler, if cancel requested, don't start remaining jobs; active job if started should be cancelled. If job starts and cancel_event already set, `wait_for` returns, raise JobCancelled.
+But for success with duration 0, `wait_for(cancel_event.wait(), timeout=0)` with cancel not set should raise TimeoutError. Need confirm: `asyncio.wait_for(fut, 0)` will wait one loop? It may raise TimeoutError if future not done. Good.
+But if cancel event is set after job started and before wait? The test sets after `job_started_event.set()`, which happens before wait? We can emit started, set event, then wait. If test sets cancel after event, race: job may wait with timeout and if duration long, cancel event set soon. Fine.
+
+But for deterministic event order and tests, we need avoid real sleep delays. For cancellation, duration could be 10, but wait_for will be interrupted quickly once cancel set. Need test set cancel. Good.
+
+Need job started event for tests to synchronize. We can expose `Runner.run()` returns result, and also maybe `runner.events`? For tests, can use an event log file and wait for line? Simpler: implement `AsyncJobRunner` with `callback` for events. Tests can pass callback to get event stream and use `asyncio.Event` when job_started. But CLI can stream to file/stdout.
+
+Design classes:
+
+`models.py`:
+```
+@dataclass(frozen=True)
+class JobSpec:
+  id: str
+  gpu: bool = False
+  duration: float = 0.0
+  fail: bool = False
+  fail_after: float | None = None
+  priority: int = 0
+  params: dict[str, Any] = field(default_factory=dict)
+  @property def requires_gpu(self): return self.gpu
+```
+`RunConfig` maybe:
+```
+manifest_path, state_path, event_path, state_dir, event_dir, redaction_literals, redaction_env, max_active_jobs=1? gpu one.
+```
+`Manifest`:
+- parse json into `Manifest(name, redaction, jobs)`.
+- Validate unique ids, positive durations, fail_after if fail.
+- `hash()` deterministic: canonical JSON (sort keys) sha256 of name+jobs+redaction? Need ignore secrets? For resume, if manifest changed, state invalid. Use `canonical_json` with `sort_keys=True`, exclude maybe redaction? Include redaction? If secrets change, maybe state invalid? Use all. But redaction env values not in manifest? env names only. Good.
+
+`redaction.py`:
+```
+class Redactor:
+  def __init__(self, literals: Sequence[str], env_names: Sequence[str])
+    self._secrets: tuple[str,...] = tuple(s for s in literals if s) + [os.environ.get(n,'') for n in env_names if os.environ.get(n)]
+  def redact(self, obj): recursively replace strings.
+  def redact_string(s): for

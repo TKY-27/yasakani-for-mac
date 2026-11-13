@@ -1,0 +1,434 @@
+# CUDA 13.1 / C++20 — Row-wise BF16 Matrix Normalization on sm_120a
+
+Below is a complete, self-contained program. It:
+
+- Parses CLI arguments (matrix size, seed, warm-up iterations, timing iterations, tolerance).
+- Generates a **deterministic** BF16 matrix on the host (LCG → FP32 → BF16).
+- Uses **RAII** device buffers (`DeviceBuffer<T>`).
+- Runs a **vectorized** CUDA kernel that normalizes each row in-place (divide by row max-abs), using `__nv_bfloat16` intrinsics and 128-bit vector loads/stores.
+- Computes a **numerically stable FP32 reference** on the host (max-abs scaling, then normalize).
+- Performs **warm-up**, **CUDA-event timing**, and **tolerance-based verification** (max absolute error + relative error).
+- Includes a `CMakeLists.txt` targeting `sm_120a`.
+
+---
+
+## `main.cpp`
+
+```cpp
+// main.cpp
+// CUDA 13.1 / C++20 — Row-wise BF16 matrix normalization on sm_120a
+//
+// Build:
+//   cmake -B build -DCMAKE_CUDA_ARCHITECTURES=120a
+//   cmake --build build
+//   ./bf16_row_norm --rows 4096 --cols 8192 --seed 42 --warmup 5 --iters 20 --tol 1e-2
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <numeric>
+#include <string>
+#include <vector>
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+// ---------------------------------------------------------------------------
+// Error checking
+// ---------------------------------------------------------------------------
+#define CUDA_CHECK(call)                                                       \
+    do {                                                                       \
+        cudaError_t err_ = (call);                                             \
+        if (err_ != cudaSuccess) {                                             \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,  \
+                    cudaGetErrorString(err_));                                 \
+            std::exit(EXIT_FAILURE);                                           \
+        }                                                                      \
+    } while (0)
+
+#define CUDNN_CHECK(call)                                                      \
+    do {                                                                       \
+        cudaError_t err_ = (call);                                             \
+        if (err_ != cudaSuccess) {                                             \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,  \
+                    cudaGetErrorString(err_));                                 \
+            std::exit(EXIT_FAILURE);                                           \
+        }                                                                      \
+    } while (0)
+
+// ---------------------------------------------------------------------------
+// RAII device buffer
+// ---------------------------------------------------------------------------
+template <typename T>
+class DeviceBuffer {
+public:
+    DeviceBuffer() = default;
+
+    explicit DeviceBuffer(std::size_t count) {
+        allocate(count);
+    }
+
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+    DeviceBuffer(DeviceBuffer&& other) noexcept
+        : ptr_(other.ptr_), count_(other.count_) {
+        other.ptr_ = nullptr;
+        other.count_ = 0;
+    }
+
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            free();
+            ptr_ = other.ptr_;
+            count_ = other.count_;
+            other.ptr_ = nullptr;
+            other.count_ = 0;
+        }
+        return *this;
+    }
+
+    ~DeviceBuffer() { free(); }
+
+    T* data() noexcept { return ptr_; }
+    const T* data() const noexcept { return ptr_; }
+    std::size_t count() const noexcept { return count_; }
+    std::size_t bytes() const noexcept { return count_ * sizeof(T); }
+
+    void allocate(std::size_t count) {
+        free();
+        count_ = count;
+        if (count_ > 0) {
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr_), bytes()));
+        }
+    }
+
+    void free() noexcept {
+        if (ptr_ != nullptr) {
+            cudaFree(ptr_);
+            ptr_ = nullptr;
+            count_ = 0;
+        }
+    }
+
+    // Copy host -> device
+    void upload(const T* host_ptr, std::size_t count) {
+        CUDA_CHECK(cudaMemcpy(ptr_, host_ptr, count * sizeof(T),
+                              cudaMemcpyHostToDevice));
+    }
+
+    // Copy device -> host
+    void download(T* host_ptr, std::size_t count) const {
+        CUDA_CHECK(cudaMemcpy(host_ptr, ptr_, count * sizeof(T),
+                              cudaMemcpyDeviceToHost));
+    }
+
+private:
+    T* ptr_ = nullptr;
+    std::size_t count_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Deterministic PRNG (64-bit LCG) — portable, no external deps
+// ---------------------------------------------------------------------------
+struct LCG {
+    uint64_t state;
+    explicit LCG(uint64_t seed) : state(seed) {}
+    uint64_t next() {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        return state;
+    }
+    // Uniform float in [0, 1)
+    float nextFloat() {
+        return static_cast<float>(next() >> 40) * (1.0f / 16777216.0f);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Host-side BF16 generation (deterministic)
+// ---------------------------------------------------------------------------
+inline __nv_bfloat16 floatToBF16(float f) {
+    return __float2bfloat16(f);
+}
+
+// ---------------------------------------------------------------------------
+// CUDA kernel: row-wise normalization (in-place)
+//
+// Each thread block handles one row.
+// Vectorized: each thread loads/stores 8 BF16 values (16 bytes) via
+// __nv_bfloat162 pairs packed into a 128-bit struct.
+//
+// Layout: row-major, rows x cols.
+// Grid: (num_rows, 1, 1)
+// Block: (threads_per_row, 1, 1) where threads_per_row = cols / 8
+// ---------------------------------------------------------------------------
+
+struct alignas(16) BF16x8 {
+    __nv_bfloat162 v[4];
+};
+
+__global__ void normalizeRowsBF16(const __nv_bfloat16* __restrict__ input,
+                                   __nv_bfloat16* __restrict__ output,
+                                   int rows, int cols) {
+    // Each block handles one row
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const int threadsPerRow = blockDim.x;
+    const int tid = threadIdx.x;
+
+    // Each thread processes 8 elements
+    const int elemsPerThread = 8;
+    const int totalElems = threadsPerRow * elemsPerThread;
+
+    // Pointer to start of this row
+    const __nv_bfloat16* rowIn = input + static_cast<size_t>(row) * cols;
+    __nv_bfloat16* rowOut = output + static_cast<size_t>(row) * cols;
+
+    // Step 1: Compute max absolute value in the row (reduction)
+    // Each thread computes local max over its 8 elements
+    float localMax = 0.0f;
+    for (int i = 0; i < elemsPerThread; ++i) {
+        int idx = tid * elemsPerThread + i;
+        if (idx < cols) {
+            float val = __bfloat162float(rowIn[idx]);
+            localMax = fmaxf(localMax, fabsf(val));
+        }
+    }
+
+    // Block-level reduction for max
+    __shared__ float s_max[32]; // max 1024 threads per block
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int numWarps = (threadsPerRow + 31) / 32;
+
+    // Warp-level reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        localMax = fmaxf(localMax, __shfl_down_sync(0xFFFFFFFF, localMax, offset));
+    }
+
+    // Write warp results to shared memory
+    if (lane == 0) {
+        s_max[warp] = localMax;
+    }
+    __syncthreads();
+
+    // Final reduction by first warp
+    if (warp == 0) {
+        localMax = (lane < numWarps) ? s_max[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            localMax = fmaxf(localMax, __shfl_down_sync(0xFFFFFFFF, localMax, offset));
+        }
+        if (lane == 0) {
+            s_max[0] = localMax;
+        }
+    }
+    __syncthreads();
+
+    float rowMax = s_max[0];
+
+    // Avoid division by zero: if rowMax is 0, set scale to 1
+    float scale = (rowMax > 0.0f) ? (1.0f / rowMax) : 1.0f;
+
+    // Step 2: Normalize and write output
+    for (int i = 0; i < elemsPerThread; ++i) {
+        int idx = tid * elemsPerThread + i;
+        if (idx < cols) {
+            float val = __bfloat162float(rowIn[idx]);
+            float norm = val * scale;
+            rowOut[idx] = __float2bfloat16(norm);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vectorized kernel: uses 128-bit loads/stores for better bandwidth
+// ---------------------------------------------------------------------------
+__global__ void normalizeRowsBF16Vec(const __nv_bfloat16* __restrict__ input,
+                                      __nv_bfloat16* __restrict__ output,
+                                      int rows, int cols) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const int threadsPerRow = blockDim.x;
+    const int tid = threadIdx.x;
+
+    const int elemsPerThread = 8;
+    const int totalElems = threadsPerRow * elemsPerThread;
+
+    const __nv_bfloat16* rowIn = input + static_cast<size_t>(row) * cols;
+    __nv_bfloat16* rowOut = output + static_cast<size_t>(row) * cols;
+
+    // Vectorized load: 8 BF16 = 16 bytes
+    // We use a union to reinterpret as BF16x8
+    union {
+        BF16x8 vec;
+        __nv_bfloat16 raw[8];
+    } data;
+
+    // Load 8 elements (if within bounds)
+    int baseIdx = tid * elemsPerThread;
+    if (baseIdx + elemsPerThread <= cols) {
+        // Full vector load
+        CUDA_CHECK(cudaMemcpyFromSymbol); // placeholder, we do manual load
+        // Manual 128-bit load via reinterpret
+        const BF16x8* vecIn = reinterpret_cast<const BF16x8*>(rowIn + baseIdx);
+        data.vec = *vecIn;
+    } else {
+        // Partial load (tail)
+        #pragma unroll
+        for (int i = 0; i < elemsPerThread; ++i) {
+            int idx = baseIdx + i;
+            data.raw[i] = (idx < cols) ? rowIn[idx] : __float2bfloat16(0.0f);
+        }
+    }
+
+    // Compute local max
+    float localMax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < elemsPerThread; ++i) {
+        float val = __bfloat162float(data.raw[i]);
+        localMax = fmaxf(localMax, fabsf(val));
+    }
+
+    // Block reduction (same as before)
+    __shared__ float s_max[32];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int numWarps = (threadsPerRow + 31) / 32;
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        localMax = fmaxf(localMax, __shfl_down_sync(0xFFFFFFFF, localMax, offset));
+    }
+    if (lane == 0) {
+        s_max[warp] = localMax;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        localMax = (lane < numWarps) ? s_max[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            localMax = fmaxf(localMax, __shfl_down_sync(0xFFFFFFFF, localMax, offset));
+        }
+        if (lane == 0) {
+            s_max[0] = localMax;
+        }
+    }
+    __syncthreads();
+
+    float rowMax = s_max[0];
+    float scale = (rowMax > 0.0f) ? (1.0f / rowMax) : 1.0f;
+
+    // Normalize
+    #pragma unroll
+    for (int i = 0; i < elemsPerThread; ++i) {
+        float val = __bfloat162float(data.raw[i]);
+        data.raw[i] = __float2bfloat16(val * scale);
+    }
+
+    // Vectorized store
+    if (baseIdx + elemsPerThread <= cols) {
+        BF16x8* vecOut = reinterpret_cast<BF16x8*>(rowOut + baseIdx);
+        *vecOut = data.vec;
+    } else {
+        #pragma unroll
+        for (int i = 0; i < elemsPerThread; ++i) {
+            int idx = baseIdx + i;
+            if (idx < cols) {
+                rowOut[idx] = data.raw[i];
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP32 reference implementation (host, numerically stable)
+// ---------------------------------------------------------------------------
+void computeFP32Reference(const std::vector<__nv_bfloat16>& input,
+                           int rows, int cols,
+                           std::vector<float>& output) {
+    output.resize(static_cast<size_t>(rows) * cols);
+    for (int r = 0; r < rows; ++r) {
+        const __nv_bfloat16* rowIn = input.data() + static_cast<size_t>(r) * cols;
+        float* rowOut = output.data() + static_cast<size_t>(r) * cols;
+
+        // Find max absolute value
+        float rowMax = 0.0f;
+        for (int c = 0; c < cols; ++c) {
+            float val = __bfloat162float(rowIn[c]);
+            rowMax = std::max(rowMax, std::fabs(val));
+        }
+
+        float scale = (rowMax > 0.0f) ? (1.0f / rowMax) : 1.0f;
+        for (int c = 0; c < cols; ++c) {
+            float val = __bfloat162float(rowIn[c]);
+            rowOut[c] = val * scale;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+struct VerificationResult {
+    bool passed;
+    float maxAbsError;
+    float maxRelError;
+    int numElements;
+};
+
+VerificationResult verify(const std::vector<__nv_bfloat16>& cudaOutput,
+                          const std::vector<float>& refOutput,
+                          int rows, int cols, float tolerance) {
+    VerificationResult result{};
+    result.numElements = rows * cols;
+    result.maxAbsError = 0.0f;
+    result.maxRelError = 0.0f;
+    result.passed = true;
+
+    for (int i = 0; i < result.numElements; ++i) {
+        float cudaVal = __bfloat162float(cudaOutput[i]);
+        float refVal = refOutput[i];
+
+        float absErr = std::fabs(cudaVal - refVal);
+        float denom = std::max(std::fabs(refVal), 1e-8f);
+        float relErr = absErr / denom;
+
+        result.maxAbsError = std::max(result.maxAbsError, absErr);
+        result.maxRelError = std::max(result.maxRelError, relErr);
+
+        if (absErr > tolerance) {
+            result.passed = false;
+        }
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+struct Args {
+    int rows = 4096;
+    int cols = 8192;
+    uint64_t seed = 42;
+    int warmup = 5;
+    int iters = 20;
+    float tolerance = 1e-2f;
+    bool verbose = true;
+};
+
+void printUsage(const char* prog) {
+    fprintf(stderr,
+        "Usage: %s [options]\n"
+        "  --rows <N>        Number of rows (default: 4096)\n"
+        "  --cols <N>        Number of columns (default: 8192)\n"
+        "  --seed <N>        RNG seed (default: 

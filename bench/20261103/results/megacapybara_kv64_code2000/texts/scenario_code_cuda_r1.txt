@@ -1,0 +1,214 @@
+```cpp
+// bf16_row_normalize.cu
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <random>
+#include <chrono>
+#include <stdexcept>
+
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
+
+// RAII wrapper for device memory
+class DeviceBuffer {
+public:
+    explicit DeviceBuffer(size_t bytes) : size_(bytes), ptr_(nullptr) {
+        if (bytes > 0) {
+            CUDA_CHECK(cudaMalloc(&ptr_, bytes));
+        }
+    }
+
+    ~DeviceBuffer() {
+        if (ptr_) {
+            cudaFree(ptr_);
+        }
+    }
+
+    // Disable copy
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+    // Enable move
+    DeviceBuffer(DeviceBuffer&& other) noexcept : size_(other.size_), ptr_(other.ptr_) {
+        other.size_ = 0;
+        other.ptr_ = nullptr;
+    }
+
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            if (ptr_) cudaFree(ptr_);
+            size_ = other.size_;
+            ptr_ = other.ptr_;
+            other.size_ = 0;
+            other.ptr_ = nullptr;
+        }
+        return *this;
+    }
+
+    void* get() const { return ptr_; }
+    size_t size() const { return size_; }
+
+private:
+    size_t size_;
+    void* ptr_;
+};
+
+// Convert BF16 to FP32
+__device__ inline float bf16_to_float(__nv_bfloat16 b) {
+    return __bfloat162float(b);
+}
+
+// Convert FP32 to BF16
+__device__ inline __nv_bfloat16 float_to_bf16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Vectorized kernel: normalize each row of a BF16 matrix in-place.
+// Each block handles one row. Threads within the block cooperatively compute
+// the L2 norm of the row, then divide each element by the norm.
+// We use vectorized loads/stores with uint4 (16 bytes = 8 BF16 values) for efficiency.
+
+template<int VEC_SIZE>
+__global__ void row_normalize_kernel(__nv_bfloat16* data, int rows, int cols) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    __nv_bfloat16* row_ptr = data + static_cast<size_t>(row) * cols;
+
+    // Number of vector elements per row
+    int vec_per_row = cols / VEC_SIZE;
+    int tid = threadIdx.x;
+
+    // Each thread processes multiple vectors if needed
+    // For simplicity, assume vec_per_row <= blockDim.x or handle strided access
+    // Let's have each thread handle one vector, and we need enough threads
+    // If vec_per_row > blockDim.x, we'd need multiple passes, but let's design
+    // so that blockDim.x >= vec_per_row for typical cases, or use grid-stride style.
+
+    // Actually, let's use a simpler approach: each thread handles one or more elements
+    // via vectorized loads. We'll have the block cooperate on reduction.
+
+    // Load vectorized chunks
+    // Each thread loads VEC_SIZE elements as a uint4 (for BF16, 8 elements per 16 bytes)
+    // But VEC_SIZE is template param; let's set VEC_SIZE=8 for uint4 load of 8 BF16s
+
+    float local_sum_sq = 0.0f;
+
+    // Stride through the row
+    for (int i = tid; i < vec_per_row; i += blockDim.x) {
+        // Load 8 BF16 values as uint4
+        uint4 raw = reinterpret_cast<uint4*>(row_ptr)[i];
+        __nv_bfloat16 vals[8];
+        memcpy(vals, &raw, sizeof(uint4));
+
+        for (int j = 0; j < 8; j++) {
+            float v = bf16_to_float(vals[j]);
+            local_sum_sq += v * v;
+        }
+    }
+
+    // Block-level reduction
+    __shared__ float sdata[1024];
+    int tx = tid;
+    sdata[tx] = local_sum_sq;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tx < stride) {
+            sdata[tx] += sdata[tx + stride];
+        }
+        __syncthreads();
+    }
+
+    float total_norm_sq = sdata[0];
+    float inv_norm = rsqrtf(total_norm_sq);
+
+    // Write back normalized values
+    for (int i = tid; i < vec_per_row; i += blockDim.x) {
+        uint4 raw = reinterpret_cast<uint4*>(row_ptr)[i];
+        __nv_bfloat16 vals[8];
+        memcpy(vals, &raw, sizeof(uint4));
+
+        for (int j = 0; j < 8; j++) {
+            float v = bf16_to_float(vals[j]);
+            vals[j] = float_to_bf16(v * inv_norm);
+        }
+
+        uint4 out_raw;
+        memcpy(&out_raw, vals, sizeof(uint4));
+        reinterpret_cast<uint4*>(row_ptr)[i] = out_raw;
+    }
+}
+
+// Host-side reference implementation using FP32 for numerical stability
+void reference_row_normalize(const std::vector<__nv_bfloat16>& input,
+                             std::vector<__nv_bfloat16>& output,
+                             int rows, int cols) {
+    output.resize(input.size());
+
+    for (int r = 0; r < rows; r++) {
+        const __nv_bfloat16* row_in = &input[static_cast<size_t>(r) * cols];
+        __nv_bfloat16* row_out = &output[static_cast<size_t>(r) * cols];
+
+        // Compute L2 norm in FP32
+        double sum_sq = 0.0;
+        for (int c = 0; c < cols; c++) {
+            float v = bf16_to_float(row_in[c]);
+            sum_sq += static_cast<double>(v) * static_cast<double>(v);
+        }
+
+        double norm = std::sqrt(sum_sq);
+        double inv_norm = (norm > 0.0) ? 1.0 / norm : 0.0;
+
+        for (int c = 0; c < cols; c++) {
+            float v = bf16_to_float(row_in[c]);
+            float normalized = static_cast<float>(v * inv_norm);
+            row_out[c] = float_to_bf16(normalized);
+        }
+    }
+}
+
+// Deterministic input generation
+std::vector<__nv_bfloat16> generate_input(int rows, int cols, unsigned seed) {
+    std::mt19937 gen(seed);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<__nv_bfloat16> data(static_cast<size_t>(rows) * cols);
+    for (size_t i = 0; i < data.size(); i++) {
+        float val = dist(gen);
+        data[i] = float_to_bf16(val);
+    }
+    return data;
+}
+
+// Tolerance-based verification
+bool verify_results(const std::vector<__nv_bfloat16>& gpu_result,
+                    const std::vector<__nv_bfloat16>& ref_result,
+                    int rows, int cols,
+                    float rel_tol, float abs_tol) {
+    bool all_pass = true;
+    int mismatches = 0;
+
+    for (int r = 0; r < rows && all_pass; r++) {
+        for (int c = 0; c < cols && all_pass; c++) {
+            size_t idx = static_cast<size_t>(r) * cols + c;
+            float gpu_val = bf16_to_float(gpu_result[idx]);
+            float ref_val = bf16_to_float(ref_result[idx]);
+
+            float diff = std::fabs(gpu_val - ref_val);
+            float tol = std::max(abs_tol, rel_tol * std::fabs(ref_val));
+
+            if (diff

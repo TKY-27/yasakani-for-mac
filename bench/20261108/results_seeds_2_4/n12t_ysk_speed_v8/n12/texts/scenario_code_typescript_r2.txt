@@ -1,0 +1,157 @@
+Let me think carefully about what's being asked. What the user wants is a complete TypeScript 5 service that does the following:
+
+1. Consumes newline-delimited request metrics (NDJSON stream)
+2. Validates them without any third-party schema library (hand-written validation)
+3. Groups records by model and fixture
+4. Computes mean, median, and sample standard deviation
+5. Exposes `/health`, `/summary`, and `/runs/:id` endpoints
+6. Includes strict types
+7. Incremental parsing
+8. Bounded memory
+9. Malformed input errors
+10. Unit tests
+11. package.json
+12. tsconfig.json
+13. A concise operational guide
+14. No placeholders
+
+So I need to build a Node.js service. Let me think about the design:
+
+**Data model:**
+
+Each line in the NDJSON stream is a "request metric record." Probably something like:
+
+```json
+{"runId":"run-001","model":"gpt-4","fixture":"latency-spike","metric":"latency_ms","value":123.4,"ts":1700000000000}
+```
+
+Fields:
+- `runId`: string (required) — used for the `/runs/:id` endpoint
+- `model`: string (required)
+- `fixture`: string (required)
+- `metric`: string (probably required) — e.g., "latency_ms", "tokens"
+- `value`: number (required, finite)
+- `ts` or `receivedAt`: optional timestamp
+
+Let me keep it simple but strict:
+
+```ts
+interface MetricRecord {
+  runId: string;
+  model: string;
+  fixture: string;
+  metric: string;
+  value: number;
+  ts: number; // epoch milliseconds
+}
+```
+
+**Endpoints:**
+
+- `POST /ingest` — accepts NDJSON (newline-delimited JSON). Parses incrementally. Validates each record. Groups and aggregates. Returns the count and errors.
+- `GET /health` — liveness/readiness, memory stats, record count.
+- `GET /summary` — grouped aggregates: for each (model, fixture, metric), returns count, mean, median, sample standard deviation (n-1), min, max, sum, plus possibly p90 as well.
+- `GET /runs/:id` — all aggregates scoped to a single runId, plus total record count and validation error count.
+
+**Incremental parsing:**
+
+For POST body, I should not use body-parser (buffering the entire body would violate bounded memory... well, bounded memory refers to the aggregation state; still, I want to stream the request body). I can read `req` as a stream, accumulate partial lines in a bounded buffer, split on `\n`, parse complete lines, and if the buffer grows past the max line size → reject as malformed/oversized.
+
+I can also support chunked NDJSON in the stream. Incremental means: process each complete line as it arrives; do not buffer the entire payload.
+
+Bounded memory:
+- Aggregate state is O(number of distinct (model, fixture, metric) groups) — bounded.
+- For median and standard deviation I need all values (or use a streaming approximation). Since I want exact median and sample standard deviation, I need to keep the values. For bounded memory, I can cap the number of values retained per group (e.g., sample cap). If values exceed the cap, either use reservoir sampling, or... the requirement says "bounded memory." A clean approach: keep a capped array per group (e.g., keep at most N values via reservoir sampling); mean and standard deviation can be computed exactly from all values via Welford's algorithm (running mean and M2 — O(1) memory), but median requires values. So: use Welford for exact mean and sample standard deviation (O(1) per group), and reservoir sampling for median (approximate median from a capped sample). But the requirement says "computes mean, median, and sample standard deviation" — presumably they want exact median. Hmm.
+
+Alternative: keep all values per group with a hard cap on total retained values (e.g., MAX_STORED_VALUES). Once the cap is hit, reject the ingest with an error (a "memory bound exceeded" error), or degrade to reservoir sampling. A simpler and more defensible design: enforce a global cap on stored values; once hit, reject ingest with an error (503, "capacity-exceeded"). This makes memory strictly bounded and makes the statistics exact. Also cap the number of distinct groups (e.g., 1000), and reject once hit.
+
+Actually, a hybrid is better: Welford for mean/std (exact, O(1)), plus a per-group reservoir sample capped at SAMPLE_CAP for median. That is truly bounded and always accepts data; median is approximate (reservoir) but documented. But unit tests for the median need to match. If reservoir cap ≥ total count, median is exact. With a sufficiently high cap (e.g., 10_000 per group) tests pass exactly, and in production memory is bounded.
+
+Hmm, which is better for "no placeholders" completeness? I think I'll do this: exact mean and standard deviation via Welford's algorithm; median from the full retained sample, with a per-group reservoir-sample cap (configurable, default e.g. 20_000, global cap on total retained values e.g. 1_000_000). When the cap is exceeded, reservoir sampling preserves exactness of mean/std while making the median approximate. Also document the behavior. Actually wait — if I cap the sample and continue, the sample is a random subset; the median of the subset approximates the true median. I'll document that.
+
+But is this too complex? Let me think about what the reviewer wants: a complete, runnable code. Simplicity + correctness + explicit memory bound. Going with:
+
+- `Aggregate`: { count, sum? (or mean via Welford), m2, min, max, sample: number[] (reservoir of capacity K), droppedSampleSlots? }
+
+Welford: maintain count n, mean, M2. Sample standard deviation = sqrt(M2/(n-1)) when n ≥ 2, else 0/undefined.
+
+Reservoir sampling (Algorithm R): when a group's sample size reaches capacity K and a new item arrives, take a random index j = floor(random * n) (n = count so far including the new item); if j < K, replace sample[j]. Standard.
+
+To make tests deterministic, I'll allow injecting a PRNG. Provide a `Random` interface: `next(): number` in [0,1). Tests can use a fixed-seed LCG or a constant.
+
+Global bounds:
+- `maxGroups` (default 1_000)
+- `maxSampleCapacity` per group (default e.g. 5_000)
+- `maxLineBytes` (default 64 KiB)
+- `maxRequestBytes`? Probably unnecessary since we're streaming; but cap the request line count? Not needed.
+- Also cap total record count? Could add `maxRecords` for safety; optional. I'll include a `maxRecords` cap defaulting to say 10_000_000, and return 503 on exceeded. Hmm, might complicate. Memory is bounded by groups × sample cap, so total records don't grow memory. I'll skip maxRecords or include for completeness — actually, a `maxRecords` cap is nice for operational control (prevents unbounded aggregation runtime). Include as an option with a high default, and if it's set (non-null), enforce it.
+
+Malformed input errors:
+- Invalid JSON line → per-line error, collect the first N errors (bounded error log, e.g., keep at most 100 recent errors, count total).
+- Validation failures: missing fields, wrong types, non-finite numbers, values exceeding allowed magnitude, string length over a limit, empty lines (ignore? treat as malformed? Usually trailing newline — empty final line after a newline is fine. Ignore completely empty/whitespace-only lines but... hmm, better: a line that is empty after trimming → skip as non-data? Safer: count as malformed? NDJSON spec: each line is a JSON document; a trailing newline means the final "line" is empty. I'll silently skip empty/whitespace-only lines (documented), but report non-empty malformed ones.
+- Response: 200 with `{ accepted, rejected, errors: [ {line, message} ... first N ] }`. If the whole thing is invalid (e.g., all lines malformed), still 200? Or 400? If there's at least one accepted line and there were rejections — 200 with counts. If accepted is zero and there were lines, 400 with errors. If the body isn't even NDJSON-ish... 415 Content-Type not application/x-ndjson or application/json? Accept `application/x-ndjson` and `application/json` and `text/plain`? Simpler: accept `application/x-ndjson` or `application/json`; otherwise 415. Hmm, being too strict is annoying for operational use. Let me accept `application/x-ndjson`, `application/json`, and `text/plain` with a note. Actually, I'll accept the two standard ones; the operational guide uses `application/x-ndjson`.
+
+Also, an error for oversized lines (> maxLineBytes) → count as malformed.
+
+**HTTP server:** use bare `node:http` — no express (avoid third-party dependencies other than devDependencies for typescript + testing). Zero runtime dependencies. Testing: use `node:test` (built-in, available in Node 18+) to avoid a testing-framework dependency. TypeScript 5. Use `tsx`? No — keep dependencies minimal: devDependencies: `typescript`, `@types/node`. Use node:test with ts? node:test can't execute TS directly. Options: compile with tsc, then run `node --test dist/test/*.js`. That's clean: build via tsc, test against the compiled JS. tsconfig: NodeNext modules, ES2022 target, strict true, outDir dist, rootDir src. package.json scripts: build, test (build + node --test), start.
+
+Node 20 LTS with built-in test runner supports glob: `node --test "dist/test/**"`? Node's `--test` accepts a path to a directory; in Node 20.?, `node --test` scans files matching patterns in a directory. Safer: `node --test dist/test/` — will it pick up `*.test.js` files under dist/test? Node's test runner, when given a directory, recursively runs all files matching test file naming conventions (files ending in `.test.js` or files inside a `test` directory). Actually per Node docs: when a directory is passed, it recursively looks for test files — test files are `*.test.js`, `*-test.js`, `*_test.js`, `test.js`, or any file in a `test` directory? Let me recall precisely: the default glob patterns for Node 20 when no path is given include: `**/*.test.js`, `**/*-test.js`, `**/*_test.js`, `**/test.js`, `**/test/*.js`. When given explicit paths, it uses those paths directly. To be safe, I'll write it as `node --test dist/test/*.test.js` — but does shell glob expansion work in a Windows cmd? npm scripts use sh in most environments; Windows uses cmd, and `*` globbing works in cmd too (the shell expands it). Yes, cmd supports wildcards. So `node --test dist/test/*.test.js` is fine. Alternatively, Node 22 supports glob natively. Targeting Node >= 18.17 (test runner stable in 18.17? test runner available since 18.0, stable in 18.7?). I'll document Node >= 18, recommended 20/22.
+
+**Module layout:**
+
+- `src/types.ts` — public types: MetricRecord, Aggregate, Summary, Config, errors.
+- `src/validate.ts` — `validateRecord(raw: unknown, opts): { ok: true, record } | { ok: false, error: ValidationError }`. No third-party schema library: manual type checks.
+- `src/aggregator.ts` — `MetricsAggregator` class with Welford + reservoir sample, bounds, `add(record)`, `getGroup(key)`, `summarize()`, scoped `summarizeForRun(runId)`.
+- `src/parser.ts` — incremental NDJSON line splitter: class `NdjsonSplitter` with `push(chunk: Buffer | string): Iterable<Line>` handling partial lines and CRLF; max-line enforcement.
+- `src/server.ts` — HTTP server: routing, NDJSON handler with streaming body, /health, /summary, /runs/:id (path parsed manually), response helpers, error envelope.
+- `src/index.ts` — entry point, config from env vars, start server, graceful shutdown.
+- `src/metrics.ts`? Consolidate into aggregator.
+- `test/aggregator.test.ts`, `test/validate.test.ts`, `test/parser.test.ts`, `test/server.test.ts` (HTTP tests with the built-in server started on an ephemeral port, using fetch — global fetch is available in Node 18+).
+
+**Statistics details:**
+
+- Mean: Welford's running mean — exact, O(1).
+- Sample standard deviation: Welford's M2; s = sqrt(M2 / (n-1)); n=1 → null (or 0? null is more honest; use null and document).
+- Median: from retained sample. If full data was retained (n ≤ capacity), exact. Otherwise approximate (reservoir). Provide a `exactMedian: boolean` flag per group? Could be nice: `medianExact: n <= sampleCapacity`? Not exactly — reservoir maintains a sample of size min(n, K); if n <= K the sample contains all values → exact. If n > K it's approximate. So I can flag `medianApprox = n > K`. A good detail.
+- min/max are exact.
+
+Sort for median: copy the sample, sort numerically.
+
+**Grouping key:** `${model}\u0000${fixture}\u0000${metric}` using a separator that can't appear? Model/fixture/metric have a max-length constraint and a character-set constraint? Should we restrict to a sane charset? That might be too strict; instead use `\u0000` separator, safe as long as fields don't contain \u0000 (JSON strings can contain it). Restrict string fields to a max length (e.g., 128), and reject \u0000? Or just use a nested Map: Map<model, Map<fixture, Map<metric, Aggregate>>> — avoids the separator issue entirely. But then enumerating is fine. Nested map is clean and strict. Let's use a nested Map. Memory bound: count the total number of groups.
+
+**Summary shape:**
+
+```json
+{
+  "totalRecords": 1234,
+  "rejectedRecords": 2,
+  "groups": [
+    {
+      "model": "...",
+      "fixture": "...",
+      "metric": "...",
+      "count": 10,
+      "mean": 123.45,
+      "median": 120,
+      "sampleStdDev": 12.3,
+      "min": 1,
+      "max": 100,
+      "medianApprox": false
+    }
+  ]
+}
+```
+
+For /runs/:id: same shape but filtered to runId, plus `runId` and existence check: if unknown runId → 404. How do I know a runId was seen? Keep a Map<runId, recordCount> (bounded by number of distinct runs... hmm, distinct runs are unbounded → memory grows with distinct runIds. To keep bounded, cap the runId registry too (maxRuns, e.g., 10_000); but then aggregations for runs beyond that would be rejected? That's annoying. Alternative: don't track runs separately; /runs/:id filters aggregates by matching records... but aggregates are keyed by (model, fixture, metric) across runs — they don't include runId in the key!
+
+Problem: grouping is "by model and fixture" (and metric). /runs/:id needs per-run statistics. So runId also needs to be in the aggregation key! "Group records by model and fixture" — but the runs endpoint requires per-run breakdown. Solution: internally aggregate by (runId, model, fixture, metric); /summary merges across runs per (model, fixture, metric) — but merging Welford stats is possible (Welford is mergeable: combine n, mean, M2), and median merging requires combining samples — can't merge reservoirs exactly; but can union the retained samples and re-sample? That's approximate.
+
+Simpler alternative: key by (runId, model, fixture, metric). /summary = per-run group stats grouped and enumerated? That changes the semantics of "summary".
+
+Better approach: maintain two layers:
+1. Primary aggregation keyed by (model, fixture, metric) — cross-run stats (Welford mergeable + reservoir sample).
+2. Run aggregation keyed by (runId, model, fixture, metric) — for /runs/:id.
+
+Both are O(1) per record with bounded memory (group count cap applies to the union). Median for /summary uses the global reservoir sample; median for /runs uses the per-run reservoir sample. Both bounded. This is clean and honest. Memory: 2 aggregates per group → constant factor, still bounded.
+
+Alternatively: primary keyed by (runId, model, fixture, metric) and /summary computes merged Welford across runs (exact) and median from union of per-run samples (approximate if the union is truncated). Hmm, merging Welford is exact: n_total, mean_total, M2_total = M1 + M2 + (n1 n2 / n_total)(mean1-mean2)^2. Then median: union samples from runs, if union size > K, resample with reservoir — approximate; if all data is retained, exact. This single structure is actually elegant, but "medianExact" logic is more complex: exact iff all values were retained (total n <= global cap...). The union of per-run samples (each ≤ K_run) can be less than the total n even when the global sample could have retained all — because per-run caps. So the exactness condition is: for a given (model, fixture, metric), total count across

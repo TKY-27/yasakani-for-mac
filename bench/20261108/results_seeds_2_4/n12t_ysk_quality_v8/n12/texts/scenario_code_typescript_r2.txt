@@ -1,0 +1,175 @@
+Let me carefully think through what's being asked:
+
+1. A complete TypeScript 5 service that:
+   - Consumes newline-delimited request metrics (NDJSON input — probably via an HTTP endpoint or a stream)
+   - Validates them without third-party schema libraries (hand-written validator)
+   - Groups records by model and fixture
+   - Computes mean / median / sample standard deviation
+   - Exposes `/health`, `/summary`, and `/runs/:id` endpoints
+   - Strict types
+   - Incremental parsing (stream processing, not buffering the entire input)
+   - Bounded memory (ring buffer or capped aggregation; per-model/fixture group caps, cap on total record count)
+   - Malformed input errors
+   - Unit tests
+   - package.json, tsconfig.json
+   - A short operational guide
+   - No placeholders
+
+I need to design this as a self-contained project. Let me plan the architecture.
+
+**Input format (NDJSON metrics):**
+Each line is a JSON object representing a request metric record. For example:
+
+```json
+{"runId":"run-001","model":"llama-3-8b","fixture":"prompt-a","latencyMs":123.4,"tokensOut":57,"ts":1700000000000}
+```
+
+Validation rules:
+- Must be a JSON object (not array/string/null)
+- `runId`: non-empty string, max length e.g. 128
+- `model`: non-empty string, max length 128
+- `fixture`: non-empty string, max length 128
+- `latencyMs`: positive finite number, ≤ some cap (e.g. 3_600_000)
+- `tokensOut`: non-negative integer, ≤ cap
+- Optional fields: `tokensIn` (non-negative int), `ts` (int within a reasonable epoch-ms range), `error` (boolean or string?)
+
+Keep it tight. Required: runId, model, fixture, latencyMs, tokensOut. Optional: ts (epoch ms), status ("ok" | "error")? Let me define it as:
+
+Required:
+- runId: string, 1..128 chars
+- model: string, 1..128 chars
+- fixture: string, 1..128 chars
+- latencyMs: number > 0, finite, ≤ 3_600_000 (1 hour)
+- tokensOut: integer ≥ 0, ≤ 10_000_000
+
+Optional:
+- ts: integer, 0..(2^53) — epoch ms, e.g. between 1970-01-01 and year 5138
+- error: boolean
+
+**Incremental parsing:**
+- Read the body as a stream (Node's http server `IncomingMessage`).
+- Split into lines incrementally with a `LineSplitter` class that handles CRLF, LF, and trailing incomplete lines. Buffer is capped at `MAX_LINE_BYTES` — if a single line exceeds the cap, that's a malformed input error (line too long) — bounded memory.
+- Each complete line is parsed with `JSON.parse` in a try/catch; parse failure → record as a malformed-line error.
+- Validate with a hand-written validator that produces typed errors.
+
+**Bounded memory:**
+- Global cap: `MAX_TOTAL_RECORDS` (e.g. 1_000_000). Once exceeded, ingestion stops (413 or 507) or drops with a counter. Better: stop ingesting and return an error, or drop with a counter. Let me design it: the aggregate store keeps per-group (model|fixture) running stats that use O(1) memory per group (count, sum, sumSq, min, max for mean/stddev; but median requires ordering — need to store values or use a streaming median structure).
+
+Median: exact median from a streaming dataset requires storage (or two heaps). Bounded memory approach: use two heaps (max-heap of the lower half, min-heap of the upper half) — still unbounded per group. Alternative: capped reservoir — but that changes the semantics of the median.
+
+Options:
+1. Store all latency values per group up to a cap; if the group exceeds the cap, mark the group as "truncated", and median is computed over the truncated sample (documented), or use a quantile sketch (t-digest) — that's more code.
+2. Two heaps for exact streaming median — memory is proportional to record count, bounded globally by the global cap `MAX_TOTAL_RECORDS`. This is legitimate: "bounded memory" is achieved by the global record cap. The two heaps total = n per group, same as an array. Two heaps give exact median in O(log n) per insert and O(1) median.
+
+Actually simpler: keep a sorted array with binary insertion? O(n) per insert. Two heaps is cleaner and O(log n). Implement a generic binary heap.
+
+But wait — for sample stddev, can use the running formula with count, sum, sumSq (Welford is more numerically stable; sumSq can lose precision; Welford's online algorithm is the proper choice). Use Welford for mean/variance. For median, two heaps.
+
+Memory: heaps store raw latency values — 8 bytes per record (JS float64 plus object overhead). Bounded by `MAX_TOTAL_RECORDS` globally. Also cap the number of distinct groups: `MAX_GROUPS` (e.g. 10_000); when exceeded, reject new groups with an error counter, or start tracking an "overflow" group. My approach: once group cap is reached, additional records with new group keys are counted as `droppedGroupOverflow` and not stored — documented behavior. Hmm, but silently dropping might be confusing. Or reject the entire ingest request. I think per-record tracking with counters is better: the summary endpoint reports dropped counts. The service stays available.
+
+Actually, let me reconsider: simpler and easier to justify — the store has hard caps:
+- `maxTotalRecords` (default 250_000, configurable) — when exceeded, ingestion endpoint returns 413 with a clear error, and subsequent records in that stream are ignored (the stream stops reading).
+- `maxGroups` (default 4_096) — new (model, fixture) pairs beyond the cap are counted as `droppedNewGroups` and not aggregated.
+- `maxLineBytes` (default 64 KiB) — line-splitter errors on oversized lines (400 in the response? but in the middle of the stream… we need per-stream behavior: stop the stream, respond with 400, record the error).
+
+Per-stream malformed lines: should the entire request fail, or should we skip bad lines? For a metrics collector, "skip bad lines and count them" is common, but the requirement says "malformed input errors" — expose the error. My approach: ingest endpoint processes line-by-line; malformed/invalid lines are counted per stream with reasons (max 5 samples kept). At end of stream, the response is 200 with `{"accepted": n, "rejected": m, "rejectionSamples": [...]}`. If the stream-level limit is hit (global record cap, line too long), we abort with 413/414 and stop consumption. That gives us both graceful per-line errors and hard caps. Hmm — should malformed JSON abort? I think counting per-line rejections is friendlier and demonstrates "malformed input errors" well. But some might expect 400 on the first bad line. Let me make it configurable: `strict: boolean` — in strict mode, the first invalid line aborts with 400 and details; in lenient mode, it skips and counts. Default lenient? Default strict? The spec says "malformed input errors" — let me implement both and default to strict=false (lenient) so the service is robust, documented in the operations guide. Actually, to show errors explicitly, default `STRICT_INGEST=false`… let me pick a default of lenient (resilient collector), and document how to flip to strict. Hmm, in tests I can test both modes. OK.
+
+**Endpoints:**
+- `GET /health` → `{ "status": "ok", "uptimeSec", "memory": {...}, "ingestion": { totalAccepted, totalRejected, ... } }`
+- `GET /summary` → global stats: totals, per-group breakdown: for each (model, fixture): count, mean, median, sampleStdDev, min, max, tokensOut sum/mean? Keep latency metrics core, and also include tokensOut mean/median/std? The spec says "groups records by model and fixture, and computes mean/median/sample standard deviation" — of what metric? Latency is the natural one. Let me compute mean/median/sampleStdDev for both `latencyMs` and `tokensOut`? Doubles the code but reuses the same Stats class. To keep focus: compute on `latencyMs` (primary), and `tokensOut` sum + mean? Hmm. To be safe, compute full stats (count, mean, median, sampleStdDev, min, max) for latencyMs, and (sum, mean) for tokensOut? That's inconsistent. Simpler: full Stats objects for both latencyMs and tokensOut — since Stats is generic, the code reuse is clean. Let me do that. Also per-group `firstSeenTs`, `lastSeenTs` (from record ts if present), `runIds`? The record belongs to a run — grouping by model+fixture may span multiple runs. `GET /runs/:id` returns records/statistics for a single run.
+
+- `GET /runs/:id` → stats for records with that runId: total count, per-(model,fixture) breakdown with stats, and maybe a list of recent raw records? For bounded memory, don't store raw records globally. But /runs/:id should return something useful: count, latency stats (overall + per model/fixture), rejected count? Let me keep a per-run aggregate: RunStats { count, byGroup: Map<groupKey, Stats>, totalTokensOut, firstTs, lastTs }. So a per-run group map too — memory doubles, but each is an O(1) aggregate, but… median needs heaps per run-group too. Two heaps per (run, group) + two heaps per (model, fixture) = 4 heap entries per record. With a global cap of 250k, that's 1 million float64 values ≈ 8MB of raw data + overhead, no problem.
+
+Hmm wait, but is it worth having per-run per-group heaps? It's consistent and bounded. OK.
+
+Also `POST /ingest` — the spec says "consumes newline-delimited request metrics" — the consumption mechanism: HTTP POST with NDJSON body is a natural service-level approach. Also support file path via CLI? The spec says "service" with those endpoints; the POST /ingest NDJSON is the consumption path. Let me add a `POST /ingest` that accepts `application/x-ndjson` (or `application/json`/`text/plain`) streams. Also support `?strict=true` query or config.
+
+Should I also add `GET /runs` (list run ids with counts)? Not required; skip to keep scope tight, but it's cheap. The spec says "exposes /health, /summary, and /runs/:id endpoints" — I must include those three; /ingest is needed for consumption. I could add `POST /reset` for testing/ops? It's useful for the operational guide and tests. Let me add `POST /reset` that clears aggregates (documented). Small cost, real utility.
+
+**Project structure:**
+
+```
+metrics-service/
+  package.json
+  tsconfig.json
+  README.md (operational guide)
+  src/
+    index.ts            (entry: starts server)
+    config.ts           (env-based config, typed)
+    types.ts            (domain types)
+    errors.ts           (AppError taxonomy)
+    validate.ts         (hand-written NDJSON record validator)
+    lineSplitter.ts     (incremental line splitting with byte cap)
+    stats.ts            (Welford + median via two heaps, Stats class)
+    store.ts            (AggregationStore: group, run, caps, counters)
+    ingest.ts           (stream processing: pipe body -> splitter -> validate -> store)
+    http/
+      server.ts         (node:http server, routing, error mapping)
+      router.ts?        (maybe fold into server)
+      responses.ts      (json send helpers)
+  test/
+    validate.test.ts
+    lineSplitter.test.ts
+    stats.test.ts
+    store.test.ts
+    ingest.test.ts      (in-memory stream tests)
+    api.test.ts         (endpoint tests with supertest-like manual fetch against ephemeral server)
+```
+
+No third-party runtime deps (validation without schema libraries; Node's built-ins suffice). Tests: use `node:test` (built-in runner, works well with TS 5 using tsx or ts-node). To avoid dev dep complexity, I could use `node --test` with a TS loader: Node 20.6+ supports `--experimental-strip-types`? Node 22 has `--experimental-strip-types`, Node 23 by default. Safer: use `tsx` as a dev dependency for running tests: `node --import tsx --test test/*.test.ts`. tsx is a dev dependency, not a runtime one — acceptable? "No third-party schema libraries" refers to validation; a dev-only transpiler is fine, and I think typical. Alternative: write tests in plain JS that import compiled JS. That avoids dev deps entirely but is awkward.
+
+Cleanest: devDependencies: `tsx`, `@types/node`, `typescript`. Test command: `node --import tsx --test test/`. This runs with Node 18.19+/20+. tsx works fine.
+
+Let me pin: typescript ^5.5, tsx ^4, @types/node ^20.
+
+**Strict types:** tsconfig: `strict: true`, `noUncheckedIndexedAccess: true`, `exactOptionalPropertyTypes: true`, `noImplicitOverride`, `forceConsistentCasingInFileNames`, `noFallthroughCasesInSwitch`, `verbatimModuleSyntax` (caution: requires `import type` in the right places — I'll be careful), `module: NodeNext`, `moduleResolution: NodeNext`, target ES2022. In NodeNext, `.js` extensions are required in imports (since TS emits NodeNext CJS or ESM). Let me use ESM (`"type": "module"` in package.json) with NodeNext; imports need explicit `.js` extensions on relative paths. That's the modern strict setup.
+
+verbatimModuleSyntax with ESM: type-only imports need `import type`. Be careful.
+
+**Validator design:**
+
+```ts
+type ValidationResult<T> = { ok: true; value: T } | { ok: false; error: RecordValidationError };
+```
+
+`RecordValidationError` with `code` (e.g. `NOT_JSON_OBJECT`, `MISSING_FIELD`, `TYPE_MISMATCH`, `OUT_OF_RANGE`, `TOO_LONG`) and `path` and message.
+
+Write small primitive helpers:
+
+```ts
+function isRecord(v: unknown): v is Record<string, unknown>
+function asStringField(obj, key, opts) ...
+```
+
+The validator returns the first error (or collects all? first is enough; let me collect up to 3 for a better error payload). Simplest: return a list of issues (max 5). Malformed line error message: `line 42: expected "model" to be a string`.
+
+Field rules:
+- runId: string, trim length 1..128, maybe pattern? Let me allow any printable chars; require no newline (JSON strings can't contain raw newlines anyway; escaped is OK). Keep length only.
+- model: string 1..128
+- fixture: string 1..128
+- latencyMs: number (not bool!), finite, > 0, ≤ 3_600_000
+- tokensOut: integer (Number.isInteger), 0..10_000_000
+- optional ts: integer, 0..2_000_000_000_000 (about year 56886; actually 2e12 ms ≈ year 63167? 2e12 ms = 63.7 million days ≈ 174,000 years. Let me use a cap of 4_102_444_800_000 = 2099-01-01T00:00:00Z. That's a nice cap: "not after 2099".
+- optional error: boolean.
+
+Note: JSON `NaN`/`Infinity` can't be represented, so numeric finite-ness check via `Number.isFinite` guards against weird parses (JSON.parse won't produce them anyway, but the validator is pure — no problem).
+
+Note on `exactOptionalPropertyTypes`: optional fields on parsed records: `ts?: number | undefined`. I'll construct the validated object with conditionals, so it's fine.
+
+**LineSplitter:**
+
+State: `carry: Buffer` (or string). Incremental: `push(chunk: Buffer): string[]` returns complete lines; `finish(): string | null` returns trailing data if any (if non-empty and not just whitespace → emit as a final line? or error "unexpected truncated line"? If the final line lacks a trailing newline, treat as a final line — common NDJSON behavior; document it.)
+
+Memory bound: keep a carry buffer; if carry length > maxLineBytes after append → emit an error (line too long) and reset the carry to a sentinel state; subsequent chunks are consumed but discarded until newline (to keep the stream in sync). Implement as a class with a `State` machine: NORMAL, DISCARD (after oversize line). Also handle NUL bytes? JSON.parse fails on lone surrogates; skip.
+
+Use Buffer and count bytes (line length is a cap in bytes). Then `line.toString('utf8')`.
+
+Line number tracking for error reporting (1-based, including blank lines? skip empty lines — NDJSON documents often have trailing newlines; empty or whitespace-only lines are silently skipped but counted as `skippedBlank`).
+
+Edge: CRLF — strip a single trailing `\r`.
+
+**Stats class (Welford + two heaps):**
+
+```ts
+class LatencyStats {
+  count = 0; sum = 0; mean = 0; m2 = 

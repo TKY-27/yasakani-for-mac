@@ -1,0 +1,199 @@
+Let me plan this task carefully. The user is asking for a complete TypeScript 5 service with the following requirements:
+
+1. **Consume newline-delimited request metrics** — i.e., a JSON-lines (NDJSON) stream input
+2. **Validate without third-party schema libraries** — hand-written validation
+3. **Group records by model and fixture**
+4. **Compute mean / median / sample standard deviation** (sample stddev, i.e., Bessel-corrected n-1)
+5. **Expose /health, /summary, /runs/:id endpoints** — HTTP API
+6. **Strict typing**
+7. **Incremental parsing** — stream processing, don't buffer the whole input
+8. **Bounded memory** — streaming + fixed summary structure (no unbounded accumulation of raw records; keep only aggregates). Probably also a bounded in-memory ring buffer of run metadata.
+9. **Malformed-input error** — 400 with structured errors
+10. **Unit tests** — no placeholder tests, actually runnable ones
+11. **package.json, tsconfig.json**
+12. **Short operations guide**
+13. **No placeholders** — everything must be complete and runnable
+
+Design decisions:
+
+- **Runtime**: Node.js with Node 18+ `node:http` (no framework → zero or near-zero third-party runtime deps). Tests with Node built-in `node:test` runner? The user asked for "unit tests" — using `node:test` avoids a Jest/Vitest dep, keeping everything self-contained and runnable. But they might expect Jest. Using `node:test` is safer: zero dependencies, runnable via `npm test`. Let's go with `node:test` + `assert/strict`. TypeScript 5 + tsconfig strict.
+
+- **Build**: Use `tsc` to compile to `dist/`. Scripts: `build`, `start`, `test` (compile then run tests? or use ts-node?). To avoid extra dev deps like ts-node/tsx, compile tests with tsc too and run with node's test runner. Simpler: a single tsconfig that compiles both src and test to dist, and `npm test` = `npm run build && node --test dist/test`. That works: `node --test dist/test` will discover `*.test.js` files. Node 20+ `node --test` accepts a directory. Good.
+
+- **HTTP endpoints**:
+  - `POST /metrics` — accept a newline-delimited stream of metric records. The core ingest endpoint. Streaming parse: read chunks, accumulate lines in a bounded buffer; process each complete line; reject if buffer exceeds a max line size (backpressure / 413/400). Return an aggregate report of the accepted batch: counts, malformed lines with line numbers and error details.
+  - `GET /health` — liveness + readiness: uptime, in-memory group count, total accepted records, malformed counter, version.
+  - `GET /summary` — all groups: mean/median/sample stddev for each model+fixture group.
+  - `GET /runs/:id` — per-run breakdown. Hmm — "group records by model and fixture" and `/runs/:id` — so records have a `runId` field, and `/runs/:id` returns stats for that run (maybe broken out per model+fixture, plus overall).
+
+  Define record schema:
+  ```json
+  {
+    "runId": "run-2024-01-01-a",
+    "model": "gpt-4.1",
+    "fixture": "smoke",
+    "latencyMs": 241.7,
+    "tokensOut": 312,
+    "status": "ok"   // or error?
+  }
+  ```
+  
+  What to aggregate? "request metrics" — compute mean/median/sample stddev of… what value? Probably latency (durationMs) and tokens. Let's define required fields:
+  - `runId`: non-empty string (≤128 chars)
+  - `model`: non-empty string (≤128 chars)
+  - `fixture`: non-empty string (≤128 chars)
+  - `durationMs`: finite non-negative number (required metric)
+  - `tokens`: non-negative integer (optional? keep it required to simplify the math but optional would be more realistic). Required `durationMs`, optional `tokens` (non-negative int ≤ some bound) is a choice — if present, also compute stats on it.
+  - `timestamp`: optional ISO 8601 string; validate with regex + Date parse; default to receive time.
+  - `status`: optional enum of "ok" | "error"? Maybe keep it. Hmm, scope control: the essential thing is stats on durationMs. Let's include optional `tokens` so we can show two metric aggregations, and make `timestamp` optional. That should be enough.
+
+  Actually let's focus: fields are `runId`, `model`, `fixture` (strings), `durationMs` (number), `tokens` (optional integer), `timestamp` (optional ISO). Stats computed on `durationMs` and `tokens` (where present).
+
+- **Grouping and statistics with bounded memory**: To compute the median with bounded memory, you need a streaming median structure. Classic approach: two heaps (max-heap for low half, min-heap for high half). This gives O(log n) per insertion and O(n) memory for the median itself — which isn't bounded in the number of records, but it's bounded by the number of *distinct groups* times group size… hmm, "bounded memory" really means: memory doesn't scale with the number of records processed *per request*, and ideally the total service memory is bounded by the number of distinct groups. But median needs to store values. Options:
+  1. Two heaps per group — memory proportional to number of records in the group (unbounded overall).
+  2. T-digest — approximate, bounded. But implementing a t-digest is heavy, and the requirement is "compute mean/median" — probably exact.
+  3. Bounded design decision: cap the number of groups and/or the number of records held per group. Provide a `maxRecordsPerGroup` setting: once exceeded, subsequent records for that group are counted but not retained for the median (median becomes "approximate/stale" — not great).
+  
+  A cleaner interpretation of "bounded memory": (a) streaming ingest means we never buffer the whole body; (b) per-line buffer bounded by max line length; (c) summary state is a fixed-size aggregate structure keyed by group with a hard cap on the number of groups (e.g., `maxGroups` = 1024) — when exceeded, reject or drop with a counter. The median via two heaps is exact; the memory for retained values is proportional to records but that's inherent to exact median computation. Document this and add a cap: `maxRetainedPerGroup`? Hmm.
+
+  Alternative: use a **streaming median with two heaps** and add a service-level cap on total retained values (`maxTrackedValues`); when the cap is exceeded, evict from the larger heap (median becomes approximate, flagged in the response as `exact: false`). This is honest and keeps memory truly bounded. It's good design for the "bounded memory" requirement: default maxTrackedValues to say 200_000, each a double — 1.6MB plus heap overhead. Good.
+
+  Mean and stddev: Welford's online algorithm → O(1) per group per metric. Sample stddev = sqrt(M2/(n-1)); undefined when n=1 → return null for `sampleStddev` (and document it).
+
+- **Median with two heaps**: implement a small binary heap class with a comparator. MaxHeap for low side, MinHeap for high side. Invariants: sizes differ by at most 1; all low ≤ all high. Insert: compare to top of low; rebalance. If n is odd and |low|>|high|, median = low.peek(); otherwise average of the two peaks. With eviction when over cap: remove max from high (or min) to preserve balance and mark approximate.
+
+  Simpler eviction: when totalTracked > cap, pop from the larger heap. Recompute median: if sizes equal, take the average of the two peaks; else peak of the larger one. Mark `medianExact = false` per group or globally.
+
+  Let me implement carefully:
+
+  ```ts
+  class BinaryHeap<T> {
+    private readonly cmp: (a: T, b: T) => number;
+    private items: T[] = [];
+    // push, peek, pop, get size
+  }
+  ```
+  Max heap: cmp = (a,b) => a - b. Min heap: (a,b) => a - b, then… no: for a min heap, the comparator returns a positive value when a should come after b. Standard: for a min heap, comparator returns positive when a should come after b. `cmp(a,b) = b - a` means a comes after b when b < a… let me just define it: the heap is a "min-heap with respect to key", key = -value, or write a generic comparator where `parent > child`. Simplest: a `MinHeap` that implements the min-heap property with `lessOrEqual(a, b)`. Let me write one `BinaryHeap` with a `compare(a, b): number` (returns <0 if a should be closer to the root). Push: sift up while compare(child, parent) < 0. Pop root: replace with last, sift down.
+
+  MedianMaintainer:
+  ```ts
+  class StreamingMedian {
+    private low = new BinaryHeap<number>((a, b) => b - a); // max-heap: a closer to root if a > b
+    private high = new BinaryHeap<number>((a, b) => a - b); // min-heap
+    private tracked = 0;
+    approximate = false;
+    
+    add(value: number, cap: number): void {
+      if (this.tracked >= cap) {
+        // evict from the larger side to preserve balance
+        if (this.low.size >= this.high.size) this.low.pop(); else this.high.pop();
+        this.tracked -= 1;
+        this.approximate = true;
+      }
+      if (this.low.size > 0 && value <= this.low.peek()) this.low.push(value);
+      else this.high.push(value);
+      // rebalance: allow low.size - high.size ∈ {0,1}
+      if (this.low.size - this.high.size > 1) this.high.push(this.low.pop()!);
+      else if (this.high.size - this.low.size > 1) this.low.push(this.high.pop()!);
+    }
+    
+    median(): number | null {
+      if (this.low.size === 0) {
+        if (this.high.size === 0) return null;
+        // high has 1 more? invariants allow high.size - low.size ≤ 1, so high=1, low=0
+        return this.high.peek();
+      }
+      if (this.low.size === this.high.size) {
+        return (this.low.peek() + this.high.peek()) / 2;
+      }
+      return this.low.peek();
+    }
+  }
+  ```
+  Check invariants: after add and rebalance, |low| - |high| ≤ 1 and |high| - |low| ≤ 1. Initial state: empty. Add: low empty → high. high size 1, low 0 → rebalance? high-low=1, OK. Add: second value: if ≤ high? no wait, low empty → push to high. high size 2 → rebalance: move high.pop() (min) to low. Now low has the min, high has the max. median = average.
+
+  Edge case: value comparison when low empty but high non-empty — condition `low.size > 0 && value <= low.peek()` is false → high.push. That's fine because invariant ensures low ≥ high when both are non-empty.
+
+- **Welford**:
+  ```ts
+  class RunningMoments {
+    n = 0; mean = 0; m2 = 0;
+    add(x: number) {
+      this.n += 1;
+      const delta = x - this.mean;
+      this.mean += delta / this.n;
+      const delta2 = x - this.mean;
+      this.m2 += delta * delta2;
+    }
+    get sampleVariance(): number | null { return this.n >= 2 ? this.m2 / (this.n - 1) : null; }
+    get sampleStddev(): number | null { const v = this.sampleVariance; return v === null || v < 0 ? null : Math.sqrt(v); }
+    get sum(): number { return this.mean * this.n; }
+  }
+  ```
+  Note: m2 can go slightly negative due to floating point; clamp.
+
+- **Validator (no third-party libs)**: function `parseMetric(line: string, lineNo: number): ParsedResult` that returns typed errors. Checks:
+  - Line must be non-empty after trim (blank lines: skip? Common in NDJSON to ignore blank lines and count as skipped, not error. Let's silently skip empty/whitespace-only lines but count them as `blankLines`.)
+  - JSON.parse — if SyntaxError → `invalid-json`.
+  - Must be a plain object (typeof object, not null, not array).
+  - Field type checks with strict types: runId/model/fixture are `string` (typeof === 'string'), trimmed non-empty, length ≤ 64/128; durationMs is finite number (typeof number, Number.isFinite) and ≥ 0; tokens optional, but if present must be a non-negative integer (Number.isInteger, ≥ 0); timestamp optional, string, must match ISO regex AND `Date.parse` is finite.
+  - Reject unknown fields? Strict mode: yes, reject unknown properties → `unknown-field` error. That's a nice strictness touch.
+  - Error object: `{ line: number, code: string, field?: string, message: string }`.
+  
+  Codes: `INVALID_JSON`, `NOT_OBJECT`, `MISSING_FIELD`, `TYPE_MISMATCH`, `OUT_OF_RANGE`, `UNKNOWN_FIELD`, `BAD_TIMESTAMP`, `TOO_LONG`. Good.
+
+  Note: JSON.parse accepts duplicate keys (last wins) — no problem.
+
+- **Incremental parser**: `MetricsLineSplitter` class: `write(chunk: Buffer|string): number[] (complete lines)`, `end(): string | null (remaining partial line)`. Bounded: hold carry buffer; if carry length > maxLineBytes (e.g., 64KB) → emit an error line `LINE_TOO_LONG` and flush (resync at next newline). Incremental processing: process line as soon as complete; O(1) carry + per-line memory. Also handle CRLF (strip trailing \r).
+
+  Implementation:
+  ```ts
+  class LineSplitter {
+    private carry = '';
+    private readonly maxLineLength: number;
+    private overflow = false;
+    write(chunk: string): string[] { ... }
+  }
+  ```
+  Approach: `const text = this.overflow ? '' : this.carry + chunk; this.carry = '';` find last newline; carry = the text after it; the preceding part is split into lines. If carry.length > maxLineLength → push a special marker? Better: emit lines normally, but when carry exceeds max, emit the `null` sentinel to signal the overflow for that logical line, and clear carry. Hmm, sentinel handling complicates line numbering.
+
+  Cleaner: the splitter returns `Line { text: string | null }` where null means the oversized line was discarded. The line number is managed by the caller.
+
+  Edge case: oversized chunk with no newlines at all: after processing, carry = the whole huge text → detect → discard, emit one null line. But we should avoid copying into carry and holding a huge string. If the chunk itself is > maxLineLength and contains no newlines, we can detect before concatenation and discard the entire chunk as a single oversized line (or split by newline, discarding any oversized segments — the chunk may have newlines and long segments). Let's write it:
+
+  ```ts
+  write(chunk: string): (string | null)[] {
+    const out: (string | null)[] = [];
+    let input = this.carry + chunk; // carry is always ≤ maxLineLength
+    // find the last \n
+    let last = input.lastIndexOf('\n');
+    if (last === -1) {
+      // no complete line
+      if (input.length > this.maxLineLength) {
+        out.push(null);
+        this.carry = '';
+      } else {
+        this.carry = input;
+      }
+      return out;
+    }
+    let head = input.slice(0, last);
+    const rest = input.slice(last + 1);
+    // split head by newlines
+    const parts = head.split('\n'); // the last part is the segment before the last \n, possibly ''
+    ...
+  }
+  ```
+  Hmm, if head has embedded newlines (carry + chunk with newlines), then head.split('\n') returns segments, each of which is a complete line. Carry = rest (which by construction has no newline… no wait, since last was the last \n, rest has no \n). Carry = rest; if rest.length > maxLineLength → the next write will trigger the discard logic; but we want to emit the null immediately to keep the error reporting accurate. Let's just check: if rest.length > maxLineLength → out.push(null), carry=''. Otherwise carry=rest.
+  
+  For each complete line segment: strip trailing \r (CRLF). If segment (after stripping) is '' → still an "empty line" — the caller skips it. For each segment, if length > maxLineLength → null, else the text. Note: a line with content exactly maxLineLength is fine.
+
+  Per-line length check happens *before* the JSON.parse cost — good for malformed-input protection.
+
+  Also cap the chunk processing: Node streams naturally backpressure with `pause`/`resume` — process the request body with `for await` over the stream, so the event loop yields between chunks; the handler is async so we get backpressure from the http client automatically.
+
+- **Group store**:
+  ```ts
+  type GroupKey = { model: string; fixture: string };
+  class Group {
+    key; count; duration: RunningMoments;

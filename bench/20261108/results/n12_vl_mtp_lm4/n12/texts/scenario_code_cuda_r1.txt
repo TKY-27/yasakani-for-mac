@@ -1,0 +1,441 @@
+# CUDA 13.1 / C++20 Row-wise BF16 Normalizer for sm_120a
+
+Below is a complete, self-contained implementation. It compiles with `nvcc` targeting `sm_120a` (Blackwell) and uses the `__nv_bfloat16` type. The program:
+
+- Parses CLI arguments (`--rows`, `--cols`, `--iters`, `--seed`, `--tol`, `--warmup`, `--help`).
+- Generates deterministic input on the host (reproducible across runs).
+- Allocates RAII-managed device buffers.
+- Runs a vectorized CUDA kernel that normalizes each row to unit L2 norm.
+- Computes a numerically stable FP32 reference on the host.
+- Verifies results with a configurable tolerance.
+- Times the kernel using CUDA events with warm-up.
+
+```
+CMakeLists.txt
+main.cpp
+```
+
+## CMakeLists.txt
+
+```cmake
+cmake_minimum_required(VERSION 3.24)
+project(bf16_row_norm LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+# Target sm_120a (Blackwell)
+set(CMAKE_CUDA_ARCHITECTURES 120a)
+
+# Find CUDA
+find_package(CUDA REQUIRED)
+
+# Main executable
+add_executable(bf16_row_norm main.cpp)
+
+# Link CUDA runtime
+target_link_libraries(bf16_row_norm PRIVATE CUDA::cudart)
+
+# Compile flags
+target_compile_options(bf16_row_norm PRIVATE
+    $<IF:$<BOOL:${CMAKE_CXX_COMPILER_ID} MATCHES "GNU">,
+        -Wall -Wextra -O2,
+        -Wall -Wextra -O2>
+)
+
+# CUDA compile flags
+set_target_properties(bf16_row_norm PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+
+target_compile_options(bf16_row_norm PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+        -O3
+        --use_fast_math
+        -Xptxas -v
+    >
+)
+
+# Install
+install(TARGETS bf16_row_norm RUNTIME DESTINATION bin)
+```
+
+## main.cpp
+
+```cpp
+// bf16_row_norm.cpp
+//
+// Row-wise L2 normalization of a large BF16 matrix on sm_120a.
+// CUDA 13.1 / C++20
+//
+// Build:
+//   cmake -B build -DCMAKE_CUDA_ARCHITECTURES=120a
+//   cmake --build build
+//   ./build/bf16_row_norm --rows 8192 --cols 4096 --iters 100 --seed 42
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <limits>
+#include <numeric>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+// ---------------------------------------------------------------------------
+// Error checking macro
+// ---------------------------------------------------------------------------
+#define CUDA_CHECK(call)                                                       \
+    do {                                                                       \
+        cudaError_t err = (call);                                              \
+        if (err != cudaSuccess) {                                              \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
+                    cudaGetErrorString(err));                                 \
+            exit(EXIT_FAILURE);                                                \
+        }                                                                      \
+    } while (0)
+
+// ---------------------------------------------------------------------------
+// RAII device buffer
+// ---------------------------------------------------------------------------
+class DeviceBuffer {
+public:
+    explicit DeviceBuffer(size_t bytes) : size_(bytes) {
+        if (bytes > 0) {
+            CUDA_CHECK(cudaMalloc(&ptr_, bytes));
+        }
+    }
+
+    ~DeviceBuffer() {
+        if (ptr_) {
+            cudaFree(ptr_);
+        }
+    }
+
+    // Non-copyable
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+    // Movable
+    DeviceBuffer(DeviceBuffer&& other) noexcept
+        : ptr_(other.ptr_), size_(other.size_) {
+        other.ptr_ = nullptr;
+        other.size_ = 0;
+    }
+
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            if (ptr_) cudaFree(ptr_);
+            ptr_ = other.ptr_;
+            size_ = other.size_;
+            other.ptr_ = nullptr;
+            other.size_ = 0;
+        }
+        return *this*;
+    }
+
+    void* data() const { return ptr_; }
+    size_t size() const { return size_; }
+
+private:
+    void* ptr_ = nullptr;
+    size_t size_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// CLI argument parsing
+// ---------------------------------------------------------------------------
+struct Args {
+    int rows = 8192;
+    int cols = 4096;
+    int iters = 100;
+    uint64_t seed = 42;
+    double tol = 1e-3;
+    int warmup = 5;
+    bool verbose = true;
+};
+
+void print_usage(const char* prog) {
+    fprintf(stderr,
+        "Usage: %s [options]\n"
+        "\n"
+        "Options:\n"
+        "  --rows <N>       Number of rows (default: 8192)\n"
+        "  --cols <N>       Number of columns (default: 4096)\n"
+        "  --iters <N>      Number of timed iterations (default: 100)\n"
+        "  --seed <N>       RNG seed for deterministic input (default: 42)\n"
+        "  --tol <F>        Relative tolerance for verification (default: 1e-3)\n"
+        "  --warmup <N>     Number of warm-up iterations (default: 5)\n"
+        "  --quiet          Suppress verbose output\n"
+        "  --help           Show this help\n",
+        prog);
+}
+
+Args parse_args(int argc, char** argv) {
+    Args args;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        auto next = [&]() -> const char* {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: missing value for %s\n", arg.c_str());
+                exit(EXIT_FAILURE);
+            }
+            return argv[++i];
+        };
+
+        if (arg == "--rows") {
+            args.rows = std::stoi(next());
+        } else if (arg == "--cols") {
+            args.cols = std::stoi(next());
+        } else if (arg == "--iters") {
+            args.iters = std::stoi(next());
+        } else if (arg == "--seed") {
+            args.seed = std::stoull(next());
+        } else if (arg == "--tol") {
+            args.tol = std::stod(next());
+        } else if (arg == "--warmup") {
+            args.warmup = std::stoi(next());
+        } else if (arg == "--quiet") {
+            args.verbose = false;
+        } else if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            exit(EXIT_SUCCESS);
+        } else {
+            fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
+            print_usage(argv[0]);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    if (args.rows <= 0 || args.cols <= 0) {
+        fprintf(stderr, "Error: rows and cols must be positive.\n");
+        exit(EXIT_FAILURE);
+    }
+    if (args.iters <= 0) {
+        fprintf(stderr, "Error: iters must be positive.\n");
+        exit(EXIT_FAILURE);
+    }
+    if (args.warmup < 0) {
+        fprintf(stderr, "Error: warmup must be non-negative.\n");
+        exit(EXIT_FAILURE);
+    }
+    if (args.tol <= 0.0) {
+        fprintf(stderr, "Error: tol must be positive.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    return args;
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic input generation
+// ---------------------------------------------------------------------------
+// Generates a matrix of BF16 values in [-1, 1] using a fixed-seed
+// Mersenne Twister. The distribution is uniform so that row norms are
+// well-behaved and non-degenerate.
+std::vector<__nv_bfloat16> generate_input(int rows, int cols, uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<__nv_bfloat16> data(static_cast<size_t>(rows) * cols);
+    for (size_t i = 0; i < data.size(); ++i) {
+        data[i] = __float2bfloat16(dist(rng));
+    }
+    return data;
+}
+
+// ---------------------------------------------------------------------------
+// FP32 reference: numerically stable row-wise L2 normalization
+//
+// For each row, compute:
+//   norm = sqrt(sum(x_i^2))
+//   y_i  = x_i / norm
+//
+// Uses Kahan summation for the sum of squares to reduce floating-point
+// error accumulation.
+// ---------------------------------------------------------------------------
+std::vector<float> compute_reference_fp32(const std::vector<__nv_bfloat16>& input,
+                                           int rows, int cols) {
+    std::vector<float> output(static_cast<size_t>(rows) * cols);
+
+    for (int r = 0; r < rows; ++r) {
+        const size_t row_offset = static_cast<size_t>(r) * cols;
+
+        // Kahan-compensated sum of squares
+        float sum = 0.0f;
+        float comp = 0.0f;
+        for (int c = 0; c < cols; ++c) {
+            float val = __bfloat162float(input[row_offset + c]);
+            float sq = val * val;
+            float y = sq - comp;
+            float t = sum + y;
+            comp = (t - sum) - y;
+            sum = t;
+        }
+
+        float norm = std::sqrt(sum);
+        if (norm == 0.0f) {
+            // Zero row: leave as zeros
+            for (int c = 0; c < cols; ++c) {
+                output[row_offset + c] = 0.0f;
+            }
+        } else {
+            float inv_norm = 1.0f / norm;
+            for (int c = 0; c < cols; ++c) {
+                float val = __bfloat162float(input[row_offset + c]);
+                output[row_offset + c] = val * inv_norm;
+            }
+        }
+    }
+
+    return output;
+}
+
+// ---------------------------------------------------------------------------
+// CUDA kernel: vectorized row-wise L2 normalization
+//
+// Each block handles one row.
+// - Vectorized loads/stores using float4 (4 x float32) when cols % 4 == 0.
+// - Each thread accumulates a partial sum of squares, then a block-level
+//   reduction computes the total sum of squares.
+// - All threads compute the inverse norm and write the normalized values.
+//
+// Layout: input and output are contiguous arrays of __nv_bfloat16.
+// Row r starts at index r * cols.
+// ---------------------------------------------------------------------------
+
+// Vectorized load: 4 BF16 values packed into a uint32_t (2 per 32-bit word)
+// Actually, __nv_bfloat16 is 16 bits. 4 BF16 = 64 bits = uint64_t.
+// We use uint64_t for 4-element vectors.
+
+__device__ __forceinline__ uint64_t load_bf16x4(const __nv_bfloat16* ptr) {
+    uint64_t val;
+    asm volatile("ld.global.v4.u32 %0, [%1];"
+                 : "=l"(val)
+                 : "l"(ptr)
+                 : "memory");
+    return val;
+}
+
+__device__ __forceinline__ void store_bf16x4(__nv_bfloat16* ptr, uint64_t val) {
+    asm volatile("st.global.v4.u32 [%0], %1;"
+                 ::"l"(ptr), "l"(val)
+                 : "memory");
+}
+
+// Convert 4 packed BF16 to 4 float32 values
+__device__ __forceinline__ void unpack_bf16x4(uint64_t packed,
+                                               float& f0, float& f1,
+                                               float& f2, float& f3) {
+    uint32_t lo = static_cast<uint32_t>(packed & 0xFFFFFFFFull);
+    uint32_t hi = static_cast<uint32_t>(packed >> 32);
+
+    __nv_bfloat162 lo_pair = *reinterpret_cast<__nv_bfloat162*>(&lo);
+    __nv_bfloat162 hi_pair = *reinterpret_cast<__nv_bfloat162*>(&hi);
+
+    float2 lo_f = __bfloat1622float2(lo_pair);
+    float2 hi_f = __bfloat1622float2(hi_pair);
+
+    f0 = lo_f.x;
+    f1 = lo_f.y;
+    f2 = hi_f.x;
+    f3 = hi_f.y;
+}
+
+// Pack 4 float32 values into 4 BF16 (uint64_t)
+__device__ __forceinline__ uint64_t pack_bf16x4(float f0, float f1,
+                                                 float f2, float f3) {
+    __nv_bfloat162 lo_pair = __floats2bfloat162_rn(f0, f1);
+    __nv_bfloat162 hi_pair = __floats2bfloat162_rn(f2, f3);
+
+    uint32_t lo = *reinterpret_cast<uint32_t*>(&lo_pair);
+    uint32_t hi = *reinterpret_cast<uint32_t*>(&hi_pair);
+
+    return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+}
+
+// Block-level reduction for sum of squares
+__device__ __forceinline__ float block_reduce_sum(float val,
+                                                   float* shared) {
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+
+    shared[tid] = val;
+    __syncthreads();
+
+    // Tree reduction
+    for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    return shared[0];
+}
+
+// Kernel: one block per row
+// cols must be divisible by 4 for the vectorized path.
+template <int BLOCK_SIZE>
+__global__ void row_normalize_bf16(const __nv_bfloat16* __restrict__ input,
+                                   __nv_bfloat16* __restrict__ output,
+                                   int rows, int cols) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const __nv_bfloat16* row_in = input + static_cast<size_t>(row) * cols;
+    __nv_bfloat16* row_out = output + static_cast<size_t>(row) * cols;
+
+    int tid = threadIdx.x;
+    int nthreads = BLOCK_SIZE;
+
+    // Shared memory for reduction
+    __shared__ float sdata[BLOCK_SIZE];
+
+    // Each thread processes 4 elements at a time (vectorized)
+    // Number of vector elements per row
+    int vec_count = cols / 4;
+    int vec_per_thread = (vec_count + nthreads - 1) / nthreads;
+
+    float local_sum = 0.0f;
+
+    // First pass: compute sum of squares
+    for (int i = 0; i < vec_per_thread; ++i) {
+        int idx = tid + i * nthreads;
+        if (idx < vec_count) {
+            uint64_t packed = load_bf16x4(row_in + idx * 4);
+            float f0, f1, f2, f3;
+            unpack_bf16x4(packed, f0, f1, f2, f3);
+            local_sum += f0 * f0 + f1 * f1 + f2 * f2 + f3 * f3;
+        }
+    }
+
+    // Block reduction
+    float total_sum = block_reduce_sum(local_sum, sdata);
+    __syncthreads();
+
+    float norm = sqrtf(total_sum);
+    float inv_norm = (norm > 0.0f) ? (1.0f / norm) : 0.0f;
+
+    // Second pass: normalize and store
+    for (int i = 0; i < vec_per_thread; ++i) {
+        int idx = tid + i * nthreads;
+        if (idx < vec_count) {
+            uint64_t packed = load_bf16x4(row_in + idx * 4);
+            float f0, f1, f2, f3;
+            unpack_bf16x4(packed, f0, f1, f2, f3);
+
+            f0 *= inv_norm;
+            f1 *= inv_norm;
+            f2 *=

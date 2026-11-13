@@ -1,0 +1,355 @@
+The user is requesting a complete Python 3.11 package for a deterministic asynchronous job runner with the following requirements:
+
+1. Read a JSON manifest
+2. Enforce only one active GPU job
+3. Persist state atomically
+4. Resume already-completed work
+5. Stream structured JSONL events
+6. Handle SIGINT
+7. Redact (mask) configured secrets
+8. Include pytest tests for success, failure, cancellation, and resume
+9. Present all source files in separate fenced blocks with their paths
+10. Include pyproject.toml
+
+Let me design this carefully.
+
+Package name: `gjobrunner` or `asyncjobrunner`. Let's go with `gjobrunner` — deterministic asynchronous job runner.
+
+Core design:
+
+**Manifest schema:**
+```json
+{
+  "version": 1,
+  "jobs": [
+    {
+      "id": "job-1",
+      "command": ["python", "-c", "..."],
+      "env": {...},
+      "gpu": true,
+      "depends_on": [...],
+      "secrets": ["API_TOKEN"]
+    }
+  ],
+  "settings": {
+    "concurrency": 1,
+    "timeout_seconds": 60,
+    "secret_names": ["API_TOKEN"],
+    "secret_redaction": "***"
+  }
+}
+```
+
+Actually, let's keep it simple but robust:
+
+- `manifest.json`:
+```json
+{
+  "schema_version": 1,
+  "jobs": [
+    {
+      "id": "train-a",
+      "gpu": true,
+      "command": ["sh", "-c", "echo training"],
+      "env": {"FOO": "bar"},
+      "depends_on": []
+    }
+  ],
+  "secrets": ["FOO"],
+  "default_timeout_seconds": 30
+}
+```
+
+**State persistence (atomic):**
+- The state file at `state.json` in a work directory.
+- Atomic write: write to a temp file in the same directory, `fsync`, `os.replace`.
+- State schema:
+```json
+{
+  "schema_version": 1,
+  "run_id": "...",
+  "created_at": "...",
+  "updated_at": "...",
+  "jobs": {
+    "job-1": {"status": "completed", "exit_code": 0, "started_at": ..., "ended_at": ...}
+  }
+}
+```
+
+**Deterministic:**
+- Process jobs in the deterministic order they appear in the manifest (topological order is stable: sort by position in the manifest).
+- Use a fixed seed for anything non-deterministic (e.g., run ID can be derived from the manifest hash rather than random — deterministic run ID = sha256 of manifest bytes).
+- The order in which jobs are scheduled is deterministic.
+
+**Enforce only one active GPU job:**
+- Track a semaphore/count: `gpu_sem` = count of running GPU jobs; if >= 1, cannot start another GPU job.
+- Non-GPU jobs can run concurrently? The requirement is "enforce only one active GPU job" — meaning multiple non-GPU jobs can run concurrently, but at most one GPU job. Let's implement a max concurrency setting (e.g. `max_workers`), plus a GPU limit of 1.
+
+**Streaming structured JSONL events:**
+- Write to `events.jsonl` — each line is a JSON object: `{"ts": ..., "seq": ..., "type": "job.start", "job_id": ..., ...}`.
+- Events: `run.start`, `job.skipped` (resumed/completed), `job.start`, `job.output` (log lines), `job.exit`, `job.completed`, `job.failed`, `job.cancelled`, `run.completed`, `run.failed`, `run.cancelled`, `run.resumed`.
+- Structured: each event has a `seq` (monotonically increasing), a `ts` ISO timestamp, a `type`, a `payload`.
+- Redaction: the output stream passes through a redactor that replaces configured secrets with `***` (or the configured redaction string).
+- Events are appended atomically enough: open in append mode, write the line, flush + fsync per event? Flush per event to guarantee streaming. Use a lock around writes.
+
+**SIGINT handling:**
+- First SIGINT: gracefully cancel — stop starting new jobs, terminate running jobs (SIGTERM), then SIGKILL after a grace period, mark as cancelled, persist state, emit a run.cancelled event.
+- Second SIGINT: hard exit (or force).
+- Implement by registering a signal handler in the main thread and setting an asyncio.Event.
+
+**Resume:**
+- On startup, load existing state if present; jobs marked as `completed` are skipped (emit `job.skipped`/`job.resumed` events). Failed jobs are retried (status failed → back to pending). Cancelled/pending → re-run.
+- Only completed work is resumed (skipped). The requirement says "resume completed work" — meaning skip jobs already completed.
+
+**Job execution:**
+- Run subprocess via asyncio.create_subprocess_exec with env (secret values injected from the actual environment? Hmm — where do secret values come from? Typically, secrets come from the process environment and should not appear in logs. The manifest lists secret names; the redactor masks those values in log output.)
+- Design: secrets are configured by name; values are read from os.environ (or `--set-secret`? Let's keep it simple: manifest's `secrets` is a list of env var names; values are taken from the process environment and passed to the job's env; the redactor masks values in all output/logs and events).
+- Capture stdout/stderr lines and emit `job.output` events, redacted.
+
+**Determinism details:**
+- run_id: deterministic — sha256 of canonical JSON of the manifest. Or include a nonce? For determinism of reruns, derive from manifest content. But two runs of the same manifest will produce the same run_id — that's fine, even desirable for resume.
+- Actually, for resume, run_id should be stable across resumes. Deriving from manifest hash works.
+- Timestamps are inherently non-deterministic; that's acceptable — "deterministic" refers to scheduling order and result. Document it.
+- Use stable topological ordering: Kahn's algorithm with a queue ordered by manifest index.
+- asyncio: use a bounded task pool: schedule jobs when dependencies are met; pick the earliest-index job among ready jobs (deterministic ordering). Use a simple scheduler loop: while pending, for each job in manifest order, if dependencies are satisfied and concurrency slots allow (total workers and gpu limit), start it.
+
+**Package layout:**
+
+```
+gjobrunner/
+  pyproject.toml
+  README.md (optional? user didn't ask but no harm — keep minimal or include small README)
+  src/
+    gjobrunner/
+      __init__.py
+      __main__.py
+      manifest.py
+      redaction.py
+      events.py
+      state.py
+      scheduler.py (runner)
+      runner.py
+      cli.py
+  tests/
+    __init__.py
+    conftest.py
+    test_success.py
+    test_failure.py
+    test_cancel.py
+    test_resume.py
+    test_redaction.py
+```
+
+Simpler: flat layout or src layout? Let's use src layout — professional.
+
+Let me write the modules.
+
+### manifest.py
+
+```python
+"""Manifest loading and validation."""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+class ManifestError(ValueError):
+    """Raised when the manifest is malformed."""
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    id: str
+    command: tuple[str, ...]
+    env: dict[str, str] = field(default_factory=dict)
+    gpu: bool = False
+    depends_on: tuple[str, ...] = ()
+    timeout_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class Manifest:
+    jobs: dict[str, JobSpec]
+    order: tuple[str, ...]           # deterministic manifest order
+    secret_names: frozenset[str]
+    redaction: str
+    max_workers: int
+    default_timeout_seconds: float | None
+
+
+def load_manifest(path: Path) -> Manifest:
+    ...
+```
+
+Validation:
+- schema_version == 1
+- jobs is a non-empty list
+- each job has id (unique), command (list of str, non-empty), optional env (str→str), gpu bool default False, depends_on list (referring to existing ids, no self-deps), timeout positive.
+- No cycles → topological check.
+- secrets: list of strings
+- max_workers >= 1
+- redaction: string, default "***"
+
+### redaction.py
+
+```python
+class Redactor:
+    def __init__(self, pairs: dict[str, str]):  # secret value -> replacement
+        self._pairs = sorted(pairs.items(), key=lambda kv: len(kv[0]), reverse=True)
+
+    def redact(self, text: str) -> str:
+        out = text
+        for value, repl in self._pairs:
+            if value:
+                out = out.replace(value, repl)
+        return out
+```
+
+Secrets come from the environment by name: `names` → values from os.environ (only those present). Also allow explicit values from the manifest? The requirement says "redact configured secrets" — configured = listed in manifest/secrets. Values: to be testable in the test suite without depending on environment variables, support both: `secrets` entries can be a string (name, value from env) or an object {"name": ..., "value": ...}? Simpler: in tests, set environment variables via monkeypatch, and let the runner read values from env. This is realistic. But for test determinism, monkeypatch.setenv works well.
+
+Alternative: allow a manifest field `"secret_values"`? Embedding secret values in the manifest is bad practice but useful for tests. Support both: a string name (from env) or a mapping `{"name": str, "value": str}`. Hmm, that complicates the schema. Let's do:
+
+```json
+"secrets": [
+  "API_TOKEN",
+  {"name": "DB_PASSWORD", "value": "s3cret"}
+]
+```
+
+Both forms; document it. Values from env take precedence? No — if both forms define the same name, prefer the manifest value? Keep it simple: later entries override earlier; names in env must be present, and if missing → ManifestError? Maybe better: if env var is missing, just don't inject and don't redact? For safety, fail early: raise ManifestError? Runtime error might be better. Hmm, failing early is more deterministic. But in tests we control the env. Let's go with: at load time, resolve values: if an explicit value is present, use it; else os.environ.get(name); if missing → ManifestError("secret ... not found in environment"). Deterministic and fails early.
+
+Wait — but the manifest is read once per process; os.environ at load time is fine.
+
+### state.py
+
+Atomic JSON write:
+
+```python
+def atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+```
+
+JobStatus enum: PENDING, RUNNING, COMPLETED, FAILED, CANCELLED.
+
+StateStore class:
+- `load()` → State or None (handle corrupted tmp leftovers: delete *.tmp on startup? If a tmp file exists, a crash may have occurred mid-write — since os.replace is atomic, the target is consistent; delete stale tmp files.)
+- `save()` → atomic write with fsync.
+- `set_job_status(job_id, status, **extra)`.
+
+State dataclass:
+
+```python
+@dataclass
+class State:
+    schema_version: int = 1
+    run_id: str
+    manifest_hash: str
+    created_at: str
+    updated_at: str
+    jobs: dict[str, JobState]
+```
+
+JobState: status, exit_code, started_at, ended_at, attempts? Keep it simple: status, exit_code, started_at, ended_at, output_lines? Storing output in state would bloat it; events.jsonl is the log. OK.
+
+### events.py
+
+EventWriter:
+- path `events.jsonl`
+- lock (asyncio.Lock) — writes are fast; could also be done synchronously.
+- `async def emit(self, type_: str, **payload)` builds `{"seq": n, "ts": iso, "run_id":..., "type":..., "payload": {...}}` with redaction applied to string values in payload (deep redact).
+- Append line, flush, fsync? Per-line fsync may be slow but guarantees durability; for "streaming" tests, flush is enough. Let's flush per line and fsync on run events (critical points) — simpler: fsync per event; jobs are small. Actually, per-line fsync is fine at test scale. Let's do flush + fsync per event — durability guarantee. Hmm, "stream structured JSONL events" — flush is the key. Let's do flush, and fsync at the end of the run + on critical state changes. Keep code simple: flush per event, fsync per event (deterministic, simple). OK.
+
+Redacting events: payload might contain dict output lines; deep-redact all str values using Redactor.
+
+seq: monotonically increasing int starting from 0.
+
+### runner.py
+
+Runner class:
+
+```python
+class Runner:
+    def __init__(self, manifest: Manifest, workdir: Path, env: Mapping[str,str] | None = None):
+        ...
+```
+
+- workdir contains `state.json`, `events.jsonl`.
+- Compute run_id deterministically: sha256 of canonical JSON of manifest (raw bytes of the manifest file? If state exists and the manifest has changed → error "manifest changed since last run; refusing to resume"). Good: save `manifest_hash` in state; on resume, compare; mismatch → error. Use hash of canonical JSON of parsed structure (stable against whitespace differences).
+
+- Resume: if a state file exists:
+  - manifest hash mismatch → RuntimeError/ManifestError.
+  - jobs with status COMPLETED → skip (emit `job.skipped` with reason "already_completed").
+  - Other statuses → reset to PENDING (a FAILED job will retry on resume).
+  - Continue events file (append) — seq continues? EventWriter: on init, if the file exists, scan existing lines to get the last seq to continue. That's a nice touch: resume the seq counter.
+
+- Scheduling loop (deterministic):
+
+```python
+async def run(self) -> int:
+    # return exit code: 0 success, 1 failure, 130 cancelled
+```
+
+Scheduler:
+
+```python
+running: dict[str, asyncio.Task] = {}
+completed: set[str] = set()
+failed: set[str] = set()
+
+def ready(job) -> bool: all(dep in completed for dep in job.depends_on)
+# If a dep failed, the job is a downstream failure: mark as "skipped (upstream_failure)"?
+```
+
+Handling of dependency failure: if a dependency fails, the dependent job never becomes ready; at the end, mark all pending jobs whose transitive dependencies failed as `skipped` with reason `dependency_failed`, emit events, and run result = failed. Deterministic.
+
+Concurrency: `max_workers` semaphore for all jobs; `gpu_in_use` counter with a limit of 1 enforced (GPU semaphore of 1). To keep it deterministic in order, when scheduling, iterate jobs in manifest order, start if:
+- total running < max_workers
+- if job.gpu: gpu_running < 1
+- deps satisfied.
+
+Loop:
+
+```python
+while pending or running:
+    started_any = False
+    for job_id in order:
+        if job_id in running or job_id in done: continue
+        job = ...
+        if not deps_ready: continue
+        if len(running) >= max_workers: break  # deterministic: stop scanning once capacity is exhausted?
+        if job.gpu and gpu_running >= 1: continue  # skip this one but allow later non-GPU jobs
+        start job
+    if not started_any:
+        if running:
+            # wait for one to complete
+            await asyncio.wait(running.values(), return_when=FIRST_COMPLETED)
+        else:
+            break
+```
+
+Hmm, careful: after `await wait`, the loop continues. When a task finishes, we need to record status and clean up `running`. Wrap each job in an async function that returns the result, and after `await wait`, iterate completed tasks and process the results.
+
+Cancel: signal handler sets `self._cancel_event`. In the main loop, check the cancel event; on cancel: stop starting new jobs; for each running task, call `proc.terminate()`; wait up to a grace period (e.g. 5 seconds), then kill. Mark running jobs as CANCELLED. Pending jobs → CANCELLED? Or PENDING? For resume semantics: cancelled pending jobs should be re-run on resume; running jobs that were terminated mid-way should also be re-run (not completed). So mark running as CANCELLED, and keep pending as PENDING in state. Hmm, but "resume completed work" — on resume, only completed is skipped; everything else is retried. Good.
+
+Actually, let's mark pending as PENDING (unchanged) and running as CANCELLED. Then the state is persisted. Run result = 130.
+
+Implementation details: the job runner:
+
+```python
+async def _run_job(self, job: JobSpec) -> JobResult:
+    env = {**os.environ...} filtered?
+```
+
+Env for subprocess: base env = current os.environ (or injected `env` mapping for tests), plus job.env overrides, plus secrets (names → resolved values). Wait — should the parent process env be inherited? Deterministic: build env explicitly: base is an environment mapping given to the Runner (default os.environ). Then override with job.env. Then secrets. Pass `env=env_dict`.
+
+Job command executed with cwd=workdir? Or a `workdir

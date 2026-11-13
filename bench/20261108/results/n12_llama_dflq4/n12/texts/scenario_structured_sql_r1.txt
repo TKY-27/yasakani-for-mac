@@ -1,0 +1,251 @@
+CREATE TABLE models (
+    model_id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL UNIQUE,
+    architecture VARCHAR(50) NOT NULL,
+    context_length INT NOT NULL CHECK (context_length > 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE fixtures (
+    fixture_id SERIAL PRIMARY KEY,
+    kind VARCHAR(50) NOT NULL,
+    description TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(kind)
+);
+
+CREATE TABLE runs (
+    run_id SERIAL PRIMARY KEY,
+    model_id INT NOT NULL REFERENCES models(model_id) ON DELETE CASCADE,
+    fixture_id INT NOT NULL REFERENCES fixtures(fixture_id) ON DELETE CASCADE,
+    started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at TIMESTAMP,
+    status VARCHAR(20) NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed')),
+    UNIQUE(model_id, fixture_id, started_at)
+);
+
+CREATE TABLE request_metrics (
+    metric_id BIGSERIAL PRIMARY KEY,
+    run_id INT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    request_id INT NOT NULL,
+    input_tokens INT NOT NULL CHECK (input_tokens >= 0),
+    output_tokens INT NOT NULL CHECK (output_tokens >= 0),
+    latency_ms DOUBLE PRECISION NOT NULL CHECK (latency_ms >= 0),
+    mtp_accepted_tokens INT NOT NULL DEFAULT 0 CHECK (mtp_accepted_tokens >= 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(run_id, request_id)
+);
+
+CREATE INDEX idx_runs_model ON runs(model_id);
+CREATE INDEX idx_runs_fixture ON runs(fixture_id);
+CREATE INDEX idx_metrics_run ON request_metrics(run_id);
+CREATE INDEX idx_metrics_latency ON request_metrics(latency_ms);
+CREATE INDEX idx_metrics_mtp ON request_metrics(mtp_accepted_tokens);
+
+CREATE VIEW v_model_performance AS
+SELECT 
+    m.name AS model_name,
+    f.kind AS fixture_kind,
+    COUNT(r.run_id) AS total_runs,
+    AVG(rm.latency_ms) AS avg_latency_ms,
+    AVG(rm.output_tokens) AS avg_output_tokens,
+    SUM(rm.output_tokens) AS total_output_tokens,
+    AVG(rm.mtp_accepted_tokens) AS avg_mtp_accepted
+FROM models m
+JOIN runs r ON m.model_id = r.model_id
+JOIN fixtures f ON r.fixture_id = f.fixture_id
+JOIN request_metrics rm ON r.run_id = rm.run_id
+WHERE r.status = 'completed'
+GROUP BY m.name, f.kind;
+
+CREATE VIEW v_long_context_analysis AS
+SELECT 
+    m.name AS model_name,
+    f.kind AS fixture_kind,
+    rm.input_tokens,
+    rm.output_tokens,
+    rm.latency_ms,
+    (rm.output_tokens::FLOAT / NULLIF(rm.input_tokens, 0)) AS output_input_ratio,
+    rm.mtp_accepted_tokens
+FROM models m
+JOIN runs r ON m.model_id = r.model_id
+JOIN fixtures f ON r.fixture_id = f.fixture_id
+JOIN request_metrics rm ON r.run_id = rm.run_id
+WHERE rm.input_tokens > 1000
+ORDER BY rm.input_tokens DESC;
+
+CREATE OR REPLACE FUNCTION upsert_request_metric(
+    p_run_id INT,
+    p_request_id INT,
+    p_input_tokens INT,
+    p_output_tokens INT,
+    p_latency_ms DOUBLE PRECISION,
+    p_mtp_accepted_tokens INT
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO request_metrics (
+        run_id,
+        request_id,
+        input_tokens,
+        output_tokens,
+        latency_ms,
+        mtp_accepted_tokens
+    ) VALUES (
+        p_run_id,
+        p_request_id,
+        p_input_tokens,
+        p_output_tokens,
+        p_latency_ms,
+        p_mtp_accepted_tokens
+    )
+    ON CONFLICT (run_id, request_id) DO UPDATE SET
+        input_tokens = EXCLUDED.input_tokens,
+        output_tokens = EXCLUDED.output_tokens,
+        latency_ms = EXCLUDED.latency_ms,
+        mtp_accepted_tokens = EXCLUDED.mtp_accepted_tokens,
+        created_at = CURRENT_TIMESTAMP;
+END;
+$$ LANGUAGE plpgsql;
+
+INSERT INTO models (name, architecture, context_length) VALUES
+('llama-3-8b', 'llama', 8192),
+('mistral-7b', 'mistral', 32768);
+
+INSERT INTO fixtures (kind, description) VALUES
+('code_completion', 'Code completion tasks'),
+('summarization', 'Text summarization tasks'),
+('question_answering', 'Question answering tasks'),
+('translation', 'Translation tasks');
+
+INSERT INTO runs (model_id, fixture_id, started_at, finished_at, status) VALUES
+(1, 1, '2024-01-15 10:00:00', '2024-01-15 10:05:00', 'completed'),
+(1, 2, '2024-01-15 10:10:00', '2024-01-15 10:15:00', 'completed'),
+(1, 3, '2024-01-15 10:20:00', '2024-01-15 10:25:00', 'completed'),
+(1, 4, '2024-01-15 10:30:00', '2024-01-15 10:35:00', 'completed'),
+(2, 1, '2024-01-15 11:00:00', '2024-01-15 11:05:00', 'completed'),
+(2, 2, '2024-01-15 11:10:00', '2024-01-15 11:15:00', 'completed'),
+(2, 3, '2024-01-15 11:20:00', '2024-01-15 11:25:00', 'completed'),
+(2, 4, '2024-01-15 11:30:00', '2024-01-15 11:35:00', 'completed');
+
+INSERT INTO request_metrics (run_id, request_id, input_tokens, output_tokens, latency_ms, mtp_accepted_tokens) VALUES
+(1, 1, 150, 45, 120.5, 12),
+(1, 2, 200, 60, 135.2, 15),
+(1, 3, 180, 50, 128.7, 13),
+(1, 4, 220, 65, 142.3, 16),
+(1, 5, 190, 55, 131.8, 14),
+(1, 6, 210, 58, 138.4, 15),
+(1, 7, 175, 48, 125.6, 12),
+(1, 8, 230, 70, 148.9, 17),
+(1, 9, 165, 42, 118.3, 11),
+(1, 10, 240, 75, 155.2, 18),
+(2, 1, 300, 90, 210.4, 25),
+(2, 2, 350, 105, 225.8, 28),
+(2, 3, 320, 95, 218.6, 26),
+(2, 4, 380, 115, 235.2, 30),
+(2, 5, 340, 100, 222.7, 27),
+(2, 6, 360, 110, 228.9, 29),
+(2, 7, 310, 88, 215.3, 24),
+(2, 8, 390, 120, 240.5, 31),
+(2, 9, 290, 85, 205.7, 23),
+(2, 10, 400, 125, 245.8, 32),
+(3, 1, 500, 150, 350.2, 40),
+(3, 2, 550, 165, 365.8, 43),
+(3, 3, 520, 155, 358.4, 41),
+(3, 4, 580, 175, 375.6, 45),
+(3, 5, 540, 160, 362.3, 42),
+(3, 6, 560, 170, 368.9, 44),
+(3, 7, 510, 148, 355.7, 39),
+(3, 8, 590, 180, 380.2, 46),
+(3, 9, 490, 145, 348.5, 38),
+(3, 10, 600, 185, 385.7, 47),
+(4, 1, 800, 240, 550.3, 60),
+(4, 2, 850, 255, 565.8, 63),
+(4, 3, 820, 245, 558.4, 61),
+(4, 4, 880, 265, 575.6, 65),
+(4, 5, 840, 250, 562.3, 62),
+(4, 6, 860, 260, 568.9, 64),
+(4, 7, 810, 238, 555.7, 59),
+(4, 8, 890, 270, 580.2, 66),
+(4, 9, 790, 235, 548.5, 58),
+(4, 10, 900, 275, 585.7, 67),
+(5, 1, 150, 45, 115.2, 12),
+(5, 2, 200, 60, 130.8, 15),
+(5, 3, 180, 50, 124.5, 13),
+(5, 4, 220, 65, 138.7, 16),
+(5, 5, 190, 55, 127.3, 14),
+(5, 6, 210, 58, 134.9, 15),
+(5, 7, 175, 48, 121.6, 12),
+(5, 8, 230, 70, 144.2, 17),
+(5, 9, 165, 42, 113.8, 11),
+(5, 10, 240, 75, 150.5, 18),
+(6, 1, 300, 90, 205.7, 25),
+(6, 2, 350, 105, 220.3, 28),
+(6, 3, 320, 95, 214.8, 26),
+(6, 4, 380, 115, 230.5, 30),
+(6, 5, 340, 100, 218.2, 27),
+(6, 6, 360, 110, 224.7, 29),
+(6, 7, 310, 88, 210.9, 24),
+(6, 8, 390, 120, 235.8, 31),
+(6, 9, 290, 85, 201.4, 23),
+(6, 10, 400, 125, 240.2, 32),
+(7, 1, 500, 150, 345.8, 40),
+(7, 2, 550, 165, 360.2, 43),
+(7, 3, 520, 155, 353.7, 41),
+(7, 4, 580, 175, 370.4, 45),
+(7, 5, 540, 160, 357.8, 42),
+(7, 6, 560, 170, 364.2, 44),
+(7, 7, 510, 148, 351.5, 39),
+(7, 8, 590, 180, 375.7, 46),
+(7, 9, 490, 145, 344.9, 38),
+(7, 10, 600, 185, 380.3, 47),
+(8, 1, 800, 240, 545.7, 60),
+(8, 2, 850, 255, 560.2, 63),
+(8, 3, 820, 245, 553.8, 61),
+(8, 4, 880, 265, 570.4, 65),
+(8, 5, 840, 250, 557.7, 62),
+(8, 6, 860, 260, 564.2, 64),
+(8, 7, 810, 238, 551.5, 59),
+(8, 8, 890, 270, 575.8, 66),
+(8, 9, 790, 235, 544.9, 58),
+(8, 10, 900, 275, 580.2, 67);
+
+SELECT 
+    m.name AS model_name,
+    f.kind AS fixture_kind,
+    COUNT(*) AS total_requests,
+    SUM(rm.output_tokens) AS total_output_tokens,
+    AVG(rm.latency_ms) AS avg_latency_ms,
+    (SUM(rm.output_tokens)::FLOAT / SUM(rm.latency_ms / 1000.0)) AS tokens_per_second
+FROM models m
+JOIN runs r ON m.model_id = r.model_id
+JOIN fixtures f ON r.fixture_id = f.fixture_id
+JOIN request_metrics rm ON r.run_id = rm.run_id
+WHERE r.status = 'completed'
+GROUP BY m.name, f.kind
+ORDER BY m.name, f.kind;
+
+SELECT 
+    m.name AS model_name,
+    f.kind AS fixture_kind,
+    STDDEV(rm.latency_ms) AS latency_stddev,
+    MIN(rm.latency_ms) AS min_latency_ms,
+    MAX(rm.latency_ms) AS max_latency_ms,
+    (MAX(rm.latency_ms) - MIN(rm.latency_ms)) AS latency_range_ms,
+    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY rm.latency_ms) AS p95_latency_ms
+FROM models m
+JOIN runs r ON m.model_id = r.model_id
+JOIN fixtures f ON r.fixture_id = f.fixture_id
+JOIN request_metrics rm ON r.run_id = rm.run_id
+WHERE r.status = 'completed'
+GROUP BY m.name, f.kind
+ORDER BY m.name, f.kind;
+
+SELECT 
+    m.name AS model_name,
+    f.kind AS fixture_kind,
+    rm.input_tokens,
+    rm.output_tokens,
+    rm.latency_ms,
+    (rm.output_tokens::FLOAT / NULLIF(rm.input_tokens, 0)) AS output_input_ratio,
+    CASE 
+        WHEN rm.input_tokens > 

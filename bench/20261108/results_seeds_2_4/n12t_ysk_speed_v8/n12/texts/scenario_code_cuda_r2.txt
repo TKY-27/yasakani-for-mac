@@ -1,0 +1,86 @@
+We need answer user's request. Need produce complete CUDA 13.1/C++20 command-line program normalizes large BF16 matrix row by row on sm_120a GPU. Include argument parsing, RAII device buffers, numerically stable FP32 reference, vectorized CUDA kernel, warm-up, CUDA-event timing, deterministic input generation, error checking, tolerance-based verification, and CMakeLists.txt. Explain memory layout and launch geometry after code. Do not omit implementations or replace sections with comments.
+
+Need think about CUDA 13.1? As of now CUDA maybe 12.x, but user says CUDA 13.1. We can target CUDA 13.1 maybe use sm_120a architecture. Need produce code. Need ensure complete runnable. Potential issue: BF16 in CUDA: __nv_bfloat16 from cuda_bf16.h. CUDA 13.1 likely supports. sm_120a? NVIDIA Blackwell? sm_120? Maybe Hopper? Actually sm_120a maybe? Need target architecture. CMake: CMAKE_CUDA_ARCHITECTURES "120a" or 120? The user specifically sm_120a. We can set CMAKE_CUDA_ARCHITECTURES 120a; also compile flags -arch=sm_120a maybe. But need portable? We can mention requires CUDA 13.1 and sm_120a. Use CMake to set cuda_arch 120a.
+
+Program: normalize large BF16 matrix row by row. What normalize? Row by row likely normalize each row to unit L2 norm (or maybe mean/std). We need define. "normalizes a large BF16 matrix row by row" ambiguous. Could be row-wise L2 normalization (Divide by row norm). We'll choose row-wise L2 normalization (unit norm) with stable FP32 reference. Input BF16 matrix MxN, output BF16 matrix with each row divided by its Euclidean norm in FP32? Need stable. Numerically stable FP32 reference: compute row norm using FP32, maybe Kahan? We can compute sum of squares in double? But reference FP32 stable: accumulate in float with two-pass or Kahan to avoid overflow? Since BF16 max 3e38, square could overflow float (3e38 squared 1e77). Need stable: scale by max absolute value per row: norm = max_abs * sqrt(sum((x/max_abs)^2)), if max_abs==0 set norm 0. This avoids overflow/underflow. That is numerically stable. Then divide by norm in FP32 and cast to BF16. Output zeros if row norm zero.
+
+Need vectorized CUDA kernel. BF16 matrix large. Need process rows. Could use each block per row? For large matrix, rows N maybe e.g. 8192, M maybe 4096/65536. Vectorized kernel: use float4 or 8? BF16 is 2 bytes. We can load as uint32_t two bf16s? Or float4 with 8 bf16s? On sm_120a maybe 128-bit loads. Use 16 bytes = 8 bf16. For each block handles one row? If row length N multiple of 8. But large matrix maybe row length configurable. Need deterministic input generation. We can generate device-side or host? Deterministic input generation: use seed, fill BF16 matrix with deterministic pseudo-random values, maybe CPU generating? But large matrix, can generate on GPU with deterministic kernel. But need reference on CPU? If CPU reference over large matrix maybe costly. We can do verification sampling? User wants tolerance-based verification. Could compute reference in FP32 CPU on a subset? But "a numerically stable FP32 reference" maybe reference output computed host? For complete program, maybe compute host reference for all matrix? If large matrix, host memory okay but maybe time. Need robust: we can do device verification kernel? But reference FP32? We can compute reference output in FP32 on GPU? But they ask FP32 reference, maybe separate CPU reference. Need include tolerance verification. We can compare CUDA BF16 output against host FP32 reference after converting output to FP32. But host reference for very large matrix may be slow but program complete. Could make verify only if --verify and maybe limit? But include. Need avoid huge host time? Maybe default sizes moderate. We can provide command-line arguments --rows, --cols, --iterations, --warmup, --verify, --seed. Default maybe 4096x4096 (16M bf16=32MB) okay. Large maybe 32768x8192 = 512M elements=1GB, too much for host. But user says large; we can allow. Verification might be expensive. Could implement host reference using same stable algorithm, but only for verification; for large default maybe 8192x8192? 134M elements=268MB, host reference maybe okay in C++ optimized? Could take seconds. Could implement host reference vectorized and deterministic. But complete.
+
+Alternative: Use GPU FP32 reference (compute reference output in FP32 on GPU using separate kernel) then compare? But "FP32 reference" may mean reference computation in FP32, not necessarily CPU. But likely they expect CPU FP32 reference to verify CUDA. However CUDA kernel uses BF16 and probably does FP32 accumulation; reference in FP32 CPU ensures correctness. Need stable. We can compute reference on host after copying input to host. For large matrix, maybe memory double. RAII device buffers for input and output. Host buffer for reference? We can have host vector for input? Deterministic generation maybe on device and copy back for reference. Could avoid storing input host if generate deterministic host values and upload to device? That uses host vector anyway. Or generate on device, then copy input to host for reference. RAII device buffers only. Host vector for input and reference can be std::vector<__nv_bfloat16> maybe. But if large, host memory. We can make verification optional. But command-line program should include verification by default? It says tolerance-based verification. We can include and default true. Could also allow --no-verify.
+
+Need RAII device buffers: class CudaBuffer with cudaMalloc/cudaFree, maybe template. For BF16. Use exceptions or error checks. Need error checking: all CUDA calls checked via macro. Need no omitted implementations.
+
+CMakeLists.txt: project, C++20, CUDA 13.1? cmake_minimum 3.28? enable CMAKE_CUDA_COMPILER? Use CMAKE_CUDA_STANDARD 20, CMAKE_CXX_STANDARD 20. set(CMAKE_CUDA_ARCHITECTURES "120a"). Add executable. Maybe need link cuda_runtime. CMake will handle. Could add compile options -O3. For CUDA 13.1 maybe CMake 3.28. Use property TARGET_ARCHITECTURES. Also maybe set CMAKE_CUDA_SEPARABLE_COMPILATION ON.
+
+Need code. Let's design.
+
+Program flow:
+- parse args:
+  - --rows=<int>
+  - --cols=<int>
+  - --seed=<uint64>
+  - --warmup=<int>
+  - --iterations=<int>
+  - --verify (bool default true) / --no-verify? Maybe easier flags.
+  - --help.
+  Need handle positive values.
+
+- Validate cols multiple of 8 for vectorization? Could require or handle tail. Since vectorized with VEC=8, if cols not multiple of 8, kernel can handle tail with scalar loads. Complete. But to simplify memory layout maybe enforce multiple of 8? User says vectorized CUDA kernel, not necessarily require. Better handle tail to be robust. But vectorized using VEC=8 with tail scalar. Need row length arbitrary. However stable normalization per row: compute norm over entire row. Kernel can have each block process one row, with threads looping. To compute norm in stable way, need max_abs first and sum squares scaled. Can do two passes over row in kernel: first pass compute max_abs (in FP32) for row; second pass compute sum of squares scaled and divide. That avoids needing reduction over max? We can compute max_abs per block using block reduction. Or since block per row, each thread computes partial max, reduce to one value. Then second pass compute scaled squared sum, reduce, compute norm. Then third pass divide and store. Or one pass with atomic? Stable requires max known before scaling, so two passes for max, one pass for sum. Or compute per-thread max then block reduce; then sum scaled. Need also divide. Three passes over row. For large matrix maybe okay. But could do one pass storing to shared? For large N maybe not. We can do two-pass: max, then sum+store? Need output divide by norm, so after sum we need norm then store. Could compute sum and store scaled values to registers? Not for large row. Do third pass. Alternatively each block thread processes multiple elements and keeps per-thread scaled squared partial? But max needs first pass. So 3 passes.
+
+But vectorized: If block per row and N large (e.g. 8192), threads maybe 256. Each thread loop VEC=8. 3 passes. Good.
+
+However for large matrix rows maybe 65536, each block one row: gridDim = rows. If rows huge, okay. If cols small, threads maybe too many. Need choose block size min(cols, 256?) But vectorized: threads = min(THREADS, (cols+VEC-1)/VEC?) We can use 256 or 512. For sm_120a, warp 32. Block size 256. If cols < 256*8 maybe still okay. Need launch geometry explain.
+
+Potential issue: block per row with max reduction over 256 threads. Need implement reduction. For max float. Use shared float warp_reduce. Then block reduce. Similarly sum. We can implement helper functions.
+
+But kernel with VEC=8 and tail. Need load 8 bf16 if idx+8 <= cols. Use uint4? For 16 bytes. Since __nv_bfloat16 2 bytes. We can reinterpret input pointer as const uint4* for aligned loads? But row offset: if cols not multiple of 8, row start offset row*cols may not be 16-byte aligned if cols not multiple of 8. Base pointer cudaMalloc aligned to 16? cudaMalloc alignment at least 256 bytes, but row start offset bytes = row*cols*2. If cols not multiple of 8, offset not multiple of 16. Vectorized uint4 load requires 16-byte alignment. Need handle alignment. We can ensure cols multiple of 8? Then row offsets multiples of 16 bytes? cols*2 multiple of 16 if cols multiple 8. So yes enforce cols % 8 == 0 to allow aligned vector loads. That simplifies. But if user passes arbitrary, program can error requiring multiple of 8. That's acceptable? It says complete command-line program, can validate. We can state cols must be multiple of 8 for vectorized kernel. Or handle unaligned scalar fallback. Complete but more code. For "vectorized" likely okay to enforce multiple of 8. But robust argument parsing can error if not multiple 8. However "large BF16 matrix" maybe user can set any. To be safe, implement vectorized with alignment handling? We can design kernel to use vectorized loads when aligned, scalar tail; but if row offset unaligned, vector load at row start unaligned; can't use vector loads for entire row. Could copy? No. Could require rows? We can pad each row to multiple of 8? Memory layout could include stride = ceil(cols/8)*8 elements. Input generated with stride. Then cols is logical, stride multiple of 8, vector loads aligned. That is more complex but robust. We can use rowStride = ((cols + 7) & ~7). Store matrix row-major with stride. Host reference must account stride. Device buffers allocate rows*stride. Kernel operates on rowStride? For normalization only first cols elements. This handles arbitrary cols while vectorized aligned. Great. Memory layout: row-major with padding to 8 BF16 elements (16 bytes) per row. The user asks explain memory layout. We can define logical cols, padded stride. That's good.
+
+Need vectorized kernel:
+- Each block handles one row. blockDim.x = min(THREADS, max(1, (rowStride + VEC-1)/VEC))? But if rowStride multiple 8, number of vector chunks = rowStride/8. We can launch block size = min(THREADS, chunks) maybe. But reduction across threads that don't participate? If chunks < THREADS, threads >= chunks idle. For max reduction, need initialize inactive threads to 0 and include them? For max, inactive 0 okay; for sum inactive 0. But if we use block reduction with all threads, fine. Need ensure each thread loops over chunks starting at tid step blockDim.x. If chunks < blockDim, some threads no elements. Good.
+
+However blockDim chosen per row? We can set blockDim.x = min(MAX_THREADS, (rowStride/VEC)). If rowStride/VEC < 32? maybe 8? But block size must multiple of warp for efficient reduction? We can choose block size = min(MAX_THREADS, max(16? chunks)). Reduction works for any block size. But CUDA block size can be e.g. 1. Better choose block size multiple of 32 to allow warp shuffle? We can implement warp reduction with __shfl_down_sync. If block size not multiple of 32, last warp partial. Need handle. We can choose blockDim as multiple of 32: e.g. desired chunks = rowStride/VEC; block_size = min(256, max(32, chunks rounded up to 32?)). If chunks <32, block_size=32. Some idle. Good. If chunks large, 256. Use 256 threads (8 warps). Could use 512? 256 fine. For large row, each thread handles multiple vector chunks. Good.
+
+Kernel details:
+```
+constexpr int VEC=8;
+constexpr int BLOCK=256;
+
+__device__ float bf16_to_float(__nv_bfloat16 x) { return float(x); }
+__device__ __nv_bfloat16 float_to_bf16(float x) { return __float2bfloat16(x); }
+
+__device__ float warp_max(float val) { for offsets 16..1 val=max(val, __shfl_xor_sync(full, val, offset)); return val; }
+__device__ float block_max(float val, __shared__ float* shared, int tid) { warpId = tid/32; lane=tid%32; float w=warp_max(val); if(lane==0) shared[warpId]=w; __syncthreads(); if(tid < numWarps) { val=shared[tid]; if(tid<32) w=warp_max(val); if(tid==0) shared[0]=w; } __syncthreads(); return shared[0]; }
+```
+But block size fixed 256, warps=8. We can use fixed. For sum block_sum similar.
+
+Need compute max_abs over row:
+```
+float thread_max = 0.f;
+uint4* row = reinterpret_cast<const uint4*>(input + rowStart);
+for (int i=tid; i<rowStride/VEC; i+=blockDim.x) {
+  uint4 v = row[i];
+  __nv_bfloat16* e = reinterpret_cast<__nv_bfloat16*>(&v);
+  for j 0..7 thread_max=max(thread_max, fabsf(float(e[j])));
+}
+float row_max = block_max(thread_max, smax, tid);
+```
+Need ensure input + rowStart is aligned. rowStart = row * rowStride; rowStride multiple of 8, base aligned => okay.
+If row_max == 0: set all elements to 0? Normalization by zero: output zeros. Could just fill output zeros for cols and maybe stride? We only care cols, but memory layout maybe padded. Set output row first cols to 0, optionally pad not needed. For safety, set all rowStride? Could not matter. We'll set first cols scalar? For vector: for chunks up to cols/VEC; but cols may not multiple 8. Since output rowStride multiple 8, but logical cols may not. We need set only first cols. Tail scalar.
+
+Second pass: sum_scaled. If row_max !=0:
+```
+float inv = 1.f / row_max;
+float thread_sum=0;
+for chunks up to (cols + VEC -1)/VEC? Need only logical cols. Since rowStride includes padding; don't include pad in norm. If cols multiple 8 maybe chunks=cols/VEC; else vector chunks for full 8 may include padding beyond cols if using rowStride chunks. We should process only logical elements. Use vector chunks = cols/VEC; tail = cols % VEC. For vector chunks: each uint4 of 8 elements; all within logical if idx*8 < cols. For tail, scalar first cols%VEC elements. Need compute max over logical only, not padding. So first pass vector chunks full = cols/VEC, tail scalar. But rowStride vector aligned; vector chunks for full part. Good.
+```
+But if cols % 8 !=0, vector loads for full chunks up to cols/VEC. tail scalar at offset full*VEC to cols-1. Good.
+
+For sum:
+```
+for i=tid; i<full_vec_chunks; i+=blockDim.x load uint4; for each val scaled = float(val)*inv; thread_sum += scaled*scaled;
+if (tid < tail?) Need tail distributed among threads? Simpler: after vector pass, have threads 0..tail-1 process tail? But if tail < blockDim, okay. But if tail maybe > blockDim? tail max 7, so yes. Need __syncthreads before tail? Not necessary if no shared dependence. But if use shared? No. We can just:
+int tail = cols & (VEC-1);
+if (tid < tail) { float x = float(input[rowStart + full_vec*VEC + tid]) * inv; thread_sum += x*x; }
+```
+But if blockDim < tail? blockDim at least 32, tail <=7, ok.
+Then block_sum(thread_sum) -> row_sum_scaled. norm = row_max * sqrt

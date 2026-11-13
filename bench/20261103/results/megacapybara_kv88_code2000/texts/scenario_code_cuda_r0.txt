@@ -1,0 +1,194 @@
+```cpp
+// bf16_row_norm.cu
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <random>
+#include <chrono>
+
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
+
+// RAII wrapper for device memory
+class DeviceBuffer {
+public:
+    DeviceBuffer() : ptr_(nullptr), size_(0) {}
+    
+    explicit DeviceBuffer(size_t bytes) : ptr_(nullptr), size_(bytes) {
+        if (bytes > 0) {
+            CUDA_CHECK(cudaMalloc(&ptr_, bytes));
+        }
+    }
+    
+    ~DeviceBuffer() {
+        if (ptr_) {
+            cudaFree(ptr_);
+            ptr_ = nullptr;
+            size_ = 0;
+        }
+    }
+    
+    // Disable copy
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    
+    // Enable move
+    DeviceBuffer(DeviceBuffer&& other) noexcept : ptr_(other.ptr_), size_(other.size_) {
+        other.ptr_ = nullptr;
+        other.size_ = 0;
+    }
+    
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            if (ptr_) cudaFree(ptr_);
+            ptr_ = other.ptr_;
+            size_ = other.size_;
+            other.ptr_ = nullptr;
+            other.size_ = 0;
+        }
+        return *this;
+    }
+    
+    void* get() const { return ptr_; }
+    size_t size() const { return size_; }
+    
+    template<typename T>
+    T* as() const { return static_cast<T*>(ptr_); }
+
+private:
+    void* ptr_;
+    size_t size_;
+};
+
+// Parse command line arguments
+struct Args {
+    int rows = 4096;
+    int cols = 8192;
+    int warmup_iters = 5;
+    int timing_iters = 20;
+    float tolerance = 1e-3f;
+    unsigned int seed = 42;
+    bool verbose = false;
+};
+
+void print_usage(const char* prog) {
+    printf("Usage: %s [options]\n", prog);
+    printf("Options:\n");
+    printf("  -r ROWS       Number of rows (default: 4096)\n");
+    printf("  -c COLS       Number of columns (default: 8192)\n");
+    printf("  -w WARMUP     Warm-up iterations (default: 5)\n");
+    printf("  -t TIMING     Timing iterations (default: 20)\n");
+    printf("  -T TOL        Tolerance for verification (default: 1e-3)\n");
+    printf("  -s SEED       Random seed (default: 42)\n");
+    printf("  -v            Verbose output\n");
+    printf("  -h            Show this help\n");
+}
+
+bool parse_args(int argc, char** argv, Args& args) {
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            return false;
+        } else if (arg == "-r") {
+            if (i + 1 >= argc) { fprintf(stderr, "Missing value for -r\n"); return false; }
+            args.rows = atoi(argv[++i]);
+            if (args.rows <= 0) { fprintf(stderr, "Rows must be positive\n"); return false; }
+        } else if (arg == "-c") {
+            if (i + 1 >= argc) { fprintf(stderr, "Missing value for -c\n"); return false; }
+            args.cols = atoi(argv[++i]);
+            if (args.cols <= 0) { fprintf(stderr, "Cols must be positive\n"); return false; }
+        } else if (arg == "-w") {
+            if (i + 1 >= argc) { fprintf(stderr, "Missing value for -w\n"); return false; }
+            args.warmup_iters = atoi(argv[++i]);
+            if (args.warmup_iters < 0) { fprintf(stderr, "Warmup iters must be non-negative\n"); return false; }
+        } else if (arg == "-t") {
+            if (i + 1 >= argc) { fprintf(stderr, "Missing value for -t\n"); return false; }
+            args.timing_iters = atoi(argv[++i]);
+            if (args.timing_iters <= 0) { fprintf(stderr, "Timing iters must be positive\n"); return false; }
+        } else if (arg == "-T") {
+            if (i + 1 >= argc) { fprintf(stderr, "Missing value for -T\n"); return false; }
+            args.tolerance = atof(argv[++i]);
+            if (args.tolerance <= 0.0f) { fprintf(stderr, "Tolerance must be positive\n"); return false; }
+        } else if (arg == "-s") {
+            if (i + 1 >= argc) { fprintf(stderr, "Missing value for -s\n"); return false; }
+            args.seed = static_cast<unsigned int>(atoi(argv[++i]));
+        } else if (arg == "-v") {
+            args.verbose = true;
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", arg.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+// Convert BF16 to FP32
+__device__ inline float bf16_to_float(__nv_bfloat16 b) {
+    return __bfloat162float(b);
+}
+
+// Convert FP32 to BF16
+__device__ inline __nv_bfloat16 float_to_bf16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Vectorized kernel: each block handles one row
+// Each thread processes multiple elements using vector loads/stores
+template<int VEC_SIZE>
+__global__ void row_normalize_kernel(
+    const __nv_bfloat16* input,
+    __nv_bfloat16* output,
+    int rows,
+    int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    
+    const __nv_bfloat16* row_ptr = input + static_cast<size_t>(row) * cols;
+    __nv_bfloat16* out_row = output + static_cast<size_t>(row) * cols;
+    
+    // Each thread handles VEC_SIZE consecutive elements
+    // Total threads per block should cover the row
+    int tid = threadIdx.x;
+    int total_vecs = cols / VEC_SIZE;
+    
+    // Accumulate sum of squares in FP32 for numerical stability
+    float sum_sq = 0.0f;
+    
+    // First pass: compute sum of squares
+    for (int idx = tid; idx < total_vecs; idx += blockDim.x) {
+        size_t offset = static_cast<size_t>(idx) * VEC_SIZE;
+        
+        // Load VEC_SIZE BF16 values
+        // For VEC_SIZE=8, we can load as uint4 (16 bytes = 8 BF16)
+        // For VEC_SIZE=4, we can load as uint2 (8 bytes = 4 BF16)
+        // For VEC_SIZE=2, we can load as uint (4 bytes = 2 BF16)
+        
+        float vals[VEC_SIZE];
+        
+        if constexpr (VEC_SIZE == 8) {
+            uint4 vec = reinterpret_cast<const uint4*>(row_ptr)[idx];
+            const __nv_bfloat16* bvals = reinterpret_cast<const __nv_bfloat16*>(&vec);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                vals[j] = bf16_to_float(bvals[j]);
+            }
+        } else if constexpr (VEC_SIZE == 4) {
+            uint2 vec = reinterpret_cast<const uint2*>(row_ptr)[idx];
+            const __nv_bfloat16* bvals = reinterpret_cast<const __nv_bfloat16*>(&vec);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                vals[j] = bf16_to

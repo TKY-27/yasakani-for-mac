@@ -1,0 +1,539 @@
+Below is a complete, self-contained Python 3.11 package named `deterministic_job_runner`. It implements:
+
+- A deterministic, resumable async job runner (priority queue, no wall-clock randomness).
+- A hard cap of **one** active GPU job (CPU jobs may run concurrently).
+- Atomic on-disk state persistence (tmp file + `os.replace`).
+- Resume semantics: completed work is never re-run; a crashed/active job is re-queued.
+- Structured **JSONL** event streaming (stdout) with configurable **secret redaction**.
+- Graceful **SIGINT** handling: first signal cancels active jobs (cooperative), second signal exits immediately.
+- Pytest tests for success, failure, cancellation, and resume.
+
+---
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deterministic-job-runner"
+version = "0.1.0"
+description = "Deterministic asynchronous job runner with GPU scheduling, atomic state, resume, JSONL events, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Example Author" }]
+keywords = ["async", "jobs", "deterministic", "scheduler", "gpu", "resumable"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+djr = "deterministic_job_runner.cli:main"
+
+[tool.setuptools]
+packages = ["deterministic_job_runner"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+---
+
+### `deterministic_job_runner/__init__.py`
+
+```python
+"""Deterministic asynchronous job runner.
+
+Public API:
+    Runner, Job, JobStatus, JobError, Event, Redactor,
+    load_manifest, validate_manifest, parse_manifest,
+    DEFAULT_MANIFEST, DEFAULT_SECRETS
+"""
+
+from .errors import JobError, ManifestError, StateError
+from .events import Event, Redactor, EventStream
+from .manifest import (
+    DEFAULT_MANIFEST,
+    DEFAULT_SECRETS,
+    load_manifest,
+    parse_manifest,
+    validate_manifest,
+)
+from .models import Job, JobStatus
+from .runner import Runner
+
+__all__ = [
+    "Runner",
+    "Job",
+    "JobStatus",
+    "JobError",
+    "ManifestError",
+    "StateError",
+    "Event",
+    "Redactor",
+    "EventStream",
+    "load_manifest",
+    "parse_manifest",
+    "validate_manifest",
+    "DEFAULT_MANIFEST",
+    "DEFAULT_SECRETS",
+]
+```
+
+---
+
+### `deterministic_job_runner/errors.py`
+
+```python
+"""Exception types for the deterministic job runner."""
+
+from __future__ import annotations
+
+
+class JobRunnerError(Exception):
+    """Base class for all runner errors."""
+
+
+class ManifestError(JobRunnerError):
+    """Raised when the manifest is invalid or unreadable."""
+
+
+class StateError(JobRunnerError):
+    """Raised when persisted state is corrupted or inconsistent."""
+
+
+class JobError(JobRunnerError):
+    """Raised when a job's work function fails."""
+
+    def __init__(self, job_id: str, message: str, cause: BaseException | None = None):
+        super().__init__(f"job {job_id!r} failed: {message}")
+        self.job_id = job_id
+        self.message = message
+        self.cause = cause
+
+    def __str__(self) -> str:
+        return f"job {self.job_id!r} failed: {self.message}"
+```
+
+---
+
+### `deterministic_job_runner/models.py`
+
+```python
+"""Core data models: Job and JobStatus."""
+
+from __future__ import annotations
+
+import enum
+import json
+from dataclasses import dataclass, field, asdict
+from typing import Any
+
+
+class JobStatus(str, enum.Enum):
+    """Lifecycle states for a job.
+
+    Ordered so that a numeric rank is available for resume bookkeeping.
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+
+    @property
+    def rank(self) -> int:
+        return _STATUS_RANK[self]
+
+
+_STATUS_RANK = {
+    JobStatus.PENDING: 0,
+    JobStatus.RUNNING: 1,
+    JobStatus.COMPLETED: 2,
+    JobStatus.FAILED: 3,
+    JobStatus.CANCELLED: 4,
+    JobStatus.SKIPPED: 5,
+}
+
+
+@dataclass
+class Job:
+    """A single unit of work.
+
+    ``work`` is a deterministic coroutine factory: it takes no arguments and
+    must return the same result every time it is invoked with the same inputs.
+    The runner never inspects or serialises the coroutine itself; it is only
+    invoked in-process.
+    """
+
+    id: str
+    work: Any  # async callable: () -> Any
+    kind: str = "cpu"  # "cpu" or "gpu"
+    priority: int = 0  # higher runs first
+    depends_on: list[str] = field(default_factory=list)
+    max_attempts: int = 1
+    attempts: int = 0
+    status: JobStatus = JobStatus.PENDING
+    result: Any = None
+    error: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialisable representation (excludes the callable ``work``)."""
+        d = asdict(self)
+        d.pop("work", None)
+        return d
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True, default=str)
+```
+
+---
+
+### `deterministic_job_runner/events.py`
+
+```python
+"""Structured JSONL event streaming with secret redaction."""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+import threading
+from dataclasses import dataclass, field
+from typing import Any, IO, TextIO
+
+
+@dataclass
+class Event:
+    """A single structured event.
+
+    ``ts`` is a monotonically increasing logical sequence number, NOT a wall
+    clock timestamp, to preserve determinism.
+    """
+
+    seq: int
+    type: str
+    job_id: str | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"seq": self.seq, "type": self.type}
+        if self.job_id is not None:
+            d["job_id"] = self.job_id
+        if self.payload:
+            d["payload"] = self.payload
+        return d
+
+
+class Redactor:
+    """Redacts configured secret values from any string.
+
+    Secrets are replaced with ``[REDACTED]``. Matching is exact-substring and
+    case-sensitive. Longer secrets are matched first to avoid partial overlap.
+    """
+
+    _MARKER = "[REDACTED]"
+
+    def __init__(self, secrets: list[str] | None = None):
+        # De-duplicate, drop empties, sort by length desc for deterministic order.
+        seen: set[str] = set()
+        filtered: list[str] = []
+        for s in (secrets or []):
+            if not s:
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            filtered.append(s)
+        self._secrets = sorted(filtered, key=len, reverse=True)
+
+    @property
+    def secrets(self) -> list[str]:
+        return list(self._secrets)
+
+    def redact(self, text: Any) -> Any:
+        """Recursively redact secrets within strings in an arbitrary structure."""
+        if isinstance(text, str):
+            return self._redact_string(text)
+        if isinstance(text, dict):
+            return {k: self.redact(v) for k, v in text.items()}
+        if isinstance(text, (list, tuple)):
+            return [self.redact(v) for v in text]
+        if isinstance(text, (set, frozenset)):
+            return {self.redact(v) for v in text}
+        return text
+
+    def _redact_string(self, s: str) -> str:
+        out = s
+        for secret in self._secrets:
+            out = out.replace(secret, self._MARKER)
+        return out
+
+
+class EventStream:
+    """Thread-safe JSONL event writer.
+
+    Emits one JSON object per line to a text stream (default: stdout).
+    A logical sequence counter guarantees deterministic ordering.
+    """
+
+    def __init__(self, stream: TextIO | None = None, redactor: Redactor | None = None):
+        self._stream: TextIO = stream if stream is not None else sys.stdout
+        self._redactor = redactor or Redactor()
+        self._lock = threading.Lock()
+        self._seq = 0
+
+    @property
+    def redactor(self) -> Redactor:
+        return self._redactor
+
+    def _next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def emit(self, type: str, job_id: str | None = None, **payload: Any) -> Event:
+        """Emit an event and return it (for tests / inspection)."""
+        with self._lock:
+            seq = self._next_seq()
+            event = Event(seq=seq, type=type, job_id=job_id, payload=payload)
+            redacted = self._redactor.redact(event.to_dict())
+            line = json.dumps(redacted, sort_keys=True, default=str, ensure_ascii=False)
+            try:
+                self._stream.write(line + "\n")
+                self._stream.flush()
+            except Exception:
+                # Never let a broken pipe crash the runner; swallow silently.
+                pass
+            return event
+
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self._stream.flush()
+            except Exception:
+                pass
+```
+
+---
+
+### `deterministic_job_runner/manifest.py`
+
+```python
+"""Manifest loading and validation.
+
+A manifest is a JSON document describing jobs. Example::
+
+    {
+      "version": 1,
+      "secrets": ["sk-abc123"],
+      "jobs": [
+        {"id": "train", "kind": "gpu", "priority": 10, "depends_on": []},
+        {"id": "eval",  "kind": "cpu", "priority": 5,  "depends_on": ["train"]}
+      ]
+    }
+
+The manifest references jobs by id. The actual ``work`` coroutines are bound
+separately by the caller (see ``Runner.bind_work``) so that the manifest stays
+pure data and the runner stays deterministic.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from .errors import ManifestError
+
+DEFAULT_MANIFEST: dict[str, Any] = {
+    "version": 1,
+    "secrets": [],
+    "jobs": [],
+}
+
+DEFAULT_SECRETS: list[str] = []
+
+
+def load_manifest(path: str | Path) -> dict[str, Any]:
+    """Load and validate a manifest from disk."""
+    p = Path(path)
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ManifestError(f"manifest not found: {p}") from exc
+    except OSError as exc:
+        raise ManifestError(f"could not read manifest {p}: {exc}") from exc
+    return parse_manifest(raw)
+
+
+def parse_manifest(raw: str) -> dict[str, Any]:
+    """Parse a manifest JSON string and validate its structure."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ManifestError(f"invalid JSON in manifest: {exc}") from exc
+    return validate_manifest(data)
+
+
+def validate_manifest(data: Any) -> dict[str, Any]:
+    """Validate a manifest dict and return a normalised copy.
+
+    Normalisation:
+      * ``version`` defaults to 1.
+      * ``secrets`` is a list of strings (defaults to []).
+      * ``jobs`` is a list of dicts, each with a required unique ``id``.
+      * ``kind`` is normalised to "cpu" or "gpu" (default "cpu").
+      * ``priority`` is an int (default 0).
+      * ``depends_on`` is a list of ids (default []).
+      * ``max_attempts`` is a positive int (default 1).
+    """
+    if not isinstance(data, dict):
+        raise ManifestError("manifest root must be a JSON object")
+
+    version = data.get("version", 1)
+    if not isinstance(version, int) or version < 1:
+        raise ManifestError("manifest 'version' must be a positive integer")
+
+    secrets_raw = data.get("secrets", [])
+    if not isinstance(secrets_raw, list):
+        raise ManifestError("manifest 'secrets' must be a list of strings")
+    secrets = [str(s) for s in secrets_raw]
+
+    jobs_raw = data.get("jobs", [])
+    if not isinstance(jobs_raw, list):
+        raise ManifestError("manifest 'jobs' must be a list")
+
+    jobs: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for idx, job in enumerate(jobs_raw):
+        if not isinstance(job, dict):
+            raise ManifestError(f"job #{idx} must be an object")
+        jid = job.get("id")
+        if not isinstance(jid, str) or not jid:
+            raise ManifestError(f"job #{idx} is missing a non-empty string 'id'")
+        if jid in seen_ids:
+            raise ManifestError(f"duplicate job id: {jid!r}")
+        seen_ids.add(jid)
+
+        kind = job.get("kind", "cpu")
+        if kind not in ("cpu", "gpu"):
+            raise ManifestError(f"job {jid!r} has invalid kind {kind!r}")
+
+        priority = job.get("priority", 0)
+        if not isinstance(priority, int):
+            raise ManifestError(f"job {jid!r} 'priority' must be an int")
+
+        depends_on = job.get("depends_on", [])
+        if not isinstance(depends_on, list):
+            raise ManifestError(f"job {jid!r} 'depends_on' must be a list")
+        depends_on = [str(d) for d in depends_on]
+
+        max_attempts = job.get("max_attempts", 1)
+        if not isinstance(max_attempts, int) or max_attempts < 1:
+            raise ManifestError(f"job {jid!r} 'max_attempts' must be a positive int")
+
+        jobs.append(
+            {
+                "id": jid,
+                "kind": kind,
+                "priority": priority,
+                "depends_on": depends_on,
+                "max_attempts": max_attempts,
+            }
+        )
+
+    # Validate dependency references.
+    for job in jobs:
+        for dep in job["depends_on"]:
+            if dep not in seen_ids:
+                raise ManifestError(
+                    f"job {job['id']!r} depends on unknown id {dep!r}"
+                )
+
+    return {
+        "version": version,
+        "secrets": secrets,
+        "jobs": jobs,
+    }
+```
+
+---
+
+### `deterministic_job_runner/state.py`
+
+```python
+"""Atomic on-disk state persistence.
+
+State is a single JSON document written atomically:
+  1. serialise to a temp file in the same directory,
+  2. fsync the temp file,
+  3. os.replace() over the target (atomic on POSIX).
+
+This guarantees a reader never observes a half-written state file.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from .errors import StateError
+from .models import Job, JobStatus
+
+STATE_VERSION = 1
+
+
+class StateStore:
+    """Persists the set of jobs and a logical clock."""
+
+    def __init__(self, path: str | Path):
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def load(self) -> dict[str, Any] | None:
+        """Load persisted state, or None if no file exists yet."""
+        if not self._path.exists():
+            return None
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise StateError(f"could not read state {self._path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise StateError("state file is not a JSON object")
+        if data.get("version") != STATE_VERSION:
+            raise StateError(
+                f"unsupported state version: {data.get('version')!r}"
+            )
+        return data
+
+    def save(self, jobs: list[Job], logical_clock: int) -> None:
+        """Atomically persist the current jobs and logical clock."""
+        payload = {
+            "version": STATE_VERSION,
+            "logical_clock": logical_clock,
+            "jobs": [j.to_dict() for j in jobs],
+        }
+        data = json.dumps(payload, sort_keys=True

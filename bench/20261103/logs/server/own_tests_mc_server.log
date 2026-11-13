@@ -1,0 +1,56 @@
+GPU     NVIDIA GeForce RTX 5090, 170 SMs, read bandwidth 1711 GB/s (best on this card 1711)
+MegaCapybara 1.39  model qwen3.8-27b-tiny.mcapy (build mx-fp4)
+context 32768 tokens (YaRN factor 1.000), 1 conversation(s), KV 6/4, prefill balanced, 127.0.0.1:8097
+each conversation: up to 32768 tokens (set the client's context limit, e.g. OpenCode's provider, to this)
+VRAM plan (planned = design size until the engine allocates it):
+   12.70 GiB  weights (decoder + head)
+    1.16 GiB  drafter (qwen3.8-27b-dflash2.mcapy)
+    0.00 GiB  vision tower (none)
+    1.33 GiB  workspace (CUDA context, step and prefill buffers)
+    0.10 GiB  speculation and sampling
+    0.03 GiB  verify graphs (14)
+    0.12 GiB  prompt checkpoint staging (5 checkpoints in RAM)
+    0.13 GiB  live state (1 slot)
+   12.86 GiB  KV pool: 641893 tokens at 21504 bytes/token
+  available after other programs and the reserve:  28.43 GiB; largest max_context at this concurrency: 641893
+weights loaded in 1.54 s (10.78 GB/s), checksums OK
+16:03:56.277 INFO [loader] qwen3.8-27b-tiny.mcapy: 790 blobs, weights in VRAM
+drafter qwen3.8-27b-dflash2.mcapy loaded in 0.19 s: speculative decoding on
+16:03:56.483 INFO [loader] drafter qwen3.8-27b-dflash2.mcapy: speculative decoding on
+16:03:56.547 INFO [engine] verify graphs for 1..7 drafts per round: 30 MiB, 0.02 s
+16:03:57.060 INFO [sched] warm-up: slot 0, prefill 4600 tokens in 0.51 s (8968 tok/s) [conv 1]
+16:03:57.165 INFO [sched] warm-up: slot 0, 40 tokens in 0.10 s (383.5 tok/s), 8 speculative rounds (5.00 tokens per round), 5.75 drafts per round, finish length [conv 1]
+16:03:57.197 INFO [sched] warm-up: slot 0, prefill 161 of 4800 tokens in 0.03 s (5045 tok/s; 4639 reused) [conv 2]
+16:03:57.277 INFO [sched] warm-up: slot 0, 40 tokens in 0.08 s (503.3 tok/s), 6 speculative rounds (6.67 tokens per round), 8.50 drafts per round, finish length [conv 2]
+16:03:57.316 INFO [sched] warm-up: slot 0, prefill 300 tokens in 0.04 s (7561 tok/s) [conv 3]
+16:03:57.731 INFO [sched] warm-up: slot 0, 16 tokens in 0.41 s (38.6 tok/s), finish length [conv 3]
+16:03:57.770 INFO [sched] warm-up: slot 0, prefill 300 tokens in 0.04 s (7737 tok/s) [conv 4]
+16:03:57.846 INFO [sched] warm-up: slot 0, 24 tokens in 0.08 s (312.3 tok/s), 7 speculative rounds (3.43 tokens per round), 2.29 drafts per round, finish length [conv 4]
+16:03:57.864 INFO [gpu] weights check: 13.86 GiB in 14192 chunks, 8.8 ms, every 10 min
+VRAM    15.81 GiB taken by the engine, all at startup (warm-up 1.3 s); 13.62 GiB free, reserve 1.0 GiB
+16:03:57.864 INFO [loader] VRAM after startup: engine 15.81 GiB, 13.62 GiB free
+16:03:57.865 INFO [http] listening on 127.0.0.1:8097
+16:03:59.229 INFO [http] chat 1 from 127.0.0.1: 26 prompt tokens (0 images), stream=1, effort=xhigh, thinking=off
+16:03:59.256 INFO [sched] chatcmpl-1: slot 0, prefill 26 tokens in 0.03 s (1003 tok/s) [conv 5]
+16:03:59.508 INFO [sched] chatcmpl-1: slot 0, 157 tokens in 0.25 s (621.6 tok/s), 23 speculative rounds (6.83 tokens per round), 5.83 drafts per round, finish stop [conv 5]
+16:03:59.533 INFO [http] chat 2 from 127.0.0.1: 26 prompt tokens (0 images), stream=1, effort=xhigh, thinking=off
+16:03:59.547 INFO [sched] chatcmpl-2: slot 0, prefill 7 of 26 tokens in 0.01 s (503 tok/s; 19 reused) [conv 6]
+16:03:59.790 INFO [sched] chatcmpl-2: slot 0, 157 tokens in 0.24 s (647.1 tok/s), 22 speculative rounds (7.14 tokens per round), 6.41 drafts per round, finish stop [conv 6]
+16:03:59.802 INFO [http] chat 3 from 127.0.0.1: 4773 prompt tokens (0 images), stream=1, effort=xhigh, thinking=off
+16:04:00.353 INFO [sched] chatcmpl-3: slot 0, prefill 4773 tokens in 0.55 s (8675 tok/s) [conv 7]
+16:04:11.056 INFO [sched] chatcmpl-3: slot 0, 4711 tokens in 10.70 s (440.2 tok/s), 925 speculative rounds (5.09 tokens per round), 6.99 drafts per round, finish stop [conv 7]
+16:04:14.252 INFO [http] chat 4 from 127.0.0.1: 4773 prompt tokens (0 images), stream=1, effort=xhigh, thinking=off
+16:04:14.267 INFO [sched] chatcmpl-4: slot 0, prefill 7 of 4773 tokens in 0.02 s (461 tok/s; 4766 reused) [conv 8]
+16:04:24.920 INFO [sched] chatcmpl-4: slot 0, 4711 tokens in 10.65 s (442.3 tok/s), 926 speculative rounds (5.09 tokens per round), 7.00 drafts per round, finish stop [conv 8]
+16:04:28.098 INFO [http] chat 5 from 127.0.0.1: 2927 prompt tokens (0 images), stream=1, effort=xhigh, thinking=off
+16:04:28.433 INFO [sched] chatcmpl-5: slot 0, prefill 2927 tokens in 0.34 s (8724 tok/s) [conv 9]
+16:04:32.802 INFO [sched] chatcmpl-5: slot 0, 2854 tokens in 4.37 s (653.3 tok/s), 381 speculative rounds (7.49 tokens per round), 7.00 drafts per round, finish stop [conv 9]
+16:04:33.079 INFO [http] chat 6 from 127.0.0.1: 2927 prompt tokens (0 images), stream=1, effort=xhigh, thinking=off
+16:04:33.093 INFO [sched] chatcmpl-6: slot 0, prefill 7 of 2927 tokens in 0.01 s (486 tok/s; 2920 reused) [conv 10]
+16:04:37.414 INFO [sched] chatcmpl-6: slot 0, 2854 tokens in 4.32 s (660.6 tok/s), 377 speculative rounds (7.57 tokens per round), 7.00 drafts per round, finish stop [conv 10]
+16:04:37.686 INFO [http] chat 7 from 127.0.0.1: 146 prompt tokens (0 images), stream=1, effort=xhigh, thinking=off
+16:04:37.725 INFO [sched] chatcmpl-7: slot 0, prefill 146 tokens in 0.04 s (3768 tok/s) [conv 11]
+16:04:50.005 INFO [sched] chatcmpl-7: slot 0, 8192 tokens in 12.28 s (667.1 tok/s), 1075 speculative rounds (7.62 tokens per round), 7.00 drafts per round, finish length [conv 11]
+16:04:50.010 INFO [http] chat 8 from 127.0.0.1: 146 prompt tokens (0 images), stream=1, effort=xhigh, thinking=off
+16:04:50.025 INFO [sched] chatcmpl-8: slot 0, prefill 7 of 146 tokens in 0.01 s (499 tok/s; 139 reused) [conv 12]
+16:05:02.330 INFO [sched] chatcmpl-8: slot 0, 8192 tokens in 12.31 s (665.7 tok/s), 1077 speculative rounds (7.61 tokens per round), 7.00 drafts per round, finish length [conv 12]

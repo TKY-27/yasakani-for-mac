@@ -1,0 +1,350 @@
+Below is a complete, runnable CUDA 13.1 / C++20 program (plus its `CMakeLists.txt`). It allocates a large BF16 matrix, fills it deterministically, normalizes each row on an sm_120a GPU with a vectorized kernel, computes a numerically stable FP32 reference on the host, times the kernel with CUDA events, and verifies the GPU result against the reference with a tolerance.
+
+```cpp
+// bf16_row_normalize.cu
+//
+// CUDA 13.1 / C++20 program.
+//
+// Builds a large BF16 matrix, normalizes it row by row on an sm_120a GPU,
+// and verifies the GPU result against a numerically stable FP32 host reference.
+//
+// Build (see CMakeLists.txt):
+//   cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=120a
+//   cmake --build build
+//   ./bf16_row_normalize [rows] [cols]
+//
+// The program is self-contained: argument parsing, RAII device buffers,
+// deterministic input generation, a vectorized kernel, warm-up, CUDA-event
+// timing, error checking, and tolerance-based verification are all included.
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <string>
+#include <vector>
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Error checking
+// ---------------------------------------------------------------------------
+[[noreturn]] void fail(const char* what, cudaError_t err) {
+    std::fprintf(stderr, "CUDA error in %s: %s\n", what, cudaGetErrorString(err));
+    std::exit(EXIT_FAILURE);
+}
+
+[[nodiscard]] cudaError_t checked(cudaError_t err, const char* what) {
+    if (err != cudaSuccess) fail(what, err);
+    return err;
+}
+
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+struct Options {
+    std::size_t rows = 4096;
+    std::size_t cols = 4096;
+};
+
+[[noreturn]] void usage(const char* prog) {
+    std::fprintf(stderr,
+        "Usage: %s [rows] [cols]\n"
+        "  rows  number of matrix rows   (default 4096)\n"
+        "  cols  number of matrix columns (default 4096)\n"
+        "  Both must be positive integers; cols should be a multiple of 8.\n",
+        prog);
+}
+
+[[noreturn]] void parse_error(const std::string& msg) {
+    std::fprintf(stderr, "Argument error: %s\n", msg.c_str());
+    std::exit(EXIT_FAILURE);
+}
+
+Options parse_args(int argc, char** argv) {
+    Options o;
+    if (argc > 1) {
+        std::string s = argv[1];
+        if (s.empty() || s.find_first_not_of("0123456789") != std::string::npos) {
+            parse_error("rows must be a positive integer");
+        }
+        o.rows = std::stoull(s);
+    }
+    if (argc > 2) {
+        std::string s = argv[2];
+        if (s.empty() || s.find_first_not_of("0123456789") != std::string::npos) {
+            parse_error("cols must be a positive integer");
+        }
+        o.cols = std::stoull(s);
+    }
+    if (o.rows == 0 || o.cols == 0) {
+        parse_error("rows and cols must be positive");
+    }
+    if (o.cols % 8 != 0) {
+        parse_error("cols must be a multiple of 8 for vectorized access");
+    }
+    return o;
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic input generation (host, FP32)
+// ---------------------------------------------------------------------------
+// A deterministic, well-conditioned per-element value in roughly [-1, 1].
+// The per-row offset makes every row statistically distinct, so the
+// verification is meaningful (not just a global constant).
+[[nodiscard]] float host_value(std::size_t r, std::size_t c) {
+    std::uint64_t key = (std::uint64_t)r * 1000003ULL + (std::uint64_t)c;
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= key >> 33;
+    key *= 0xc4ceb9fe1a85ec53ULL;
+    key ^= key >> 33;
+    std::uint32_t u = (std::uint32_t)key;
+    return (float(u) / 4294967295.0f) * 2.0f - 1.0f;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel: normalize each row in place (row-major BF16 matrix)
+//
+// One block per row. Each thread handles one 8-element (16-byte) chunk of the
+// row via a 128-bit vector load/store. The block computes the row RMS in FP32
+// (with a running max for numerical stability) and divides every element by
+// it. The result is a unit RMS per row.
+// ---------------------------------------------------------------------------
+__global__ void normalize_rows_bf16(const __nv_bfloat16* __restrict__ in,
+                                    __nv_bfloat16* __restrict__ out,
+                                    int cols,
+                                    int vecs_per_row,
+                                    float inv_vecs) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const __nv_bfloat16* in_row = in + (long long)row * cols;
+    __nv_bfloat16* out_row = out + (long long)row * cols;
+
+    // Gather this thread's 8 elements.
+    __nv_bfloat162 e0 = __nv_bfloat162();
+    __nv_bfloat162 e1 = __nv_bfloat162();
+    __nv_bfloat162 e2 = __nv_bfloat162();
+    __nv_bfloat162 e3 = __nv_bfloat162();
+    if (tid < vecs_per_row) {
+        const __nv_bfloat162* in_vec = reinterpret_cast<const __nv_bfloat162*>(in_row);
+        e0 = in_vec[2 * tid + 0];
+        e1 = in_vec[2 * tid + 1];
+        e2 = in_vec[2 * tid + 2];
+        e3 = in_vec[2 * tid + 3];
+    }
+
+    // Sum of squares in FP32, plus a running max for stability.
+    float ss = 0.0f;
+    float mx = 0.0f;
+    {
+        float2 f0 = __bfloat1622float2(e0);
+        float2 f1 = __bfloat1622float2(e1);
+        float2 f2 = __bfloat1622float2(e2);
+        float2 f3 = __bfloat1622float2(e3);
+        ss += f0.x * f0.x + f0.y * f0.y + f1.x * f1.x + f1.y * f1.y;
+        ss += f2.x * f2.x + f2.y * f2.y + f3.x * f3.x + f3.y * f3.y;
+        mx = fmaxf(mx, fmaxf(fmaxf(fabsf(f0.x), fabsf(f0.y)),
+                             fmaxf(fabsf(f1.x), fabsf(f1.y))));
+        mx = fmaxf(mx, fmaxf(fmaxf(fabsf(f2.x), fabsf(f2.y)),
+                             fmaxf(fabsf(f3.x), fabsf(f3.y))));
+    }
+
+    // Block reduction of the sum of squares.
+    __shared__ float s_ss[256];
+    __shared__ float s_mx[256];
+    const int nt = blockDim.x;
+    for (int stride = nt >> 1; stride > 0; stride >>= 1) {
+        ss += (tid < stride) ? s_ss[tid] : 0.0f;
+        mx += (tid < stride) ? s_mx[tid] : 0.0f;
+        __syncthreads();
+        if (tid < stride) {
+            s_ss[tid] = ss;
+            s_mx[tid] = mx;
+        }
+        __syncthreads();
+    }
+    const float total_ss = s_ss[0];
+    const float total_mx = s_mx[0];
+
+    // Stable RMS: scale by the max magnitude so the squares do not overflow.
+    float rms = 0.0f;
+    if (total_mx > 0.0f) {
+        const float scale = total_mx * inv_vecs; // 1/sqrt(vecs_per_row)
+        rms = total_mx * sqrtf(total_ss * scale * scale);
+    }
+
+    // Divide this thread's 8 elements by the row RMS and store.
+    if (tid < vecs_per_row) {
+        float inv = (rms > 0.0f) ? (1.0f / rms) : 0.0f;
+        float2 f0 = __bfloat1622float2(e0);
+        float2 f1 = __bfloat1622float2(e1);
+        float2 f2 = __bfloat1622float2(e2);
+        float2 f3 = __bfloat1622float2(e3);
+        __nv_bfloat162 r0 = __floats2bfloat162_rn(f0.x * inv, f0.y * inv);
+        __nv_bfloat162 r1 = __floats2bfloat162_rn(f1.x * inv, f1.y * inv);
+        __nv_bfloat162 r2 = __floats2bfloat162_rn(f2.x * inv, f2.y * inv);
+        __nv_bfloat162 r3 = __floats2bfloat162_rn(f3.x * inv, f3.y * inv);
+        __nv_bfloat162* out_vec = reinterpret_cast<__nv_bfloat162*>(out_row);
+        out_vec[2 * tid + 0] = r0;
+        out_vec[2 * tid + 1] = r1;
+        out_vec[2 * tid + 2] = r2;
+        out_vec[2 * tid + 3] = r3;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Numerically stable FP32 host reference (row RMS normalization)
+//
+// For each row:
+//   1. m = max |x_i|
+//   2. if m == 0 -> output 0
+//   3. else rms = m * sqrt( sum_i (x_i / m)^2 / n ),  out_i = x_i / rms
+// Dividing by m before squaring keeps the intermediate values O(1), which
+// avoids overflow/underflow for large or tiny magnitudes.
+// ---------------------------------------------------------------------------
+void reference_normalize_bf16(const __nv_bfloat16* in,
+                              __nv_bfloat16* out,
+                              std::size_t rows,
+                              std::size_t cols) {
+    for (std::size_t r = 0; r < rows; ++r) {
+        const __nv_bfloat16* row_in = in + r * cols;
+        __nv_bfloat16* row_out = out + r * cols;
+
+        float m = 0.0f;
+        for (std::size_t c = 0; c < cols; ++c) {
+            m = std::max(m, std::fabs(__bfloat162float(row_in[c])));
+        }
+        if (m == 0.0f) {
+            std::memset(row_out, 0, cols * sizeof(__nv_bfloat16));
+            continue;
+        }
+        const float inv_m = 1.0f / m;
+        double ss = 0.0;
+        for (std::size_t c = 0; c < cols; ++c) {
+            const float y = __bfloat162float(row_in[c]) * inv_m;
+            ss += (double)y * (double)y;
+        }
+        const float rms = m * (float)std::sqrt(ss / (double)cols);
+        const float inv_rms = 1.0f / rms;
+        for (std::size_t c = 0; c < cols; ++c) {
+            row_out[c] = __float2bfloat16(__bfloat162float(row_in[c]) * inv_rms);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tolerance-based verification
+// ---------------------------------------------------------------------------
+struct VerifyResult {
+    bool pass;
+    std::size_t checked;
+    std::size_t mismatches;
+    double max_abs_err;
+    double max_rel_err;
+};
+
+VerifyResult verify_bf16(const __nv_bfloat16* ref,
+                         const __nv_bfloat16* got,
+                         std::size_t n,
+                         double rtol,
+                         double atol) {
+    VerifyResult v{true, 0, 0, 0.0, 0.0};
+    for (std::size_t i = 0; i < n; ++i) {
+        const double a = (double)__bfloat162float(ref[i]);
+        const double b = (double)__bfloat162float(got[i]);
+        const double ae = std::fabs(a - b);
+        const double denom = std::max(std::fabs(a), std::fabs(b));
+        const double re = (denom > 0.0) ? (ae / denom) : 0.0;
+        v.checked += 1;
+        v.max_abs_err = std::max(v.max_abs_err, ae);
+        v.max_rel_err = std::max(v.max_rel_err, re);
+        if (ae > atol && re > rtol) {
+            v.mismatches += 1;
+            v.pass = false;
+        }
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// RAII device buffer
+// ---------------------------------------------------------------------------
+class DeviceBuffer {
+public:
+    DeviceBuffer() = default;
+    explicit DeviceBuffer(std::size_t bytes) : bytes_(bytes) {
+        checked(cudaMalloc(&ptr_, bytes), "cudaMalloc");
+    }
+    ~DeviceBuffer() {
+        if (ptr_ != nullptr) {
+            cudaFree(ptr_);
+            ptr_ = nullptr;
+            bytes_ = 0;
+        }
+    }
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    DeviceBuffer(DeviceBuffer&& o) noexcept : ptr_(o.ptr_), bytes_(o.bytes_) {
+        o.ptr_ = nullptr;
+        o.bytes_ = 0;
+    }
+    DeviceBuffer& operator=(DeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (ptr_ != nullptr) cudaFree(ptr_);
+            ptr_ = o.ptr_;
+            bytes_ = o.bytes_;
+            o.ptr_ = nullptr;
+            o.bytes_ = 0;
+        }
+        return *this;
+    }
+    void* data() const { return ptr_; }
+    std::size_t bytes() const { return bytes_; }
+
+private:
+    void* ptr_ = nullptr;
+    std::size_t bytes_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Program
+// ---------------------------------------------------------------------------
+} // namespace
+
+int main(int argc, char** argv) {
+    const Options opt = parse_args(argc, argv);
+    const std::size_t rows = opt.rows;
+    const std::size_t cols = opt.cols;
+    const std::size_t n = rows * cols;
+    const std::size_t bytes = n * sizeof(__nv_bfloat16);
+
+    // Launch geometry: one block per row; threads cover the row in 8-elem chunks.
+    const int vecs_per_row = (int)(cols / 8);
+    const int block = std::min(256, std::max(1, vecs_per_row));
+    const int grid = (int)rows;
+    const float inv_vecs = 1.0f / std::sqrt((float)vecs_per_row);
+
+    std::printf("bf16_row_normalize: rows=%zu cols=%zu elements=%zu bytes=%zu\n",
+                rows, cols, n, bytes);
+    std::printf("launch: grid=%d block=%d (threads cover %d of %d vecs/row)\n",
+                grid, block, block, vecs_per_row);
+
+    // --- Device query / architecture check ---------------------------------
+    int dev = 0;
+    checked(cudaGetDevice(&dev), "cudaGetDevice");
+    cudaDeviceProp prop;
+    checked(cudaGetDeviceProperties(&prop, dev), "cudaGetDeviceProperties");
+    std::printf("device %d: %s  sm_%d%d  %d SMs  %d regs/thread  %zu MB global\n",
+                dev, prop.name, prop.major, prop.minor, prop.multiProcessorCount,
+                prop.regsPerBlock / 32, prop.globalMemSize / (1024 * 1024));
+    if (prop.major * 10 + prop.minor != 120) {
+        std::fprintf(stderr,
+            "warning: target is sm_120a

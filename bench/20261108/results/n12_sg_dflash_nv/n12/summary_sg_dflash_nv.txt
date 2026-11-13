@@ -1,0 +1,15 @@
+label sg_dflash_nv  model qwen3.8-27b  temperature 0.00
+cat         fixture                            mean      min      max   ntok
+code        scenario_code_cuda                235.3    232.0    238.5   4096
+code        scenario_code_python              249.6    248.0    251.2   4096
+code        scenario_code_typescript          323.8    323.8    323.8    200
+story       scenario_story_zh_scifi           108.8    106.7    110.9   3570
+story       scenario_story_en_mystery         163.1    162.3    163.9   3114
+story       scenario_story_zh_dialogue        100.7     99.9    101.4   2823
+translation scenario_translation_zh_en        315.5    315.5    315.6    781
+translation scenario_translation_en_zh        232.2    232.2    232.2    873
+translation scenario_translation_markdown     189.1    183.6    194.6    919
+structured  scenario_structured_jsonl         416.8    416.5    417.1   4096
+structured  scenario_structured_csv           353.5    338.8    368.3   4096
+structured  scenario_structured_sql           341.8    338.2    345.4   4096
+per category (mean of runs): code 269.5, story 124.2, translation 245.6, structured 370.7

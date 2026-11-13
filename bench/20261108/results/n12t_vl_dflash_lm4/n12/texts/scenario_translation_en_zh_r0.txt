@@ -1,0 +1,204 @@
+我们需要回答用户：将提供的完整英文文档翻译成准确、自然的简体中文，保留六个章节标题和所有技术边界。译文之后附上至少二十项英中术语表。用户用中文提出要求。需要给出译文，保留六个章节标题。还要至少二十项英中术语表。需要准确自然，保留技术边界。我们先分析文本。
+
+英文：
+Section One — Ownership. A reliable inference service gives every mutable frontier a single owner. The program may delegate mathematical operations to kernels, but kernels do not silently advance request state. This separation makes successful rounds, rejected speculative drafts, cancellation, and prefix restoration observable as complete transitions.
+
+Section Two — Measurement. Loading time, prompt preparation, prefill, decode, and network transport answer different questions. A benchmark should name the interval behind every reported rate. The first generated token belongs to prefill in this engine, while the remaining generated tokens belong to decode, so the token counts must follow the same boundary.
+
+Section Three — Reproducibility. Inputs are frozen before the official run. The request body, resolved sampling parameters, model identity, context capacity, cache format, and raw timing fields are retained. Warm-up requests are labeled and excluded instead of being mixed into the measured repetitions.
+
+Section Four — Long Context. Allocating the maximum cache capacity is not the same as presenting a maximum-length prompt. The engine can keep a 262,144-token allocation while the test varies the actual prepared prompt. This isolates the cost of visible context without changing the memory plan between cases.
+
+Section Five — Speculation. Draft acceptance is workload dependent. Code, prose, translation, and structured records have different local predictability, so both accepted-draft percentage and output tokens per round are necessary. Throughput remains the user-visible result; acceptance statistics explain rather than replace it.
+
+Section Six — Reporting. Publish the complete configuration, repeated measurements, variation, and material limitations. Do not discard a valid slow run, and do not describe an internal timer as client-observed latency. Clear boundaries make an excellent result easier to trust.
+
+需要翻译准确自然。保留章节标题：Section One — Ownership 等。中文标题可为“第一部分 — 所有权”“第二部分 — 测量”等？“所有权”可能指 mutable frontier 的单一 owner。可用“单一所有权”？标题保留六个章节标题：也许 “第一节 — 所有权”更自然。保留技术边界。mutable frontier 可译“可变前沿”？在推理服务里 frontier 可能指生成前沿/请求状态前沿。要准确。我们可术语表定义。
+
+关键术语：
+- inference service: 推理服务
+- mutable frontier: 可变前沿（请求状态前沿）
+- owner: 所有者
+- kernels: 内核/计算核？这里 kernels 可能指 CUDA kernels 或计算内核。中文“内核”或“算子/内核”。在 GPU 语境常称“kernel”为“核函数”或“内核”。但为准确，保留“kernel”？用户要求中文自然。可以译“内核函数”或“算子内核”。技术边界：程序可将数学运算委托给内核，但内核不会静默推进请求状态。若用“内核”也可。
+- request state: 请求状态
+- transitions: 状态转移/完整转移
+- successful rounds: 成功轮次
+- speculative drafts: 推测草稿/投机草稿。Speculation 推测解码。draft acceptance: 草稿接受率。accepted-draft percentage: 已接受草稿占比。
+- cancellation: 取消
+- prefix restoration: 前缀恢复
+- Loading time: 加载时间
+- prompt preparation: 提示词准备/提示准备
+- prefill: 预填充
+- decode: 解码
+- network transport: 网络传输
+- benchmark: 基准测试
+- interval: 时间区间/统计区间。name the interval behind every reported rate: 为每个上报速率指明其所对应的时间区间。
+- first generated token: 首个生成令牌/首个生成 token。token 可译“词元”或“令牌”？自然常用“token”。中文技术文档常保留“token”。用户要求准确自然简体中文，术语表可列 token 为“词元/令牌”。但译文可保留“token”？要求翻译成简体中文，最好将 token 译为“词元”？技术边界保留，可写“词元（token）”或保留“token”。LLM 领域中文常使用“token”作为不可翻译术语。但“翻译成准确、自然的简体中文”不一定每个术语都中文化；技术边界可保留英文专有名词。可译“令牌/词元”并术语表。为自然，使用“词元”？在中文 LLM 文本中常用“token”更自然。但要求简体中文，术语表至少二十项。可以译文保留关键术语英文并注释？例如“首个生成词元（token）”会显式。可能更好：使用“词元”统一。262,144-token allocation -> 262,144 词元分配。
+- cache format: 缓存格式
+- raw timing fields: 原始计时字段
+- warm-up requests: 预热请求
+- measured repetitions: 被测量重复/受测重复次数
+- context capacity: 上下文容量
+- cache capacity: 缓存容量
+- memory plan: 内存计划/内存分配计划
+- visible context: 可见上下文
+- structured records: 结构化记录
+- local predictability: 局部可预测性
+- output tokens per round: 每轮输出词元数
+- user-visible result: 用户可见结果
+- internal timer: 内部计时器
+- client-observed latency: 客户端观测延迟
+- material limitations: 实质性限制/重大限制
+- variation: 变异/波动/变异幅度。这里 repeated measurements, variation -> 重复测量、波动。
+- complete configuration: 完整配置
+- valid slow run: 有效慢速运行/有效但较慢的运行
+- ownership: 所有权
+- measurement: 测量
+- reproducibility: 可复现性
+- long context: 长上下文
+- speculation: 推测
+- reporting: 报告
+
+需要至少 20 项英中术语表。可列 30+。格式：英文术语 | 中文译法。也许包含缩写说明。需要确保至少二十项。
+
+翻译风格：简洁，保留章节标题。可能用“第一节 — 所有权”等。原文 Section One — Ownership. 用 em dash。保留六个章节标题。译文：
+第一节 — 所有权。一个可靠的推理服务为每个可变前沿赋予单一所有者。程序可以将数学运算委托给内核，但内核不会静默推进请求状态。这种分离使成功轮次、被拒绝的推测草稿、取消以及前缀恢复都能作为完整状态转移被观察到。
+
+“gives every mutable frontier a single owner” -> “为每个可变前沿指定唯一所有者”。
+“kernels do not silently advance request state” -> “内核不会静默地推进请求状态”。
+“observable as complete transitions” -> “可被观察为完整的状态转移”。
+
+第二节 — 测量。加载时间、提示词准备、预填充、解码和网络传输分别回答不同的问题。基准测试应为每个上报速率指明其对应的时间区间。在本引擎中，首个生成词元属于预填充，其余生成词元属于解码，因此词元计数必须遵循同一边界。
+“prompt” 译为“提示词”或“提示”？LLM prompt 常用“提示词”或“提示”。为自然，“提示词准备”可。也可“提示准备”。“maximum-length prompt” 译“最大长度提示词”。
+“first generated token belongs to prefill in this engine” -> “在本引擎中，首个生成的词元归属于预填充阶段”。
+“so the token counts must follow the same boundary” -> “因此词元计数也必须遵循同一边界”。
+
+第三节 — 可复现性。在正式运行之前冻结输入。保留请求体、解析后的采样参数、模型身份、上下文容量、缓存格式以及原始计时字段。预热请求应被标记并排除，而不是混入被测量的重复中。
+“resolved sampling parameters” -> “已解析的采样参数”/“最终确定的采样参数”。
+“model identity” -> “模型身份标识”/“模型标识”。
+“raw timing fields” -> “原始计时字段”。
+“measured repetitions” -> “被测量重复”/“受测重复”。更自然：“而不是混入受测重复中”。
+
+第四节 — 长上下文。分配最大缓存容量并不等同于提交最大长度提示词。引擎可以维持 262,144 个词元的分配，同时让测试改变实际准备好的提示词。这样可以在各用例之间不改变内存计划的情况下，隔离出可见上下文的成本。
+“Allocating the maximum cache capacity is not the same as presenting a maximum-length prompt.” -> “将缓存容量分配至最大值，并不等同于呈现一个最大长度的提示词。”
+“keep a 262,144-token allocation” -> “保持 262,144 词元的分配”。
+“while the test varies the actual prepared prompt” -> “同时测试改变实际准备好的提示词”/“让测试变动实际已准备的提示词”。
+“without changing the memory plan between cases” -> “在各用例之间不改变内存计划”。
+“isolates the cost of visible context” -> “隔离可见上下文的成本”。
+
+第五节 — 推测。草稿接受度取决于工作负载。代码、散文、翻译和结构化记录具有不同的局部可预测性，因此既需要已接受草稿占比，也需要每轮输出词元数。吞吐量仍然是用户可见的结果；接受统计用于解释，而非替代它。
+“Draft acceptance is workload dependent.” -> “草稿接受度取决于工作负载。”
+“prose” -> “散文”/“自然语言文本”？在 LLM workload 中 prose 可“普通文本/散文”。自然：“代码、散文、翻译和结构化记录”可。
+“local predictability” -> “局部可预测性”。
+“accepted-draft percentage” -> “已接受草稿占比”。
+“output tokens per round” -> “每轮输出词元数”。
+“acceptance statistics explain rather than replace it” -> “接受统计只能解释吞吐量，而不能替代它。”或“接受统计用于解释，而非替代用户可见结果。”
+
+第六节 — 报告。发布完整配置、重复测量、波动以及实质性限制。不要丢弃一次有效但较慢的运行，也不要将内部计时器描述为客户端观测延迟。清晰的边界会使优秀结果更值得信赖。
+“variation” 在重复测量中 -> “变异幅度”/“波动”。
+“material limitations” -> “重大限制”/“实质性限制”。
+“valid slow run” -> “有效但较慢的运行”/“有效的慢速运行”。
+“client-observed latency” -> “客户端观测到的延迟”。
+
+术语表至少 20 项。可以列 35 项。需要包含章节术语和技术边界。至少二十项。可以列：
+1. inference service — 推理服务
+2. mutable frontier — 可变前沿
+3. owner — 所有者
+4. kernel — 内核（计算内核）
+5. request state — 请求状态
+6. transition — 状态转移
+7. successful round — 成功轮次
+8. speculative draft — 推测草稿
+9. cancellation — 取消
+10. prefix restoration — 前缀恢复
+11. loading time — 加载时间
+12. prompt preparation — 提示词准备
+13. prefill — 预填充
+14. decode — 解码
+15. network transport — 网络传输
+16. benchmark — 基准测试
+17. interval — 时间区间
+18. generated token — 生成词元
+19. warm-up request — 预热请求
+20. measured repetitions — 受测重复
+21. context capacity — 上下文容量
+22. cache capacity — 缓存容量
+23. cache format — 缓存格式
+24. raw timing fields — 原始计时字段
+25. visible context — 可见上下文
+26. memory plan — 内存计划
+27. local predictability — 局部可预测性
+28. accepted-draft percentage — 已接受草稿占比
+29. output tokens per round — 每轮输出词元数
+30. throughput — 吞吐量
+31. user-visible result — 用户可见结果
+32. internal timer — 内部计时器
+33. client-observed latency — 客户端观测延迟
+34. material limitations — 实质性限制
+35. variation — 波动/变异幅度
+36. model identity — 模型标识
+37. sampling parameters — 采样参数
+38. ownership — 所有权
+39. reproducibility — 可复现性
+40. speculation — 推测（解码）
+41. reporting — 报告
+42. token — 词元
+43. prompt — 提示词
+44. round — 轮次
+45. draft acceptance — 草稿接受度
+
+至少二十，足够。需要确保译文之后附上术语表。可以分两部分：译文，术语表。不要添加多余解释。用户要求“将下面完整英文文档翻译成准确、自然的简体中文，保留六个章节标题和所有技术边界。译文之后附上至少二十项英中术语表。” 应只给译文+术语表。可加标题“译文”和“术语表”。
+
+需要考虑“所有技术边界”指保留技术边界，不要模糊：比如 prefill/decode boundary，cache allocation vs prompt length, internal timer vs client latency。翻译需保留这些边界。可用“阶段边界”等。
+
+是否使用“词元”还是“令牌”？中文 LLM 中“词元”较学术，但“token”常见。若翻译“词元”，术语表注明“token（词元/令牌）”。自然？“262,144 词元分配”略不自然但可接受。也可保留“token”以自然：如“首个生成 token”。但用户要求简体中文，保留技术边界，不一定禁止英文术语。术语表可列“token — 词元（常保留 token）”。为了自然，中文 LLM 文档中保留 token 更自然。可是“翻译成准确、自然的简体中文”最好中文化。若使用“词元”，读者能懂。也可“词元（token）”首次出现加英文，后续用词元。可让译文保持中文。术语表列“token — 词元（译文统一为‘词元’）”。
+
+“kernel”在 GPU/推理中可能指 CUDA kernel。译“内核”可能歧义操作系统内核。技术边界可用“内核函数”或“算子内核”。在 GPU 编程中 “kernel”常称“内核”。如果避免歧义，译“内核（计算内核）”或“kernel 内核”。译文：“程序可以将数学运算委托给计算内核，但计算内核不会静默推进请求状态。” 技术边界清楚。术语表 “kernel — 计算内核 / 内核函数”。使用“计算内核”更明确，不指操作系统。好。
+
+“mutable frontier”：可能推理引擎中“frontier”是 token 生成边界？可译“可变前沿”。可术语表：“mutable frontier — 可变前沿（状态前沿）”。译文：“为每个可变前沿指定唯一所有者。”
+
+“rounds”：在 speculative decoding 中 round 可能是一轮生成，包含 draft+verify。译“轮次”。
+
+“prefix restoration”：恢复前缀。可译“前缀恢复”。
+
+“prompt preparation”：提示词准备。若用“提示词”统一。
+
+“resolved sampling parameters”：已解析采样参数。可译“最终确定的采样参数”更自然。保留“已解析”技术边界。可“已解析的采样参数”。
+
+“context capacity”：上下文容量。可指最大上下文长度。
+
+“cache capacity”：缓存容量。
+
+“262,144-token allocation”：262,144 词元分配。是否加“的”？“262,144 个词元分配”？更自然：“262,144 个词元的分配”。原文 “keep a 262,144-token allocation” -> “保持一个 262,144 词元分配”。中文：“引擎可以保持 262,144 个词元的分配规模”。
+
+“test varies the actual prepared prompt” -> “让测试改变实际已准备的提示词”。“实际准备好的提示词”。
+
+“cost of visible context” -> “可见上下文的成本”。
+
+“memory plan” -> “内存计划”或“内存分配计划”。“内存计划”在引擎中可能指 memory allocation plan。可术语表“memory plan — 内存计划（内存分配计划）”。译文：“在不改变各用例之间内存分配计划的情况下，隔离可见上下文的成本。”更自然。
+
+“repeated measurements, variation” -> “重复测量及其波动”。原文 “Publish the complete configuration, repeated measurements, variation, and material limitations.” -> “发布完整配置、重复测量、波动幅度以及实质性限制。” 技术边界：variation 可指测量间变异。可“波动/离散程度”。
+
+“Do not discard a valid slow run” -> “不要丢弃有效但较慢的运行结果”。
+
+“internal timer” -> “内部计时器”。
+
+“client-observed latency” -> “客户端观测延迟”或“客户端观测到的延迟”。
+
+“Clear boundaries make an excellent result easier to trust.” -> “清晰的边界会让优秀结果更可信。”或“使卓越结果更值得信赖”。
+
+“ownership” 标题： “所有权”。在软件中 “单一所有权” maybe. Section One title can be “第一节 — 所有权”。若强调 single owner，也可 “第一节 — 单一所有权”，但原标题 Ownership。保留六个章节标题，可直译“所有权”。
+
+“Measurement” -> “测量”还是“度量”？benchmark measurement 可“度量”/“测量”。章节标题 “第二节 — 度量”更技术？原文 Measurement。为自然，用“度量”？ “Loading time... answer different questions” -> “度量”。但标题可“测量”。术语表可“Measurement — 测量/度量”。译文标题用“测量”即可。
+
+“Reproducibility” -> “可复现性”。
+
+“Long Context” -> “长上下文”。
+
+“Speculation” -> “推测”。在 LLM 中 “推测解码”。“第五节 — 推测”可。也可 “推测解码”。原标题 Speculation，技术边界是 speculative drafts。可标题 “推测”。术语表 “speculation — 推测（解码）”。
+
+“Reporting” -> “报告”。
+
+可能译文：
+第一节 — 所有权。
+可靠的推理服务为每个可变前沿指定唯一所有者。程序可以将数学运算委托给计算内核，但计算内核不会静默地推进请求状态。这种分离使成功轮次、被拒绝的推测草稿、取消以及前缀恢复都能作为完整

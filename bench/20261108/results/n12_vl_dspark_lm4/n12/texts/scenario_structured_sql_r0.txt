@@ -1,0 +1,173 @@
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS models (
+    model_id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    architecture TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fixtures (
+    fixture_id SERIAL PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('synthetic', 'real_world', 'adversarial', 'multilingual')),
+    description TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id SERIAL PRIMARY KEY,
+    model_id INTEGER NOT NULL REFERENCES models(model_id) ON DELETE CASCADE,
+    fixture_id INTEGER NOT NULL REFERENCES fixtures(fixture_id) ON DELETE CASCADE,
+    started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMP WITH TIME ZONE,
+    status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed')),
+    UNIQUE (model_id, fixture_id, started_at)
+);
+
+CREATE TABLE IF NOT EXISTS request_metrics (
+    metric_id SERIAL PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    tokens_per_second REAL CHECK (tokens_per_second >= 0),
+    latency_ms REAL CHECK (latency_ms >= 0),
+    context_length INTEGER CHECK (context_length > 0),
+    retention_score REAL CHECK (retention_score BETWEEN 0 AND 1),
+    mtp_acceptance_rate REAL CHECK (mtp_acceptance_rate BETWEEN 0 AND 1),
+    error_count INTEGER NOT NULL DEFAULT 0 CHECK (error_count >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_model ON runs(model_id);
+CREATE INDEX IF NOT EXISTS idx_runs_fixture ON runs(fixture_id);
+CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_metrics_run ON request_metrics(run_id);
+CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON request_metrics(timestamp);
+CREATE INDEX IF NOT EXISTS idx_metrics_tps ON request_metrics(tokens_per_second);
+
+CREATE OR REPLACE VIEW v_model_performance AS
+SELECT 
+    m.name AS model_name,
+    f.kind AS fixture_kind,
+    COUNT(DISTINCT r.run_id) AS total_runs,
+    AVG(rm.tokens_per_second) AS avg_tps,
+    STDDEV(rm.tokens_per_second) AS tps_stddev,
+    AVG(rm.retention_score) AS avg_retention,
+    AVG(rm.mtp_acceptance_rate) AS avg_mtp_acceptance
+FROM models m
+JOIN runs r ON m.model_id = r.model_id
+JOIN fixtures f ON r.fixture_id = f.fixture_id
+JOIN request_metrics rm ON r.run_id = rm.run_id
+WHERE r.status = 'completed'
+GROUP BY m.name, f.kind;
+
+CREATE OR REPLACE VIEW v_long_context_analysis AS
+SELECT 
+    m.name AS model_name,
+    CASE 
+        WHEN rm.context_length < 4096 THEN 'short'
+        WHEN rm.context_length < 32768 THEN 'medium'
+        ELSE 'long'
+    END AS context_category,
+    COUNT(*) AS sample_count,
+    AVG(rm.retention_score) AS avg_retention,
+    MIN(rm.retention_score) AS min_retention,
+    MAX(rm.retention_score) AS max_retention
+FROM models m
+JOIN runs r ON m.model_id = r.model_id
+JOIN request_metrics rm ON r.run_id = rm.run_id
+WHERE r.status = 'completed'
+GROUP BY m.name, context_category;
+
+CREATE OR REPLACE FUNCTION upsert_request_metrics(
+    p_run_id INTEGER,
+    p_timestamp TIMESTAMP WITH TIME ZONE,
+    p_tps REAL,
+    p_latency REAL,
+    p_context INTEGER,
+    p_retention REAL,
+    p_mtp REAL,
+    p_errors INTEGER
+) RETURNS INTEGER AS $$
+DECLARE
+    v_metric_id INTEGER;
+BEGIN
+    INSERT INTO request_metrics (
+        run_id, timestamp, tokens_per_second, latency_ms, 
+        context_length, retention_score, mtp_acceptance_rate, error_count
+    ) VALUES (
+        p_run_id, p_timestamp, p_tps, p_latency, 
+        p_context, p_retention, p_mtp, p_errors
+    )
+    ON CONFLICT (run_id, timestamp) DO UPDATE SET
+        tokens_per_second = EXCLUDED.tokens_per_second,
+        latency_ms = EXCLUDED.latency_ms,
+        context_length = EXCLUDED.context_length,
+        retention_score = EXCLUDED.retention_score,
+        mtp_acceptance_rate = EXCLUDED.mtp_acceptance_rate,
+        error_count = EXCLUDED.error_count
+    RETURNING metric_id INTO v_metric_id;
+    
+    RETURN v_metric_id;
+END;
+$$ LANGUAGE plpgsql;
+
+INSERT INTO models (name, architecture) VALUES 
+('llama-3-8b', 'transformer'),
+('mistral-7b', 'transformer');
+
+INSERT INTO fixtures (kind, description) VALUES 
+('synthetic', 'Random token sequences for baseline testing'),
+('real_world', 'Actual user queries from production logs'),
+('adversarial', 'Edge cases and prompt injection attempts'),
+('multilingual', 'Mixed language inputs for cross-lingual evaluation');
+
+INSERT INTO runs (model_id, fixture_id, started_at, completed_at, status) VALUES 
+(1, 1, '2024-01-15 10:00:00+00', '2024-01-15 10:30:00+00', 'completed'),
+(1, 1, '2024-01-15 11:00:00+00', '2024-01-15 11:30:00+00', 'completed'),
+(1, 2, '2024-01-15 12:00:00+00', '2024-01-15 12:45:00+00', 'completed'),
+(1, 2, '2024-01-15 13:00:00+00', '2024-01-15 13:45:00+00', 'completed'),
+(1, 3, '2024-01-15 14:00:00+00', '2024-01-15 14:20:00+00', 'completed'),
+(1, 3, '2024-01-15 15:00:00+00', '2024-01-15 15:20:00+00', 'completed'),
+(1, 4, '2024-01-15 16:00:00+00', '2024-01-15 16:40:00+00', 'completed'),
+(1, 4, '2024-01-15 17:00:00+00', '2024-01-15 17:40:00+00', 'completed'),
+(2, 1, '2024-01-16 10:00:00+00', '2024-01-16 10:25:00+00', 'completed'),
+(2, 1, '2024-01-16 11:00:00+00', '2024-01-16 11:25:00+00', 'completed'),
+(2, 2, '2024-01-16 12:00:00+00', '2024-01-16 12:40:00+00', 'completed'),
+(2, 2, '2024-01-16 13:00:00+00', '2024-01-16 13:40:00+00', 'completed'),
+(2, 3, '2024-01-16 14:00:00+00', '2024-01-16 14:15:00+00', 'completed'),
+(2, 3, '2024-01-16 15:00:00+00', '2024-01-16 15:15:00+00', 'completed'),
+(2, 4, '2024-01-16 16:00:00+00', '2024-01-16 16:35:00+00', 'completed'),
+(2, 4, '2024-01-16 17:00:00+00', '2024-01-16 17:35:00+00', 'completed');
+
+INSERT INTO request_metrics (run_id, timestamp, tokens_per_second, latency_ms, context_length, retention_score, mtp_acceptance_rate, error_count) VALUES 
+(1, '2024-01-15 10:05:00+00', 45.2, 22.1, 2048, 0.92, 0.85, 0),
+(1, '2024-01-15 10:10:00+00', 44.8, 22.3, 2048, 0.91, 0.84, 0),
+(1, '2024-01-15 10:15:00+00', 46.1, 21.7, 4096, 0.89, 0.82, 0),
+(1, '2024-01-15 10:20:00+00', 43.5, 23.0, 4096, 0.88, 0.81, 1),
+(1, '2024-01-15 10:25:00+00', 45.0, 22.2, 8192, 0.85, 0.79, 0),
+(2, '2024-01-15 11:05:00+00', 44.9, 22.3, 2048, 0.93, 0.86, 0),
+(2, '2024-01-15 11:10:00+00', 45.3, 22.1, 2048, 0.92, 0.85, 0),
+(2, '2024-01-15 11:15:00+00', 44.1, 22.7, 4096, 0.90, 0.83, 0),
+(2, '2024-01-15 11:20:00+00', 43.8, 22.8, 4096, 0.89, 0.82, 0),
+(2, '2024-01-15 11:25:00+00', 44.5, 22.5, 8192, 0.87, 0.80, 0),
+(3, '2024-01-15 12:05:00+00', 42.3, 23.6, 16384, 0.82, 0.75, 0),
+(3, '2024-01-15 12:10:00+00', 41.8, 23.9, 16384, 0.81, 0.74, 0),
+(3, '2024-01-15 12:15:00+00', 43.0, 23.3, 32768, 0.78, 0.71, 0),
+(3, '2024-01-15 12:20:00+00', 42.5, 23.5, 32768, 0.77, 0.70, 1),
+(3, '2024-01-15 12:25:00+00', 41.2, 24.3, 65536, 0.72, 0.65, 0),
+(3, '2024-01-15 12:30:00+00', 40.8, 24.5, 65536, 0.71, 0.64, 0),
+(3, '2024-01-15 12:35:00+00', 42.0, 23.8, 131072, 0.65, 0.58, 0),
+(3, '2024-01-15 12:40:00+00', 41.5, 24.1, 131072, 0.64, 0.57, 0),
+(4, '2024-01-15 13:05:00+00', 42.8, 23.4, 16384, 0.83, 0.76, 0),
+(4, '2024-01-15 13:10:00+00', 42.2, 23.7, 16384, 0.82, 0.75, 0),
+(4, '2024-01-15 13:15:00+00', 43.5, 23.0, 32768, 0.79, 0.72, 0),
+(4, '2024-01-15 13:20:00+00', 43.0, 23.2, 32768, 0.78, 0.71, 0),
+(4, '2024-01-15 13:25:00+00', 41.8, 24.0, 65536, 0.73, 0.66, 0),
+(4, '2024-01-15 13:30:00+00', 41.3, 24.2, 65536, 0.72, 0.65, 0),
+(4, '2024-01-15 13:35:00+00', 42.5, 23.5, 131072, 0.66, 0.59, 0),
+(4, '2024-01-15 13:40:00+00', 42.0, 23.8, 131072, 0.65, 0.58, 0),
+(5, '2024-01-15 14:05:00+00', 38.5, 26.0, 2048, 0.88, 0.80, 0),
+(5, '2024-01-15 14:10:00+00', 37.8, 26.5, 2048, 0.87, 0.79, 0),
+(5, '2024-01-15 14:15:00+00', 39.2, 25.5, 4096, 0.85, 0.77, 0),
+(6, '2024-01-15 15:05:00+00', 38.2, 26.2, 2048, 0.89, 0.81, 0),
+(6, '2024-01-15 15:10:00+00', 37.5, 26.7, 2048, 0.88, 0.80, 0),
+(6, '2024-01-15 15:15:00+00', 38.8, 25.8, 4096, 0.86, 

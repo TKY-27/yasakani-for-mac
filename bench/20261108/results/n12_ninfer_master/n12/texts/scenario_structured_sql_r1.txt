@@ -1,0 +1,207 @@
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS models (
+    model_id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    architecture VARCHAR(100) NOT NULL,
+    parameter_count BIGINT CHECK (parameter_count > 0),
+    context_length INT CHECK (context_length > 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS fixtures (
+    fixture_id SERIAL PRIMARY KEY,
+    kind VARCHAR(50) NOT NULL CHECK (kind IN ('code', 'math', 'long_context', 'chat')),
+    description TEXT,
+    avg_token_length INT CHECK (avg_token_length > 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id SERIAL PRIMARY KEY,
+    model_id INT NOT NULL REFERENCES models(model_id) ON DELETE CASCADE,
+    fixture_id INT NOT NULL REFERENCES fixtures(fixture_id) ON DELETE CASCADE,
+    batch_size INT CHECK (batch_size > 0),
+    sequence_length INT CHECK (sequence_length > 0),
+    start_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    end_time TIMESTAMP,
+    status VARCHAR(20) CHECK (status IN ('completed', 'failed', 'running')),
+    UNIQUE (model_id, fixture_id, batch_size, sequence_length, start_time)
+);
+
+CREATE INDEX idx_runs_model ON runs(model_id);
+CREATE INDEX idx_runs_fixture ON runs(fixture_id);
+CREATE INDEX idx_runs_status ON runs(status);
+
+CREATE TABLE IF NOT EXISTS request_metrics (
+    metric_id SERIAL PRIMARY KEY,
+    run_id INT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    request_index INT NOT NULL,
+    input_tokens INT CHECK (input_tokens >= 0),
+    output_tokens INT CHECK (output_tokens >= 0),
+    latency_ms FLOAT CHECK (latency_ms >= 0),
+    mtp_accepted_tokens INT CHECK (mtp_accepted_tokens >= 0),
+    mtp_total_proposed INT CHECK (mtp_total_proposed >= 0),
+    first_token_latency_ms FLOAT CHECK (first_token_latency_ms >= 0),
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (run_id, request_index)
+);
+
+CREATE INDEX idx_metrics_run ON request_metrics(run_id);
+CREATE INDEX idx_metrics_latency ON request_metrics(latency_ms);
+CREATE INDEX idx_metrics_mtp ON request_metrics(mtp_accepted_tokens, mtp_total_proposed);
+
+CREATE VIEW v_throughput_summary AS
+SELECT 
+    r.run_id,
+    m.name AS model_name,
+    f.kind AS fixture_kind,
+    r.batch_size,
+    r.sequence_length,
+    COUNT(*) AS total_requests,
+    SUM(rm.output_tokens) * 1.0 / (MAX(rm.timestamp) - MIN(rm.timestamp)) AS tokens_per_second
+FROM runs r
+JOIN models m ON r.model_id = m.model_id
+JOIN fixtures f ON r.fixture_id = f.fixture_id
+JOIN request_metrics rm ON r.run_id = rm.run_id
+WHERE r.status = 'completed'
+GROUP BY r.run_id, m.name, f.kind, r.batch_size, r.sequence_length;
+
+CREATE VIEW v_mtp_acceptance_rate AS
+SELECT 
+    r.run_id,
+    m.name AS model_name,
+    f.kind AS fixture_kind,
+    SUM(rm.mtp_accepted_tokens) * 1.0 / NULLIF(SUM(rm.mtp_total_proposed), 0) AS acceptance_rate,
+    AVG(rm.mtp_accepted_tokens) AS avg_accepted,
+    AVG(rm.mtp_total_proposed) AS avg_proposed
+FROM runs r
+JOIN models m ON r.model_id = m.model_id
+JOIN fixtures f ON r.fixture_id = f.fixture_id
+JOIN request_metrics rm ON r.run_id = rm.run_id
+WHERE r.status = 'completed' AND rm.mtp_total_proposed > 0
+GROUP BY r.run_id, m.name, f.kind;
+
+CREATE OR REPLACE FUNCTION upsert_request_metric(
+    p_run_id INT,
+    p_request_index INT,
+    p_input_tokens INT,
+    p_output_tokens INT,
+    p_latency_ms FLOAT,
+    p_mtp_accepted INT,
+    p_mtp_proposed INT,
+    p_first_token_ms FLOAT
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO request_metrics (
+        run_id, request_index, input_tokens, output_tokens, latency_ms,
+        mtp_accepted_tokens, mtp_total_proposed, first_token_latency_ms
+    ) VALUES (
+        p_run_id, p_request_index, p_input_tokens, p_output_tokens, p_latency_ms,
+        p_mtp_accepted, p_mtp_proposed, p_first_token_ms
+    )
+    ON CONFLICT (run_id, request_index) DO UPDATE SET
+        input_tokens = EXCLUDED.input_tokens,
+        output_tokens = EXCLUDED.output_tokens,
+        latency_ms = EXCLUDED.latency_ms,
+        mtp_accepted_tokens = EXCLUDED.mtp_accepted_tokens,
+        mtp_total_proposed = EXCLUDED.mtp_total_proposed,
+        first_token_latency_ms = EXCLUDED.first_token_latency_ms,
+        timestamp = CURRENT_TIMESTAMP;
+END;
+$$ LANGUAGE plpgsql;
+
+INSERT INTO models (name, architecture, parameter_count, context_length) VALUES
+('Llama-3-8B-Instruct', 'llama', 8000000000, 8192),
+('Mistral-7B-v0.1', 'mistral', 7000000000, 32768);
+
+INSERT INTO fixtures (kind, description, avg_token_length) VALUES
+('code', 'Python function generation', 512),
+('math', 'Algebra problem solving', 256),
+('long_context', 'Document summarization', 4096),
+('chat', 'Conversational Q&A', 128);
+
+INSERT INTO runs (model_id, fixture_id, batch_size, sequence_length, status) VALUES
+(1, 1, 1, 512, 'completed'),
+(1, 1, 4, 512, 'completed'),
+(1, 2, 1, 256, 'completed'),
+(1, 2, 4, 256, 'completed'),
+(1, 3, 1, 4096, 'completed'),
+(1, 3, 2, 4096, 'completed'),
+(1, 4, 1, 128, 'completed'),
+(1, 4, 8, 128, 'completed'),
+(2, 1, 1, 512, 'completed'),
+(2, 1, 4, 512, 'completed'),
+(2, 2, 1, 256, 'completed'),
+(2, 2, 4, 256, 'completed'),
+(2, 3, 1, 4096, 'completed'),
+(2, 3, 2, 4096, 'completed'),
+(2, 4, 1, 128, 'completed'),
+(2, 4, 8, 128, 'completed');
+
+INSERT INTO request_metrics (run_id, request_index, input_tokens, output_tokens, latency_ms, mtp_accepted_tokens, mtp_total_proposed, first_token_latency_ms) VALUES
+(1, 1, 512, 128, 1200.5, 45, 60, 150.2),
+(1, 2, 512, 135, 1250.3, 48, 60, 155.1),
+(1, 3, 512, 122, 1180.7, 42, 60, 148.9),
+(1, 4, 512, 140, 1300.1, 50, 60, 160.3),
+(1, 5, 512, 125, 1210.4, 46, 60, 152.7),
+(1, 6, 512, 130, 1230.8, 47, 60, 154.5),
+(1, 7, 512, 118, 1170.2, 40, 60, 145.8),
+(1, 8, 512, 132, 1240.6, 49, 60, 156.2),
+(2, 1, 512, 128, 450.2, 45, 60, 50.1),
+(2, 2, 512, 135, 460.5, 48, 60, 52.3),
+(2, 3, 512, 122, 440.8, 42, 60, 48.7),
+(2, 4, 512, 140, 470.1, 50, 60, 55.4),
+(2, 5, 512, 125, 455.3, 46, 60, 51.2),
+(2, 6, 512, 130, 465.7, 47, 60, 53.8),
+(2, 7, 512, 118, 435.9, 40, 60, 47.5),
+(2, 8, 512, 132, 475.2, 49, 60, 54.6),
+(3, 1, 256, 64, 600.3, 20, 30, 75.4),
+(3, 2, 256, 70, 620.5, 22, 30, 78.1),
+(3, 3, 256, 58, 580.7, 18, 30, 72.3),
+(3, 4, 256, 75, 650.2, 25, 30, 82.5),
+(3, 5, 256, 62, 610.4, 21, 30, 76.8),
+(3, 6, 256, 68, 630.6, 23, 30, 79.2),
+(3, 7, 256, 55, 570.8, 17, 30, 70.5),
+(3, 8, 256, 72, 640.3, 24, 30, 81.7),
+(4, 1, 256, 64, 220.5, 20, 30, 25.1),
+(4, 2, 256, 70, 230.2, 22, 30, 26.4),
+(4, 3, 256, 58, 210.8, 18, 30, 23.7),
+(4, 4, 256, 75, 240.1, 25, 30, 28.5),
+(4, 5, 256, 62, 225.3, 21, 30, 25.9),
+(4, 6, 256, 68, 235.7, 23, 30, 27.2),
+(4, 7, 256, 55, 205.9, 17, 30, 22.5),
+(4, 8, 256, 72, 245.2, 24, 30, 28.7),
+(5, 1, 4096, 256, 5000.2, 100, 150, 500.5),
+(5, 2, 4096, 265, 5100.5, 105, 150, 510.2),
+(5, 3, 4096, 248, 4900.7, 95, 150, 490.8),
+(5, 4, 4096, 270, 5200.1, 110, 150, 520.3),
+(5, 5, 4096, 252, 5050.4, 102, 150, 505.7),
+(5, 6, 4096, 260, 5150.8, 108, 150, 515.5),
+(5, 7, 4096, 245, 4850.2, 92, 150, 485.8),
+(5, 8, 4096, 268, 5250.6, 109, 150, 525.2),
+(6, 1, 4096, 256, 2500.5, 100, 150, 250.2),
+(6, 2, 4096, 265, 2550.3, 105, 150, 255.1),
+(6, 3, 4096, 248, 2450.7, 95, 150, 245.8),
+(6, 4, 4096, 270, 2600.1, 110, 150, 260.3),
+(6, 5, 4096, 252, 2525.4, 102, 150, 252.7),
+(6, 6, 4096, 260, 2575.8, 108, 150, 257.5),
+(6, 7, 4096, 245, 2425.2, 92, 150, 242.8),
+(6, 8, 4096, 268, 2625.6, 109, 150, 262.2),
+(7, 1, 128, 32, 150.2, 10, 15, 15.5),
+(7, 2, 128, 35, 160.5, 11, 15, 16.2),
+(7, 3, 128, 30, 140.7, 9, 15, 14.8),
+(7, 4, 128, 38, 170.1, 12, 15, 17.3),
+(7, 5, 128, 33, 155.4, 10, 15, 15.7),
+(7, 6, 128, 36, 165.8, 11, 15, 16.5),
+(7, 7, 128, 28, 135.2, 8, 15, 13.8),
+(7, 8, 128, 34, 162.6, 11, 15, 16.2),
+(8, 1, 128, 32, 50.5, 10, 15, 5.2),
+(8, 2, 128, 35, 52.3, 11, 15, 5.4),
+(8, 3, 128, 30, 48.7, 9, 15, 4.9),
+(8, 4, 128, 38, 55.1, 12, 15, 5.6),
+(8, 5, 128, 33, 51.4, 10, 15, 5.3),
+(8, 6, 128, 36, 53.8, 11, 15, 5.5),
+(8, 7, 128, 28, 45.2, 8, 15, 4.6),
+(8, 8, 128, 34, 54.6, 11, 15, 5.4),
+(

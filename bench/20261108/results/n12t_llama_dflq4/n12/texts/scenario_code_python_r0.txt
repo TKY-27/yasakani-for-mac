@@ -1,0 +1,130 @@
+We need respond to user: "Write a complete Python 3.11 package for a deterministic asynchronous job runner. It must read a JSON manifest, enforce one active GPU job, persist atomic state, resume completed work, stream structured JSONL events, handle SIGINT, redact configured secrets, and include pytest tests for success, failure, cancellation, and resume. Present every source file in a separate fenced block with its path and include pyproject.toml."
+
+Need produce complete runnable code. Need think carefully. We need package structure, files. It should be deterministic asynchronous job runner. Requirements:
+- read JSON manifest
+- enforce one active GPU job
+- persist atomic state
+- resume completed work
+- stream structured JSONL events
+- handle SIGINT
+- redact configured secrets
+- include pytest tests for success, failure, cancellation, resume
+- Present every source file in separate fenced block with path and include pyproject.toml.
+
+Need final answer with code blocks for all source files. Must be complete runnable. Need decide design.
+
+Python 3.11 package. Async job runner. Deterministic. Maybe manifest contains jobs, gpu constraint, secrets config. We need enforce one active GPU job: scheduler should only start one job with requires_gpu true at a time. Non-GPU maybe can run? The phrase "enforce one active GPU job" suggests at most one job requiring GPU active. Could also mean only one active GPU job overall. Implement concurrency: jobs have fields: id, command? Or callable? Since manifest JSON can't include callables. For deterministic async runner, maybe jobs have "type": "gpu" or "cpu" and "args", "command" executed as subprocess? Or tasks with simulated sleep? Need tests success/failure/cancellation/resume. Could implement runner that executes jobs defined by "command" (argv) or "echo"? Need deterministic and testable without GPU. We can define job spec with "command" list, "env" maybe secrets redacted, "requires_gpu". Runner runs each job as asyncio subprocess, capturing stdout/stderr, emits events. But subprocess with commands in tests: use echo, false, sleep, etc. Cross-platform? Python 3.11 tests likely run on Linux? We can use sys.executable -c for deterministic. For failure use sys.exit(1). For cancellation: SIGINT handling. Maybe runner handles SIGINT to cancel current job(s) and save state. Tests cancellation: start runner as subprocess? Or use async in-process and send SIGINT to process? Need robust.
+
+Alternative: jobs have "fn" not possible JSON. Could have built-in operations: "sleep", "fail", "compute" with deterministic results. Then easier tests. But "job runner" usually executes commands. Need read JSON manifest; could include "jobs": [{"id": ..., "kind": "sleep", "seconds": ...}] or "command": [...]. For test success/failure/cancellation/resume, built-in deterministic operations better. But a real GPU job runner would launch commands. We can support both: built-in tasks and command. To keep deterministic and avoid external shell, built-in tasks. But "one active GPU job" maybe a job with "gpu": true. The runner can simulate GPU jobs by tasks that take time and require GPU lock.
+
+Need atomic state persistence. Use JSON state file in directory; write temp file + os.replace. State includes completed job ids, failed? pending? started? current? events? Need resume completed work: if state has completed, skip. Maybe also skip failed? Requirement says resume completed work; could skip completed, but failed maybe retriable? Deterministic runner maybe failed jobs marked failed and not retried? Need tests for failure and resume. Failure test: manifest with failing job, expect exit code 1? State records failed, completed maybe preceding. Resume test: after failure? Or partial success? Could have manifest with 3 jobs, first succeeds, second fails, runner stops? Then resume should skip completed first, maybe retry failed? The requirement "resume completed work" means skip completed jobs, not necessarily retry failed. We need tests for success, failure, cancellation, and resume. We can design runner: processes jobs sequentially? Deterministic. If one active GPU job, maybe can run CPU jobs concurrently while GPU running? But deterministic maybe sequential order. "asynchronous job runner" could schedule jobs asynchronously with concurrency but deterministic by manifest order and event ordering? Could run independent jobs concurrently but GPU exclusive. To test determinism, maybe jobs run sequentially in listed order, but each job is an async task. That trivially enforces one active GPU job. But "asynchronous" could be just use asyncio. Need robust.
+
+Maybe implement scheduler:
+- Parse manifest: {"jobs": [...], "concurrency": int, "gpu": {"max_active":1}}
+- Each job: id, name, command (argv) or task spec, requires_gpu bool, env, workdir, timeout? secrets? 
+- Runner has event log JSONL: events with timestamp? Deterministic? Timestamps make non-deterministic. Could use logical sequence number and no wall time or optional epoch. Requirement stream structured JSONL events. Deterministic: maybe include seq, type, job_id, data. Avoid timestamp for determinism? Could include time but tests can ignore. Maybe deterministic output? "deterministic asynchronous job runner" likely deterministic scheduling and state; event stream can include monotonic seq. Use no random.
+- Redact configured secrets: Manifest may have "secrets": {"values": {"API_KEY": "..."}, "patterns": [...], "env": ["API_KEY"]}. Runner redacts secrets from logs, event data, stdout/stderr? It must redact configured secrets. We can have a Redactor class with secret values and patterns; redact strings by replacing values with [REDACTED]. It redacts environment variables? If job command includes secret in args? Need redact configured secrets from events and logs. We can also prevent secrets from state? State should redact any captured output and args. For command jobs, we know argv and env; redact.
+
+Atomic state: State file path in state_dir. Save after each job completes, on signal, periodically? Use tmp in same dir.
+
+Handle SIGINT: In asyncio, loop.add_signal_handler(SIGINT, handler). Handler sets cancel flag, cancels current tasks, saves state, exits gracefully. For tests cancellation: can run runner in subprocess and send SIGINT. Or in-process: simulate SIGINT by calling handler? Better test real SIGINT with subprocess for cancellation. Need tests robust across platforms. asyncio.add_signal_handler not on Windows? Python 3.11: loop.add_signal_handler works? On Windows, signal handling in asyncio maybe not fully supported? It is supported? loop.add_signal_handler only on Unix? Actually ProactorEventLoop doesn't support add_signal_handler? It raises NotImplementedError. Tests may be run on Unix. Could make graceful: if add_signal_handler not available, use signal.signal. For tests, maybe use subprocess with start_new_session, send SIGINT. On Windows, SIGINT is CTRL_C_EVENT, not same. Could test cancellation in-process by simulating SIGINT handler invocation. The requirement says handle SIGINT, tests cancellation. Could implement runner CLI and in test start subprocess on POSIX only; if not POSIX, simulate by invoking cancel via control file? Hmm.
+
+We need present complete package. We can include tests that use in-process cancellation by monkeypatching signal or runner.cancel() to avoid platform issues. But "handle SIGINT" test can send SIGINT to current process? In pytest, sending SIGINT to own process can be messy. Better: implement a `run` function that installs signal handlers. For cancellation test, run in a subprocess with a manifest containing a long sleep job; send SIGINT; assert state has cancelled job and exit code maybe 130 or 0? Need deterministic. On Linux works. For cross-platform, maybe fallback to in-process if not POSIX. But final answer can assume Unix? Usually Python package should be cross-platform. We can write tests that skip if not POSIX. But requirement include tests for cancellation; skip may be okay? Better provide cancellation test that uses an in-process simulation of SIGINT by calling runner._handle_sigint() after scheduling. That still tests cancellation behavior, not OS signal. But "handle SIGINT" could be tested by subprocess on POSIX. We can include both: subprocess test if POSIX, and in-process test always. Need not overdo.
+
+Need design API:
+Package name maybe `jobrunner`.
+Files:
+- pyproject.toml
+- src/jobrunner/__init__.py
+- src/jobrunner/__main__.py
+- src/jobrunner/models.py? dataclasses
+- src/jobrunner/manifest.py
+- src/jobrunner/state.py
+- src/jobrunner/events.py
+- src/jobrunner/redaction.py
+- src/jobrunner/scheduler.py
+- src/jobrunner/runner.py
+- src/jobrunner/commands.py? built-in job operations
+- tests/__init__.py? maybe not needed
+- tests/conftest.py? maybe helper fixtures
+- tests/test_runner.py
+
+Need ensure importable and pytest runs. Use setuptools or hatchling? pyproject with setuptools. Package under src layout. Need pytest config.
+
+Let's design details.
+
+Manifest schema:
+{
+  "run_id": optional,
+  "state_dir": optional? default ./state
+  "events_file": optional? default ./events.jsonl
+  "max_concurrency": int default 1? But deterministic maybe one? Could allow.
+  "gpu_max_active": 1 default.
+  "secrets": {
+      "values": {"KEY": "value"},
+      "patterns": ["sk-.*"],
+      "env": ["API_KEY"]? maybe env names to redact.
+  },
+  "jobs": [
+     {
+       "id": "job1",
+       "name": "...",
+       "requires_gpu": false,
+       "command": ["python", "-c", "..."],
+       "env": {"FOO": "bar"},
+       "timeout_seconds": 10,
+       "retry": 0,
+       "params": {} for built-in?
+     },
+     {"id": "j2", "task": "sleep", "seconds": 0.05, "requires_gpu": true},
+     {"task": "fail", "message": "boom"},
+     {"task": "compute", "operation": "add", "operands": [1,2]}
+  ]
+}
+
+But command with Python -c may be environment-specific; tests can use sys.executable.
+
+Maybe better: built-in `task` operations for deterministic. Also command for real GPU jobs. For test success/failure/resume, use built-in tasks. But requirement "GPU job" could be any job with requires_gpu; no real GPU needed. Simulated GPU job can be `sleep` or `gpu_compute` that checks lock. We'll have job `task: "sleep"`, `task: "fail"`, `task: "echo"`.
+
+Need enforce one active GPU job. If jobs are concurrent, need semaphore for GPU jobs. Deterministic scheduling: use priority queue based on manifest index? But async concurrency with GPU semaphore. Could implement scheduler that processes jobs in order, but if concurrency >1, start jobs in order until max concurrency; GPU semaphore ensures at most one. However event order may not be deterministic if tasks complete in varying times. For deterministic tests, maybe set max_concurrency=1. But "asynchronous" not necessarily concurrent. We can set default concurrency = 1. If concurrency >1, events may depend on timing. But deterministic if no sleeping? Hmm.
+
+Simpler: Runner runs jobs sequentially in manifest order, each as async task. That guarantees deterministic event order, state, resume. Enforces one active GPU job trivially. But is that a "job runner"? It is asynchronous (awaits). Could be too trivial. But tests for one active GPU job: if concurrency=1, cannot test multiple. We can still implement GPU semaphore and allow concurrency. Need deterministic event stream? Could include seq assigned as event emitted; order can vary with concurrency and timing. For deterministic, maybe event order is scheduler order not completion order? But streaming events as they happen; if concurrent, order nondeterministic. The requirement "deterministic" might refer to given manifest, state, and no randomness, not event wall order. But to be safe, default max_concurrency=1. Tests for GPU enforcement can use manifest with two GPU jobs and concurrency 2? If max_concurrency=1, only one active anyway. To specifically enforce one active GPU job while allowing CPU concurrency, we can create test with max_concurrency=2, two GPU jobs and CPU job; track max active GPU via custom task? Built-in tasks can report active? Hard. Could use event `job_started` and `job_finished` in JSONL and assert at any prefix no more than 1 GPU active. But event order may vary if concurrent. We can design scheduler with deterministic ordering and use sleep small; still event interleaving may vary. Could implement concurrency but process completions in FIFO order? For deterministic, we can run all active tasks but record events in order of occurrence; with sleeps, not deterministic. Maybe tests avoid concurrency for event order; for GPU enforcement use concurrency 2 and jobs that sleep? Need assert by state? Could use an instrumented task that writes to a file? Hmm.
+
+Maybe implement scheduler that uses a single GPU lock and a global concurrency limit, but jobs are executed sequentially for deterministic mode? We can have `deterministic: true` default, meaning no concurrency. But then one active GPU job is trivial. The requirement specifically "enforce one active GPU job" could be satisfied by a semaphore even if concurrency 1. But to show, include tests using concurrency 2? Let's think.
+
+Could implement a "GPU lease" and event stream includes active_gpu_count? We can include in state `gpu_active`? Or events: `resource_lock_acquired` etc. For test, manifest with two GPU jobs, max_concurrency=2, and each job task `sleep` 0.1. Even if event order variable, we can parse events and ensure no overlap of intervals for GPU jobs: start/finish events. If two GPU jobs run concurrently, start1, start2 before finish1 would show overlap. But if GPU semaphore serializes, there will be no overlap: start1 finish1 start2 finish2, maybe with CPU interleaving. Even with asyncio sleeps, if both GPU jobs start sequentially due to semaphore, events order: job1 start, maybe job2 start after job1 finish. If CPU job can run concurrently, event order with CPU may vary but GPU start/finish order remains? If GPU jobs both waiting, first acquired starts, second waits; first finish then second starts. Event order for GPU should be serialized. We can assert using event times? No times. Use seq order. If events emitted under lock, seq order will show no overlap. Good.
+
+Need make scheduler deterministic enough: if max_concurrency=2, start jobs as they become available. Suppose jobs: GPU1 (sleep 0.05), CPU (sleep 0.05), GPU2 (sleep 0.05). Start GPU1, CPU, GPU2 waits GPU semaphore. Events: gpu1 start, cpu start. Then whichever finishes first? GPU1 and CPU both 0.05; due to scheduling, maybe CPU finish before GPU1 or vice versa. Then GPU2 starts. GPU serialization still: gpu1 finish before gpu2 start if GPU1 still holds? Wait GPU2 waits until GPU1 finish. So GPU2 start event after GPU1 finish event, regardless of CPU. Good. We can assert GPU start/finish non-overlap by seq: for any GPU job, its finish seq > all starts? More simply collect GPU intervals [start_seq, finish_seq], assert no overlap: sort by start, for i+1 start >= prev finish. Since serialized, yes. If due to event order? Finish event emitted when task completes after releasing semaphore. Good.
+
+But state resume with concurrency: if multiple tasks running on SIGINT, state may mark cancelled. Need atomic.
+
+Event types:
+- run_started
+- job_skipped (reason already_completed)
+- job_started
+- job_finished (status success/failed/cancelled, exit_code?, duration? no time? include seq maybe)
+- run_finished
+- error
+Structured JSONL: each line JSON object with seq, event, data. Redact data.
+
+Atomic state format:
+{
+ "version": 1,
+ "run_id": "...",
+ "status": "running"|"finished"|"failed"|"cancelled",
+ "jobs": {
+   "job1": {"status": "completed"|"failed"|"cancelled"|"pending"|"running", "attempts": 1, "result": {...}}
+ },
+ "current": ["job_id"],
+ "events_seq": 12
+}
+
+Resume: On start, load state if exists. If job status completed, skip. If failed? Could skip or retry? Need deterministic. Maybe by default do not retry failed jobs; mark run failed and exit? But resume after partial success: If previous run cancelled or failed, resume should skip completed and continue pending/failed? The phrase "resume completed work" suggests skip completed. For failed, maybe mark failed and not retry unless `retry`? Could include `retry_on_resume`? Simpler: On resume, skip completed; treat failed as terminal unless `retry` > 0? But tests for failure and resume: failure test: one success then failure; state has first completed, second failed, run failed. Resume test: use state where first completed and second pending? How to create? Could run a manifest that cancels? Or simulate by pre-writing state. Need tests for resume completed work: e.g., state file indicates job1 completed; manifest has job1 and job2; run should skip job1 and execute job2. We can create state manually in test. Or run first with cancellation? For cancellation test, state has current job cancelled, previous completed; resume after cancellation should skip previous completed and maybe retry cancelled? Need decide.
+
+Maybe statuses:
+- completed: terminal success, skip on resume.
+- failed: terminal failure, skip on resume by default? But then a run with failure will not process later jobs. Resume after failure would skip failed and process later? That seems odd. Maybe if a job fails, runner stops processing further jobs (fail-fast) and exits code 1. On resume, skip completed and failed, continue remaining? If failure was transient? Hmm.
+
+Requirement: "resume completed work" not "resume failed work". For deterministic, maybe on failure, runner records failure and stops. On resume, it skips completed but can retry failed if job status is `failed`? Could be useful. But if failure test expects state failed and exit 1. Resume test can start from state with job1 completed and job2 failed, then resume with `retry_failed: true`? But not required.
+
+Maybe simpler: jobs are independent; runner processes all jobs, records failed, continues to next, final status failed if any failure. Then resume skips completed and also failed? If failure is deterministic, retrying fails again. But to test resume, prepopulate completed for first job and pending for second. Could be after cancellation: first

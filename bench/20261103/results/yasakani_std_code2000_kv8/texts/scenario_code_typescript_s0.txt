@@ -1,0 +1,254 @@
+# `metrics-service` — a complete, runnable TypeScript 5 service
+
+Below is a full, self-contained implementation. It uses **only Node built-ins** (no third-party runtime dependencies) for the service, and **only `typescript` + `@types/node`** as dev dependencies. Tests use Node's built-in `node:test` runner.
+
+---
+
+## 1. `package.json`
+
+```json
+{
+  "name": "metrics-service",
+  "version": "1.0.0",
+  "description": "Newline-delimited request-metrics ingestion, validation, and aggregation service.",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "main": "dist/index.js",
+  "bin": {
+    "metrics-service": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsc -p tsconfig.json --watch & node --watch dist/index.js",
+    "test": "tsc -p tsconfig.json && node --test dist/test/",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "keywords": [
+    "metrics",
+    "ingestion",
+    "aggregation",
+    "typescript"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
+```
+
+---
+
+## 2. `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
+```
+
+> `exactOptionalPropertyTypes` + `noUncheckedIndexedAccess` keep the strict types honest. `NodeNext` matches the `"type": "module"` package.
+
+---
+
+## 3. `src/types.ts` — strict domain types
+
+```ts
+/**
+ * Core domain types for the metrics service.
+ *
+ * Design notes:
+ *  - `RunRecord` is the *validated* shape. Raw input is `unknown` until it
+ *    passes `validateRunRecord`, so we never trust the wire format.
+ *  - `GroupKey` is a stable, serializable identity for a (model, fixture)
+ *    pair. We keep it as a plain object (not a Map key) so it can be
+ *    serialized to JSON for the API.
+ *  - `Aggregation` holds only the *sufficient statistics* needed to compute
+ *    mean, median, and sample standard deviation. Median requires the full
+ *    sorted sample, so we store the sorted values (bounded by the per-group
+ *    cap). This is the "bounded memory" trade-off: memory is O(cap) per
+ *    group, not O(total records).
+ */
+
+/** A single validated request-metrics record. */
+export interface RunRecord {
+  /** Unique run identifier (string). */
+  id: string;
+  /** Model name (string). */
+  model: string;
+  /** Fixture name (string). */
+  fixture: string;
+  /** Latency in milliseconds (finite number, >= 0). */
+  latencyMs: number;
+  /** HTTP status code (integer 100..599). */
+  status: number;
+  /** Unix epoch milliseconds (finite number, >= 0). */
+  timestampMs: number;
+  /** Optional free-form error message (string). */
+  error?: string;
+}
+
+/** Stable identity for a (model, fixture) group. */
+export interface GroupKey {
+  model: string;
+  fixture: string;
+}
+
+/** Sufficient statistics for a group. */
+export interface Aggregation {
+  key: GroupKey;
+  /** Number of records in the group. */
+  count: number;
+  /** Sum of latencyMs (for mean). */
+  sum: number;
+  /** Sum of latencyMs^2 (for variance). */
+  sumSq: number;
+  /** Sorted latency values (for median). Bounded by per-group cap. */
+  sorted: number[];
+  /** Minimum latency observed. */
+  min: number;
+  /** Maximum latency observed. */
+  max: number;
+  /** Number of records with status >= 400. */
+  errorCount: number;
+  /** Number of records with status >= 500. */
+  serverErrorCount: number;
+  /** First timestamp seen (for "first seen" reporting). */
+  firstSeenMs: number;
+  /** Last timestamp seen (for "last seen" reporting). */
+  lastSeenMs: number;
+}
+
+/** A fully computed summary for one group. */
+export interface GroupSummary {
+  model: string;
+  fixture: string;
+  count: number;
+  meanMs: number;
+  medianMs: number;
+  /** Sample standard deviation (n-1 denominator). 0 when count < 2. */
+  sampleStdDevMs: number;
+  minMs: number;
+  maxMs: number;
+  errorRate: number;
+  serverErrorRate: number;
+  firstSeenMs: number;
+  lastSeenMs: number;
+}
+
+/** The full /summary response body. */
+export interface SummaryResponse {
+  generatedAtMs: number;
+  totalRecords: number;
+  totalGroups: number;
+  groups: GroupSummary[];
+}
+
+/** The /runs/:id response body. */
+export interface RunResponse {
+  id: string;
+  model: string;
+  fixture: string;
+  latencyMs: number;
+  status: number;
+  timestampMs: number;
+  error?: string;
+}
+
+/** The /health response body. */
+export interface HealthResponse {
+  status: 'ok' | 'degraded';
+  uptimeMs: number;
+  receivedRecords: number;
+  rejectedRecords: number;
+  groupCount: number;
+  memoryUsedBytes: number;
+  memoryLimitBytes: number;
+  memoryUsedPct: number;
+}
+
+/** A validation error with a machine-readable code and human message. */
+export class ValidationError extends Error {
+  readonly code: string;
+  readonly field?: string;
+  readonly line?: number;
+
+  constructor(code: string, message: string, field?: string, line?: number) {
+    super(message);
+    this.name = 'ValidationError';
+    this.code = code;
+    this.field = field;
+    this.line = line;
+  }
+}
+
+/** A batch of validation errors (one per malformed line). */
+export interface MalformedLine {
+  line: number;
+  raw: string;
+  code: string;
+  message: string;
+  field?: string;
+}
+
+/** Result of parsing a batch of NDJSON lines. */
+export interface ParseResult {
+  records: RunRecord[];
+  malformed: MalformedLine[];
+}
+```
+
+---
+
+## 4. `src/validate.ts` — schema validation without third-party libraries
+
+```ts
+/**
+ * Hand-rolled schema validation for RunRecord.
+ *
+ * We deliberately avoid ajv/zod/etc. The schema is small and fixed, so a
+ * direct, explicit validator is clearer, faster, and dependency-free.
+ *
+ * Every check returns a ValidationError with a stable `code` so callers
+ * (and tests) can assert on specific failure modes.
+ */
+
+import type { RunRecord } from './types.js';
+import { ValidationError } from './types.js';
+
+/** Maximum allowed length for string fields. */
+const MAX_STRING_LEN = 512;
+/** Maximum allowed magnitude for numeric fields. */
+const MAX_NUMBER = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Validate a single raw record (of type `unknown`) into a RunRecord.
+ * Throws ValidationError on the first problem found.
+ *
+ *

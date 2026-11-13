@@ -1,0 +1,43 @@
+# 发布流程
+
+发布负责人必须精确保留 `request_id`、`max_context`、`kv_dtype` 和 `mtp_rounds` 等标识符。将散文内容翻译为中文，但不得翻译代码、JSON 键、命令行标志、文件名或表格中的值。
+
+| Phase | Required evidence | Failure action |
+|---|---|---|
+| prepare | fixture hash and prompt-token count | stop before generation |
+| warmup | one successful unmeasured request | restart the service |
+| measure | five sequential responses | invalidate the complete block |
+| publish | summary plus per-request rows | withhold the headline |
+
+```json
+{"model":"qwen3.6-35b-a3b","max_completion_tokens":1024,"seed":42,"stream":false}
+```
+
+## 备注
+
+操作员需检查前缀复用是否已禁用，缓存命中计数是否为零，以及是否有无关的 GPU 进程正在运行。自然停止的响应仍视为有效观测；因客户端断开连接而丢失的响应则不视为有效。报告需区分服务器内部 TTFT 与网络观测时间，并说明第一个生成的 token 归属于 prefill 阶段。
+
+## 双语术语表
+
+| English Term | Chinese Term | Note |
+|---|---|---|
+| Release owner | 发布负责人 | Person accountable for the release process |
+| request_id | 请求标识符 | Unique identifier for a specific request |
+| max_context | 最大上下文 | Maximum context length supported by the model |
+| kv_dtype | KV 数据类型 | Data type used for key-value cache storage |
+| mtp_rounds | MTP 轮次 | Number of multi-token prediction rounds |
+| fixture hash | 测试夹具哈希 | Hash value of the test fixture |
+| prompt-token count | 提示词 token 数量 | Number of tokens in the input prompt |
+| warmup | 预热 | Initial phase to stabilize the system |
+| unmeasured request | 未测量请求 | Request executed without performance metrics |
+| sequential responses | 顺序响应 | Responses generated in sequence |
+| invalidate the complete block | 使完整块失效 | Rejecting the entire set of measurements |
+| per-request rows | 每请求行 | Data rows corresponding to individual requests |
+| headline | 标题/摘要 | Summary or key result of the report |
+| prefix reuse | 前缀复用 | Reusing previously computed prefix states |
+| cache-hit count | 缓存命中计数 | Number of times the cache was successfully accessed |
+| GPU process | GPU 进程 | Process utilizing GPU resources |
+| TTFT | 首 token 时间 | Time to first token |
+| prefill | 预填充 | Phase where input tokens are processed |
+| generated token | 生成 token | Token produced by the model |
+| client disconnected | 客户端断开 | Connection loss from the client side |<|im_end|>

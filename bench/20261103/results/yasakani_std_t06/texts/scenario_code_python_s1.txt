@@ -1,0 +1,565 @@
+Below is a complete, runnable Python 3.11 package. Every file is in its own fenced block with its path.
+
+Design notes (so the code makes sense):
+- **Determinism:** a single worker loop pulls jobs from a FIFO queue in manifest order; the only nondeterminism is wall-clock timestamps, which are injected via a `Clock` so tests can run deterministically.
+- **One active GPU job:** enforced by a `threading.Lock` (`gpu_lock`) that is held for the entire duration of a job's execution.
+- **Atomic state:** all state writes are `temp-file + fsync + os.replace` on the same filesystem.
+- **Resume:** state is reloaded on startup; jobs already `completed`/`failed` are skipped, a job that was `running` is re-queued (crash recovery), and `pending` jobs are queued in order.
+- **Structured JSONL events:** every lifecycle event is a single-line JSON object on stdout; secrets are redacted by a `SecretRedactor` applied to all payloads.
+- **SIGINT:** a handler sets a cancellation flag and emits a `cancellation_requested` event; the worker finishes the current job (or interrupts it at the next checkpoint) and then exits cleanly.
+
+---
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jobrunner"
+version = "0.1.0"
+description = "Deterministic asynchronous GPU job runner with atomic state, resume, JSONL events, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Example", email = "example@example.com" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7.4"]
+
+[project.scripts]
+jobrunner = "jobrunner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["jobrunner*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+```
+
+---
+
+### `jobrunner/__init__.py`
+
+```python
+"""Deterministic asynchronous GPU job runner."""
+
+from jobrunner.clock import Clock, FakeClock
+from jobrunner.config import Config, JobSpec, Manifest, load_manifest
+from jobrunner.redaction import SecretRedactor
+from jobrunner.state import State, StateStore
+from jobrunner.runner import JobRunner, RunnerResult
+
+__all__ = [
+    "Clock",
+    "FakeClock",
+    "Config",
+    "JobSpec",
+    "Manifest",
+    "load_manifest",
+    "SecretRedactor",
+    "State",
+    "StateStore",
+    "JobRunner",
+    "RunnerResult",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+### `jobrunner/clock.py`
+
+```python
+"""Clock abstraction so execution is deterministic under test."""
+
+from __future__ import annotations
+
+import time
+from typing import Protocol
+
+
+class Clock(Protocol):
+    def now(self) -> float:
+        ...
+
+
+class SystemClock:
+    """Monotonic-ish wall clock backed by time.time()."""
+
+    def now(self) -> float:
+        return time.time()
+
+
+class FakeClock:
+    """Deterministic, manually-advanced clock for tests."""
+
+    def __init__(self, start: float = 1_000_000.0) -> None:
+        self._t = float(start)
+
+    def now(self) -> float:
+        return self._t
+
+    def advance(self, seconds: float) -> float:
+        self._t += float(seconds)
+        return self._t
+
+    def set(self, value: float) -> None:
+        self._t = float(value)
+```
+
+---
+
+### `jobrunner/redaction.py`
+
+```python
+"""Recursive secret redaction for structured event payloads."""
+
+from __future__ import annotations
+
+from typing import Any
+
+REDACTED = "***REDACTED***"
+
+
+class SecretRedactor:
+    """Redacts any value whose key (case-insensitive) is a known secret key."""
+
+    def __init__(self, keys: list[str] | None = None) -> None:
+        self._keys = {k.strip().lower() for k in (keys or []) if k and k.strip()}
+
+    def is_secret_key(self, key: str) -> bool:
+        return key.strip().lower() in self._keys
+
+    def redact(self, value: Any) -> Any:
+        return self._walk(value)
+
+    def _walk(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            out: dict[str, Any] = {}
+            for k, v in value.items():
+                if self.is_secret_key(k):
+                    out[k] = REDACTED
+                else:
+                    out[k] = self._walk(v)
+            return out
+        if isinstance(value, list):
+            return [self._walk(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._walk(item) for item in value)
+        return value
+```
+
+---
+
+### `jobrunner/config.py`
+
+```python
+"""Manifest and configuration models."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+class ConfigError(ValueError):
+    """Raised when a manifest is invalid."""
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    id: str
+    command: list[str]
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    gpu: bool = True
+    timeout: float | None = None
+    retries: int = 0
+    checkpoint_interval: float = 0.0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Manifest:
+    name: str
+    jobs: list[JobSpec]
+    secrets: list[str]
+    raw: dict[str, Any]
+
+    def job_ids(self) -> list[str]:
+        return [j.id for j in self.jobs]
+
+
+def _as_float(value: Any, default: float | None) -> float | None:
+    if value is None:
+        return default
+    return float(value)
+
+
+def _as_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    return int(value)
+
+
+def load_manifest(path: str | Path) -> Manifest:
+    path = Path(path)
+    if not path.exists():
+        raise ConfigError(f"manifest not found: {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"invalid JSON in manifest {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConfigError("manifest root must be a JSON object")
+
+    name = str(raw.get("name", path.stem))
+    secrets = [str(s) for s in (raw.get("secrets") or [])]
+
+    jobs_raw = raw.get("jobs")
+    if not isinstance(jobs_raw, list) or not jobs_raw:
+        raise ConfigError("manifest must contain a non-empty 'jobs' list")
+
+    jobs: list[JobSpec] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(jobs_raw):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"job #{index} must be an object")
+        jid = entry.get("id")
+        if not jid or not isinstance(jid, str):
+            raise ConfigError(f"job #{index} is missing a string 'id'")
+        if jid in seen:
+            raise ConfigError(f"duplicate job id: {jid!r}")
+        seen.add(jid)
+
+        command = entry.get("command")
+        if not command or not isinstance(command, list):
+            raise ConfigError(f"job {jid!r} is missing a non-empty 'command' list")
+        command = [str(c) for c in command]
+
+        args = [str(a) for a in (entry.get("args") or [])]
+        env = {str(k): str(v) for k, v in (entry.get("env") or {}).items()}
+        metadata = entry.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            raise ConfigError(f"job {jid!r} 'metadata' must be an object")
+
+        jobs.append(
+            JobSpec(
+                id=jid,
+                command=command,
+                args=args,
+                env=env,
+                gpu=bool(entry.get("gpu", True)),
+                timeout=_as_float(entry.get("timeout"), None),
+                retries=_as_int(entry.get("retries"), 0),
+                checkpoint_interval=_as_float(entry.get("checkpoint_interval"), 0.0),
+                metadata=metadata,
+            )
+        )
+
+    return Manifest(name=name, jobs=jobs, secrets=secrets, raw=raw)
+```
+
+---
+
+### `jobrunner/state.py`
+
+```python
+"""Atomic, resumable job state persisted to disk."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+PENDING = "pending"
+RUNNING = "running"
+COMPLETED = "completed"
+FAILED = "failed"
+CANCELLED = "cancelled"
+
+TERMINAL = frozenset({COMPLETED, FAILED, CANCELLED})
+
+
+@dataclass
+class JobState:
+    id: str
+    status: str = PENDING
+    attempts: int = 0
+    started_at: float | None = None
+    finished_at: float | None = None
+    error: str | None = None
+    result: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class State:
+    manifest: str
+    version: int = 1
+    jobs: dict[str, JobState] = field(default_factory=dict)
+
+    def job(self, job_id: str) -> JobState:
+        return self.jobs[job_id]
+
+    def is_terminal(self, job_id: str) -> bool:
+        return self.jobs[job_id].status in TERMINAL
+
+    def counts(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for js in self.jobs.values():
+            out[js.status] = out.get(js.status, 0) + 1
+        return out
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+class StateStore:
+    """Reads and atomically writes the state file."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    def load(self) -> State | None:
+        if not self.path.exists():
+            return None
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        jobs: dict[str, JobState] = {}
+        for jid, entry in (raw.get("jobs") or {}).items():
+            jobs[jid] = JobState(
+                id=jid,
+                status=entry.get("status", PENDING),
+                attempts=int(entry.get("attempts", 0)),
+                started_at=entry.get("started_at"),
+                finished_at=entry.get("finished_at"),
+                error=entry.get("error"),
+                result=entry.get("result") or {},
+            )
+        return State(manifest=raw.get("manifest", ""), version=int(raw.get("version", 1)), jobs=jobs)
+
+    def save(self, state: State) -> None:
+        payload = {
+            "version": state.version,
+            "manifest": state.manifest,
+            "jobs": {
+                jid: {
+                    "status": js.status,
+                    "attempts": js.attempts,
+                    "started_at": js.started_at,
+                    "finished_at": js.finished_at,
+                    "error": js.error,
+                    "result": js.result,
+                }
+                for jid, js in state.jobs.items()
+            },
+        }
+        data = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
+        _atomic_write(self.path, data)
+```
+
+---
+
+### `jobrunner/events.py`
+
+```python
+"""Structured JSONL event stream."""
+
+from __future__ import annotations
+
+import json
+import sys
+from typing import Any, TextIO
+
+from jobrunner.clock import Clock
+from jobrunner.redaction import SecretRedactor
+
+
+class EventStream:
+    """Emits single-line JSON objects to a text stream (stdout by default)."""
+
+    def __init__(
+        self,
+        clock: Clock,
+        redactor: SecretRedactor,
+        stream: TextIO | None = None,
+    ) -> None:
+        self._clock = clock
+        self._redactor = redactor
+        self._stream = stream if stream is not None else sys.stdout
+
+    def emit(self, event_type: str, **payload: Any) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "ts": self._clock.now(),
+            "type": event_type,
+        }
+        record.update(self._redactor.redact(payload))
+        line = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        self._stream.write(line + "\n")
+        self._stream.flush()
+        return record
+```
+
+---
+
+### `jobrunner/worker.py`
+
+```python
+"""Job execution: subprocess running, timeouts, and cooperative cancellation."""
+
+from __future__ import annotations
+
+import subprocess
+import threading
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from jobrunner.clock import Clock
+from jobrunner.config import JobSpec
+from jobrunner.state import State
+
+
+class JobError(Exception):
+    """Raised when a job fails (non-zero exit, timeout, or missing command)."""
+
+
+class CancellationRequested(Exception):
+    """Raised when cancellation is requested while a job is running."""
+
+
+@dataclass
+class JobOutcome:
+    ok: bool
+    returncode: int | None
+    stdout: str
+    stderr: str
+    duration: float
+    cancelled: bool = False
+    error: str | None = None
+    result: dict[str, Any] = None  # type: ignore[assignment]
+
+
+def run_job(
+    spec: JobSpec,
+    state: State,
+    clock: Clock,
+    cancel_event: threading.Event,
+    checkpoint: Callable[[], None] | None = None,
+) -> JobOutcome:
+    """Run a single job to completion, honouring timeout and cancellation.
+
+    `checkpoint` is called periodically so that long-running jobs can observe
+    cancellation between progress points.
+    """
+    js = state.job(spec.id)
+    js.attempts += 1
+    js.status = "running"
+    js.started_at = clock.now()
+
+    if checkpoint is not None:
+        checkpoint()
+
+    try:
+        proc = subprocess.Popen(
+            [spec.command[0]] + spec.args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(spec.env) if spec.env else None,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        js.status = "failed"
+        js.finished_at = clock.now()
+        js.error = f"command not found: {spec.command[0]} ({exc})"
+        raise JobError(js.error) from exc
+
+    try:
+        stdout, stderr = _communicate_with_cancel(
+            proc, cancel_event, checkpoint, spec.checkpoint_interval, clock
+        )
+    except CancellationRequested:
+        proc.kill()
+        proc.wait()
+        js.status = "cancelled"
+        js.finished_at = clock.now()
+        js.error = "cancellation requested"
+        return JobOutcome(
+            ok=False,
+            returncode=proc.returncode,
+            stdout=stdout or "",
+            stderr=stderr or "",
+            duration=clock.now() - js.started_at,
+            cancelled=True,
+            error=js.error,
+            result={},
+        )
+
+    returncode = proc.returncode
+    duration = clock.now() - js.started_at
+
+    if returncode == 0:
+        js.status = "completed"
+        js.finished_at = clock.now()
+        js.result = {"returncode": returncode, "stdout_tail": _tail(stdout)}
+        return JobOutcome(
+            ok=True,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            duration=duration,
+            cancelled=False,
+            error=None,
+            result=js.result,
+        )
+
+    js.status = "failed"
+    js.finished_at = clock.now()
+    js.error = f"exit code {returncode}"
+    raise JobError(
+        f"{js.error}: {stderr.strip()[:500] if stderr else 'no stderr'}"
+    )
+
+
+def _communicate_with_cancel(
+    proc: "subprocess.Popen[str]",
+    cancel_event: threading.Event,
+    checkpoint: Callable[[], None] | None,
+    checkpoint_interval: float,
+    clock: Clock,
+) -> tuple[str, str]:
+    """Wait for the process, polling for cancellation at checkpoints."""
+    if checkpoint_interval and checkpoint_interval > 0 and checkpoint is not None:
+        while proc.poll() is None:
+            if cancel_event.is_set():
+                raise CancellationRequested()
+            checkpoint()
+            clock.advance(checkpoint_interval)
+            proc.wait(timeout=checkpoint

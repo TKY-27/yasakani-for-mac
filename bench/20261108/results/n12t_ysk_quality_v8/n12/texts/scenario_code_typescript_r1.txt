@@ -1,0 +1,132 @@
+Let me carefully analyze the requirements:
+
+1. **TypeScript 5 service** — consume request metrics in newline-delimited format (NDJSON)
+2. **Validate without third-party schema libraries** — hand-written validation
+3. **Group records by model and fixture**
+4. **Compute mean / median / sample standard deviation** (sample stddev, i.e. n-1 denominator)
+5. **Expose /health, /summary, /runs/:id endpoints**
+6. **Strict types** (strict: true in tsconfig, use `satisfies`, discriminated unions, etc.)
+7. **Incremental parsing** — process line by line, support partial/buffered input
+8. **Bounded memory** — don't keep all records; use streaming aggregation (mean + M2 via Welford, plus quantile approximation for median… hmm, median is tricky under bounded memory).
+
+Wait — median under bounded memory: to compute an exact median, all values are needed, or at least a data structure that supports quantiles. Options:
+- Bounded reservoir + t-digest (complex)
+- Bounded "sorted structure": e.g., two heaps — median can be computed from two heaps (max-heap of lower half, min-heap of upper half), but the heaps grow without bound.
+- Fixed-capacity approach: keep a bounded set of sample values to approximate the median, or use a t-digest-like sketch.
+- Simpler: impose a hard cap on retained values per group (e.g., keep at most N values via reservoir sampling), compute mean/stddev exactly (Welford is streaming O(1)), approximate the median from the retained reservoir.
+
+But the requirement says "compute mean / median / sample stddev" — ideally exact, but "bounded memory" means we can't hold all values. Practical design:
+- Mean and stddev: exact via Welford's streaming algorithm — O(1) per group.
+- Median: exact is impossible in bounded memory without storing values; use a bounded quantile sketch. Implement a simple, deterministic quantile sketch: a fixed-capacity array of sample values via reservoir sampling, and median = median of the reservoir. Or a P² algorithm (streaming median estimation, 5 statistics, O(1) memory) — this is a legitimate classic algorithm, no third-party library needed, and it's bounded memory! The P² (Jain & Chlamtac) algorithm fits "bounded memory" beautifully.
+
+Actually, let me think about which is more defensible and testable:
+- P² algorithm: 5 markers, exact for small n (if n ≤ threshold, keep the exact sorted array, then transition to sketch). Memory O(1) after threshold. Implementable and testable.
+- Reservoir: simpler, but median quality depends on reservoir size; still bounded.
+
+A hybrid is good: keep exact values up to a per-group capacity (say 1024) to keep small groups exact, then switch to P² or reservoir. Hmm, that adds complexity. Let's do this: per (model, fixture) group:
+- count
+- Welford (mean, M2) for exact mean and sample stddev
+- Quantile sketch: keep all values sorted until capacity K (e.g., 256 or 512); once full, transition to P² initialized from the current values? Or just P² from the start with an exact phase?
+
+Cleaner: implement `MedianSketch`:
+- Exact phase: sorted insertion (binary search + splice) up to capacity K (bounded! K is a constant).
+- Once K is reached, switch to P² seeded with the Kth value? P² seeding: just start the estimate from the current value and continue.
+
+Actually, simpler and still rigorous: after the exact phase fills up, switch to P² initialized with the current K values (use min, current quantile estimate, max, and continue). P² doesn't need all values; initialize markers at min, quantile estimate, max with approximate positions and continue processing. The estimate will be somewhat off for a while, but acceptable as an *estimate*. Document that the median is exact up to K samples and an estimate beyond that, and expose `medianExact: boolean`.
+
+Alternatively reservoir sampling with K=2048: simple, deterministic with a seed, memory bounded, median of reservoir is a decent estimator. Tests can verify with a seeded RNG. But "compute mean / median / sample stddev" sounds like the user wants the standard statistics. Welford mean + stddev are exact; median is the issue. I think P² is the right engineering choice to show expertise, and it's a known algorithm. Let's implement P² properly.
+
+Let me recall P² algorithm (Jain & Chlamtac 1985):
+- Observations up to 5: store in array `values`, sort; markers are indices 0..4; marker positions are 1..5; no updates yet.
+- For the 6th observation: if x < v[0], v[0]=x; else if x >= v[4], v[4]=x; else insert in sorted order (shifting v). Marker positions q = [1, 2.5, 4, 5.5, 7]; positions q'[i] = i+1.
+- For each subsequent observation x:
+  1. Find cell k: if x < v[0] { v[0]=x; k=0 } else if x >= v[4] { v[4]=x; k=3 } else k such that v[k] <= x < v[k+1].
+  2. Increment positions: for i = k+1..4, q'[i] += 1.
+  3. Update desired positions: for i=1..3, q[i] += delta[i]*n, where n is the new count and delta = [0, p/2, p, p - p/2, 0] for p=0.5 → [0, 0.25, 0.5, 0.25, 0].
+  4. Update marker heights/positions for i=1..3: d = q[i] - q'[i]; if (d >= 1 && q'[i+1] - q'[i] > 1) || (d <= -1 && q'[i] - q'[i-1] > -1) then q'[i] += sign(d); v[i] = parabolic(i, d) if possible, else linear.
+
+Parabolic: v[i] + (d / (q'[i+1] - q'[i-1])) * ( (q'[i] - q'[i-1]) * (v[i+1] - v[i-1]) / (q'[i+1] - q'[i-1]) ... let me write the standard form:
+
+parabolic(i, d):
+v[i] + d/(q'[i+1] - q'[i-1]) * ( (q'[i] - q'[i-1]) * (v[i+1] - v[i-1])/(q'[i+1] - q'[i-1])? no…
+
+Standard formula:
+v_new = v[i] + d * ( (q'[i] - q'[i-1]) * (v[i+1] - v[i]) / (q'[i+1] - q'[i]) + (q'[i+1] - q'[i]) * (v[i] - v[i-1]) / (q'[i+1] - q'[i-1]) ) / (q'[i+1] - q'[i-1])?
+
+Let me get it right. From the original paper:
+
+The parabolic formula for a marker i with displacement d:
+
+v[i] + (d / (q[i+1] - q[i-1])) * ( ((q[i] - q[i-1]) * (v[i+1] - v[i-1])) / (q[i+1] - q[i-1]) ...
+
+I'm not 100% confident from memory. Let me derive: P²'s parabolic interpolation:
+
+v̂(i) = v[i] + d * [ (q[i] - q[i-1]) / (q[i+1] - q[i-1]) * (v[i+1] - v[i]) / (q[i+1] - q[i]) + (q[i+1] - q[i]) / (q[i+1] - q[i-1]) * (v[i] - v[i-1]) / (q[i] - q[i-1]) ]
+
+Yes, that's the formula:
+
+v_parabolic = v[i] + d * ( (q[i] - q[i-1]) * (v[i+1] - v[i]) / ((q[i+1] - q[i]) * (q[i+1] - q[i-1])) ) + d * ( (q[i+1] - q[i]) * (v[i] - v[i-1]) / ((q[i] - q[i-1]) * (q[i+1] - q[i-1])) )
+
+In code:
+
+```ts
+function parabolic(v: number[], q: number[], i: number, d: number): number {
+  return (
+    v[i] +
+    (d / (q[i + 1] - q[i - 1])) *
+      ((q[i] - q[i - 1]) * (v[i + 1] - v[i]) / (q[i + 1] - q[i]) +
+       (q[i + 1] - q[i]) * (v[i] - v[i - 1]) / (q[i] - q[i - 1]))
+  );
+}
+```
+
+Linear: v[i] + d * (v[i+1] - v[i]) / (q[i+1] - q[i]) if d > 0, else v[i] + d * (v[i] - v[i-1]) / (q[i] - q[i-1]).
+
+I'm confident this is correct — it's the standard implementation (same as in Apache Spark / many P² implementations).
+
+For p = 0.5, the desired positions:
+q0' = n? Actually marker position q'[i] is a count (1-based). Initial (after 5 observations) q' = [1, 2.5, 4, 5.5, 7]. Desired position increment per observation: dq = [0, 0.25, 0.5, 0.25, 0].
+
+OK. Also, we can implement an exact phase before P²: keep the first 5 exact, but that's a tiny phase. Better: exact up to K (e.g. 64 or 128), then P² seeded from the sorted buffer? P²'s transition needs v[0..4] and marker positions. We can initialize P² directly from K exact values: pick marker heights as exact quantile values from the buffer: v[0]=min, v[4]=max, v[1]=buffer[floor(K*0.25)], v[2]=buffer[floor(K*0.5)], v[3]=buffer[floor(K*0.75)]; marker positions q' = [1, 1+0.25*(K-1)? Hmm.
+
+Simpler: use P² from observation 6 onward, but keep the sorted buffer of the first K (K=5? no…) observations. Hmm, honestly the cleanest defensible design:
+
+`MedianSketch`:
+- phase 'exact': hold sorted array (insert with binary search + splice), while length < K (K configurable, default e.g. 1024 — bounded constant memory).
+- phase 'p2': P² initialized with 5 seed points derived from the sorted buffer (min, exact 25th/50th/75th percentiles, max), with marker positions corresponding to the actual count n: q' = [1, 1 + 0.25*(n-1), 1+0.5*(n-1), 1+0.75*(n-1), n]. And desired position offsets dq scaled by p: [0, 0.25, 0.5, 0.25, 0] per new observation.
+
+Wait, in P² marker positions q'[i] represent (count-based) 1-based ranks. With n observations so far (n = K at the transition), the marker for quantile p should sit at position 1 + (n-1)*p. So q' = [1, 1 + (K-1)*0.25, 1+(K-1)*0.5, 1+(K-1)*0.75, K]. Good, that's a correct seeding.
+
+Then process subsequent observations normally. This gives us: exact median while n ≤ K, and P² estimate beyond.
+
+Bounded memory: per group, O(K) exact buffer (K a constant, e.g. 1024 doubles = 8 KB) or O(5) once in P². If we release the buffer after transition, it's O(1). Let's release it (set to undefined) to keep true bounded memory. Good.
+
+Number of groups: model × fixture pairs. Should that also be bounded? "Bounded memory" — we should cap the number of distinct groups with a maxGroups setting (e.g., 10_000), and once exceeded, fail with an error / reject new groups (reject the line and count as malformed? or drop). Better: reject the record with a 400 error on ingest (since it's a request metrics ingestion service), or track overflow. For the HTTP endpoint, if a group is unknown → 404. For ingestion: we're streaming NDJSON, and if we encounter a new group beyond the cap, mark as dropped (rejected) with a reason. Design decision: `maxGroups` default e.g. 4096; on overflow, increment `droppedGroupCount` and skip the record (still valid schema-wise, but can't be stored). Document this. Also global record cap for sanity? The statistics themselves are streaming O(1), so the number of records is unbounded by design — that's fine and desirable (memory bounded independent of stream length). Also cap buffered unprocessed lines in the incremental parser (e.g. maxLineBytes like 64 KB per line; oversized lines → malformed).
+
+Now the service architecture:
+
+**Core modules:**
+1. `types.ts` — strict types: `RequestMetricRecord` (validated input), errors, summary types.
+2. `validation.ts` — hand-rolled validator: parse JSON of one line, strict typing, no unknown fields? Strict typing: reject unknown properties (a good strict validator behavior — configurable `allowUnknownFields` default false). Ranges: durationMs is non-negative finite number; tokensIn/Out are non-negative integers; runId is non-empty string with pattern; model is non-empty string with pattern (e.g. `^[A-Za-z0-9._-]{1,128}$`); fixture is a non-empty string with pattern; timestamp: ISO-8601 string parseable, or epoch millis? Spec says "request metrics" — let me define the record schema:
+
+```json
+{
+  "runId": "run-2024-06-01-0001",
+  "model": "gpt-4o",
+  "fixture": "summarize-512",
+  "timestamp": "2024-06-01T12:00:00.000Z",
+  "durationMs": 1234.5,
+  "tokensIn": 512,
+  "tokensOut": 256,
+  "status": "ok"  // maybe
+}
+```
+
+Which metric fields do we aggregate? "Compute mean / median / sample stddev" — of which measure? Probably durationMs is the key metric; we could compute stats on durationMs, tokensIn, tokensOut. Let me make the service compute statistics for a configurable set of numeric metrics (default: durationMs, tokensIn, tokensOut). That's a nice generic design: `numericFields: readonly MetricKey[]`. Statistics: mean, median, sampleStdDev, min, max, count, p25, p75? The spec asks mean/median/stddev — let me include min/max/count as natural extras but keep focus. Let me include count, mean, median, sampleStdDev, min, max per metric. sampleStdDev: n<2 → null. median: from sketch (exact or estimated — include `medianApproximate: boolean`).
+
+3. `math.ts` — Welford, MedianSketch (exact phase + P²).
+4. `parser.ts` — incremental NDJSON parser: feed(chunk: Uint8Array | string) → yields parsed lines, handles partial lines, buffers with byte cap, handles \r\n, empty lines (skip or error? Configurable: skip empty lines), UTF-8 decodes across chunk boundaries — need a UTF-8 incremental decoder to handle multibyte splits at chunk boundaries. Node has `string_decoder`! `require('string_decoder')` handles partial UTF-8. But if we use Node builtins we depend on node — that's fine, it's a Node service (package.json with start scripts, node http server). Alternatively write a small UTF-8 incremental decoder in TS (no dependencies). Hmm, "no third-party schema libraries" — only schema libraries are forbidden; other dependencies are allowed, but zero-dep is cleaner. Let me write a small incremental UTF-8 decoder (~40 lines) — I can fully control it and test it. Actually Node's `Buffer` + manual carry of trailing incomplete sequences is simple: decode with 'utf8', track leftover bytes. Implement `Utf8ChunkDecoder` that holds a carry buffer.
+
+Edge: invalid UTF-8 → malformed line error.
+
+5. `aggregator.ts` — `MetricsAggregator`: accepts validated record, groups by `${model}\u0000${fixture}`, updates Welford per metric + median sketch per metric (need median per metric? probably yes; cost is fine). Track per group: count, firstSeen/lastSeen timestamp, per metric stats, plus runIds set? Bounded: runIds per group can grow unbounded → use a bounded set? /runs/:id endpoint: given a runId, return summary of records for that run? That implies tracking records per run or a mapping from run → group contributions. Memory bound: track `runIndex`: Map<runId, RunSummary> with count + firstSeen/lastSeen + per (model,fixture) counts

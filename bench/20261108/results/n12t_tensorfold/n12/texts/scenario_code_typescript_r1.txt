@@ -1,0 +1,268 @@
+The user is asking for a complete TypeScript 5 service. Requirements:
+1. Consume newline-delimited request metrics
+2. Validate them without a third-party schema library (i.e., hand-rolled validation)
+3. Group records by model and fixture
+4. Compute mean/median/sample standard deviation
+5. Expose /health, /summary, /runs/:id endpoints
+6. Strict types
+7. Incremental parsing
+8. Memory bounds
+9. Errors for malformed input
+10. Unit tests
+11. package.json, tsconfig.json
+12. A concise operations guide
+13. No placeholders
+
+Let me design this carefully.
+
+Architecture:
+- A Node.js HTTP server (use node:http to avoid third-party dependencies — the "no third-party schema library" is specifically about validation, but to keep it robust and self-contained, avoid third-party runtime deps entirely, and maybe keep express out too; but tests need a test runner. Node has a built-in test runner (node:test) since Node 18. That avoids third-party deps completely. Nice.
+- TypeScript 5, strict mode.
+- Incremental parsing: buffer incoming data, split by newline, hold back incomplete trailing line, enforce a max line length to bound memory.
+- Validation: JSON.parse, then validate shape/types/ranges by hand. Reject NaN, Infinity, negative latency, etc.
+- Memory bounds:
+  - Ring buffer / cap on stored records: e.g., keep the most recent N records per group using a fixed-size circular buffer, or a global cap on record count where new ones evict oldest (FIFO). Also compute aggregate values incrementally (mean via running sum, sample variance via Welford's algorithm, median via bounded structure or approximation).
+  - Median with memory bound: exact median needs all values. Options: a bounded sorted structure that only retains a window (e.g., last K values) to compute median — document the approximation. Or compute median over the retained window. Simplest: per-group FIFO deque of at most `retention` values; compute median on the retained values. Mean/std computed over all records via Welford (O(1) memory), median computed over the bounded recent window (documented as an approximation once the window overflows). That's honest engineering. Actually, we can be simpler but still defensible: compute all three stats over the retained window? Then mean/std are also windowed. Hmm. Requirement is "compute mean/median/sample standard deviation" — doesn't specify over what population. Clean approach:
+    - Running aggregates (all-time within process lifetime, O(1) memory): count, mean (Welford), sample standard deviation (Welford).
+    - Median: computed from a bounded sorted window (last W values) per group — exact over the window; documented.
+  - Global memory cap: if the total number of groups exceeds a cap, or if the process has ingested more than maxRecords, stop accepting (503) or evict. Simpler: cap on group count; return 429/503 on overflow. Also cap on number of runs.
+- Runs: each metrics record has `run_id`. Grouping is by model and fixture, but /runs/:id endpoint returns per-run aggregates. So we need two views:
+  - By group (model, fixture): running stats + window for median.
+  - By run (run_id): stats for that run.
+  Both can be bounded.
+- Endpoints:
+  - POST /ingest: accepts newline-delimited JSON (NDJSON) body, or a stream. Incremental parsing across the stream. Response: accepted count, errors count, per-error details (line number, error).
+  - GET /health: liveness + readiness: uptime, memory (process.memoryUsage), buffer state, bounded capacity usage.
+  - GET /summary: all groups with stats, plus totals.
+  - GET /runs/:id: stats for a single run including its groups; 404 if unknown.
+  - Maybe also GET /runs: list of runs. Not in requirements but harmless. Let's include a minimal one.
+- Errors for malformed input: 400 with structured error listing rejected lines and reasons; valid lines in same batch still get ingested (incremental semantics) — this is a good design: per-line errors, atomic per line.
+
+Strict types: discriminated unions for validation errors, exact types for records.
+
+Validation rules (hand-rolled):
+- record must be a JSON object
+- Fields:
+  - run_id: non-empty string, max length (e.g., 128), maybe pattern: printable, trimmed? Let's say must match /^[A-Za-z0-9._:-]+$/
+  - model: non-empty string, same pattern, max 128
+  - fixture: non-empty string, same pattern
+  - latency_ms: finite number, >= 0, <= 1e7 (10,000 seconds? maybe 3_600_000), and not integer? Allow any finite number.
+  - tokens_in, tokens_out: non-negative integers
+  - status: integer in {200, 4xx, 5xx}? or string enum? Keep it: `ok: boolean` or `status_code: number` 100..599. Let's use status: number, integer 100–599.
+  - ts (timestamp): RFC3339 string, or epoch millis number? Keep it: `ts`: string ISO8601, validated via Date.parse and regex. Or number epoch millis >= 0. For simplicity and robustness, accept epoch-millis number or ISO string. Validation via a shared predicate.
+- Required fields all required; reject unknown fields? Optional strict: reject unknown keys (strict). This is a nice touch: `extraKeys` error.
+- Duplicate? no.
+
+Welford's algorithm for mean and sample standard deviation:
+- count n, mean, M2 (sum of squared diffs). Sample standard deviation = sqrt(M2/(n-1)) for n>=2; n===1 → 0? Convention: undefined → report as null? Strict types: maybe `sampleStdDev: number | null`, null when n<2. Or 0. Reporting null when undefined is more honest. In the JSON output: `sampleStdDev: null` when n < 2.
+
+Median with a bounded window:
+- Keep a sorted array insertion (O(W) insertion, fine for W ~ 256). Or two heaps (max-heap of lower half, min-heap of upper half) with lazy eviction? Since we're FIFO evicting oldest values, we need to know which side the evicted value belongs to — can store value with sequence number. Simpler: maintain a sorted array with binary insertion, window size W (e.g., 1024). Insertion is O(W) via splice — fine.
+- If window overflowed, median is the median of the last W values — document as "median over last windowValues values (exact if total ≤ window)".
+
+Memory bounds:
+- Max pending buffer bytes per connection (e.g., 1 MiB) — return 413 if exceeded.
+- Max line bytes (e.g., 64 KiB) — error for that line.
+- Max groups (e.g., 4096) — reject new groups beyond cap with a 507-ish error (or 409). Let's use 503 "group limit exceeded" and count as error.
+- Max runs (e.g., 4096) same.
+- Global record cap? Welford is O(1) per group so group cap covers memory. But per-run stats are also per run. Window array per group: W * 8 bytes * groups — bounded. OK: bound via group/run count and window size. Also enforce total ingestion via process-level soft cap: `maxIngestedRecords`; after that, ingest returns 503 and stats stay frozen. Good for bounded memory guarantees.
+
+Incremental parsing details:
+- Read request stream; chunk accumulation; keep a `leftover` string; on each chunk: leftover += chunk; split by /\r?\n/; all complete lines are processed; last partial is held back. If leftover length exceeds maxLineBytes without newline → abort with 413/400.
+- Handle CRLF: treat \r\n and \n; strip trailing \r.
+- Empty lines: skip (not an error) — but count? skip and don't count in errors. Let's say blank line = silently skipped, or counted in `blankLines`. Nice touch.
+- Encoding: assume UTF-8; use `string_decoder` for multibyte boundary correctness.
+
+Per-line processing:
+1. JSON.parse → on fail: error "invalid JSON: <msg>"
+2. validateRecord → structured error with list of field issues.
+3. If valid: ingest into group & run aggregates; if capacity exceeded: error.
+
+Response shape for /ingest:
+```json
+{
+  "receivedLines": 12,
+  "accepted": 10,
+  "rejected": 2,
+  "blankLines": 1,
+  "errors": [{"line": 3, "reason": "..."}],
+  "capacity": {"recordsRemaining": ..., "groupsUsed": ...}
+}
+```
+Status: 200 if any accepted (or 200 if all processed even if zero valid, e.g., all rejected → 400?). Design: HTTP 200 with errors array when at least one accepted or all blank; HTTP 400 if all non-blank lines were rejected; 413 if buffer overflow; 503 for capacity. That's reasonable. Let's define: if received>0 && accepted===0 && nonBlank>0 → 400; if accepted>0 → 200; if only blank/empty → 202? Let's do 200 with a note. Keep it simple: 200 if accepted>0 or no non-blank lines; 400 if everything rejected.
+
+Unit tests: use node:test + assert. Test targets:
+- parser: incremental split across chunk boundaries (including CRLF, incomplete lines, blank lines)
+- validator: valid record; each field failure; unknown key; NaN/Infinity (JSON.parse doesn't produce NaN from valid JSON, but the validator should guard against a non-finite number); negatives; out-of-range.
+- stats: Welford mean/std against known values (compare to hand-computed), median window behavior, eviction.
+- server: use node:test with an actual http server on an ephemeral port; test /health, ingest valid + invalid mixed, /summary, /runs/:id, 404, 413 overflow, capacity limits, 405 for wrong method.
+- Bounded memory: ingest many records, verify window size stays ≤ W and group stats n grows.
+
+package.json:
+```json
+{
+  "name": "ndjson-metrics-service",
+  "version": "1.0.0",
+  "type": "module",
+  "engines": { "node": ">=18.17" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/server.js",
+    "test": "tsc -p tsconfig.json && node --test dist/test/"
+  },
+  "devDependencies": { "typescript": "^5.5.0", "@types/node": "^20.14.0" }
+}
+```
+Node's test runner can run compiled JS: `node --test dist/test` works if test files are dist/test/*.test.js. With "type": "module" and ESM output.
+
+tsconfig.json:
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": ".",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration": true,
+    "sourceMap": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}
+```
+verbatimModuleSyntax + Node16 module: imports need `import type` where appropriate and file extension in ESM imports? With module Node16 and type module, relative imports need .js extension in TS files. Yes — ESM requires explicit extensions, and TS enforces when module is nodenext/node16. So in code write `import { x } from './x.js'`.
+
+noUncheckedIndexedAccess: array indexing returns T | undefined — must handle carefully in tests and code. Write code defensively to accommodate: use `.at()`, non-null assertions where safe, or restructure. Actually to keep code clean, we could disable noUncheckedIndexedAccess, but "strict types" — strict alone is the requirement. Let's include noUncheckedIndexedAccess and handle undefined properly, demonstrating rigor. Just be careful in a few places (sorted window insertion, median retrieval).
+
+exactOptionalPropertyTypes: careful with optional properties — only set when present. Keep optional properties minimal.
+
+Now the file structure:
+- src/types.ts — core domain types (RequestMetric, validation error types, stats types, summary types)
+- src/config.ts — service config with defaults + env parsing (hand-rolled env parsing, bounded values)
+- src/validation.ts — validateRecord(value: unknown): Result<RequestMetric, ValidationError>
+- src/stats.ts — WelfordAggregator, BoundedWindow (sorted), StatsSnapshot
+- src/aggregates.ts — MetricAggregator managing groups and runs with capacity; ingestion logic
+- src/ndjson.ts — IncrementalNdjsonParser (feed(chunk): lines; flush(); bounds)
+- src/http.ts — small typed HTTP helpers? maybe fold into server.ts
+- src/server.ts — HTTP server, routing, handlers
+- src/index.ts? or just server.ts as entry. Let's do src/server.ts with `main` guard.
+- test/*.test.ts — tests for each module + integration.
+- package.json, tsconfig.json, README.md (operations guide).
+
+Let me carefully write each piece.
+
+**types.ts**
+
+```ts
+/** A single validated request-metric record. */
+export interface RequestMetric {
+  readonly runId: string;
+  readonly model: string;
+  readonly fixture: string;
+  /** End-to-end latency in milliseconds. */
+  readonly latencyMs: number;
+  readonly tokensIn: number;
+  readonly tokensOut: number;
+  /** HTTP status code observed for the request (100..599). */
+  readonly status: number;
+  /** Observation time as epoch milliseconds (UTC). */
+  readonly ts: number;
+}
+```
+
+Raw JSON input type: `readonly JsonValue = null | boolean | number | string | JsonValue[] | { readonly [k: string]: JsonValue }`.
+
+Validation error:
+
+```ts
+export type FieldIssue =
+  | { kind: 'missing'; field: string }
+  | { kind: 'type'; field: string; expected: string; actual: string }
+  | { kind: 'range'; field: string; message: string }
+  | { kind: 'unknown'; field: string };
+
+export interface ValidationError {
+  readonly issues: readonly FieldIssue[];
+}
+
+export type LineResult =
+  | { ok: true; metric: RequestMetric }
+  | { ok: false; error: ValidationError; rawError?: string };
+```
+
+Hmm, for invalid JSON the error is different from schema validation. Let's define:
+
+```ts
+export type RejectionReason =
+  | { code: 'invalid-json'; message: string }
+  | { code: 'schema'; issues: readonly FieldIssue[] }
+  | { code: 'capacity-groups'; message: string }
+  | { code: 'capacity-runs'; message: string }
+  | { code: 'capacity-records'; message: string }
+  | { code: 'line-too-long'; bytes: number; limit: number };
+```
+
+And a `LineOutcome`:
+```ts
+export type LineOutcome =
+  | { status: 'accepted' }
+  | { status: 'rejected'; reason: RejectionReason }
+  | { status: 'blank' };
+```
+
+Stats snapshot types:
+
+```ts
+export interface GroupStats {
+  readonly model: string;
+  readonly fixture: string;
+  readonly count: number;
+  readonly meanLatencyMs: number | null;      // null until count>=1
+  readonly sampleStdDevMs: number | null;    // null until count>=2
+  readonly medianLatencyMs: number | null;   // over the retained window
+  readonly medianWindow: number;             // number of values retained for median
+  readonly medianWindowSize: number;         // configured window
+  readonly windowOverflowed: boolean;
+  readonly sumTokensIn: number;
+  readonly sumTokensOut: number;
+  readonly errorCount: number;               // status >= 500
+  readonly minLatencyMs: number;
+  readonly maxLatencyMs: number;
+  readonly lastSeenTs: number;
+}
+```
+
+Run stats similar minus model/fixture, plus per-fixture? Let's keep it simple: run stats aggregate over the run: count, mean/std/median latency, tokens, error count, first/last ts, maybe set of distinct models+fixtures. Let's include a `groups` summary within a run: a list of {model, fixture, count} — bounded? Distinct groups within a run can grow but is bounded by global group cap. Fine.
+
+Summary response:
+
+```ts
+export interface SummaryResponse {
+  readonly totalRecords: number;
+  readonly groups: readonly GroupStats[];
+  readonly rejectedRecords: number;
+  readonly recordsRemaining: number | null; // null if unlimited
+}
+```
+
+**config.ts**
+
+```ts
+export interface ServiceConfig {
+  readonly host: string;
+  readonly port: number;
+  readonly maxLineBytes: number;
+  readonly maxBodyBytes: number;
+  readonly medianWindowSize: number;
+  readonly

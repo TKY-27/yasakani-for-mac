@@ -1,0 +1,63 @@
+第一节 — 所有权归属。可靠的推理服务为每个可变边界指定唯一的所有者。程序可以将数学运算委托给内核执行，但内核不得在未经显式授权的情况下静默推进请求状态。这种职责分离使得成功轮次、被拒绝的投机草稿、取消操作以及前缀恢复等事件，均可被观测为完整且明确的状态转换。
+
+第二节 — 测量定义。加载时间、提示词准备、预填充（prefill）、解码（decode）以及网络传输分别回答不同的性能问题。基准测试必须明确标注每一项所报告速率对应的具体测量区间。在本引擎中，首个生成的令牌归属于预填充阶段，其余生成的令牌归属于解码阶段，因此令牌计数必须遵循相同的阶段边界。
+
+第三节 — 可复现性。在正式运行前，所有输入均被冻结。请求体、已解析的采样参数、模型标识、上下文容量、缓存格式以及原始计时字段均被完整保留。预热请求会被明确标记并排除在测量重复之外，而非混入正式测量数据。
+
+第四节 — 长上下文。分配最大缓存容量并不等同于提交最大长度的提示词。引擎可以维持 262,144 个令牌的缓存分配，同时测试中实际准备的提示词长度可以变化。这种方式在保持各测试用例间内存规划不变的前提下，隔离了可见上下文带来的成本。
+
+第五节 — 投机解码。草稿接受率取决于工作负载类型。代码、散文、翻译和结构化记录具有不同的局部可预测性，因此必须同时报告草稿接受百分比和每轮输出令牌数。吞吐量仍是用户可见的最终结果；接受率统计用于解释性能，而非替代吞吐量指标。
+
+第六节 — 报告规范。应发布完整的配置信息、重复测量结果、数据波动以及重大局限性说明。不得丢弃有效的慢速运行结果，也不得将内部计时器数据描述为客户端观测到的延迟。清晰的边界定义有助于增强优秀结果的公信力。
+
+---
+
+**英中术语表**
+
+1.  inference service — 推理服务
+2.  mutable frontier — 可变边界
+3.  owner — 所有者
+4.  delegate — 委托
+5.  kernel — 内核
+6.  request state — 请求状态
+7.  round — 轮次
+8.  speculative draft — 投机草稿
+9.  cancellation — 取消操作
+10. prefix restoration — 前缀恢复
+11. observable transition — 可观测的状态转换
+12. loading time — 加载时间
+13. prompt preparation — 提示词准备
+14. prefill — 预填充
+15. decode — 解码
+16. network transport — 网络传输
+17. benchmark — 基准测试
+18. interval — 测量区间
+19. generated token — 生成的令牌
+20. token count — 令牌计数
+21. frozen input — 冻结的输入
+22. request body — 请求体
+23. sampling parameters — 采样参数
+24. model identity — 模型标识
+25. context capacity — 上下文容量
+26. cache format — 缓存格式
+27. raw timing fields — 原始计时字段
+28. warm-up request — 预热请求
+29. measured repetition — 测量重复
+30. cache allocation — 缓存分配
+31. maximum-length prompt — 最大长度提示词
+32. visible context — 可见上下文
+33. memory plan — 内存规划
+34. draft acceptance — 草稿接受
+35. workload dependent — 取决于工作负载
+36. local predictability — 局部可预测性
+37. accepted-draft percentage — 草稿接受百分比
+38. output tokens per round — 每轮输出令牌数
+39. throughput — 吞吐量
+40. user-visible result — 用户可见的结果
+41. complete configuration — 完整配置
+42. repeated measurements — 重复测量
+43. variation — 数据波动
+44. material limitations — 重大局限性
+45. valid slow run — 有效的慢速运行
+46. internal timer — 内部计时器
+47. client-observed latency — 客户端观测到的延迟

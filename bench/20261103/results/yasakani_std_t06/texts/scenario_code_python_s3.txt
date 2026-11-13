@@ -1,0 +1,526 @@
+Below is a complete, runnable Python 3.11 package. Every file is in its own fenced block with its path. The package is `jobrunner`; tests live under `tests/` and are discovered by pytest.
+
+**Design notes (brief):**
+- Determinism: jobs run in manifest order; a single active GPU job is enforced by a per‑process `asyncio.Lock` plus a persisted `active_job_id` in the state file.
+- Atomic persistence: state is written to a temp file in the same directory and `os.replace`d over the real file.
+- Resume: completed jobs are skipped; a job that was `active` in a crashed state is re‑queued.
+- Events: structured JSONL lines on stdout, one per lifecycle event.
+- Secrets: values listed in the manifest are redacted from all emitted event payloads.
+- SIGINT: first signal requests graceful cancellation of the active job; a second signal exits immediately.
+
+---
+
+`pyproject.toml`
+```toml
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jobrunner"
+version = "0.1.0"
+description = "Deterministic asynchronous job runner with atomic state and resume."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[project.scripts]
+jobrunner = "jobrunner.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["jobrunner*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+`jobrunner/__init__.py`
+```python
+"""Deterministic asynchronous job runner."""
+from .runner import JobRunner
+from .manifest import Manifest, JobSpec
+
+__all__ = ["JobRunner", "Manifest", "JobSpec"]
+```
+
+`jobrunner/errors.py`
+```python
+"""Exception hierarchy for the job runner."""
+
+
+class JobRunnerError(Exception):
+    """Base class for all job runner errors."""
+
+
+class ManifestError(JobRunnerError):
+    """Raised when the manifest is invalid or unreadable."""
+
+
+class JobFailedError(JobRunnerError):
+    """Raised when a job's callable raises."""
+```
+
+`jobrunner/manifest.py`
+```python
+"""Manifest loading and validation."""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+from .errors import ManifestError
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    id: str
+    name: str
+    command: str
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class Manifest:
+    version: str
+    jobs: list[JobSpec]
+    secrets: list[str] = field(default_factory=list)
+
+    def job_ids(self) -> list[str]:
+        return [j.id for j in self.jobs]
+
+
+def _coerce_job(raw: dict[str, Any], index: int) -> JobSpec:
+    if not isinstance(raw, dict):
+        raise ManifestError(f"jobs[{index}] must be an object")
+    jid = raw.get("id")
+    if not jid or not isinstance(jid, str):
+        raise ManifestError(f"jobs[{index}] missing string 'id'")
+    name = raw.get("name", jid)
+    command = raw.get("command", "")
+    args = raw.get("args", [])
+    env = raw.get("env", {})
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        raise ManifestError(f"jobs[{index}].args must be a list of strings")
+    if not isinstance(env, dict):
+        raise ManifestError(f"jobs[{index}].env must be an object")
+    return JobSpec(id=jid, name=name, command=command, args=list(args), env=dict(env))
+
+
+def load_manifest(path: str | Path) -> Manifest:
+    p = Path(path)
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ManifestError(f"manifest not found: {p}") from exc
+    except json.JSONDecodeError as exc:
+        raise ManifestError(f"invalid JSON in {p}: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise ManifestError("manifest root must be an object")
+
+    version = raw.get("version", "1")
+    jobs_raw = raw.get("jobs", [])
+    if not isinstance(jobs_raw, list):
+        raise ManifestError("'jobs' must be a list")
+
+    secrets_raw = raw.get("secrets", [])
+    if not isinstance(secrets_raw, list) or not all(isinstance(s, str) for s in secrets_raw):
+        raise ManifestError("'secrets' must be a list of strings")
+
+    jobs = [_coerce_job(j, i) for i, j in enumerate(jobs_raw)]
+
+    ids = [j.id for j in jobs]
+    if len(ids) != len(set(ids)):
+        dupes = {i for i in ids if ids.count(i) > 1}
+        raise ManifestError(f"duplicate job ids: {sorted(dupes)}")
+
+    return Manifest(version=str(version), jobs=jobs, secrets=list(secrets_raw))
+```
+
+`jobrunner/redact.py`
+```python
+"""Recursive secret redaction for event payloads."""
+from __future__ import annotations
+
+from typing import Any
+
+REDACTED = "***REDACTED***"
+
+
+def redact(value: Any, secrets: list[str]) -> Any:
+    """Return a deep copy of *value* with any occurrence of a secret replaced."""
+    if not secrets:
+        return value
+    secrets = [s for s in secrets if s]
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, str):
+            out = node
+            for s in secrets:
+                if s in out:
+                    out = out.replace(s, REDACTED)
+            return out
+        if isinstance(node, dict):
+            return {k: _walk(v) for k, v in node.items()}
+        if isinstance(node, (list, tuple)):
+            return [_walk(v) for v in node]
+        if isinstance(node, set):
+            return [_walk(v) for v in sorted(node, key=str)]
+        return node
+
+    return _walk(value)
+```
+
+`jobrunner/events.py`
+```python
+"""Structured JSONL event emission."""
+from __future__ import annotations
+
+import json
+import sys
+from typing import Any, TextIO
+
+from .redact import redact
+
+
+class EventSink:
+    def __init__(self, stream: TextIO, secrets: list[str]) -> None:
+        self._stream = stream
+        self._secrets = secrets
+
+    def emit(self, event: str, **payload: Any) -> None:
+        data = {"event": event, **payload}
+        data = redact(data, self._secrets)
+        line = json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)
+        self._stream.write(line + "\n")
+        self._stream.flush()
+```
+
+`jobrunner/state.py`
+```python
+"""Atomic, resumable on-disk state."""
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+class State:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._data: dict[str, Any] = self._load()
+
+    def _load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {
+                "version": 1,
+                "completed": {},
+                "failed": {},
+                "cancelled": {},
+                "active_job_id": None,
+            }
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            # Corrupt state: start fresh rather than crash.
+            return {
+                "version": 1,
+                "completed": {},
+                "failed": {},
+                "cancelled": {},
+                "active_job_id": None,
+            }
+        data.setdefault("version", 1)
+        data.setdefault("completed", {})
+        data.setdefault("failed", {})
+        data.setdefault("cancelled", {})
+        data.setdefault("active_job_id", None)
+        return data
+
+    @property
+    def completed(self) -> dict[str, Any]:
+        return self._data["completed"]
+
+    @property
+    def failed(self) -> dict[str, Any]:
+        return self._data["failed"]
+
+    @property
+    def cancelled(self) -> dict[str, Any]:
+        return self._data["cancelled"]
+
+    @property
+    def active_job_id(self) -> str | None:
+        return self._data["active_job_id"]
+
+    def is_done(self, job_id: str) -> bool:
+        return job_id in self.completed or job_id in self.failed or job_id in self.cancelled
+
+    def mark_completed(self, job_id: str, result: Any) -> None:
+        self._data["completed"][job_id] = {"result": result}
+        self._data["active_job_id"] = None
+        self._persist()
+
+    def mark_failed(self, job_id: str, error: str) -> None:
+        self._data["failed"][job_id] = {"error": error}
+        self._data["active_job_id"] = None
+        self._persist()
+
+    def mark_cancelled(self, job_id: str) -> None:
+        self._data["cancelled"][job_id] = {}
+        self._data["active_job_id"] = None
+        self._persist()
+
+    def set_active(self, job_id: str) -> None:
+        self._data["active_job_id"] = job_id
+        self._persist()
+
+    def clear_active(self) -> None:
+        self._data["active_job_id"] = None
+        self._persist()
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(json.dumps(self._data))
+
+    def _persist(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix=".state-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(self._data, fh, ensure_ascii=False, sort_keys=True, indent=2)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+```
+
+`jobrunner/runner.py`
+```python
+"""Core deterministic asynchronous job runner."""
+from __future__ import annotations
+
+import asyncio
+import os
+import signal
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from .events import EventSink
+from .manifest import JobSpec, Manifest, load_manifest
+from .state import State
+
+# A job callable receives its JobSpec and returns a result (sync or awaitable).
+JobCallable = Callable[[JobSpec], Any | Awaitable[Any]]
+
+
+class JobRunner:
+    def __init__(
+        self,
+        manifest: str | Path,
+        state_path: str | Path,
+        job_fn: JobCallable,
+        stream: Any = None,
+    ) -> None:
+        self.manifest = load_manifest(manifest)
+        self.state = State(state_path)
+        self.job_fn = job_fn
+        self._stream = stream
+        self._sink = EventSink(self._stream, self.manifest.secrets)
+        self._lock = asyncio.Lock()
+        self._cancel_requested = False
+        self._signal_count = 0
+
+    def _emit(self, event: str, **payload: Any) -> None:
+        self._sink.emit(event, **payload)
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+        self._signal_count += 1
+        if self._signal_count >= 2:
+            raise SystemExit(130)
+
+    def install_signal_handlers(self) -> None:
+        """Install SIGINT handling. Safe to call from the main thread only."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.add_signal_handler(signal.SIGINT, self.request_cancel)
+
+    def _next_pending(self) -> JobSpec | None:
+        for job in self.manifest.jobs:
+            if not self.state.is_done(job.id):
+                return job
+        return None
+
+    async def _run_job(self, job: JobSpec) -> Any:
+        self.state.set_active(job.id)
+        self._emit("job_started", job_id=job.id, name=job.name, command=job.command, args=job.args)
+        try:
+            result = self.job_fn(job)
+            if asyncio.iscoroutine(result):
+                result = await result
+        except asyncio.CancelledError:
+            self.state.mark_cancelled(job.id)
+            self._emit("job_cancelled", job_id=job.id)
+            raise
+        except Exception as exc:  # noqa: BLE001 - surfaced as structured event
+            self.state.mark_failed(job.id, f"{type(exc).__name__}: {exc}")
+            self._emit("job_failed", job_id=job.id, error=f"{type(exc).__name__}: {exc}")
+            return None
+        self.state.mark_completed(job.id, result)
+        self._emit("job_completed", job_id=job.id, result=result)
+        return result
+
+    async def run(self) -> dict[str, Any]:
+        self.install_signal_handlers()
+        self._emit(
+            "runner_started",
+            manifest_version=self.manifest.version,
+            total_jobs=len(self.manifest.jobs),
+            resumed=[j.id for j in self.manifest.jobs if self.state.is_done(j.id)],
+        )
+
+        # Re-queue a job that was active when a previous process died.
+        if self.state.active_job_id is not None:
+            self._emit("resume_requeue", job_id=self.state.active_job_id)
+            self.state.clear_active()
+
+        while True:
+            job = self._next_pending()
+            if job is None:
+                break
+
+            async with self._lock:
+                if self._cancel_requested:
+                    self.state.mark_cancelled(job.id)
+                    self._emit("job_cancelled", job_id=job.id, reason="cancel_requested")
+                    continue
+                await self._run_job(job)
+
+        self._emit(
+            "runner_finished",
+            completed=len(self.state.completed),
+            failed=len(self.state.failed),
+            cancelled=len(self.state.cancelled),
+        )
+        return self.state.to_dict()
+```
+
+`jobrunner/cli.py`
+```python
+"""Command-line entry point."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+from pathlib import Path
+
+from .runner import JobRunner
+
+
+def _default_job_fn(job):
+    # Placeholder execution: report the command without side effects.
+    return {"command": job.command, "args": job.args, "status": "ok"}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="jobrunner", description="Deterministic async job runner.")
+    parser.add_argument("manifest", help="Path to the JSON manifest.")
+    parser.add_argument("--state", default=".jobrunner-state.json", help="Path to the state file.")
+    args = parser.parse_args(argv)
+
+    runner = JobRunner(args.manifest, args.state, _default_job_fn, stream=sys.stdout)
+    result = asyncio.run(runner.run())
+    print(json.dumps({"exit": 0, "state": result}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+`tests/conftest.py`
+```python
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture
+def tmp_manifest(tmp_path: Path) -> Path:
+    manifest = {
+        "version": "1",
+        "secrets": ["s3cr3t-token"],
+        "jobs": [
+            {"id": "a", "name": "job-a", "command": "echo a", "args": []},
+            {"id": "b", "name": "job-b", "command": "echo b", "args": []},
+            {"id": "c", "name": "job-c", "command": "echo c", "args": []},
+        ],
+    }
+    p = tmp_path / "manifest.json"
+    p.write_text(json.dumps(manifest), encoding="utf-8")
+    return p
+```
+
+`tests/test_success.py`
+```python
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+from jobrunner.runner import JobRunner
+
+
+def _events(stream) -> list[dict]:
+    return [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
+
+
+@pytest.mark.asyncio
+async def test_success_runs_in_order_and_persists(tmp_manifest: Path, tmp_path: Path, capsys):
+    calls: list[str] = []
+
+    def job_fn(job):
+        calls.append(job.id)
+        return f"done:{job.id}"
+
+    state_path = tmp_path / "state.json"
+    runner = JobRunner(tmp_manifest, state_path, job_fn, stream=capsys.fdopen(1, "w"))
+    result = await runner.run()
+
+    assert calls == ["a", "b", "c"]
+    assert result["completed"] == {
+        "a": {"result": "done:a"},
+        "b": {"result": "done:b"},
+        "c": {"result": "done:c"},
+    }
+    assert result["failed"] == {}
+    assert result["cancelled"] == {}
+
+    events =

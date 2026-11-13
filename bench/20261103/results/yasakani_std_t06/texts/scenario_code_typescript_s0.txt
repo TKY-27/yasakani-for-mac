@@ -1,0 +1,521 @@
+# Request Metrics Service
+
+Below is a complete, runnable TypeScript 5 service. It streams newline-delimited JSON, validates with a hand-rolled validator (no schema libraries), groups by `(model, fixture)`, computes mean/median/sample standard deviation incrementally (Welford's algorithm), enforces a bounded memory cap, and exposes `/health`, `/summary`, and `/runs/:id`.
+
+## File tree
+
+```
+request-metrics/
+├── package.json
+├── tsconfig.json
+├── README.md
+└── src/
+    ├── types.ts
+    ├── errors.ts
+    ├── validator.ts
+    ├── stats.ts
+    ├── stream.ts
+    ├── aggregator.ts
+    ├── server.ts
+    ├── cli.ts
+    └── index.ts
+```
+
+---
+
+### `package.json`
+
+```json
+{
+  "name": "request-metrics",
+  "version": "1.0.0",
+  "description": "Streams NDJSON request metrics, validates them, groups by (model, fixture), and serves summary statistics over HTTP.",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "main": "dist/index.js",
+  "bin": {
+    "request-metrics": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "test": "node --test dist/test/*.test.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
+```
+
+---
+
+### `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*.ts"]
+}
+```
+
+> `noUncheckedIndexedAccess` is enabled, so every `Record`/array index access is treated as possibly `undefined`. The code below is written to satisfy that.
+
+---
+
+### `src/types.ts`
+
+```typescript
+/**
+ * Shared, strict types for the request-metrics service.
+ * No third-party schema/validation libraries are used; validation lives in
+ * `validator.ts` and produces these exact shapes.
+ */
+
+/** A single validated request-metric record. */
+export interface RequestMetric {
+  /** Unique run identifier. */
+  runId: string;
+  /** Model identifier (e.g. "gpt-4"). */
+  model: string;
+  /** Fixture / prompt identifier. */
+  fixture: string;
+  /** Wall-clock timestamp of the request, in epoch milliseconds. */
+  timestamp: number;
+  /** Latency in milliseconds. */
+  latencyMs: number;
+  /** Tokens consumed. */
+  tokens: number;
+  /** HTTP status code. */
+  status: number;
+  /** Whether the request was a cache hit. */
+  cacheHit: boolean;
+  /** Optional free-form error message. */
+  error?: string;
+}
+
+/** A single metric record before validation (raw input shape). */
+export interface RawMetric {
+  runId?: unknown;
+  model?: unknown;
+  fixture?: unknown;
+  timestamp?: unknown;
+  latencyMs?: unknown;
+  tokens?: unknown;
+  status?: unknown;
+  cacheHit?: unknown;
+  error?: unknown;
+}
+
+/** Key used to group records by model and fixture. */
+export interface GroupKey {
+  model: string;
+  fixture: string;
+}
+
+/** Incremental per-group statistics. */
+export interface GroupStats {
+  count: number;
+  mean: number;
+  /** Sample standard deviation (n-1 denominator); 0 when count < 2. */
+  sampleStdDev: number;
+  median: number;
+  min: number;
+  max: number;
+  /** Sum of latencyMs. */
+  totalLatencyMs: number;
+  /** Sum of tokens. */
+  totalTokens: number;
+  /** Number of cache hits. */
+  cacheHits: number;
+  /** Number of non-2xx statuses (errors). */
+  errors: number;
+  /** Distinct run ids observed in this group. */
+  runs: Set<string>;
+  /** Bounded reservoir sample of latencies (for inspection). */
+  sample: number[];
+  /** First-seen timestamp in the group. */
+  firstSeen: number;
+  /** Last-seen timestamp in the group. */
+  lastSeen: number;
+}
+
+/** A single run's aggregate view. */
+export interface RunSummary {
+  runId: string;
+  count: number;
+  models: string[];
+  fixtures: string[];
+  totalLatencyMs: number;
+  totalTokens: number;
+  meanLatencyMs: number;
+  medianLatencyMs: number;
+  sampleStdDev: number;
+  minLatencyMs: number;
+  maxLatencyMs: number;
+  cacheHits: number;
+  cacheHitRate: number;
+  errors: number;
+  errorRate: number;
+  firstSeen: number;
+  lastSeen: number;
+}
+
+/** The full summary payload for /summary. */
+export interface SummaryResponse {
+  generatedAt: number;
+  totalRecords: number;
+  totalRuns: number;
+  groups: number;
+  byGroup: Record<string, GroupStatsPublic>;
+  byRun: Record<string, RunSummary>;
+}
+
+/** Public (serializable) form of GroupStats. */
+export interface GroupStatsPublic {
+  model: string;
+  fixture: string;
+  count: number;
+  mean: number;
+  sampleStdDev: number;
+  median: number;
+  min: number;
+  max: number;
+  totalLatencyMs: number;
+  totalTokens: number;
+  cacheHits: number;
+  cacheHitRate: number;
+  errors: number;
+  errorRate: number;
+  distinctRuns: number;
+  firstSeen: number;
+  lastSeen: number;
+}
+
+/** Health payload for /health. */
+export interface HealthResponse {
+  status: 'ok' | 'degraded';
+  uptimeMs: number;
+  totalRecords: number;
+  totalRuns: number;
+  groups: number;
+  memoryUsedMb: number;
+  memoryRssMb: number;
+  memoryLimitMb: number;
+  memoryNearLimit: boolean;
+  /** True when the memory cap has been reached and records are being dropped. */
+  dropping: boolean;
+}
+
+/** Configuration for the service. */
+export interface ServiceConfig {
+  /** Port to listen on. */
+  port: number;
+  /** Host to bind. */
+  host: string;
+  /** Max number of records to keep in memory before dropping. */
+  maxRecords: number;
+  /** Reservoir sample size per group. */
+  reservoirSize: number;
+  /** Max bytes per NDJSON line. */
+  maxLineBytes: number;
+  /** Fraction of maxRecords at which we consider memory "near limit". */
+  memoryWarnFraction: number;
+}
+
+/** Default configuration. */
+export const DEFAULT_CONFIG: ServiceConfig = {
+  port: 8080,
+  host: '0.0.0.0',
+  maxRecords: 1_000_000,
+  reservoirSize: 64,
+  maxLineBytes: 64 * 1024,
+  memoryWarnFraction: 0.8,
+};
+```
+
+---
+
+### `src/errors.ts`
+
+```typescript
+/**
+ * Error types used across the service. All are plain classes so no
+ * third-party error library is required.
+ */
+
+/** Base error for the service. */
+export class ServiceError extends Error {
+  public readonly code: string;
+  public readonly details: Record<string, unknown>;
+
+  constructor(code: string, message: string, details: Record<string, unknown> = {}) {
+    super(message);
+    this.name = 'ServiceError';
+    this.code = code;
+    this.details = details;
+  }
+}
+
+/** Thrown when an NDJSON line is not valid JSON. */
+export class MalformedJsonError extends ServiceError {
+  constructor(lineNumber: number, reason: string) {
+    super('MALFORMED_JSON', `Line ${lineNumber}: invalid JSON: ${reason}`, {
+      lineNumber,
+      reason,
+    });
+  }
+}
+
+/** Thrown when a record fails schema validation. */
+export class ValidationFailureError extends ServiceError {
+  public readonly fieldErrors: Record<string, string>;
+
+  constructor(lineNumber: number, fieldErrors: Record<string, string>) {
+    super(
+      'VALIDATION_FAILURE',
+      `Line ${lineNumber}: ${Object.keys(fieldErrors).length} field(s) failed validation`,
+      { lineNumber, fieldErrors },
+    );
+    this.fieldErrors = fieldErrors;
+  }
+}
+
+/** Thrown when a line exceeds the configured byte limit. */
+export class LineTooLongError extends ServiceError {
+  constructor(lineNumber: number, bytes: number, max: number) {
+    super('LINE_TOO_LONG', `Line ${lineNumber}: ${bytes} bytes exceeds limit of ${max}`, {
+      lineNumber,
+      bytes,
+      max,
+    });
+  }
+}
+
+/** Thrown when the memory cap is reached and a record must be dropped. */
+export class MemoryLimitError extends ServiceError {
+  constructor(totalRecords: number, maxRecords: number) {
+    super(
+      'MEMORY_LIMIT',
+      `Record dropped: total records ${totalRecords} reached cap of ${maxRecords}`,
+      { totalRecords, maxRecords },
+    );
+  }
+}
+
+/** Thrown for internal / unexpected failures. */
+export class InternalError extends ServiceError {
+  constructor(message: string, cause?: unknown) {
+    super('INTERNAL', message, { cause: cause instanceof Error ? cause.message : String(cause) });
+  }
+}
+```
+
+---
+
+### `src/validator.ts`
+
+```typescript
+/**
+ * Hand-rolled schema validation for request-metric records.
+ * No third-party schema library is used. Validation is strict:
+ *  - required fields must be present and of the correct type
+ *  - numeric fields must be finite numbers within sane bounds
+ *  - string fields must be non-empty and within a length cap
+ *  - status must be an integer in [100, 599]
+ *  - cacheHit must be a boolean
+ *  - error, when present, must be a string
+ */
+
+import type { RawMetric, RequestMetric } from './types.js';
+import { ValidationFailureError } from './errors.js';
+
+const MAX_STRING_LEN = 512;
+const MAX_LATENCY_MS = 10 * 60 * 60 * 1000; // 10 hours
+const MAX_TOKENS = 1_000_000_000;
+const MIN_TIMESTAMP = 0;
+const MAX_TIMESTAMP = 4_102_444_800_000; // 2100-01-01
+
+export interface ValidationResult {
+  ok: boolean;
+  value?: RequestMetric;
+  error?: ValidationFailureError;
+}
+
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === 'string' && v.length > 0;
+}
+
+/**
+ * Validate a single raw record. Returns a strict result object so callers
+ * can decide how to handle failures (e.g. log + continue vs. abort).
+ */
+export function validateMetric(raw: RawMetric, lineNumber: number): ValidationResult {
+  const fieldErrors: Record<string, string> = {};
+
+  // runId
+  if (!isNonEmptyString(raw.runId)) {
+    fieldErrors.runId = 'must be a non-empty string';
+  } else if (raw.runId.length > MAX_STRING_LEN) {
+    fieldErrors.runId = `must be at most ${MAX_STRING_LEN} characters`;
+  }
+
+  // model
+  if (!isNonEmptyString(raw.model)) {
+    fieldErrors.model = 'must be a non-empty string';
+  } else if (raw.model.length > MAX_STRING_LEN) {
+    fieldErrors.model = `must be at most ${MAX_STRING_LEN} characters`;
+  }
+
+  // fixture
+  if (!isNonEmptyString(raw.fixture)) {
+    fieldErrors.fixture = 'must be a non-empty string';
+  } else if (raw.fixture.length > MAX_STRING_LEN) {
+    fieldErrors.fixture = `must be at most ${MAX_STRING_LEN} characters`;
+  }
+
+  // timestamp
+  if (!isFiniteNumber(raw.timestamp)) {
+    fieldErrors.timestamp = 'must be a finite number (epoch ms)';
+  } else if (raw.timestamp < MIN_TIMESTAMP || raw.timestamp > MAX_TIMESTAMP) {
+    fieldErrors.timestamp = `must be between ${MIN_TIMESTAMP} and ${MAX_TIMESTAMP}`;
+  }
+
+  // latencyMs
+  if (!isFiniteNumber(raw.latencyMs)) {
+    fieldErrors.latencyMs = 'must be a finite number';
+  } else if (raw.latencyMs < 0 || raw.latencyMs > MAX_LATENCY_MS) {
+    fieldErrors.latencyMs = `must be between 0 and ${MAX_LATENCY_MS}`;
+  }
+
+  // tokens
+  if (!isFiniteNumber(raw.tokens)) {
+    fieldErrors.tokens = 'must be a finite number';
+  } else if (raw.tokens < 0 || raw.tokens > MAX_TOKENS) {
+    fieldErrors.tokens = `must be between 0 and ${MAX_TOKENS}`;
+  }
+
+  // status
+  if (!isFiniteNumber(raw.status)) {
+    fieldErrors.status = 'must be a finite number';
+  } else if (!Number.isInteger(raw.status) || raw.status < 100 || raw.status > 599) {
+    fieldErrors.status = 'must be an integer in [100, 599]';
+  }
+
+  // cacheHit
+  if (typeof raw.cacheHit !== 'boolean') {
+    fieldErrors.cacheHit = 'must be a boolean';
+  }
+
+  // error (optional)
+  if (raw.error !== undefined && typeof raw.error !== 'string') {
+    fieldErrors.error = 'must be a string when present';
+  } else if (raw.error !== undefined && raw.error.length > MAX_STRING_LEN * 4) {
+    fieldErrors.error = `must be at most ${MAX_STRING_LEN * 4} characters`;
+  }
+
+  if (Object.keys(fieldErrors).length > 0) {
+    return { ok: false, error: new ValidationFailureError(lineNumber, fieldErrors) };
+  }
+
+  const value: RequestMetric = {
+    runId: raw.runId as string,
+    model: raw.model as string,
+    fixture: raw.fixture as string,
+    timestamp: raw.timestamp as number,
+    latencyMs: raw.latencyMs as number,
+    tokens: raw.tokens as number,
+    status: raw.status as number,
+    cacheHit: raw.cacheHit as boolean,
+  };
+  if (typeof raw.error === 'string') {
+    value.error = raw.error;
+  }
+  return { ok: true, value };
+}
+```
+
+---
+
+### `src/stats.ts`
+
+```typescript
+/**
+ * Incremental statistics.
+ *
+ *  - Mean and sample variance use Welford's online algorithm (numerically
+ *    stable, single pass, O(1) memory per group).
+ *  - Median is maintained with a two-heap (max-heap for lower half, min-heap
+ *    for upper half) so it is available in O(1) after each insertion.
+ *  - A bounded reservoir sample (Vitter's Algorithm R) keeps a small random
+ *    subset of latencies for inspection without unbounded memory.
+ */
+
+import type { GroupStats } from './types.js';
+
+/** Max-heap: largest element at root. */
+class MaxHeap {
+  private heap: number[] = [];
+
+  get size(): number {
+    return this.heap.length;
+  }
+
+  peek(): number | undefined {
+    return this.heap[0];
+  }
+
+  push(value: number): void {
+    this.heap.push(value);
+    this.siftUp(this.heap.length - 1);
+  }
+
+  pop(): number | undefined {
+    const n = this.heap.length;
+    if (n === 0) return undefined;
+    const top = this.heap[0] as number;
+    const last = this.heap.pop() as number;
+    if (n > 1) {
+      this.heap[0] = last;
+      this.siftDown(0);
+    }
+    return top;
+  }
+
+  private siftUp(i: number): void {
+    const h = this.heap;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if ((h[parent] as number) >= (h[i] as number)) break;
+      const tmp = h[parent] as number;
+      h[parent] = h[i] as number;
+      h[i] = tmp;
+      i = parent;
+    }
+  }
+

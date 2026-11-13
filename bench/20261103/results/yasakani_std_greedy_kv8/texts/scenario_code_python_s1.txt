@@ -1,0 +1,553 @@
+Below is a complete, runnable Python 3.11 package. It is designed so that the "GPU" is simulated (a deterministic, time‑based workload) so the whole thing runs and is testable on any machine, while still enforcing a single active GPU job, atomic state persistence, resume, JSONL event streaming, SIGINT handling, and secret redaction.
+
+**Layout**
+
+```
+gpu_runner/
+├── pyproject.toml
+├── gpu_runner/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── manifest.py
+│   ├── state.py
+│   ├── events.py
+│   ├── redact.py
+│   ├── runner.py
+│   └── cli.py
+└── tests/
+    ├── conftest.py
+    ├── test_success.py
+    ├── test_failure.py
+    ├── test_cancellation.py
+    └── test_resume.py
+```
+
+---
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-runner"
+version = "0.1.0"
+description = "Deterministic asynchronous GPU job runner with atomic state, resume, JSONL events, SIGINT handling, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "GPU Runner Maintainers" }]
+keywords = ["gpu", "jobs", "async", "runner", "deterministic"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pytest-asyncio>=0.21"]
+
+[project.scripts]
+gpu-runner = "gpu_runner.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gpu_runner*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+---
+
+### `gpu_runner/__init__.py`
+
+```python
+"""Deterministic asynchronous GPU job runner."""
+
+from .manifest import Job, Manifest, load_manifest
+from .state import State, StateStore
+from .events import Event, EventStream
+from .redact import Redactor
+from .runner import JobRunner, RunnerConfig
+
+__all__ = [
+    "Job",
+    "Manifest",
+    "load_manifest",
+    "State",
+    "StateStore",
+    "Event",
+    "EventStream",
+    "Redactor",
+    "JobRunner",
+    "RunnerConfig",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+### `gpu_runner/manifest.py`
+
+```python
+"""Manifest loading and validation.
+
+The manifest is a JSON document describing a set of GPU jobs. Each job has a
+deterministic workload (a fixed number of steps) so that repeated runs produce
+identical results.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+class ManifestError(ValueError):
+    """Raised when a manifest is malformed or invalid."""
+
+
+@dataclass(frozen=True)
+class Job:
+    """A single GPU job.
+
+    Attributes:
+        id: Unique identifier for the job.
+        name: Human readable name.
+        steps: Number of deterministic steps to execute.
+        gpu: Logical GPU index to run on (informational; the runner enforces
+            a single active GPU job regardless).
+        params: Arbitrary parameters for the job.
+        secrets: Names of parameters that must be redacted in logs/events.
+    """
+
+    id: str
+    name: str
+    steps: int
+    gpu: int = 0
+    params: dict[str, Any] = field(default_factory=dict)
+    secrets: list[str] = field(default_factory=list)
+
+    def redact_params(self, redactor: "Redactor") -> dict[str, Any]:
+        """Return a copy of params with configured secrets redacted."""
+        out: dict[str, Any] = {}
+        for key, value in self.params.items():
+            if key in self.secrets:
+                out[key] = redactor.redact(key, value)
+            else:
+                out[key] = value
+        return out
+
+
+@dataclass(frozen=True)
+class Manifest:
+    """A collection of jobs plus global settings."""
+
+    jobs: list[Job]
+    max_concurrency: int = 1
+    seed: int = 0
+
+    def job_ids(self) -> list[str]:
+        return [j.id for j in self.jobs]
+
+    def get(self, job_id: str) -> Job:
+        for job in self.jobs:
+            if job.id == job_id:
+                return job
+        raise KeyError(job_id)
+
+
+def _require(obj: Any, key: str, kind: type, where: str) -> Any:
+    if key not in obj:
+        raise ManifestError(f"Missing required field '{key}' in {where}")
+    value = obj[key]
+    if not isinstance(value, kind):
+        raise ManifestError(
+            f"Field '{key}' in {where} must be {kind.__name__}, got {type(value).__name__}"
+        )
+    return value
+
+
+def _parse_job(raw: dict[str, Any], index: int) -> Job:
+    where = f"jobs[{index}]"
+    job_id = _require(raw, "id", str, where)
+    name = raw.get("name", job_id)
+    if not isinstance(name, str):
+        raise ManifestError(f"Field 'name' in {where} must be str")
+    steps = _require(raw, "steps", int, where)
+    if steps < 0:
+        raise ManifestError(f"Field 'steps' in {where} must be >= 0")
+    gpu = raw.get("gpu", 0)
+    if not isinstance(gpu, int):
+        raise ManifestError(f"Field 'gpu' in {where} must be int")
+    params = raw.get("params", {})
+    if not isinstance(params, dict):
+        raise ManifestError(f"Field 'params' in {where} must be object")
+    secrets = raw.get("secrets", [])
+    if not isinstance(secrets, list) or not all(isinstance(s, str) for s in secrets):
+        raise ManifestError(f"Field 'secrets' in {where} must be list of str")
+    return Job(
+        id=job_id,
+        name=name,
+        steps=steps,
+        gpu=gpu,
+        params=params,
+        secrets=list(secrets),
+    )
+
+
+def load_manifest(path: str | Path) -> Manifest:
+    """Load and validate a JSON manifest from disk."""
+    path = Path(path)
+    if not path.exists():
+        raise ManifestError(f"Manifest not found: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ManifestError(f"Invalid JSON in manifest {path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ManifestError("Manifest root must be a JSON object")
+
+    jobs_raw = _require(data, "jobs", list, "manifest")
+    jobs: list[Job] = []
+    seen: set[str] = set()
+    for i, raw in enumerate(jobs_raw):
+        if not isinstance(raw, dict):
+            raise ManifestError(f"jobs[{i}] must be an object")
+        job = _parse_job(raw, i)
+        if job.id in seen:
+            raise ManifestError(f"Duplicate job id '{job.id}'")
+        seen.add(job.id)
+        jobs.append(job)
+
+    max_concurrency = data.get("max_concurrency", 1)
+    if not isinstance(max_concurrency, int) or max_concurrency < 1:
+        raise ManifestError("Field 'max_concurrency' must be int >= 1")
+
+    seed = data.get("seed", 0)
+    if not isinstance(seed, int):
+        raise ManifestError("Field 'seed' must be int")
+
+    return Manifest(jobs=jobs, max_concurrency=max_concurrency, seed=seed)
+```
+
+---
+
+### `gpu_runner/state.py`
+
+```python
+"""Atomic, resumable state persistence.
+
+State is written to a temporary file in the same directory and then atomically
+renamed into place (os.replace), so a crash mid-write never leaves a corrupt
+state file.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class JobState:
+    id: str
+    status: JobStatus = JobStatus.PENDING
+    attempts: int = 0
+    result: Any = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "status": self.status.value,
+            "attempts": self.attempts,
+            "result": self.result,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "JobState":
+        return cls(
+            id=data["id"],
+            status=JobStatus(data.get("status", JobStatus.PENDING.value)),
+            attempts=data.get("attempts", 0),
+            result=data.get("result"),
+            error=data.get("error"),
+        )
+
+
+@dataclass
+class State:
+    """Top-level runner state."""
+
+    seed: int
+    jobs: dict[str, JobState] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "seed": self.seed,
+            "jobs": {jid: js.to_dict() for jid, js in self.jobs.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "State":
+        jobs = {
+            jid: JobState.from_dict(js) for jid, js in data.get("jobs", {}).items()
+        }
+        return cls(seed=data.get("seed", 0), jobs=jobs)
+
+    def pending(self) -> list[str]:
+        return [jid for jid, js in self.jobs.items() if js.status == JobStatus.PENDING]
+
+    def running(self) -> list[str]:
+        return [jid for jid, js in self.jobs.items() if js.status == JobStatus.RUNNING]
+
+    def terminal(self) -> list[str]:
+        return [
+            jid
+            for jid, js in self.jobs.items()
+            if js.status in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED)
+        ]
+
+    def all_terminal(self) -> bool:
+        return all(
+            js.status in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED)
+            for js in self.jobs.values()
+        )
+
+
+class StateStore:
+    """Persists :class:`State` atomically to a JSON file."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def load(self) -> State | None:
+        if not self.path.exists():
+            return None
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            # Corrupt state file: treat as absent so the caller can start fresh.
+            return None
+        return State.from_dict(data)
+
+    def save(self, state: State) -> None:
+        """Atomically write state to disk."""
+        payload = json.dumps(state.to_dict(), sort_keys=True, indent=2)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(self.path.parent), prefix=".state-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_name, self.path)
+        except BaseException:
+            # Best-effort cleanup of the temp file on failure.
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+```
+
+---
+
+### `gpu_runner/events.py`
+
+```python
+"""Structured JSONL event streaming.
+
+Each event is a single JSON object on its own line. Events are written to a
+file (and optionally an in-memory buffer for tests) and are always redacted
+before emission.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+
+@dataclass
+class Event:
+    """A single structured event."""
+
+    type: str
+    ts: float
+    data: dict[str, Any] = field(default_factory=dict)
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {"type": self.type, "ts": self.ts, "data": self.data},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+
+class EventStream:
+    """Writes JSONL events to a file and/or an in-memory list."""
+
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        buffer: list[str] | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.path = Path(path) if path is not None else None
+        self.buffer = buffer if buffer is not None else []
+        self.clock = clock
+        self._fh = None
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = self.path.open("a", encoding="utf-8")
+
+    def emit(self, type_: str, **data: Any) -> Event:
+        event = Event(type=type_, ts=self.clock(), data=data)
+        line = event.to_json()
+        self.buffer.append(line)
+        if self._fh is not None:
+            self._fh.write(line + "\n")
+            self._fh.flush()
+        return event
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def __enter__(self) -> "EventStream":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+```
+
+---
+
+### `gpu_runner/redact.py`
+
+```python
+"""Secret redaction.
+
+A :class:`Redactor` replaces configured secret values with a placeholder in
+any string that is emitted (events, logs). It works by scanning for the
+literal secret value and replacing it.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+class Redactor:
+    """Redacts configured secret values from strings."""
+
+    def __init__(self, secrets: dict[str, str] | None = None) -> None:
+        # Map of secret name -> secret value.
+        self._secrets: dict[str, str] = {}
+        if secrets:
+            for name, value in secrets.items():
+                if value is not None:
+                    self._secrets[name] = str(value)
+
+    def add(self, name: str, value: str) -> None:
+        if value is not None:
+            self._secrets[name] = str(value)
+
+    def redact(self, name: str, value: Any) -> str:
+        """Return the redacted placeholder for a named secret."""
+        return f"<redacted:{name}>"
+
+    def redact_text(self, text: str) -> str:
+        """Replace any known secret value in ``text`` with a placeholder."""
+        if not isinstance(text, str):
+            return text
+        out = text
+        for name, value in self._secrets.items():
+            if value:
+                out = out.replace(value, f"<redacted:{name}>")
+        return out
+
+    def redact_obj(self, obj: Any) -> Any:
+        """Recursively redact secret values in a JSON-like structure."""
+        if isinstance(obj, str):
+            return self.redact_text(obj)
+        if isinstance(obj, dict):
+            return {k: self.redact_obj(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [self.redact_obj(v) for v in obj]
+        return obj
+```
+
+---
+
+### `gpu_runner/runner.py`
+
+```python
+"""The asynchronous job runner.
+
+Responsibilities:
+  * Enforce a single active GPU job at a time (a semaphore of size 1).
+  * Persist state atomically after every transition.
+  * Resume already-completed work (skip terminal jobs).
+  * Stream structured JSONL events (redacted).
+  * Handle SIGINT by cancelling the active job and draining gracefully.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import signal
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+from .events import EventStream
+from .manifest import Job, Manifest
+from .redact import Redactor
+from .state import JobState, JobStatus, State, StateStore
+
+
+class JobError(Exception):
+    """Raised when a job's workload fails."""
+
+
+@dataclass
+class RunnerConfig:
+    """Runtime configuration for :class:`JobRunner`."""
+
+    state_path: str | Path
+    events_path: str | Path | None = None
+    secrets: dict[str, str] = field(default_factory=dict)
+    # Simulated per-step duration in seconds. Kept tiny for tests.
+    step_duration: float = 0

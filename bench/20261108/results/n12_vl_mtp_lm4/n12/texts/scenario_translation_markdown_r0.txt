@@ -1,0 +1,46 @@
+# 发布流程
+
+发布负责人必须原样保留诸如 `request_id`、`max_context`、`kv_dtype` 和 `mtp_rounds` 等标识符。将正文翻译为中文，但请勿翻译代码、JSON 键、命令行标志、文件名或表格中的值。
+
+| Phase | Required evidence | Failure action |
+|---|---|---|
+| prepare | fixture hash and prompt-token count | stop before generation |
+| warmup | one successful unmeasured request | restart the service |
+| measure | five sequential responses | invalidate the complete block |
+| publish | summary plus per-request rows | withhold the headline |
+
+```json
+{"model":"qwen3.6-35b-a3b","max_completion_tokens":1024,"seed":42,"stream":false}
+```
+
+## 备注
+
+操作员需检查前缀复用已禁用、缓存命中计数为零，且没有无关的 GPU 进程处于活动状态。自然停止的响应仍视为有效观测；因客户端断开连接而丢失的响应则不视为有效。报告区分了服务器内部 TTFT 与网络观测时间，并说明首个生成 token 被分配给 prefill 阶段。
+
+## 双语术语表
+
+| 英文术语 | 中文术语 | 简要说明 |
+| :--- | :--- | :--- |
+| release owner | 发布负责人 | 负责管理发布流程及确保数据完整性的角色。 |
+| request_id | 请求标识符 | 用于唯一标识单个 API 请求的字符串。 |
+| max_context | 最大上下文长度 | 模型可处理的最大输入 token 数量限制。 |
+| kv_dtype | KV 缓存数据类型 | 键值（Key-Value）缓存存储所使用的数值数据类型。 |
+| mtp_rounds | MTP 轮次 | 多 token 预测（Multi-Token Prediction）的迭代轮数。 |
+| fixture hash | 测试数据哈希 | 用于验证测试输入数据完整性的哈希值。 |
+| prompt-token count | 提示词 token 数量 | 输入提示词中包含的 token 总数。 |
+| warmup | 预热 | 在正式测量前运行非计时请求以稳定系统状态的过程。 |
+| unmeasured request | 非计时请求 | 不纳入性能统计的测试请求。 |
+| sequential responses | 顺序响应 | 按顺序连续生成的多个响应结果。 |
+| invalidate | 使无效 | 标记某数据块或结果不可用或需重新生成。 |
+| per-request rows | 每请求行 | 报告中针对每个单独请求列出的详细数据行。 |
+| headline | 标题/主要指标 | 报告中展示的核心性能指标或结论。 |
+| prefix reuse | 前缀复用 | 利用相同前缀的缓存以加速后续请求的机制。 |
+| cache-hit count | 缓存命中计数 | 成功从缓存中获取数据的次数统计。 |
+| GPU process | GPU 进程 | 占用图形处理器资源的操作系统进程。 |
+| observation | 观测 | 在实验或测试中记录到的数据点或结果。 |
+| TTFT | 首字延迟 | Time To First Token，从请求发出到收到第一个生成 token 的时间。 |
+| network-observed time | 网络观测时间 | 客户端通过网络测量到的端到端响应时间。 |
+| prefill | 预填充 | 模型处理输入提示词并生成初始 KV 缓存的阶段。 |
+| generated token | 生成 token | 模型在解码阶段逐个输出的语言单元。 |
+| stream | 流式传输 | 是否以流式方式逐步返回生成内容的布尔标志。 |
+| seed | 随机种子 | 用于控制随机数生成器以确保结果可复现的整数。 |

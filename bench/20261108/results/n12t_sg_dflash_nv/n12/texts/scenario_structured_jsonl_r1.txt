@@ -1,0 +1,132 @@
+We need answer user's request exactly 160 JSONL records no Markdown. Need produce 160 lines, each strict JSON object. Fields: id RUN-0001 through RUN-0160, model alternating qwen3.6-27b and qwen3.6-35b-a3b. prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance, status, tags. Use deterministic arithmetic progressions, status values ok/warn in a 4:1 pattern, and two tags per record. Every line must parse independently as strict JSON.
+
+Need ensure exact 160 lines no markdown. Need decide arithmetic progressions. Could make simple:
+id = RUN-%04d for n=1..160.
+model = n odd qwen3.6-27b, even qwen3.6-35b-a3b (alternating).
+prompt_tokens maybe 1000 + 10*(n-1)? completion_tokens = 200 + 5*(n-1). decode_tok_s = 50 + 0.5*(n-1) but JSON number can be decimal. mtp_acceptance = 0.8 + 0.001*(n-1) maybe. status: ok/warn in 4:1 pattern. Need interpret: every 5 records one warn, e.g., if (n-1)%5 == 4 warn else ok (4 ok then 1 warn). Or maybe 4 ok :1 warn. For 160 records, 32 warns.
+tags: two tags per record. Could deterministic: ["batch", "run-"+str(n)]? Need two tags. Maybe ["decode","mtp"] or rotating? To be safe: tags ["run", "batch"]? But each record two tags. Could use ["tag-a", "tag-b"]? Need deterministic. Maybe ["decode", "mtp"] all same. But maybe more informative. Could use first tag based on status? e.g., ["ok", "mtp"] or ["warn","decode"]? But two tags. Simpler: ["run-"+str(n), "deterministic"]? JSON strings okay. Need exactly 160 lines.
+
+Need ensure no trailing extra? Could output lines. Need not include code block. Must be no Markdown. So raw JSONL.
+
+Need verify arithmetic progression: prompt_tokens: 1000 + 10*(i-1) = 1000,1010,...1590. completion_tokens: 200+5*(i-1)=200..995. decode_tok_s: 50 + 0.5*(i-1)=50..129.5. mtp_acceptance: 0.8 + 0.001*(i-1)=0.8..0.959. Strict JSON numbers ok. But floating decimal maybe 0.800? Could include 0.8, 0.801 etc. For 0.8 + 0.001*159=0.959. Good.
+
+Need status 4:1 pattern. If i mod 5? For i=1: ok, 2 ok,3 ok,4 ok,5 warn, 6 ok... So condition i % 5 == 0 warn. That's 4:1.
+
+Need tags two per record. Use ["seq-"+str(i), "deterministic"]? Each record has unique tag. Or perhaps ["ok","mtp"]? If status changes maybe tags can be ["status-ok","mtp"]. But two tags. Let's do tags: ["run-"+str(i), "deterministic"] maybe two tags. The string "run-1" okay. Or ["batch","sequence"]? Could be same. The user didn't specify unique tags. Need deterministic arithmetic progressions maybe tags not arithmetic? Could make tags ["t"+str(i), "deterministic"]? That's two strings. Fine.
+
+But if id already RUN-0001, tags can be ["batch","deterministic"]? All same is okay but maybe less deterministic? It is deterministic. But maybe two tags per record, no requirement unique. Could do ["decode","mtp"] all records. But to show progressions maybe tags: ["tag-a","tag-b"]? I'd use ["batch", "deterministic"] to be simple. But maybe all same okay. Need every line parse. Let's construct 160 lines.
+
+Need avoid mistakes. Could generate mentally? Need exact 160 lines. We can generate systematically. We need final answer only lines. Need ensure no markdown. Need count 160. I can produce by patterns. Need be careful with ids formatting 4 digits.
+
+Let's plan line template:
+{"id":"RUN-0001","model":"qwen3.6-27b","prompt_tokens":1000,"completion_tokens":200,"decode_tok_s":50,"mtp_acceptance":0.8,"status":"ok","tags":["batch","deterministic"]}
+{"id":"RUN-0002","model":"qwen3.6-35b-a3b","prompt_tokens":1010,"completion_tokens":205,"decode_tok_s":50.5,"mtp_acceptance":0.801,"status":"ok","tags":["batch","deterministic"]}
+...
+For i=5 warn, mtp_acceptance 0.804? 0.8+0.004=0.804.
+Need ensure decode_tok_s for i=1 50 (integer ok), i=2 50.5, i=3 51, etc. mtp_acceptance maybe 0.8, 0.801, 0.802, 0.803, 0.804. Could output 0.801 etc. Strict JSON permits trailing? Yes.
+
+Need 160 lines. We can maybe generate in blocks of 10 with status. Need not overthink but must count. Could use a table. Let's create all lines. Need ensure no missing. Could produce 160 lines by grouping. Since final is long, need carefully.
+
+Let's create generation formulas:
+n from 1 to 160.
+id: RUN-0001 to RUN-0160.
+model: n odd -> qwen3.6-27b; even -> qwen3.6-35b-a3b.
+prompt = 1000 + 10*(n-1)
+completion = 200 + 5*(n-1)
+decode = 50 + 0.5*(n-1). For integer when n odd? n-1 even -> integer + .0? Actually 0.5*(even) = integer. So n odd decode integer: 50,51,...; n even decimal .5: 50.5,51.5.
+mtp = 0.8 + 0.001*(n-1). For n=1:0.8, 2:0.801, ..., 160:0.959. Output maybe 0.8 for n=1, 0.801 etc. For n=101? 0.8+0.1=0.9. Could output 0.9. Need consistency? Arithmetic progression. Could output 0.9 or 0.900. Strict JSON okay. But if I output 0.900, valid? JSON numbers can have leading zeros? 0.900 valid. Could use fixed three decimals for mtp_acceptance except 0.800? JSON 0.800 valid. But maybe simpler: 0.8, 0.801, 0.802, ... But at 101: 0.9, 102: 0.901, etc. That's fine. Need avoid 0.80? 0.800? I can output 0.800 for n=1? JSON number 0.800 valid. But perhaps uniform 0.800,0.801,...0.959. Strict JSON permits trailing zeros. That is neat. For n=1: 0.800. For n=100: 0.899, n=101:0.900. Good. Use 3 decimals always. For decode, maybe uniform? Could output 50.0,50.5,51.0? JSON 50.0 valid. But user didn't require fixed. Could output integers for integer values, decimal for halves. To avoid mistakes, use integer if no .5? e.g., 50, 50.5. Strict JSON okay. Could use 50.0? Also okay. But if use 50.0 maybe fine. However prompt_tokens and completion_tokens integer.
+
+Need status: if n%5==0 warn else ok. So line 5 warn, 10 warn, ...160 warn? 160%5=0, warn. Good.
+
+Tags: I think use ["batch", "deterministic"] for all. Two tags. But maybe they expect tags array with two strings. Yes.
+
+Need exact 160. Let's generate. I can write a mental loop and output. Need be very careful. Since long, maybe I can create 16 blocks of 10 lines. For each block n=1-10, 11-20, ... 151-160.
+
+Let's create template for 10 consecutive n. We'll list values.
+
+For n=1:
+id RUN-0001, model qwen3.6-27b, prompt 1000, comp 200, decode 50, mtp 0.800, status ok
+n=2:
+RUN-0002, model qwen3.6-35b-a3b, prompt 1010, comp 205, decode 50.5, mtp 0.801, ok
+n=3:
+RUN-0003, 27b, 1020,210,51,0.802,ok
+n=4:
+RUN-0004, 35b,1030,215,51.5,0.803,ok
+n=5:
+RUN-0005,27b,1040,220,52,0.804,warn
+n=6:
+RUN-0006,35b,1050,225,52.5,0.805,ok
+n=7:
+RUN-0007,27b,1060,230,53,0.806,ok
+n=8:
+RUN-0008,35b,1070,235,53.5,0.807,ok
+n=9:
+RUN-0009,27b,1080,240,54,0.808,ok
+n=10:
+RUN-0010,35b,1090,245,54.5,0.809,warn
+
+Need note for n=10 status warn (n%5=0). Good.
+
+Block 11-20:
+11: 1100? Wait prompt 1000+10*(10)=1100 yes for n=11 (n-1=10). comp 200+5*10=250. decode 50+0.5*10=55. mtp 0.810. status ok (11%5=1). model odd 27b.
+12: prompt1110 comp255 dec55.5 mtp0.811 ok 35b
+13:1120 260 56 0.812 ok 27b
+14:1130 265 56.5 0.813 ok 35b
+15:1140 270 57 0.814 warn 27b
+16:1150 275 57.5 0.815 ok 35b
+17:1160 280 58 0.816 ok 27b
+18:1170 285 58.5 0.817 ok 35b
+19:1180 290 59 0.818 ok 27b
+20:1190 295 59.5 0.819 warn 35b
+
+Block 21-30:
+21: prompt 1200, comp 300, dec 60, mtp 0.820, ok 27b
+22:1210,305,60.5,0.821 ok 35
+23:1220,310,61,0.822 ok 27
+24:1230,315,61.5,0.823 ok 35
+25:1240,320,62,0.824 warn 27
+26:1250,325,62.5,0.825 ok 35
+27:1260,330,63,0.826 ok 27
+28:1270,335,63.5,0.827 ok 35
+29:1280,340,64,0.828 ok 27
+30:1290,345,64.5,0.829 warn 35
+
+Block 31-40:
+31:1300,350,65,0.830 ok 27
+32:1310,355,65.5,0.831 ok 35
+33:1320,360,66,0.832 ok 27
+34:1330,365,66.5,0.833 ok 35
+35:1340,370,67,0.834 warn 27
+36:1350,375,67.5,0.835 ok 35
+37:1360,380,68,0.836 ok 27
+38:1370,385,68.5,0.837 ok 35
+39:1380,390,69,0.838 ok 27
+40:1390,395,69.5,0.839 warn 35
+
+Block 41-50:
+41:1400,400,70,0.840 ok 27
+42:1410,405,70.5,0.841 ok 35
+43:1420,410,71,0.842 ok 27
+44:1430,415,71.5,0.843 ok 35
+45:1440,420,72,0.844 warn 27
+46:1450,425,72.5,0.845 ok 35
+47:1460,430,73,0.846 ok 27
+48:1470,435,73.5,0.847 ok 35
+49:1480,440,74,0.848 ok 27
+50:1490,445,74.5,0.849 warn 35
+
+Block 51-60:
+51:1500,450,75,0.850 ok 27
+52:1510,455,75.5,0.851 ok 35
+53:1520,460,76,0.852 ok 27
+54:1530,465,76.5,0.853 ok 35
+55:1540,470,77,0.854 warn 27
+56:1550,475,77.5,0.855 ok 35
+57:1560,480,78,0.856 ok 27
+58:1570,485,78.5,0.857 ok 35
+59:1580,490,79,0.858 ok 27
+60:1590,495,79.5,0.859 warn 35
+
+Block 61-70:
+61:1600,500,80,0.860 ok 27
+62:1610,505,80.5,0.861 ok 3

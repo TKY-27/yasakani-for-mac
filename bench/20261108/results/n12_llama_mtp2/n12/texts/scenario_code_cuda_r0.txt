@@ -1,0 +1,376 @@
+# BF16 Row-Normalization on sm_120a (CUDA 13.1 / C++20)
+
+Below is a complete, self-contained program. It generates a deterministic BF16 matrix, normalizes each row to unit L2 norm using a vectorized `sm_120a` kernel, verifies against a numerically-stable FP32 reference, and reports CUDA-event timing.
+
+```cpp
+// bf16_row_norm.cu
+//
+// Row-wise L2 normalization of a large BF16 matrix on an sm_120a GPU.
+//
+//   * Deterministic input generation (xorshift64* PRNG -> BF16)
+//   * RAII device buffers (throwing, exception-safe)
+//   * Vectorized CUDA kernel (16-byte loads/stores, __nv_bfloat162)
+//   * Numerically-stable FP32 reference (two-pass, Kahan-compensated)
+//   * Warm-up + CUDA-event timing
+//   * Tolerance-based verification
+//   * Full CUDA error checking
+//
+// Build (see CMakeLists.txt):
+//   cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=120a
+//   cmake --build build
+//   ./bf16_row_norm --rows 8192 --cols 4096 --iters 20
+//
+// NOTE: sm_120a is a Blackwell-family architecture. This code is written
+// against the CUDA 13.1 toolchain (nvcc --gpu-architecture=sm_120a).
+// The kernel uses only portable intrinsics (__nv_bfloat162, __float2bfloat162_rn,
+// __bfloat162float2, __ldg, __ldcs, __stcs, __shfl_xor_sync, __syncthreads,
+// __reduce_add_sync) so it also compiles for sm_80/sm_90/sm_100/sm_120.
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <limits>
+#include <string>
+#include <vector>
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+// ---------------------------------------------------------------------------
+// CUDA error checking
+// ---------------------------------------------------------------------------
+#define CUDA_CHECK(call)                                                       \
+  do {                                                                         \
+    cudaError_t _e = (call);                                                   \
+    if (_e != cudaSuccess) {                                                   \
+      std::fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,       \
+                   cudaGetErrorString(_e));                                    \
+      std::exit(EXIT_FAILURE);                                                 \
+    }                                                                          \
+  } while (0)
+
+#define CUDA_CHECK_KERNEL()                                                    \
+  do {                                                                         \
+    cudaError_t _e = cudaGetLastError();                                       \
+    if (_e != cudaSuccess) {                                                   \
+      std::fprintf(stderr, "CUDA kernel launch error %s:%d: %s\n", __FILE__,   \
+                   __LINE__, cudaGetErrorString(_e));                          \
+      std::exit(EXIT_FAILURE);                                                 \
+    }                                                                          \
+    _e = cudaDeviceSynchronize();                                              \
+    if (_e != cudaSuccess) {                                                   \
+      std::fprintf(stderr, "CUDA device sync error %s:%d: %s\n", __FILE__,     \
+                   __LINE__, cudaGetErrorString(_e));                          \
+      std::exit(EXIT_FAILURE);                                                 \
+    }                                                                          \
+  } while (0)
+
+// ---------------------------------------------------------------------------
+// Deterministic PRNG: xorshift64* (Marsaglia-style). 64-bit state, cheap,
+// well-distributed, and reproducible across runs/platforms.
+// ---------------------------------------------------------------------------
+struct Xorshift64Star {
+  uint64_t state;
+  explicit Xorshift64Star(uint64_t seed) : state(seed ? seed : 0x9E3779B97F4A7C15ull) {}
+  uint64_t next() {
+    uint64_t x = state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    state = x;
+    return x * 0x2545F4914F6CDD17ull;
+  }
+  // Uniform float in [0, 1)
+  float nextFloat() {
+    return static_cast<float>(next() >> 40) * (1.0f / 1048576.0f); // 24-bit mantissa
+  }
+  // Standard normal via Box-Muller (one pair per two calls)
+  float nextNormal() {
+    float u1 = nextFloat();
+    if (u1 < 1e-12f) u1 = 1e-12f;
+    float u2 = nextFloat();
+    float r = std::sqrt(-2.0f * std::log(u1));
+    return r * std::cos(2.0f * static_cast<float>(M_PI) * u2);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// RAII device buffer. Throws on allocation failure; frees on destruction.
+// ---------------------------------------------------------------------------
+class DeviceBuffer {
+ public:
+  DeviceBuffer() = default;
+  explicit DeviceBuffer(size_t bytes) {
+    if (bytes == 0) return;
+    CUDA_CHECK(cudaMalloc(&ptr_, bytes));
+    bytes_ = bytes;
+  }
+  ~DeviceBuffer() {
+    if (ptr_) {
+      cudaFree(ptr_);
+      ptr_ = nullptr;
+      bytes_ = 0;
+    }
+  }
+  DeviceBuffer(const DeviceBuffer&) = delete;
+  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+  DeviceBuffer(DeviceBuffer&& o) noexcept : ptr_(o.ptr_), bytes_(o.bytes_) {
+    o.ptr_ = nullptr;
+    o.bytes_ = 0;
+  }
+  DeviceBuffer& operator=(DeviceBuffer&& o) noexcept {
+    if (this != &o) {
+      if (ptr_) cudaFree(ptr_);
+      ptr_ = o.ptr_;
+      bytes_ = o.bytes_;
+      o.ptr_ = nullptr;
+      o.bytes_ = 0;
+    }
+    return *this;
+  }
+  void* data() const { return ptr_; }
+  size_t bytes() const { return bytes_; }
+  bool valid() const { return ptr_ != nullptr; }
+
+ private:
+  void* ptr_ = nullptr;
+  size_t bytes_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Problem configuration
+// ---------------------------------------------------------------------------
+struct Config {
+  int rows = 8192;
+  int cols = 4096;
+  int iters = 20;
+  uint64_t seed = 0xC0FFEEull;
+  bool verify = true;
+  bool quiet = false;
+};
+
+static void printUsage(const char* prog) {
+  std::fprintf(stderr,
+               "Usage: %s [options]\n"
+               "  --rows <N>      number of rows (default 8192)\n"
+               "  --cols <N>      number of columns (default 4096)\n"
+               "  --iters <N>     timed iterations (default 20)\n"
+               "  --seed <hex>    PRNG seed (default 0xC0FFEE)\n"
+               "  --no-verify     skip reference verification\n"
+               "  --quiet         suppress per-iteration output\n"
+               "  --help          show this message\n",
+               prog);
+}
+
+static bool parseArgs(int argc, char** argv, Config& cfg) {
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    auto need = [&](const char* name) -> const char* {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "Missing value for %s\n", name);
+        return nullptr;
+      }
+      return argv[++i];
+    };
+    if (a == "--rows") {
+      const char* v = need("--rows");
+      if (!v) return false;
+      cfg.rows = std::atoi(v);
+    } else if (a == "--cols") {
+      const char* v = need("--cols");
+      if (!v) return false;
+      cfg.cols = std::atoi(v);
+    } else if (a == "--iters") {
+      const char* v = need("--iters");
+      if (!v) return false;
+      cfg.iters = std::atoi(v);
+    } else if (a == "--seed") {
+      const char* v = need("--seed");
+      if (!v) return false;
+      cfg.seed = std::strtoull(v, nullptr, 0);
+    } else if (a == "--no-verify") {
+      cfg.verify = false;
+    } else if (a == "--quiet") {
+      cfg.quiet = true;
+    } else if (a == "--help" || a == "-h") {
+      printUsage(argv[0]);
+      std::exit(0);
+    } else {
+      std::fprintf(stderr, "Unknown option: %s\n", a.c_str());
+      printUsage(argv[0]);
+      return false;
+    }
+  }
+  if (cfg.rows <= 0 || cfg.cols <= 0 || cfg.iters <= 0) {
+    std::fprintf(stderr, "rows/cols/iters must be positive\n");
+    return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Host-side deterministic input generation.
+//
+// Layout: row-major, [rows][cols] of __nv_bfloat16.
+// Each element is a standard-normal sample, then rounded to BF16.
+// ---------------------------------------------------------------------------
+static void generateInput(std::vector<__nv_bfloat16>& out, int rows, int cols,
+                          uint64_t seed) {
+  out.resize(static_cast<size_t>(rows) * cols);
+  Xorshift64Star rng(seed);
+  for (int r = 0; r < rows; ++r) {
+    __nv_bfloat16* row = out.data() + static_cast<size_t>(r) * cols;
+    for (int c = 0; c < cols; ++c) {
+      row[c] = __float2bfloat16(rng.nextNormal());
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Vectorized CUDA kernel.
+//
+// Grid:  (rows, 1, 1)          -> one block per row
+// Block: (threadsPerRow, 1, 1) -> threads cooperate on one row
+//
+// Each thread processes a strided set of 8-element (16-byte) chunks.
+// Two passes:
+//   Pass 1: accumulate sum-of-squares in FP32 (Kahan-compensated).
+//   Pass 2: scale each element by 1/sqrt(sum) and store as BF16.
+//
+// Reduction of the per-thread partial sums uses warp shuffle + shared memory.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float warpReduceSum(float val) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    val += __shfl_xor_sync(0xFFFFFFFFu, val, offset);
+  }
+  return val;
+}
+
+__global__ void rowNormalizeKernel(const __nv_bfloat16* __restrict__ in,
+                                   __nv_bfloat16* __restrict__ out,
+                                   int cols) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+
+  const __nv_bfloat16* rowIn = in + static_cast<size_t>(row) * cols;
+  __nv_bfloat16* rowOut = out + static_cast<size_t>(row) * cols;
+
+  // Number of 8-element chunks in this row.
+  const int chunks = cols / 8;
+
+  // Shared memory for inter-warp reduction.
+  __shared__ float warpSums[32];  // up to 32 warps (1024 threads)
+
+  // ---- Pass 1: compute sum of squares (Kahan-compensated per thread) ----
+  float sum = 0.0f;
+  float comp = 0.0f;  // Kahan compensation
+
+  for (int c = tid; c < chunks; c += nthreads) {
+    // 16-byte aligned load of 8 BF16 values.
+    const uint4* p = reinterpret_cast<const uint4*>(rowIn) + c;
+    uint4 v = __ldg(p);
+
+    // Convert 8 BF16 -> 8 FP32 via 4 x __nv_bfloat162.
+    const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&v);
+    float2 f0 = __bfloat162float2(h2[0]);
+    float2 f1 = __bfloat162float2(h2[1]);
+    float2 f2 = __bfloat162float2(h2[2]);
+    float2 f3 = __bfloat162float2(h2[3]);
+
+    // Kahan sum of squares.
+    float y0 = f0.x * f0.x - comp;
+    float t0 = sum + y0;
+    comp = (t0 - sum) - y0;
+    sum = t0;
+
+    float y1 = f0.y * f0.y - comp;
+    float t1 = sum + y1;
+    comp = (t1 - sum) - y1;
+    sum = t1;
+
+    float y2 = f1.x * f1.x - comp;
+    float t2 = sum + y2;
+    comp = (t2 - sum) - y2;
+    sum = t2;
+
+    float y3 = f1.y * f1.y - comp;
+    float t3 = sum + y3;
+    comp = (t3 - sum) - y3;
+    sum = t3;
+
+    float y4 = f2.x * f2.x - comp;
+    float t4 = sum + y4;
+    comp = (t4 - sum) - y4;
+    sum = t4;
+
+    float y5 = f2.y * f2.y - comp;
+    float t5 = sum + y5;
+    comp = (t5 - sum) - y5;
+    sum = t5;
+
+    float y6 = f3.x * f3.x - comp;
+    float t6 = sum + y6;
+    comp = (t6 - sum) - y6;
+    sum = t6;
+
+    float y7 = f3.y * f3.y - comp;
+    float t7 = sum + y7;
+    comp = (t7 - sum) - y7;
+    sum = t7;
+  }
+
+  // ---- Block reduction of per-thread partial sums ----
+  const int warpId = tid / 32;
+  const int laneId = tid % 32;
+  float wsum = warpReduceSum(sum);
+  if (laneId == 0) warpSums[warpId] = wsum;
+  __syncthreads();
+
+  // Reduce across warps (at most 32 warps).
+  float blockSum = 0.0f;
+  if (tid < 32) {
+    float v = (warpId < nthreads / 32) ? warpSums[warpId] : 0.0f;
+    v = warpReduceSum(v);
+    if (laneId == 0) warpSums[0] = v;
+  }
+  __syncthreads();
+  blockSum = warpSums[0];
+
+  // ---- Compute scale factor ----
+  float scale = 0.0f;
+  if (blockSum > 0.0f) {
+    scale = rsqrtf(blockSum);
+  }
+
+  // ---- Pass 2: scale and store ----
+  for (int c = tid; c < chunks; c += nthreads) {
+    const uint4* p = reinterpret_cast<const uint4*>(rowIn) + c;
+    uint4 v = __ldcs(p);  // streaming load (evict-first)
+
+    const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&v);
+    float2 f0 = __bfloat162float2(h2[0]);
+    float2 f1 = __bfloat162float2(h2[1]);
+    float2 f2 = __bfloat162float2(h2[2]);
+    float2 f3 = __bfloat162float2(h2[3]);
+
+    f0.x *= scale; f0.y *= scale;
+    f1.x *= scale; f1.y *= scale;
+    f2.x *= scale; f2.y *= scale;
+    f3.x *= scale; f3.y *= scale;
+
+    uint4 outV;
+    __nv_bfloat162* o2 = reinterpret_cast<__nv_bfloat162*>(&outV);
+    o2[0] = __float2bfloat162_rn(f0);
+    o2[1] = __float2bfloat162_rn(f1);
+    o2[2] = __float2bfloat162_rn(f2);
+    o2[3] = __float2bfloat162_rn(f3);
+
+    uint4* po = reinterpret_cast<uint4*>(rowOut) + c;
+    __stcs(po, out

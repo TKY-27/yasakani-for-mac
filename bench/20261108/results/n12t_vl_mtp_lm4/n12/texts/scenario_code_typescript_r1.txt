@@ -1,0 +1,293 @@
+The user is asking for a complete TypeScript 5 service with the following features:
+
+1. Consumes newline-delimited (NDJSON) request metrics
+2. Validates without third-party schema libraries (i.e., no zod, no ajv)
+3. Groups records by model and fixture
+4. Computes mean/median/sample standard deviation
+5. Exposes `/health`, `/summary`, `/runs/:id` endpoints
+6. Includes strict types
+7. Incremental parsing
+8. Bounded memory
+9. Malformed-input errors
+10. Unit tests
+11. package.json
+12. tsconfig.json
+13. A short operational guide
+14. No placeholders
+
+Let's design this properly.
+
+**Architecture:**
+
+- **Ingestion source**: NDJSON stream. Support stdin and/or HTTP POST endpoint (ingest) — the requirement says "consumes newline-delimited request metrics" so the natural way is a stream-based consumer. We can accept NDJSON via stdin, and also support POST /ingest for programmatic use. Actually, to keep it focused, implement a stream-based ingest that reads from stdin or a file, plus optionally an HTTP POST ingest endpoint. Hmm, but that might broaden scope. The endpoints required are /health, /summary, /runs/:id. Ingest comes from NDJSON stream — implement a `NdjsonIngestService` that consumes an `AsyncIterable<string>` / Node streams, does incremental line parsing, validates, aggregates into bounded memory.
+
+- **Bounded memory**: Since we group by (model, fixture) and compute mean/median/sample stddev, we can use Welford's algorithm for online mean and variance (O(1) per group). Median requires all values, which is unbounded. To bound memory, implement a bounded reservoir / bounded sliding-window per group: keep the most recent K values (a ring buffer) for median estimation. Document that median is estimated over the most recent `maxSamplesPerGroup` values, bounded. Also bound the number of distinct groups with an LRU eviction or rejection policy (a max distinct groups cap). This achieves bounded memory even for long streams.
+
+Let's design:
+
+**Types:**
+
+```ts
+interface RequestMetricRecord {
+  runId: string;
+  model: string;
+  fixture: string;
+  latencyMs: number; // latency per request
+  status: number?
+  ts: string; // ISO timestamp
+}
+```
+
+Let's define the record schema:
+
+```
+{"runId":"r-01","model":"gpt-x","fixture":"search","ts":"2025-01-01T00:00:00Z","latencyMs":123.4,"status":200}
+```
+
+Fields:
+- runId: non-empty string, max length
+- model: non-empty string, max length
+- fixture: non-empty string, max length
+- ts: ISO 8601 string parseable by Date
+- latencyMs: finite number, >= 0, capped at some max
+- status: optional integer 100–599? Make status optional.
+
+Required fields: runId, model, fixture, latencyMs. Optional: ts (defaults to ingest time), status.
+
+**Validation without a schema library**: manual validation with type guards and an error type. Produce structured validation errors with path, message, and code.
+
+**Incremental parsing**: `NdjsonLineReader` — an incremental parser that splits an arbitrary byte stream into lines. Handles lines split across chunk boundaries, handles \n and \r\n, enforces max-line-length (line too long => malformed input error, discard the rest of that line until newline — bounded memory). Then JSON.parse each line (JSON.parse is per-line and incremental; can catch parse errors per line).
+
+**Error handling**: Malformed input errors should be collected with a per-batch limit (bounded: keep only the last N errors), report them in /summary or /health, and count the number rejected. Should not crash the service on malformed lines; count and continue. But maybe provide a `failFast` option.
+
+**Aggregation**:
+
+```ts
+class GroupAggregator {
+  key: `${model}|${fixture}`
+  count: number
+  Welford for mean/variance (n, mean, M2)
+  ring buffer of most recent up to K latencyMs values for median
+}
+```
+
+Mean = mean; sample stddev = sqrt(M2/(n-1)) when n >= 2, else null (or 0? sample stddev is undefined for n=1 => null). Median over the window (when count > K, median is approximate — indicate `medianSampled` flag).
+
+**Bounded memory for groups**: cap on distinct groups `maxGroups`. When exceeded, evict least-recently-seen group (simple LRU using a Map iteration order — Map preserves insertion order; move to front on access with delete+set). Track `evictedGroups` count.
+
+**Endpoints**:
+- GET /health: liveness + counters (linesSeen, parsed, rejected, activeGroups, uptimeMs, memory heuristic)
+- GET /summary: overall + per-group stats: [{model, fixture, count, mean, sampleStdDev, median, medianSampled}] sorted by count desc or by key.
+- GET /runs/:id: filter stats for a specific runId. But the grouping key is (model, fixture) — run-scoped stats need per-run sub-aggregates. Hmm. To support /runs/:id without unbounded memory, we can keep a bounded map of per-run aggregations: keep at most `maxTrackedRuns` runs (LRU). Each run entry aggregates per (model|fixture)? That doubles memory. Alternative: /runs/:id returns the group stats restricted to records of that run — we'd need per-run sub-aggregations. Let's implement a bounded runs index: `Map<runId, RunStats>` with RunStats having its own per-group aggregates? More simply: RunStats = { count, perGroup: Map<groupKey, GroupAggregator> } — but this doubles memory. Since both are bounded (maxTrackedRuns * maxGroupsPerRun), memory is bounded. Bounded: cap total distinct runIds tracked (LRU), and cap per-run groups by global group cap or a per-run cap.
+
+Simpler: keep a single global per-group aggregator, and for per-run, keep a parallel structure keyed by runId -> Map<groupKey, GroupAggregator>, but to avoid double-counting complexity, per-run entries reference the same GroupAggregator instance? If global evicts, run references break. Simpler and cleaner: independent per-run aggregators, each with its own window. Memory = maxRuns * maxGroupsPerRun * windowSize. All bounded.
+
+But that's complex. Alternative: keep records themselves? No — that's unbounded.
+
+I think that's cleanest: two-level structure:
+- `groups: Map<GroupKey, GroupAgg>` global (bounded by maxGroups, LRU)
+- `runs: Map<runId, Map<GroupKey, GroupAgg>>` bounded by maxRuns (LRU), each inner map bounded by maxGroupsPerRun (LRU-ish or just reject new groups within a run once cap reached — simpler: if inner map has cap and new group appears, increment a `droppedGroups` counter and skip aggregation for that record's run scope while still counting it in the global aggregate).
+
+Median window: `medianWindow` per group.
+
+**Service**:
+
+```ts
+interface MetricsService {
+  ingest(line: string): IngestResult
+  ingestAll(stream: AsyncIterable<string>): Promise<IngestReport>
+  summary(): Summary
+  run(id: string): RunSummary | undefined
+  health(): Health
+}
+```
+
+**HTTP server**: Use Node's built-in `http` module to avoid third-party deps (no Express). Strict types. The endpoints read from in-memory service. Ingest: read NDJSON from stdin, and optionally a file passed as CLI arg, plus maybe POST /ingest (NDJSON body, bounded size) so it can run as a standalone service. The user said "consumes newline-delimited request metrics" — let's support:
+- CLI: `node dist/main.js --file metrics.ndjson` or stdin pipe
+- HTTP POST /ingest also accepts an NDJSON body (bounded request size) — this makes it a true service. Include POST /ingest, but the required three endpoints are health/summary/runs/:id. Adding /ingest makes it a full service. Keep it but with bounded body (e.g., 1MB).
+
+**Tests**: Use Node's built-in `node:test` runner to avoid a third-party test framework? User said no third-party *schema* libraries; other deps are probably OK, but the fewest deps the better. Use `node:test` + `assert` — built in, zero deps, works with tsx/ts-node? TypeScript 5 + node:test: `ts-node` or compile with tsc then run node:test against the JS. Or use `tsx` to run TS tests directly. To keep zero runtime deps and minimal dev deps: typescript, @types/node, and tsx for dev/test convenience. Tests: run with `npx tsx --test tests/*.test.ts`? Does tsx support --test? `tsx --test` does work (tsx passes the node flag; node --test with tsx loader). Actually `node --import tsx --test tests/` works on Node 18.19+/20. Let's use that in the package.json scripts:
+
+```json
+{
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/main.js",
+    "dev": "tsx src/main.ts",
+    "test": "node --import tsx --test tests/*.test.ts"
+  }
+}
+```
+
+Note: `node --import tsx --test` — in Node 20, `node --test` with `--import tsx` will work. `--import` was added in Node 19.6/20.6? `--import` was added in Node 20.6 / 18.19. Fine, target Node 20+.
+
+Alternative is compile and test JS. Let's target Node >=20 and use the tsx approach; fallback: `npm test` uses tsx. Keep devDependencies: typescript@5.x, tsx, @types/node. No runtime deps.
+
+**tsconfig**: strict: true, exactOptionalPropertyTypes maybe, noUncheckedIndexedAccess, target ES2022, module NodeNext, outDir dist.
+
+**Files:**
+
+```
+package.json
+tsconfig.json
+README.md (operational guide — "short operational guide" — put it in README.md)
+src/
+  main.ts            (entry: HTTP server + stdin/file ingest)
+  types.ts           (strict types, Result, errors)
+  validate.ts        (record validation, no schema library)
+  parse.ts           (incremental line reader)
+  stats.ts           (Welford, median window)
+  aggregate.ts       (bounded aggregator, LRU, per-run)
+  service.ts         (MetricsService that ties ingest + stats + queries)
+  server.ts          (HTTP server with /health, /summary, /runs/:id, POST /ingest)
+  config.ts          (limits)
+tests/
+  validate.test.ts
+  parse.test.ts
+  stats.test.ts
+  service.test.ts
+  server.test.ts
+sample/sample.ndjson
+```
+
+Let me write each file carefully.
+
+### types.ts
+
+```ts
+export interface RequestMetricRecord {
+  runId: string;
+  model: string;
+  fixture: string;
+  latencyMs: number;
+  ts: string;        // ISO-8601
+  status?: number;
+}
+
+export type ValidationErrorCode =
+  | 'INVALID_JSON'
+  | 'NOT_OBJECT'
+  | 'UNKNOWN_FIELD'   // maybe we don't reject unknown fields... let's decide: reject unknown fields? Being strict is nice. Let's allow unknown? For strictness reject with error, and make the error surface. Reject unknown fields => better data hygiene. Let's do it, but be explicit in docs.
+  | 'MISSING_FIELD'
+  | 'INVALID_TYPE'
+  | 'OUT_OF_RANGE'
+  | 'TOO_LONG'
+  | 'INVALID_TIMESTAMP';
+
+export interface ValidationIssue {
+  code: ...;
+  path: string;
+  message: string;
+}
+
+export type ValidationResult =
+  | { ok: true; value: RequestMetricRecord }
+  | { ok: false; issues: ValidationIssue[] };
+```
+
+Limits:
+
+```ts
+export interface ValidationLimits {
+  maxRunIdLength: number;
+  maxModelLength: number;
+  maxFixtureLength: number;
+  maxLatencyMs: number;
+  allowedStatuses: [number, number]; // 100..599
+}
+```
+
+validate.ts:
+
+```ts
+export function validateRecord(raw: string, limits: ValidationLimits): ValidationResult
+```
+
+Steps:
+- Trim line; empty line => skip (return ok with value null?) Let's define: an empty/whitespace-only line is silently skipped as not an error. `parseLine` returns `kind: 'empty' | 'error(INVALID_JSON) | 'record'`.
+- JSON.parse; catch => INVALID_JSON with position info? JSON.parse error message includes position; include it.
+- If not object / null => NOT_OBJECT.
+- Unknown keys => UNKNOWN_FIELD issue (collect all, don't stop early — collect all issues per line, up to a limit of N issues per line for bounded error messages).
+- runId: string, non-empty (after trim? require non-empty and length <= maxRunIdLength; enforce charset? Keep it printable ASCII to prevent weirdness: /^[A-Za-z0-9._-]+$/ — good strictness. Same for model/fixture.)
+- latencyMs: number, finite, >= 0, <= maxLatencyMs.
+- status optional: integer 100..599.
+- ts optional? Let's make ts optional, default server time on ingest (record.ingestedAt). If present, ISO-8601, `Date.parse` finite, and additionally validate with a regex to avoid Date.parse accepting e.g. "2024-13-01" which would be invalid... Actually, "2024-13-01" returns NaN in V8. But Date.parse accepts e.g. "not a date"? No. Accepts some weird things like "01/02/2024"? I think Date.parse("01/02/2024") returns NaN on modern V8? Actually it does parse as US-style MM/DD? Historically V8 accepted "01/02/2024"? I recall Date.parse("1/2/2024") is valid in V8. To be strict, use an ISO regex: /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/, then Date.parse finite. Then check that calendar values are in range with new Date. Good.
+
+Return all issues (bounded to like 8 per line).
+
+### parse.ts — incremental line reader
+
+```ts
+export interface LineReaderOptions {
+  maxLineBytes: number;
+  onError?: (e: { kind: 'line-too-long'; lineBytes: number }) => void;
+}
+
+export class IncrementalLineReader {
+  private buffer: string;
+  private overflowRemaining: number; // when overflow, count bytes until next newline
+  ...
+  push(chunk: string): string[]
+  end(): string[]
+}
+```
+
+Design: keep a pending partial line in memory (bounded by maxLineLength). On chunk: append; while buffer contains \n: split. If segment length > maxLineLength, report an error (kind line-too-long) and discard until the next newline — set a "discarding" mode with a remaining length. Handle \r\n: strip a single trailing \r. Also handle UTF-8: consume the stream as a string via `Readable` with default encoding 'utf8' — Node will handle the encoding incrementally and won't split multi-byte characters. In file mode, we read chunks as utf8. Fine.
+
+Implementation details:
+
+```ts
+type LineEvent =
+  | { kind: 'line'; line: string }
+  | { kind: 'line-too-long'; length: number }
+  | { kind: 'empty' } // maybe not needed; treat empty line as a line and let the service skip
+
+class IncrementalLineReader {
+  private pending = '';
+  private discarding = 0;
+  constructor(private readonly maxLineLength: number) {}
+  push(chunk: string): LineEvent[] {
+    const events: LineEvent[] = [];
+    let rest = chunk;
+    while (rest.length > 0) {
+      if (this.discarding > 0) {
+        const nl = rest.indexOf('\n');
+        if (nl === -1) {
+          const take = Math.min(rest.length, this.discarding);
+          rest = rest.slice(take);
+          this.discarding -= take;
+        } else {
+          // consume up to newline
+          rest = rest.slice(nl + 1);
+          this.discarding = 0;
+          this.pending = '';
+        }
+        continue;
+      }
+      const nl = this.pending.length === 0 ? rest.indexOf('\n') : ...;
+      ...
+    }
+  }
+}
+```
+
+Simpler: always prepend pending to the front: `this.pending += chunk;` then process:
+
+```ts
+push(chunk: string): LineEvent[] {
+  if (this.discarding === 0) this.pending += chunk;
+  const events: LineEvent[] = [];
+  while (true) {
+    if (this.discarding > 0) {
+      const nl = this.pending.indexOf('\n');
+      if (nl === -1) {
+        // Need more data; but pending is holding entire discarded data unbounded!
+      }
+    }
+  }
+}
+```
+
+Problem: while discarding, we shouldn't hold data; only hold until newline. But the chunk can be huge. Better approach: handle discarding directly on the chunk, not on the pending buffer:
+
+State: `discardingLeft` (number of characters to skip before we stop discarding, counting characters; when 0, we're right after consuming the \n... actually track "discarding until

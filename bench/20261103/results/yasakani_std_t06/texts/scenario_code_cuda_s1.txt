@@ -1,0 +1,461 @@
+# `bf16_rownorm` — BF16 row normalization on sm_120a (Blackwell)
+
+Below is a complete, self‑contained project. Build it with the supplied `CMakeLists.txt` (requires CUDA ≥ 13.1 and C++20).
+
+```
+bf16_rownorm/
+├── CMakeLists.txt
+├── src/
+│   ├── main.cpp
+│   ├── common.hpp
+│   ├── common.cpp
+│   ├── device.hpp
+│   ├── device.cpp
+│   ├── bf16.hpp
+│   ├── bf16.cu
+│   ├── reference.hpp
+│   ├── reference.cpp
+│   ├── kernel.cu
+│   └── verify.hpp
+└── tests/
+    └── test_bf16.cpp
+```
+
+---
+
+## `CMakeLists.txt`
+
+```cmake
+cmake_minimum_required(VERSION 3.26)
+
+project(bf16_rownorm LANGUAGES CXX CUDA)
+
+# ---------------------------------------------------------------------------
+# Toolchain
+# ---------------------------------------------------------------------------
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+# sm_120a is the "architecture-accelerated" Blackwell feature target.  We
+# compile for it explicitly and forbid any other arch so the binary is
+# guaranteed to run only on the intended silicon.
+set(CMAKE_CUDA_ARCHITECTURES "120a" PARENT_SCOPE)
+
+if(NOT CMAKE_CUDA_COMPILER)
+    message(FATAL_ERROR "No CUDA compiler found.  Set CMAKE_CUDA_COMPILER.")
+endif()
+
+# ---------------------------------------------------------------------------
+# Build type
+# ---------------------------------------------------------------------------
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# ---------------------------------------------------------------------------
+# CUDA runtime flags (CMake appends these to the nvcc driver invocation)
+# ---------------------------------------------------------------------------
+set(CUDA_FLAGS
+    -O3
+    --expt-relaxed-constexpr
+    -lineinfo
+)
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    list(APPEND CUDA_FLAGS -Xcudafe --diag_suppress=unrecognized_pragma)
+endif()
+
+# ---------------------------------------------------------------------------
+# Library target (device code + shared host helpers)
+# ---------------------------------------------------------------------------
+add_library(bf16_rownorm_lib STATIC
+    src/common.cpp
+    src/device.cpp
+    src/bf16.cu
+    src/reference.cpp
+    src/kernel.cu
+)
+target_include_directories(bf16_rownorm_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(bf16_rownorm_lib PRIVATE $<$<LANG:CUDA>:${CUDA_FLAGS}>)
+target_link_libraries(bf16_rownorm_lib PUBLIC CUDA::cudart)
+
+# ---------------------------------------------------------------------------
+# Executable
+# ---------------------------------------------------------------------------
+add_executable(bf16_rownorm src/main.cpp)
+target_link_libraries(bf16_rownorm PRIVATE bf16_rownorm_lib)
+
+# ---------------------------------------------------------------------------
+# Unit tests
+# ---------------------------------------------------------------------------
+enable_testing()
+add_executable(bf16_rownorm_tests tests/test_bf16.cpp)
+target_link_libraries(bf16_rownorm_tests PRIVATE bf16_rownorm_lib)
+add_test(NAME bf16_unit COMMAND bf16_rownorm_tests)
+```
+
+---
+
+## `src/common.hpp`
+
+```cpp
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace bf16 {
+
+// ---------------------------------------------------------------------------
+// Command-line options
+// ---------------------------------------------------------------------------
+struct Options {
+    int    M = 0;              // rows
+    int    N = 0;              // columns
+    int    iters = 10;         // timed kernel iterations
+    int    warmup = 2;         // untimed warm-up iterations
+    int    seed = 0xC0FFEE;    // deterministic RNG seed
+    float  eps = 0.0f;         // row-norm epsilon (0 = pure L2)
+    bool   verify = true;      // run CPU reference + tolerance check
+    bool   verbose = false;    // print per-iteration timings
+    bool   help = false;
+};
+
+// Parse argv into Options.  Returns false (and prints usage) on error.
+bool parseArgs(int argc, char** argv, Options& out);
+void printUsage(const char* prog);
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+std::string formatBytes(unsigned long long bytes);
+std::string formatGbps(double bytes, double seconds);
+std::string formatMs(double seconds);
+
+// ---------------------------------------------------------------------------
+// Deterministic input generation (host, FP32)
+// ---------------------------------------------------------------------------
+// Generates a deterministic M x N matrix of values in [-1, 1].
+// The generator is a simple, portable, seedable LCG so results are
+// bit-identical across runs and platforms.
+std::vector<float> generateInput(int M, int N, int seed);
+}  // namespace bf16
+```
+
+---
+
+## `src/common.cpp`
+
+```cpp
+#include "common.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <stdexcept>
+
+namespace bf16 {
+
+namespace {
+
+// A tiny, portable, seedable LCG (Numerical Recipes constants).  It is not
+// cryptographically strong, but it is deterministic and fast enough for
+// generating test data, and it produces identical bits on every platform.
+struct Lcg {
+    uint64_t state;
+    explicit Lcg(uint64_t s) : state(s ? s : 0x12345678ULL) {}
+    // Returns a float in [0, 1).
+    float nextFloat() {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        // Take the upper 24 bits for a 24-bit mantissa in [0, 2^24).
+        uint32_t bits = static_cast<uint32_t>(state >> 40);
+        return static_cast<float>(bits) / static_cast<float>(1u << 24);
+    }
+};
+
+}  // namespace
+
+void printUsage(const char* prog) {
+    std::printf(
+        "Usage: %s [options]\n"
+        "\n"
+        "Options:\n"
+        "  -m, --rows <int>        Number of rows M        (default 4096)\n"
+        "  -n, --cols <int>        Number of columns N     (default 4096)\n"
+        "  -i, --iters <int>       Timed iterations        (default 10)\n"
+        "  -w, --warmup <int>      Warm-up iterations      (default 2)\n"
+        "  -s, --seed <int>        RNG seed                (default 0xC0FFEE)\n"
+        "  -e, --eps <float>       Norm epsilon            (default 0)\n"
+        "  -v, --verify            Run CPU verification    (default on)\n"
+        "      --no-verify         Skip CPU verification\n"
+        "      --verbose           Print per-iteration ms\n"
+        "  -h, --help              Show this help\n",
+        prog);
+}
+
+bool parseArgs(int argc, char** argv, Options& out) {
+    out = Options{};
+    out.M = 4096;
+    out.N = 4096;
+    out.iters = 10;
+    out.warmup = 2;
+    out.seed = 0xC0FFEE;
+    out.eps = 0.0f;
+    out.verify = true;
+    out.verbose = false;
+
+    auto needValue = [&](int& i, const char* name) -> const char* {
+        if (i + 1 >= argc) {
+            std::fprintf(stderr, "error: option %s requires a value\n", name);
+            return nullptr;
+        }
+        return argv[++i];
+    };
+
+    for (int i = 1; i < argc; ++i) {
+        const char* a = argv[i];
+        if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0) {
+            out.help = true;
+        } else if (std::strcmp(a, "-m") == 0 || std::strcmp(a, "--rows") == 0) {
+            const char* v = needValue(i, a); if (!v) return false;
+            out.M = std::atoi(v);
+        } else if (std::strcmp(a, "-n") == 0 || std::strcmp(a, "--cols") == 0) {
+            const char* v = needValue(i, a); if (!v) return false;
+            out.N = std::atoi(v);
+        } else if (std::strcmp(a, "-i") == 0 || std::strcmp(a, "--iters") == 0) {
+            const char* v = needValue(i, a); if (!v) return false;
+            out.iters = std::atoi(v);
+        } else if (std::strcmp(a, "-w") == 0 || std::strcmp(a, "--warmup") == 0) {
+            const char* v = needValue(i, a); if (!v) return false;
+            out.warmup = std::atoi(v);
+        } else if (std::strcmp(a, "-s") == 0 || std::strcmp(a, "--seed") == 0) {
+            const char* v = needValue(i, a); if (!v) return false;
+            out.seed = static_cast<int>(std::strtoul(v, nullptr, 0));
+        } else if (std::strcmp(a, "-e") == 0 || std::strcmp(a, "--eps") == 0) {
+            const char* v = needValue(i, a); if (!v) return false;
+            out.eps = std::atof(v);
+        } else if (std::strcmp(a, "-v") == 0 || std::strcmp(a, "--verify") == 0) {
+            out.verify = true;
+        } else if (std::strcmp(a, "--no-verify") == 0) {
+            out.verify = false;
+        } else if (std::strcmp(a, "--verbose") == 0) {
+            out.verbose = true;
+        } else {
+            std::fprintf(stderr, "error: unknown option '%s'\n", a);
+            return false;
+        }
+    }
+
+    if (out.M <= 0 || out.N <= 0) {
+        std::fprintf(stderr, "error: rows and cols must be positive\n");
+        return false;
+    }
+    if (out.iters < 1) out.iters = 1;
+    if (out.warmup < 0) out.warmup = 0;
+    return true;
+}
+
+std::string formatBytes(unsigned long long bytes) {
+    const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double v = static_cast<double>(bytes);
+    int u = 0;
+    while (v >= 1024.0 && u < 4) { v /= 1024.0; ++u; }
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.2f %s", v, units[u]);
+    return buf;
+}
+
+std::string formatGbps(double bytes, double seconds) {
+    if (seconds <= 0.0) return "N/A";
+    double gbps = (bytes / 1000.0) / (seconds * 1.0e9);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.2f GB/s", gbps);
+    return buf;
+}
+
+std::string formatMs(double seconds) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.4f ms", seconds * 1000.0);
+    return buf;
+}
+
+std::vector<float> generateInput(int M, int N, int seed) {
+    std::vector<float> data(static_cast<size_t>(M) * static_cast<size_t>(N));
+    Lcg rng(static_cast<uint64_t>(static_cast<uint32_t>(seed)));
+    // Values in [-1, 1] so that row norms are O(sqrt(N)) and the normalized
+    // result is well-conditioned (no overflow/underflow in FP32).
+    for (auto& x : data) {
+        x = rng.nextFloat() * 2.0f - 1.0f;
+    }
+    return data;
+}
+
+}  // namespace bf16
+```
+
+---
+
+## `src/device.hpp`
+
+```cpp
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+
+namespace bf16 {
+
+// ---------------------------------------------------------------------------
+// RAII CUDA device buffer
+// ---------------------------------------------------------------------------
+// Owns a device allocation and its lifetime.  Move-only.  All CUDA calls are
+// checked and throw std::runtime_error on failure.
+class DeviceBuffer {
+public:
+    DeviceBuffer() = default;
+    explicit DeviceBuffer(size_t bytes);
+    ~DeviceBuffer();
+
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    DeviceBuffer(DeviceBuffer&& other) noexcept;
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept;
+
+    void*  data() const { return ptr_; }
+    size_t bytes() const { return bytes_; }
+    bool   valid() const { return ptr_ != nullptr; }
+
+    // H2D / D2H / D2D copies (checked).
+    void copyFromHost(const void* src, size_t bytes);
+    void copyToHost(void* dst, size_t bytes) const;
+    void copyToDevice(const DeviceBuffer& src, size_t bytes) const;
+
+    // Zero the buffer.
+    void zero();
+
+private:
+    void*  ptr_ = nullptr;
+    size_t bytes_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// RAII CUDA event pair for timing
+// ---------------------------------------------------------------------------
+class CudaTimer {
+public:
+    CudaTimer();
+    ~CudaTimer();
+
+    CudaTimer(const CudaTimer&) = delete;
+    CudaTimer& operator=(const CudaTimer&) = delete;
+
+    void start();
+    void stop();
+    // Returns elapsed milliseconds, synchronizing the stop event.
+    double elapsedMs();
+
+private:
+    void* start_ = nullptr;  // cudaEvent_t
+    void* stop_  = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// Error checking
+// ---------------------------------------------------------------------------
+[[noreturn]] void cudaError(const char* expr, const char* file, int line);
+
+}  // namespace bf16
+
+#define CUDA_CHECK(expr)                                                       \
+    do {                                                                       \
+        cudaError_t _e = (expr);                                               \
+        if (_e != cudaSuccess) {                                               \
+            bf16::cudaError(#expr, __FILE__, __LINE__);                       \
+        }                                                                      \
+    } while (0)
+```
+
+---
+
+## `src/device.cpp`
+
+```cpp
+#include "device.hpp"
+
+#include <cuda_runtime.h>
+
+#include <cctype>
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+
+namespace bf16 {
+
+void cudaError(const char* expr, const char* file, int line) {
+    std::string msg = std::string("CUDA error at ") + file + ":" + std::to_string(line) +
+                      " in expression '" + expr + "': " + cudaGetErrorString(cudaGetLastError());
+    throw std::runtime_error(msg);
+}
+
+// ---------------------------------------------------------------------------
+// DeviceBuffer
+// ---------------------------------------------------------------------------
+DeviceBuffer::DeviceBuffer(size_t bytes) : bytes_(bytes) {
+    if (bytes_ == 0) return;
+    CUDA_CHECK(cudaMalloc(&ptr_, bytes_));
+}
+
+DeviceBuffer::~DeviceBuffer() {
+    if (ptr_) {
+        cudaFree(ptr_);
+        ptr_ = nullptr;
+        bytes_ = 0;
+    }
+}
+
+DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept
+    : ptr_(other.ptr_), bytes_(other.bytes_) {
+    other.ptr_ = nullptr;
+    other.bytes_ = 0;
+}
+
+DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
+    if (this != &other) {
+        if (ptr_) cudaFree(ptr_);
+        ptr_ = other.ptr_;
+        bytes_ = other.bytes_;
+        other.ptr_ = nullptr;
+        other.bytes_ = 0;
+    }
+    return *this;
+}
+
+void DeviceBuffer::copyFromHost(const void* src, size_t bytes) {
+    if (bytes > bytes_) bytes = bytes_;
+    if (bytes == 0) return;
+    CUDA_CHECK(cudaMemcpy(ptr_, src, bytes, cudaMemcpyHostToDevice));
+}
+
+void DeviceBuffer::copyToHost(void* dst, size_t bytes) const {
+    if (bytes > bytes_) bytes = bytes_;
+    if (bytes == 0) return;
+    CUDA_CHECK(cudaMemcpy(dst, ptr_, bytes, cudaMemcpyDeviceToHost));
+}
+
+void DeviceBuffer::copyToDevice(const DeviceBuffer& src, size_t bytes) const {
+    if (bytes > bytes_ || bytes > src.bytes_) bytes = std::min(bytes_, src.bytes_);
+    if (bytes == 0) return;
+    CUDA_CHECK(cudaMemcpy(ptr_, src.ptr_, bytes, cudaMemcpyDeviceToDevice));
+}
+
+void DeviceBuffer::zero() {
+    if (bytes_ == 0) return;
+    CUDA_CHECK(cudaMemset(ptr_, 0,

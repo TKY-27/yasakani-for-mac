@@ -1,0 +1,171 @@
+We need answer user's request: produce CSV only, header and exactly 220 data rows. Columns sample_id,language,category,prompt_tokens,output_tokens,accepted_drafts,drafted_tokens,decode_tok_s,valid. Sample IDs S0001-S0220, cycle languages en/zh/ja, cycle categories code/story/translation/structured, generate internally consistent positive numeric values. Quote fields only when CSV requires. No commentary.
+
+Need ensure exactly 220 rows. Need internally consistent positive numeric values. Need define consistency. Could create deterministic formulas. sample_id from S0001 to S0220. language cycles en, zh, ja. category cycles code, story, translation, structured. Need maybe category cycle independent? "cycle categories" likely sequence repeats code/story/translation/structured. Need positive numeric values. Could use integers or decimals. Positive. accepted_drafts <= drafted_tokens maybe. output_tokens? prompt_tokens? decode_tok_s? valid? Maybe valid as positive numeric? Column valid likely maybe boolean? But user says positive numeric values, so valid should be positive numeric? Could be 1 for valid. But if all positive numeric, valid=1. Maybe "valid" could be 0/1, but 0 not positive. So use 1. Need CSV only.
+
+Need produce 220 rows manually or with logic. We can generate via mental pattern. Need exact 220 rows. Could use formulas with sample number n (1..220). language index n-1 mod 3. category index n-1 mod 4. For positive values:
+prompt_tokens = 100 + 3*n
+output_tokens = 50 + 2*n
+drafted_tokens = output_tokens + accepted_drafts? Maybe accepted_drafts <= drafted_tokens. Let's choose drafted_tokens = 200 + n. accepted_drafts = 10 + n? Need accepted_drafts <= drafted_tokens. If n up to 220: output_tokens 490, drafted 420? 200+220=420, accepted=230 <=420. okay. decode_tok_s = 10.0 + n/100? positive. valid=1.
+But maybe accepted_drafts should be number of accepted draft tokens, not necessarily <= drafted tokens? Could be yes.
+Could use decimal decode_tok_s to vary: 12.5 + n*0.01. CSV numeric no quotes.
+
+Need exactly header plus 220 rows. Need ensure no extra spaces? CSV can have no spaces. sample_id S0001 etc. language no quotes. category no quotes. numbers no quotes.
+
+Need maybe "internally consistent" means e.g. drafted_tokens >= accepted_drafts, output_tokens maybe <= drafted_tokens? Could set drafted_tokens = output_tokens + 50? accepted_drafts = output_tokens - 10? Let's define:
+n from 1 to 220.
+prompt_tokens = 100 + n
+output_tokens = 200 + n
+drafted_tokens = 300 + n
+accepted_drafts = 250 + n
+decode_tok_s = 10 + n/100 (one/two decimals)
+valid=1
+Then accepted_drafts <= drafted_tokens, output_tokens < drafted_tokens, prompt_tokens positive. All positive. Good.
+
+Need cycle language: for n=1 en, 2 zh, 3 ja, 4 en... category: 1 code, 2 story, 3 translation, 4 structured, 5 code...
+Could generate rows. Need be careful 220 rows. Could produce via pattern maybe in chunks. Since final answer huge. Need exact. We can create table in analysis and then final. Need count. 220 rows manageable but need avoid errors. Could exploit periodic combined cycle lcm(3,4)=12. For n mod 12 patterns:
+1 en code
+2 zh story
+3 ja translation
+4 en structured
+5 zh code
+6 ja story
+7 en translation
+8 zh structured
+9 ja code
+10 en story
+11 zh translation
+12 ja structured
+Then repeats every 12. 220 = 18*12 + 4 (since 216+4). So rows 1-216 repeat 18 cycles, then 217-220 correspond to 1-4 pattern.
+
+Need generate numeric values for n. Could do chunk by 12 rows with n values. Need 18 full cycles (1-216) plus 4. Could create 20 cycles? Need exactly 220. We can systematically write 220 rows.
+
+Could use formula:
+sample_id S%04d.
+prompt_tokens=100+n
+output_tokens=200+n
+drafted_tokens=300+n
+accepted_drafts=250+n
+decode_tok_s = 10 + n/100. Need maybe two decimals: e.g. n=1 ->10.01; n=10 ->10.10; n=100 ->11.00; n=220 ->12.20. Good. valid=1.
+
+Row n:
+S0001,en,code,101,201,301,251,10.01,1
+S0002,zh,story,102,202,302,252,10.02,1
+S0003,ja,translation,103,203,303,253,10.03,1
+S0004,en,structured,104,204,304,254,10.04,1
+S0005,zh,code,105,205,305,255,10.05,1
+S0006,ja,story,106,206,306,256,10.06,1
+S0007,en,translation,107,207,307,257,10.07,1
+S0008,zh,structured,108,208,308,258,10.08,1
+S0009,ja,code,109,209,309,259,10.09,1
+S0010,en,story,110,210,310,260,10.10,1
+S0011,zh,translation,111,211,311,261,10.11,1
+S0012,ja,structured,112,212,312,262,10.12,1
+...
+This pattern. Need 220. Could generate using 12-row blocks. For block k (0-based) n = 12k + i, i=1..12.
+Block 0 n 1-12 as above.
+Block 1 n 13-24:
+S0013,en,code,113,213,313,263,10.13,1
+S0014,zh,story,114,214,314,264,10.14,1
+S0015,ja,translation,115,215,315,265,10.15,1
+S0016,en,structured,116,216,316,266,10.16,1
+S0017,zh,code,117,217,317,267,10.17,1
+S0018,ja,story,118,218,318,268,10.18,1
+S0019,en,translation,119,219,319,269,10.19,1
+S0020,zh,structured,120,220,320,270,10.20,1
+S0021,ja,code,121,221,321,271,10.21,1
+S0022,en,story,122,222,322,272,10.22,1
+S0023,zh,translation,123,223,323,273,10.23,1
+S0024,ja,structured,124,224,324,274,10.24,1
+
+Need up to 220. We can produce by incrementing.
+
+Need ensure 220 rows. Could maybe write all rows with line numbers not included. Need no commentary.
+
+Potential issue: sample_id S0220 should correspond to n=220. n=220 mod 12? 216 is 18*12, so n=217 i=1 en code, 218 zh story, 219 ja translation, 220 en structured. Good.
+
+Need count exactly. Could produce 18 full cycles = 216 rows, plus 4. How to avoid missing? Could write blocks of 12, 18 blocks, then 4. Need label? No labels. Need count lines. Let's create blocks 1-18 and final 4. Each block 12. Need ensure block numbers correct.
+
+Maybe easier: produce rows n=1..220 in one long list. Need careful numeric. Could use pattern every 12. We'll create in final as 220 lines. Need verify counts manually? Let's design generation with blocks and maybe count block number in analysis, but final no counts.
+
+Block 1: 1-12
+Block 2: 13-24
+Block 3: 25-36
+Block 4: 37-48
+Block 5: 49-60
+Block 6: 61-72
+Block 7: 73-84
+Block 8: 85-96
+Block 9: 97-108
+Block 10: 109-120
+Block 11: 121-132
+Block 12: 133-144
+Block 13: 145-156
+Block 14: 157-168
+Block 15: 169-180
+Block 16: 181-192
+Block 17: 193-204
+Block 18: 205-216
+Final: 217-220 (first 4 of block pattern)
+
+Let's generate all.
+
+Need values:
+For n:
+S n
+prompt = 100+n
+output=200+n
+drafted=300+n
+accepted=250+n
+decode = 10 + n/100, format two decimals. For n<10, 10.0n? Need 10.01 etc. For n=10, 10.10. For n=100, 11.00. For n=101, 11.01. For n=205, 12.05. For n=220, 12.20. Use two decimals always. Good.
+
+Let's build blocks:
+
+Block 1 (1-12):
+1 S0001 en code 101 201 301 251 10.01 1
+2 S0002 zh story 102 202 302 252 10.02 1
+3 S0003 ja translation 103 203 303 253 10.03 1
+4 S0004 en structured 104 204 304 254 10.04 1
+5 S0005 zh code 105 205 305 255 10.05 1
+6 S0006 ja story 106 206 306 256 10.06 1
+7 S0007 en translation 107 207 307 257 10.07 1
+8 S0008 zh structured 108 208 308 258 10.08 1
+9 S0009 ja code 109 209 309 259 10.09 1
+10 S0010 en story 110 210 310 260 10.10 1
+11 S0011 zh translation 111 211 311 261 10.11 1
+12 S0012 ja structured 112 212 312 262 10.12 1
+
+Block 2 (13-24): add 12 to n.
+13 S0013 en code 113 213 313 263 10.13
+14 S0014 zh story 114 214 314 264 10.14
+15 S0015 ja translation 115 215 315 265 10.15
+16 S0016 en structured 116 216 316 266 10.16
+17 S0017 zh code 117 217 317 267 10.17
+18 S0018 ja story 118 218 318 268 10.18
+19 S0019 en translation 119 219 319 269 10.19
+20 S0020 zh structured 120 220 320 270 10.20
+21 S0021 ja code 121 221 321 271 10.21
+22 S0022 en story 122 222 322 272 10.22
+23 S0023 zh translation 123 223 323 273 10.23
+24 S0024 ja structured 124 224 324 274 10.24
+
+Block 3 (25-36): add 24
+25 S0025 en code 125 225 325 275 10.25
+26 S0026 zh story 126 226 326 276 10.26
+27 S0027 ja translation 127 227 327 277 10.27
+28 S0028 en structured 128 228 328 278 10.28
+29 S0029 zh code 129 229 329 279 10.29
+30 S0030 ja story 130 230 330 280 10.30
+31 S0031 en translation 131 231 331 281 10.31
+32 S0032 zh structured 132 232 332 282 10.32
+33 S0033 ja code 133 233 333 283 10.33
+34 S0034 en story 134 234 334 284 10.34
+35 S0035 zh translation 135 235 335 285 10.35
+36 S0036 ja structured 136 236 336 286 10.36
+
+Block 4 (37-48): add 36
+37 S0037 en code 137 237 337 287 10.37
+38 S0038 zh story 138 238 338 288 10.38
+39 S0039 ja translation 139 239 339 289 10.39
+40 S0040 en structured 140 240 340 290 10.40
+41 S0041 zh code 141 241 341 291 10.41
+42 S0

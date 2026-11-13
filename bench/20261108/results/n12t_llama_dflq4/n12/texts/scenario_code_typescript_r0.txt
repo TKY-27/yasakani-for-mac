@@ -1,0 +1,220 @@
+The user wants a complete TypeScript 5 service. Let me think carefully about the requirements:
+
+1. **Consumes newline-delimited request metrics** — NDJSON input. Probably a stream, e.g. from an HTTP endpoint (POST /ingest), from stdin, from a file. Should support at least one well-defined ingestion path. For "incremental parsing" and "bounded memory", stream parsing is a natural fit: an NDJSON stream processor that accumulates records one line at a time.
+
+2. **Validate without a third-party schema library** — hand-written validation of each JSON record: required fields, types, ranges. Fields might be: `runId` (string), `model` (string), `fixture` (string), `latencyMs` (finite number ≥ 0), `status` (enum: ok/error/timeout), and possibly `timestamp` (ISO-8601 / epoch ms). Define a strict metric record type.
+
+3. **Group records by model and fixture** — composite key `model/fixture` or nested map.
+
+4. **Compute mean / median / sample standard deviation** — but bounded memory means we can't keep all values per group for median... hmm. Median requires sorted data or a selection algorithm. Bounded memory means we can't store unbounded values. Options:
+   - Store only summary statistics per group (mean via Welford, sample variance via Welford, min/max, count). But exact median from streaming data requires unbounded storage (or approximate median via t-digest / quantile sketch).
+   - "Bounded memory" might mean: cap total records (max buffer size) — e.g. accept at most N records, reject overflow. Then we can keep exact values and compute exact median.
+   
+   A pragmatic approach: bounded memory with a hard cap (e.g. `maxRecords = 100_000`, `maxPayloadBytes`). Once the cap is reached, ingestion returns 413/507 (Insufficient Storage). Within the cap, store per-group value arrays (Float64Array per group) to compute exact mean, median, sample standard deviation. Document the memory bounds: memory is O(cap) bounded by configuration.
+
+   Alternatively, use Welford for mean/std and keep values for median but cap at maxRecords per group. I think global cap is cleaner: total records stored ≤ `maxTotalRecords` (configurable, default e.g. 250k). Memory bound = cap × (value bytes + fixed overhead per group).
+
+   Let me design: an `MetricsStore` class with:
+   - `maxRecords` (config, default 250_000)
+   - `maxGroupValues`? No, global cap is sufficient.
+   - `add(record): { accepted: boolean; reason? }`
+   - `getGroups(): Summary[]` — compute on demand (sort a copy? Sort per group in O(n log n); to avoid mutating, sort a copy or store Float64Array and sort a copy for median). Actually, we could maintain a sorted insertion per value (O(n) insertion) — costly. Simpler: store values per group in a `number[]` (or Float64Array) and sort a copy to compute statistics on read. With a bounded cap, this is fine.
+
+   Sample standard deviation: Welford's online algorithm gives exact sample variance for all values — we can compute mean and sample std online without keeping values. Median requires values. So store values per group, but use Welford for mean/std anyway (cheap, exact). Actually with stored values, computing mean/std on read is fine too. But Welford demonstrates good technique; still, computing on read from the array is simpler and exact. Hmm — compute all stats on read from stored arrays: mean, median (sort a copy), sample std (two-pass or Welford on the array). That's simple and exact.
+
+   Edge cases: n=1 → sample std is undefined (return null or NaN → use null). n=0 group can't exist.
+
+5. **Endpoints**:
+   - `GET /health` → `{ status: "ok", records, groups, memoryBytes?, uptime }`
+   - `GET /summary` → overall summary: total records, per model+fixture breakdown with count, mean, median, sampleStd.
+   - `GET /runs/:id` → filter by runId: groups within that run with statistics; if the run doesn't exist, 404.
+
+   Should I also add a `POST /ingest` endpoint for NDJSON? The prompt says "consumes newline-delimited request metrics". To make it a runnable service with no placeholders, I need an ingestion path. Options: read a file passed as argument on startup, or POST /ingest accepting `application/x-ndjson`, or stdin. What I'll implement:
+   - `POST /ingest` — accept NDJSON body (or a stream), parse incrementally (line by line), validate each record, append valid ones, and return per-line results (accepted/rejected counts + a bounded list of error details).
+   - `GET /ingest` is probably not needed.
+   - Also support reading from a file path via CLI? Could add `node dist/index.js --file metrics.ndjson`. Might be nice but adds complexity. What I'll keep: HTTP ingest endpoint + optional stdin pipe mode when run without an HTTP server? Simpler: HTTP only, and document curl usage. But "incremental parsing" — use a Transform/line splitter over the incoming request stream (stream.Readable). I'll implement a `createLineSplitter` Transform stream (handles \n and \r\n, flushes the trailing incomplete line at end) and a `LineProcessor` that validates each line.
+
+   Bounded memory on ingest: limit request size (e.g. 5 MB) and abort if exceeded; also per-line size limit (e.g. 64 KB) to prevent huge single lines.
+
+6. **Strict types** — `strict: true` tsconfig, exhaustive checks, discriminated union for parse errors, `readonly` where appropriate.
+
+7. **Unit tests** — no third-party test framework? The requirement says "no third-party schema library" — test framework is probably fine, but to keep zero deps and be safe, write a small test runner using `node:test` (built-in Node 18+/20) + `assert`. That's clean: `node --test`. With tsconfig and ts-node? Better: compile with `tsc` then run tests from dist with `node --test dist/test/`. That entirely avoids third-party deps. Good: dependencies = zero (node built-ins only: node:http, node:stream, node:assert, node:test).
+
+   Wait — do I need express? "No third-party schema library" specifically refers to schemas, but zero-deps is more robust and "runnable". Write raw node:http server. That also demonstrates strict endpoint handling. Yes, zero runtime dependencies.
+
+8. **package.json** — name, scripts: build, test, start, typecheck. `"type": "module"`. Dev deps: typescript@5.x, @types/node. Node engine >= 18 (node:test stable in 18.17+? node:test exists in 18, experimental until 20; stable in 20). Set `"engines": { "node": ">=18.17" }` or >=20. Require >=18.17, or just >=20 to be safe. Let me use `>=20`.
+
+9. **tsconfig.json** — ES2022, NodeNext modules, strict, outDir dist, rootDir src, declaration maybe false, sourceMap, noUncheckedIndexedAccess (good strictness), noImplicitOverride, exactOptionalPropertyTypes? exactOptionalPropertyTypes can cause friction; but "strict types" — I can include it and be careful. Let me include `strict: true`, `noUncheckedIndexedAccess: true`, `noImplicitReturns: true`, `noFallthroughCasesInSwitch: true`, `forceConsistentCasingInFileNames: true`, `verbatimModuleSyntax`? With NodeNext ESM, imports need `.js` extension in source — yes, ESM TS requires explicit `.js` extensions for relative imports. Must remember this in code.
+
+   Test discovery: `node --test dist/test/` runs files matching test patterns (`*.test.js`, or the entire directory? `node --test` with a directory argument runs test files in the directory matching patterns: files named `test.js`, `test-*.js`, `*.test.js`, etc., and subdirectories? In Node 20, `node --test dir` searches for test files matching a pattern). To be safe, name test files `*.test.ts` and run `node --test dist/test`.
+
+10. **Short operational guide** — a section at the end (or a README file?). "No placeholders" — include the guide as a README.md file and/or within the response. Include a README.md in the deliverable and a short guide in the response text. The response should probably present the whole code in chat. Since the ask is "generate complete, runnable code", present all files in markdown code blocks, followed by a short operational guide.
+
+Now let me design the architecture:
+
+```
+metrics-service/
+├── package.json
+├── tsconfig.json
+├── README.md
+├── src/
+│   ├── index.ts            (entry: start server, wire everything)
+│   ├── config.ts           (service config, env parsing)
+│   ├── types.ts            (MetricRecord, validation errors, summaries)
+│   ├── validate.ts         (record validation, no schema library)
+│   ├── parser.ts           (line splitter stream + incremental NDJSON processor)
+│   ├── stats.ts            (mean, median, sample standard deviation)
+│   ├── store.ts            (MetricsStore: grouped values, bounded memory)
+│   ├── http.ts             (router, /health /summary /runs/:id /ingest, JSON errors)
+│   └── test/
+│       ├── validate.test.ts
+│       ├── stats.test.ts
+│       ├── store.test.ts
+│       ├── parser.test.ts
+│       └── http.test.ts
+```
+
+Let me write each piece carefully.
+
+### types.ts
+
+```ts
+/** Canonical, fully validated metric record. */
+export interface MetricRecord {
+  readonly runId: string;
+  readonly model: string;
+  readonly fixture: string;
+  readonly latencyMs: number; // finite, >= 0
+  readonly status: "ok" | "error" | "timeout";
+  readonly timestamp: number; // epoch millis, finite, >= 0, <= now-ish? Keep finite >= 0
+}
+```
+
+Field constraints:
+- `runId`: string, non-empty after trim, max 128 chars, matches `^[A-Za-z0-9_.:-]+$`? Maybe allow a broader set. Validate: typeof string, length 1..128.
+- `model`: string 1..128, non-empty after trim; normalize by trimming? Preserve original value but trim for grouping? Safer: require non-whitespace-only; use the raw string as key, but reject strings that contain `\u0000`? Keep simple: 1..128 chars, not whitespace-only.
+- `fixture`: same.
+- `latencyMs`: number, finite, >= 0, <= 1_000_000_000 (1000 days) to catch absurd values.
+- `status`: one of `ok|error|timeout`.
+- `timestamp`: number, finite, >= 0. Should we allow ISO string too? Keep number (epoch ms) for strictness; document. Allow only number. Should I also accept ISO string? Strict types — keep number only, document it.
+
+Validation error union:
+
+```ts
+export type FieldPath = "runId" | "model" | "fixture" | "latencyMs" | "status" | "timestamp" | "$";
+
+export interface FieldError {
+  readonly field: FieldPath;
+  readonly code: string;      // e.g. "type", "range", "required", "empty", "invalid"
+  readonly message: string;
+}
+
+export type ParseResult =
+  | { readonly ok: true; readonly value: MetricRecord }
+  | { readonly ok: false; readonly errors: readonly FieldError[]; readonly message: string };
+```
+
+JSON-level errors (not an object, or invalid JSON) → `lineError` type:
+
+```ts
+export interface LineFailure {
+  readonly line: number;      // 1-based
+  readonly code: "invalid-json" | "not-object" | "validation" | "too-large";
+  readonly message: string;
+  readonly errors?: readonly FieldError[];
+}
+```
+
+### validate.ts
+
+Hand-written checks:
+
+```ts
+import type { FieldError, MetricRecord, ParseResult } from "./types.js";
+
+const MAX_NAME_LEN = 128;
+const MAX_LATENCY_MS = 1e9;
+const STATUSES: ReadonlySet<string> = new Set(["ok", "error", "timeout"]);
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+export function validateMetric(input: unknown): ParseResult {
+  const errors: FieldError[] = [];
+  if (!isPlainObject(input)) {
+    return { ok: false, errors: [{ field: "$", code: "not-object", message: "record must be a JSON object" }], message: "record must be a JSON object" };
+  }
+  // runId, model, fixture: string name fields
+  const runId = checkName(input, "runId", errors);
+  const model = checkName(input, "model", errors);
+  const fixture = checkName(input, "fixture", errors);
+  const latency = checkNumber(input, "latencyMs", { min: 0, max: MAX_LATENCY_MS, finite: true }, errors);
+  const status = checkStatus(input, errors);
+  const timestamp = checkNumber(input, "timestamp", { min: 0, max: Number.MAX_SAFE_INTEGER }, errors);
+  if (errors.length > 0) return { ok: false, errors, message: errors.map(e => e.message).join("; ") };
+  // non-null assertion after check
+  return { ok: true, value: { runId: runId!, model: model!, fixture: fixture!, latencyMs: latency!, status: status!, timestamp: timestamp! } };
+}
+```
+
+Under `strict` and `noUncheckedIndexedAccess`, index access on `Record<string, unknown>` returns `unknown` — fine. Non-null assertions: can I avoid `!`? I can push the value and track it. Cleaner approach: build with local variables and only return when errors is empty; but the type system doesn't know the value was set. Using `!` is acceptable, but "strict" purists prefer a function returning `{ value?: ... }`. Alternative: build a record object of `undefined` union types, and narrow via a guard `if (errors.length === 0)` — but TS won't narrow through a function. Simplest and most honest approach: use `!` with a comment, or restructure checkers to return a discriminated union and short-circuit collect. Let me restructure:
+
+```ts
+function nameField(input: Record<string, unknown>, field: string): { value: string } | FieldError
+```
+
+And accumulate; after checks, if any error → fail; else construct from the successful union via narrowing:
+
+```ts
+const r1 = nameField(obj, "runId");
+const r2 = nameField(obj, "model");
+...
+if ("error" in r1) errors.push(r1.error)... 
+```
+
+Hmm, the union `{ value: string } | FieldError` — narrowing `"error" in r1` requires FieldError to have a literal `"error"` property. Add `readonly kind: "error"` to FieldError? Or make the union `Ok<T> | Err`. Let me define a local helper union:
+
+```ts
+type Checked<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: FieldError };
+```
+
+Then:
+
+```ts
+const fields: Checked<string | number> ...
+```
+
+Then:
+
+```ts
+if (!runId.ok || !model.ok || ...) return fail;
+return { ok: true, value: { runId: runId.value, ... } };
+```
+
+But `status`'s value type is a union; `latencyMs` and `timestamp` are number. Let me keep separate variables per checker; the types will work out:
+
+```ts
+const runId = checkName(obj, "runId");
+const model = checkName(obj, "model");
+const fixture = checkName(obj, "fixture");
+const latencyMs = checkLatency(obj);
+const status = checkStatus(obj);
+const timestamp = checkTimestamp(obj);
+const bad = [runId, model, fixture, latencyMs, status, timestamp].filter((c): c is Extract<Checked<unknown>, {ok:false}> => !c.ok);
+if (bad.length) return { ok: false, errors: bad.map(b => b.error), message: ... };
+return { ok: true, value: { runId: runId.value, model: model.value, fixture: fixture.value, latencyMs: latencyMs.value, status: status.value, timestamp: timestamp.value } };
+```
+
+This is clean and strict without `!`.
+
+Field rules:
+- Missing → `{ field, code: "missing", message: "'runId' is required" }`
+- Wrong type → `code: "type"`, e.g. `"'runId' must be a string"`.
+- String but empty / whitespace-only → `code: "empty"`.
+- Length > 128 → `code: "too-long"`.
+- Latency: not a number, or `Number.isFinite` fails, or `< 0`, or `> 1e9`.
+- Status: string but not in the set → `code: "invalid"`.
+- Timestamp: number, finite, >= 0.
+
+Also reject extra unknown fields? Not required; but "strict" — I could flag unknown keys as an error with code `unknown-field`. This is a nice strictness touch and easy to test. Hmm, might be annoying for ingestion. Include — strict service. Actually wait: rejecting unknown fields might make real-world ingestion brittle. The requirement says strict types, not strict keys. I'll allow unknown keys but ignore them... let me think about what's

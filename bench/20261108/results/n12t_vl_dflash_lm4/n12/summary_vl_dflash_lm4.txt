@@ -1,0 +1,15 @@
+label vl_dflash_lm4  model qwen3.8-27b  temperature 1.00
+cat         fixture                            mean      min      max   ntok
+code        scenario_code_cuda                131.0    129.8    132.2   4096
+code        scenario_code_python              125.4    121.9    128.8   4096
+code        scenario_code_typescript          127.0    121.8    132.2   4096
+story       scenario_story_zh_scifi           107.5    107.4    107.6   4096
+story       scenario_story_en_mystery         110.8    107.9    113.8   4096
+story       scenario_story_zh_dialogue        108.1    102.5    113.6   4096
+translation scenario_translation_zh_en        205.0    201.6    208.5   4096
+translation scenario_translation_en_zh        190.2    183.1    197.2   4096
+translation scenario_translation_markdown     181.9    178.4    185.4   4096
+structured  scenario_structured_jsonl         213.1    211.5    214.6   4096
+structured  scenario_structured_csv           192.8    180.0    205.7   4096
+structured  scenario_structured_sql           161.8    157.5    166.2   4096
+per category (mean of runs): code 127.8, story 108.8, translation 192.3, structured 189.2

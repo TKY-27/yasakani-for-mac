@@ -1,0 +1,220 @@
+We need answer user's request: produce CSV only, one header and exactly 220 data rows. Need generate consistent positive numeric values. No commentary. Need ensure 220 rows S0001-S0220. Columns: sample_id,language,category,prompt_tokens,output_tokens,accepted_drafts,drafted_tokens,decode_tok_s,valid.
+
+Need think about internal consistency positive numeric values. Let's design deterministic formulas to ensure valid CSV. Languages cycle en/zh/ja starting S0001 en, S0002 zh, S0003 ja, repeat. Categories cycle code/story/translation/structured starting S0001 code, S0002 story, S0003 translation, S0004 structured, repeat. Need 220 rows.
+
+Positive numeric values: all numbers >0. Could be integers or decimals. Need decode_tok_s maybe tokens/sec. accepted_drafts <= drafted_tokens? For speculative decoding: accepted_drafts maybe count of accepted draft tokens, drafted_tokens total drafts? positive. Could ensure accepted_drafts < drafted_tokens maybe. output_tokens positive. prompt_tokens positive. valid maybe boolean? They said positive numeric values, valid column maybe numeric 1? Since positive numeric values all numeric? valid could be 1 or 0 but positive means >0 maybe use 1. Or maybe 0.1? But valid likely boolean. Use 1 for all to be positive numeric. Need ensure no commas within fields, no quotes needed except if CSV requires. None require. 
+
+Need exactly 220 data rows plus header. Need produce manually? We can generate in reasoning maybe with formulas, but final must include all rows. Need be careful count. Could produce using pattern with 220 rows. Need no mistakes.
+
+Could create table with row i from 1 to 220. language = (i-1)%3: 0 en,1 zh,2 ja. category = (i-1)%4: 0 code,1 story,2 translation,3 structured.
+
+Numbers: Need positive. Let's define:
+prompt_tokens = 1000 + i*7 maybe up to 2543. output_tokens = 200 + i*3. accepted_drafts = 20 + (i*11) % 100? positive, but must be less than drafted_tokens. drafted_tokens = accepted_drafts + 10 + i? Or simply drafted_tokens = 100 + i*5; accepted_drafts = 50 + i*2. Ensure accepted < drafted: 50+2i < 100+5i for i>=1 yes. decode_tok_s = 50 + (i % 50)*0.7? positive. Could use integer decode_tok_s = 50 + i % 100. valid = 1. All positive. But internal consistency maybe output_tokens should relate to drafted? Not necessary. accepted_drafts could be > output_tokens? Drafts accepted could not exceed output? In speculative decoding, accepted drafts per step maybe not total output. But could be any positive. To be safer, accepted_drafts < output_tokens. Let's define output_tokens = 300 + i*4 (304 to 1180). accepted_drafts = 100 + i*2 (102 to 540). drafted_tokens = accepted_drafts + 20 + i (i? 123 to 562). decode_tok_s = 50 + (i*37 % 1000)/100? But simple integer okay: decode_tok_s = 50 + (i*7 % 50) (positive 50-99). But decode_tok_s positive. Could be float with 2 decimals. Need CSV numeric okay.
+
+Maybe use formulas:
+prompt_tokens = 512 + 13*i
+output_tokens = 128 + 5*i
+accepted_drafts = 16 + 3*i
+drafted_tokens = 24 + 4*i (accepted < drafted? 16+3i <24+4i for i>=1 yes)
+decode_tok_s = 40 + (i * 7) / 10? For i=1 40.7, i=220 40+154=194. positive. Could have decimals. Need internal consistency maybe decode_tok_s = output_tokens / some time? Not required.
+
+But "generate internally consistent positive numeric values" could mean all numbers positive and plausible. Maybe valid = 1. If valid is boolean, positive numeric? 1.
+
+Need ensure exactly 220 rows. If we manually enumerate, risk miscount. Could use pattern in final. Need count 220. Let's plan to write 220 lines. Could group by 10 or 20 to verify. Need final no extra. We can produce via systematic sequence. Need be extremely careful.
+
+Let's decide exact values:
+For i=1..220:
+language: cycle en, zh, ja.
+category: cycle code, story, translation, structured.
+prompt_tokens = 512 + 13*i
+output_tokens = 128 + 5*i
+accepted_drafts = 16 + 3*i
+drafted_tokens = 24 + 4*i
+decode_tok_s = 40 + (i * 7) / 10? This yields decimals .7, .4, .1, .8, .5... For i=1 40.7, i=2 41.4, i=3 42.1, i=4 42.8, i=5 43.5, etc. Need one decimal? i*7/10 can be 40.7, 41.4, 42.1, 42.8, 43.5, 44.2... up to i=220: 40+154=194.0? 220*7/10=154.0, so 194. Could write 194.0 to maintain one decimal. But CSV okay.
+valid = 1
+
+Check positive: yes.
+
+Maybe accepted_drafts and drafted_tokens should be <= output_tokens? accepted_drafts 16+3i; output 128+5i, accepted<output yes. drafted 24+4i < output? 24+4i < 128+5i for i > -104 yes. So drafted<output. Could accepted_drafts be less than drafted yes.
+
+Now generate rows. Need ensure cycle correctly. Could generate table. Let's create sequence.
+
+i, lang, cat:
+1 en code
+2 zh story
+3 ja translation
+4 en structured
+5 zh code
+6 ja story
+7 en translation
+8 zh structured
+9 ja code
+10 en story
+11 zh translation
+12 ja structured
+13 en code
+... Pattern length lcm 12. For i mod 12:
+1 en code
+2 zh story
+3 ja translation
+4 en structured
+5 zh code
+6 ja story
+7 en translation
+8 zh structured
+9 ja code
+10 en story
+11 zh translation
+12 ja structured
+Repeat.
+
+Need compute numeric values. Could use formulas to compute each row. To avoid errors, maybe create rows in batches with i and values. Need 220 lines. We can generate via mental? Long. Need high accuracy. Could use deterministic formula and maybe not compute all manually? As language model can generate 220 lines, but need count and correct values. We can leverage pattern and maybe write a pseudo-code? But final must be CSV only. Need manually output. We can systematically list i from 1 to 220 with formula. Need avoid arithmetic mistakes. Could reduce complexity by using simpler numbers maybe easier: prompt_tokens = 100 + i, output_tokens = 50 + i, accepted_drafts = 20 + i, drafted_tokens = 30 + i, decode_tok_s = 10 + i, valid=1. All positive, simple. But internal consistency? drafted_tokens > accepted_drafts yes. output_tokens > drafted_tokens? 50+i > 30+i yes. prompt > output? 100+i > 50+i. decode positive. This is much easier and less arithmetic. Let's choose simpler:
+prompt_tokens = 100 + i
+output_tokens = 50 + i
+accepted_drafts = 20 + i
+drafted_tokens = 30 + i
+decode_tok_s = 10 + i
+valid=1
+
+But is output_tokens too small? positive. accepted_drafts positive. decode_tok_s positive. internal consistency: drafted_tokens > accepted_drafts, output_tokens > drafted_tokens, prompt_tokens > output_tokens. Good. All positive.
+
+Need language/category cycles. Numbers simple: for i=1: 101,51,21,31,11. i=220: 320,270,240,250,230.
+
+Now generate 220 rows. Need count. We can produce by 10-row batches. Let's make a table for i 1-220. Use patterns for language/category. Need values simple. Let's define row format:
+S0001,en,code,101,51,21,31,11,1
+
+Need ensure IDs S0001 through S0220 with leading zeros 4 digits. S0220.
+
+Let's produce batches 1-10, 11-20, etc. Need language/category for each. Let's create mapping for i mod 12. For 1-12:
+1 en code
+2 zh story
+3 ja translation
+4 en structured
+5 zh code
+6 ja story
+7 en translation
+8 zh structured
+9 ja code
+10 en story
+11 zh translation
+12 ja structured
+Then repeat.
+
+For numbers: prompt=100+i, output=50+i, accepted=20+i, drafted=30+i, decode=10+i.
+
+Need generate 220 rows. 220 = 12*18 =216 plus 4. So last batch 217-220 corresponds 1-4.
+
+Could generate all rows by repeating 12-row block 18 times with incrementing numbers. But numbers not same across blocks. Need compute each i. We can write in final sequentially. To reduce mistakes, maybe create a template and fill.
+
+Let's maybe generate using 20-row blocks. Need language/category pattern for each i. Could create a master list of i, lang, cat for 1-220. Then numbers are formula. But output final only CSV, no analysis visible. Need ensure final line count 221 including header.
+
+Potential issue: user says "Quote fields only when CSV requires it." We don't need quotes. No fields contain commas. Good.
+
+Need no commentary before or after. final just CSV.
+
+Let's plan rigorous generation.
+
+I can make an array in reasoning:
+For i=1 to 220:
+lang = [en,zh,ja][(i-1)%3]
+cat = [code,story,translation,structured][(i-1)%4]
+row.
+
+Could I use a script mentally? Maybe generate 220 lines by copying pattern. Since numbers simple, maybe I can create each line with i. Let's do batch by 10, with a table of lang/cat. Need verify.
+
+Let's list i 1-12 mapping:
+1 en code
+2 zh story
+3 ja translation
+4 en structured
+5 zh code
+6 ja story
+7 en translation
+8 zh structured
+9 ja code
+10 en story
+11 zh translation
+12 ja structured
+
+13-24 same as 1-12:
+13 en code
+14 zh story
+15 ja translation
+16 en structured
+17 zh code
+18 ja story
+19 en translation
+20 zh structured
+21 ja code
+22 en story
+23 zh translation
+24 ja structured
+
+25-36 same.
+
+Thus can generate in 12-blocks. 220 = 18 blocks (216) + 4. So 18 identical language/category blocks, numbers increasing by 12 per block for the 12 rows? Within block values increase by 1 per i. For block b (0-index), starting i=12b+1. prompt = 100+12b+1 = 101+12b. output=51+12b. accepted=21+12b. drafted=31+12b. decode=11+12b. Then for row offset k=1..12 add k-1 to each numeric except id. So each block has 12 rows with same lang/cat and numeric starting values.
+
+Could produce 18 blocks of 12 lines plus 4 lines. This is manageable. Need compute starting values for each block b=0..17.
+
+Block b start i=12b+1:
+base_prompt = 101 + 12b
+base_output = 51 + 12b
+base_acc = 21 + 12b
+base_draft = 31 + 12b
+base_decode = 11 + 12b
+
+Rows offset r=0..11:
+id = S(12b+1+r) padded.
+prompt=base_prompt+r
+output=base_output+r
+acc=base_acc+r
+draft=base_draft+r
+decode=base_decode+r.
+
+Block 0 b=0 start 1:
+1 101,51,21,31,11
+2 102,52,22,32,12
+3 103,53,23,33,13
+4 104,54,24,34,14
+5 105,55,25,35,15
+6 106,56,26,36,16
+7 107,57,27,37,17
+8 108,58,28,38,18
+9 109,59,29,39,19
+10 110,60,30,40,20
+11 111,61,31,41,21
+12 112,62,32,42,22
+
+Block 1 b=1 start 13:
+base 113,63,33,43,23
+13 113,63,33,43,23
+14 114,64,34,44,24
+15 115,65,35,45,25
+16 116,66,36,46,26
+17 117,67,37,47,27
+18 118,68,38,48,28
+19 119,69,39,49,29
+20 120,70,40,50,30
+21 121,71,41,51,31
+22 122,72,42,52,32
+23 123,73,43,53,33
+24 124,74,44,54,34
+
+Block 2 start 25: base 125,75,45,55,35
+...
+
+Need up to block 17 start 205? b=17: 12*17=204 start 205 base 101+204=305, output 255? Wait base output =51+204=255, acc 225, draft 235, decode 215. Last row i=216: prompt 316, output266, acc236, draft246, decode226.
+Then remaining i=217-220 base for block 18 partial start 217: base prompt=317? 100+217=317, output267, acc237, draft247, decode227; ids 217-220 mapping en code, zh story, ja translation, en structured.
+
+Need count 18 full blocks = 216 rows. Good.
+
+Need create final CSV. Could produce by block. Need be careful with IDs: S0001 etc. For i 1-9 S000x, 10-99 S0xx? Four digits: S0010, S0011... S0099, S0100... S0220. Need ensure no S000? For 10: S0010 (4 digits). For 100: S0100. For 220: S0220.
+
+Let's produce final carefully. Could maybe use block repeated but with numbers. Need not include line numbers. Let's draft in analysis and then final.
+
+I'll generate 12-row block template:
+S{0},en,code,P0,O0,A0,D0,T0
+S{1},zh,story,P0+1,O0+1,A0+1,D0+1,T0+1
+S{2},ja,translation,P0+2,O0+2,A0+2,D0+2,T0+2
+S{3},en,structured,P0+3,O0+3,A0+3,D0+3,T0+3
+S{4},zh,code,P0+4,O0+4,A0+4,D0+4,T0+4

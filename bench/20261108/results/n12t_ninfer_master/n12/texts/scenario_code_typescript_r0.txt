@@ -1,0 +1,197 @@
+The user wants a complete TypeScript 5 service with the following features:
+
+1. Consumes newline-delimited request metrics
+2. Validates them without third-party schema libraries
+3. Groups records by model and fixture
+4. Computes mean, median, and sample standard deviation
+5. Exposes /health, /summary, and /runs/:id endpoints
+6. Has strict types
+7. Incremental parsing
+8. Bounded memory
+9. Errors for malformed input
+10. Unit tests
+11. package.json
+12. tsconfig.json
+13. Short operations guide
+14. No placeholders
+
+Let me design this carefully.
+
+**Architecture:**
+
+- HTTP server (should use Node.js's `http` module to avoid Express's third-party dependency — the requirement says "no third-party schema libraries", which strictly means schema libraries only, but to be safe and self-contained, use the standard `http` module and a minimal router)
+- Actually, the constraint is "validate without third-party schema libraries" — so we can use other libraries, but writing with zero runtime deps is cleaner and more professional. Use Node's `http`.
+- Input consumption: "consumes newline-delimited request metrics" — probably via an HTTP endpoint like `POST /ingest` that accepts a NDJSON body (or a stream). Design it so that POST /ingest accepts NDJSON lines (with streaming/incremental parsing via the request stream), plus an optional file-tail mode? The service should consume NDJSON. Implement:
+  - `POST /ingest` — body is NDJSON, parsed incrementally as the stream arrives (bounded line buffer)
+  - Also allow NDJSON file ingestion at startup via the `METRICS_INPUT_FILE` env var? The spec doesn't require it. Keep the ingest endpoint as the primary consumption path, and add a CLI entry that pipes stdin? "Consumes newline-delimited request metrics" — the service consumes metrics. A POST /ingest endpoint with an incremental line parser is a good fit. Additionally support ingestion from a file path at startup via env. Include both but keep the file-ingest simple (also reads line by line with a bounded reader using fs createReadStream).
+
+Let me decide the shape of a metric record:
+
+```json
+{"runId":"r-123","model":"gpt-4o","fixture":"qa-banking","latencyMs":142.7,"tokens":512,"status":"ok","timestamp":"2024-05-01T12:00:00Z"}
+```
+
+Fields:
+- runId: string (non-empty, max length)
+- model: string (non-empty, max length)
+- fixture: string (non-empty, max length)
+- latencyMs: number (finite, >= 0)
+- tokens: number (integer >= 0)? Keep tokens as integer >= 0.
+- status: enum? Might keep optional. Keep required? Let's define a required set: runId, model, fixture, latencyMs. Optional: tokens (integer >= 0), timestamp (ISO 8601), status (one of "ok"|"error"|"timeout")? Simpler: required: runId, model, fixture, latencyMs, timestamp? Keep timestamp optional for leniency. Let me define:
+
+Required:
+- runId: string, 1..128 chars, must match `^[A-Za-z0-9._-]+$`
+- model: string, 1..64
+- fixture: string, 1..64
+- latencyMs: number (JSON number), finite, 0 <= v < 1e9
+Optional:
+- tokens: integer, 0 <= v <= 1e9
+- timestamp: ISO 8601 string, parseable as Date, and Date.parse finite
+
+Validation without schema libraries: hand-written validator returning typed results (`Ok<T> | Err<ValidationError[]>`). Strict type guards.
+
+**Grouping and stats:**
+
+Groups keyed by `model|fixture`. Stats computed:
+- count
+- mean (of latencyMs)
+- median (sort a copy)
+- sample standard deviation (n-1 denominator, 0 if n=1)
+- min/max maybe (useful, include)
+- p95? Not required. Stay with what's requested + min/max.
+- sum of tokens, average tokens? Not required; maybe sum tokens too. Keep minimal: count, mean, median, sampleStd, min, max. Optionally sumTokens too.
+
+**Incremental parsing:**
+
+`NdjsonLineSplitter` class: `push(chunk: Buffer): string[]` — buffer partial lines, return complete lines. Enforce a max line length (e.g. 64 KiB) and max buffer length (e.g. 256 KiB) — throw/reject on overflow ("line too long"), bounded memory.
+
+**Bounded memory:**
+
+- `BoundedMap` or a group registry with a cap: max number of model×fixture groups (e.g. 1024); max records per group (e.g. 100_000)? To compute the median exactly, we need all values — store the values array per group; cap the number of values per group, and on overflow drop the record with a `rejected` counter (rejecting the record with a "group full" error). Or use two heaps for median with streaming — but sample stddev requires sum and sum-of-squares, or Welford, and streaming is fine; a streaming median with two heaps is also possible. Hmm. Exact median via two heaps: push to small heap (max-heap) etc. That gives exact median for the full dataset and is O(log n) per insertion, but the heaps still hold all n values — memory per group is still unbounded. To bound memory strictly, we'd cap the number of stored values and reject beyond the cap. That's honest: "bounded memory" means the process cannot be OOM'd by the input. Implementation:
+  - Max groups: `MAX_GROUPS` (env var)
+  - Max samples per group: `MAX_SAMPLES_PER_GROUP`
+  - Enforce both; on overflow → record rejected with reason.
+- Also cap the total record count? Implied by groups × per-group cap.
+- Bounded request body: reject bodies > `MAX_BODY_BYTES` (e.g. 8 MiB), stop reading and return 413.
+
+**Malformed-input errors:**
+
+- 400 with a JSON error payload: `{ "error": { "code": "MALFORMED_RECORD", "message": ..., "line": <n>, "field": ..., "detail": ... } }`
+- Whole-body behavior: should one bad line fail the whole ingest? Design decision: return 200 with a summary of applied/invalid records per line (partial success), or all-or-nothing? The requirement "malformed-input errors" suggests we report errors. Implementation: line-by-line validation; invalid lines are counted and returned in the response with details (capped list, e.g. first 10 invalid lines with line numbers). If any invalid → response status 207? Simpler: 200 with `ingested` and `rejected` arrays; if all rejected → 400? Hmm. Clean approach:
+  - 413 for body too large
+  - 415 for non-JSON content-type? Not strictly needed; skip.
+  - Per line: parse + validate; valid → ingest; invalid → collect error {line, code, message, field?}.
+  - Response 200 `{ ingested: N, rejected: M, errors: [ ...up to 20... ] }`. If M > 0, use 207 Multi-Status? 207 is webdav-ish. Use 200 always for partial results, but if the body has zero valid records and >0 lines, then... still 200 with the info. But "malformed-input errors" — the client gets error details; if no lines at all (empty body), also 400? Empty body → 400 "empty body". Non-NDJSON (e.g. a single JSON array)? The first line will fail JSON parse → rejected line. Good.
+
+Actually, let me reconsider: strict services often go all-or-nothing (400, nothing applied). But partial success with per-line error reporting is more useful for metrics ingestion pipelines and demonstrates per-line error handling. I'll go partial with `strict` option: `POST /ingest?strict=1` → all-or-nothing 400. That covers both. Nice.
+
+**Endpoints:**
+
+- `GET /health` → 200 `{ status: "ok", uptimeSec, version, ingestedTotal, rejectedTotal, groups: N, memory: { rss, heapUsed } }` (from process.memoryUsage).
+- `GET /summary` → 200 `{ groups: { "<model>/<fixture>"? or nested } }`. Nested is nicer: `{ "summary": { "gpt-4o": { "qa-banking": { count, mean, median, sampleStdDev, min, max } } }, "totals": {...} }`.
+- `GET /runs/:id` → stats for records of that runId across groups: `{ runId, count, mean, median, sampleStdDev, min, max, models: [...], fixtures: [...] }`, 404 if unknown runId.
+
+For /runs/:id, we need per-run aggregates in addition to per-group storage. Options:
+1. Store all records in a flat array and compute on demand — memory unbounded; also double storage.
+2. Maintain a `RunStats` accumulator per runId (count, sum, sumSq for Welford-ish stddev, min, max) plus store per-run values for the median? Median needs values. Hmm, exact median for a run needs the raw values. We could keep a per-run values array, but that's duplicate memory.
+
+Simpler: keep one record store keyed by group with the full values array, plus per-run indexes? That's a lot of complexity.
+
+Alternative: keep a `records: MetricRecord[]` flat array capped at `MAX_RECORDS` (e.g. 250,000), plus per-group and per-run summary accumulators (count, Welford for mean/variance, min, max). For exact median:
+- /summary needs per-group median → compute by sorting the group's values. Store values in the group (needed anyway).
+- /runs/:id needs per-run median → collect that run's latencyMs from the flat store on request and sort (O(k log k), k = records of that run). The flat store is bounded by MAX_RECORDS.
+
+So memory: groups hold values arrays (≤ groups × per-group cap), flat store capped by MAX_RECORDS. Both bounded, both reject when full. The flat store is needed for runs anyway; groups hold values for the median. Slight duplication, but acceptable and clearly bounded. Or, the flat store holds records and groups only hold a pointer... Let's simplify: flat bounded ring of records `RecordStore` (FIFO drop? no — reject when full with a counter). Actually the ring buffer that discards old data makes the stats stale/inconsistent. Rejection is better: when the total cap is reached, new records are rejected with a reason "record cap reached". Honest and bounded.
+
+So data structures:
+- `store: Array<MetricRecord>` (append-only, capped at MAX_RECORDS).
+- `groups: Map<GroupKey, GroupAccumulator>` where GroupAccumulator has values: number[] (capped), Welford (count, mean, m2), min, max, tokenSum?, tokensCount.
+- `runs: Map<runId, RunAccumulator>` with Welford, min, max, count, models: Set<string>, fixtures: Set<string> (bounded? Set of strings is small; cap the size of the Set to like 128 to keep memory bounded).
+- Counters: ingestedTotal, rejectedTotal, errorsByCode.
+
+Median: exact — sort a copy of the values array. Sample stddev: sqrt(m2/(n-1)) via Welford; n=1 → 0.
+
+Welford gives numerically stable mean/variance; but if I use the capped values array, I could compute stddev from values directly with a two-pass approach... The Welford accumulator matches the values array exactly (they grow together and never shrink), so it's consistent. Good.
+
+**Strict type guards:**
+
+- `type` predicate: `isRecordShape(value: unknown): value is LooseMetricRecord`
+- `validateMetricRecord(value: unknown): ValidationResult<MetricRecord>`
+- Discriminated union `type ValidationResult<T> = { ok: true; value: T } | { ok: false; error: ValidationError }`
+- ValidationError: `{ field?: string; code: ErrorCodes; message: string }`
+
+**Incremental parsing:** `LineSplitter` with `push(chunk: Uint8Array): string[]` using TextDecoder with stream:true? Caveat: a multi-byte UTF-8 character may be split across chunk boundaries. Use `TextDecoder` streaming to handle that. Implementation:
+
+```ts
+class LineSplitter {
+  private decoder = new TextDecoder("utf-8", { fatal: true });
+  private buf: string = "";
+  ...
+}
+```
+
+With fatal: true, malformed UTF-8 throws → catch → emit a malformed error for the chunk (reject the rest?). Simpler: non-fatal decoder and treat replacement characters as invalid? Strict: use fatal and, on decode error, report a "MALFORMED_UTF8" error, reset state, and return an error flag instead of a line. Have `push` return `{ lines: string[]; error?: LineError }`.
+
+Enforce per-line max length: accumulate the line in `buf`; if `buf.length > MAX_LINE_CHARS`, mark an error state; the next complete line is discarded with a "LINE_TOO_LONG" error. Bounded memory: buf is bounded by MAX_LINE_CHARS + 1 chunk.
+
+Also count bytes: track line char count by the accumulated length.
+
+**Router:**
+
+Small hand-written router: parse URL, method, route table. `/:param` matching.
+
+**HTTP server details:**
+
+- `createServer`
+- Read the request body into a bounded buffer: read chunks; if total > MAX_BODY_BYTES → respond with 413 and destroy the socket (or consume? destroy is simpler and memory-safe).
+- But incremental parsing: the requirement says "incremental parsing" — parse lines as they arrive, not waiting for the full body. So: on each chunk: lineSplitter.push → validate each line → ingest or record an error. Keep a running errors array capped at MAX_REPORTED_ERRORS (e.g. 50). Track count. This is truly incremental.
+- Enforce max line length in the splitter; body total cap via byte count.
+- On `finish`: if strict && rejected>0 → 400; if totalBytes === 0 → 400 EMPTY_BODY; otherwise 200 with the result JSON.
+- Also cap the number of lines per request: `MAX_LINES_PER_REQUEST` (e.g. 100_000). Exceeded → reject further lines with a code? Return 400? Stop accepting and return 413/400 with a reason. Implementation: when exceeded, stop parsing (ignore the rest, but we still need to drain the socket — or destroy after response). Drain: just keep consuming without processing until finish, and respond 400. Simpler: when exceeded, respond with 400 LINE_LIMIT and `req.destroy()`. Hmm, destroying mid-request is a bit rude but acceptable for an ops tool. Alternative is to keep draining. Let me implement drain: set `aborted` flag, keep receiving chunks (no processing) and respond at the finish. Memory-safe.
+
+Wait — if we respond with 400 and keep reading, the client may not send the rest; Node's keepalive... For simplicity and robustness: when a fatal condition occurs (body too large), respond and then `req.resume()` to drain? `res.end` followed by destroying the socket on keep-alive might drop subsequent pipelined requests. Cleanest: on fatal, respond, then `res.destroy`/`req.destroy`? Node: `res.destroy()` destroys the socket. For an ops metrics service, that's fine. I'll do this: respond with an error, then `socket.destroy()` to avoid state inconsistency. Document in the ops guide.
+
+Simpler alternative: always buffer the body up to the cap (bounded memory!), then parse. That's "bounded memory" but not "incremental parsing". The requirement explicitly asks for incremental parsing — so parse as chunks arrive. OK, going with the streaming approach.
+
+Also `GET /runs/:id` — URL-decode runId and validate with runId pattern (else 400).
+
+**Configuration via env:**
+
+- `PORT` (default 8080)
+- `MAX_LINE_CHARS` (default 65536)
+- `MAX_BODY_BYTES` (default 8 MiB)
+- `MAX_GROUPS` (default 1024)
+- `MAX_SAMPLES_PER_GROUP` (default 100000)
+- `MAX_RECORDS` (default 500000)
+- `MAX_REPORTED_ERRORS` (default 50)
+- `SHUTDOWN_TIMEOUT_MS`? for graceful shutdown.
+- `LOG_LEVEL`? Keep logs simple JSON lines via console. Small logger.
+
+Provide `Config` type and `loadConfig(env: NodeJS.ProcessEnv = process.env): Config` with validation (integers, positive, etc.) and clear errors.
+
+**Project layout:**
+
+```
+package.json
+tsconfig.json
+README.md (ops guide)
+src/
+  types.ts          // domain types, validation result types
+  config.ts         // config loading/validation
+  validation.ts     // record validation (no third-party libs)
+  lineSplitter.ts   // incremental NDJSON line splitter (bounded)
+  stats.ts          // Welford, median, aggregators
+  store.ts          // bounded stores, grouping, ingest logic
+  errors.ts         // error codes + HTTP error helpers
+  router.ts         // small router
+  server.ts         // HTTP server wiring, endpoints, body streaming
+  app.ts            // createApp(): builds everything, returns { server, close }
+  main.ts           // entrypoint: load config, start server, graceful shutdown
+test/
+  lineSplitter.test.ts
+  validation.test.ts
+  stats.test.ts
+  store.test.ts
+  server.test.ts    // endpoint tests using supertest? No, third-party! Use built-in fetch + http.
+```
+

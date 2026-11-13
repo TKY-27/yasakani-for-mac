@@ -1,0 +1,15 @@
+[12:16:45] engine settings: {"YSKN_ATX_PK3_PLUT": "1", "YSKN_ATX_PKV": "3", "YSKN_ATX_VSP": "7", "YSKN_BDR_SHEAD_M": "512", "YSKN_Q35_ATX": "1", "YSKN_Q35_G6": "1", "YSKN_Q35_KV8": "1", "YSKN_Q35_KV_FP16": "0", "YSKN_Q35_LAYER_OVERLAP": "1", "YSKN_Q35_LAYER_ROWS": "4096", "YSKN_Q35_PFALT": "1", "YSKN_Q35_PMAX": "1024", "YSKN_Q35_SHARED_WEIGHTS": "1", "YSKN_TB_CAP": "0", "YSKN_TB_VIT2": "1"}
+[q35_g6] prefill only, temporary workspace 111543640 bytes
+[KV-PROTOCOL] target_kv=int8-row-f32-scale
+[qwen3_5] 64 layers loaded, LNORD codes 11.81 GB, free 9.8 / 34.2 GB
+[qwen3_5] SHEAD drafter head loaded (<model_dir>\bdraft2_k8.shead): rank 512, 1.41 GB, score grid 340 blocks; GPU free 6.3 / 34.2 GB
+[12:16:51] engine ready in 5.3 s, max_ctx 262144
+[12:16:51] sampling: temperature 0.00 (<=0 is greedy), top-p 0.95, top-k 20, label mc_code2000_kv8, overrides {"YSKN_TB_CAP": "0"}
+[12:16:51] warm-up done
+[12:16:56] code        scenario_code_cuda             s0:   425.1 tok/s,  2000 tokens in    4.70 s (length), 414 passes, 4.83 tok/pass, 11.36 ms/pass, prompt 144
+[12:17:01] code        scenario_code_cuda             s1:   423.1 tok/s,  2000 tokens in    4.73 s (length), 414 passes, 4.83 tok/pass, 11.41 ms/pass, prompt 144
+[12:17:05] code        scenario_code_python           s0:   462.9 tok/s,  2000 tokens in    4.32 s (length), 381 passes, 5.25 tok/pass, 11.33 ms/pass, prompt 122
+[12:17:09] code        scenario_code_python           s1:   460.5 tok/s,  2000 tokens in    4.34 s (length), 381 passes, 5.25 tok/pass, 11.39 ms/pass, prompt 122
+[12:17:15] code        scenario_code_typescript       s0:   396.8 tok/s,  2000 tokens in    5.04 s (length), 447 passes, 4.47 tok/pass, 11.27 ms/pass, prompt 122
+[12:17:20] code        scenario_code_typescript       s1:   396.5 tok/s,  2000 tokens in    5.04 s (length), 447 passes, 4.47 tok/pass, 11.28 ms/pass, prompt 122
+[12:17:21] done

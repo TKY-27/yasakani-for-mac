@@ -1,0 +1,141 @@
+The user wants a complete TypeScript 5 service that meets the following requirements:
+
+1. Consumes newline-delimited request metrics
+2. Validates them without a third-party schema library
+3. Groups records by model and fixture
+4. Computes mean/median/sample standard deviation
+5. Exposes `/health`, `/summary`, and `/runs/:id` endpoints
+6. Includes strict typing
+7. Incremental parsing
+8. Bounded memory
+9. Malformed input errors
+10. Unit tests
+11. package.json, tsconfig.json
+12. A concise operations guide
+13. No placeholders allowed
+
+Let me design this carefully.
+
+**Architecture:**
+
+- HTTP server. Should I use Node.js built-in `http` module to avoid a third-party dependency? The user said "no third-party schema library," but other dependencies might be OK. However, to make it self-contained and guaranteed runnable, using Node's built-in `http` and `node:test` runner is safest — zero runtime dependencies, devDependencies are only `typescript` and `@types/node`. This makes the whole thing truly runnable: `npm install`, `npm run build`, `npm test`, `npm start`.
+
+- Input format: newline-delimited records. Let me define the metric record format. Options:
+  - NDJSON (each line is a JSON object) — a natural "newline-delimited" format.
+  - Or CSV-like.
+
+  NDJSON is the cleanest "newline-delimited" format and lets me write a strict validator without a schema library. Let's go with NDJSON.
+
+**Record schema:**
+
+```json
+{
+  "runId": "run-2024-001",
+  "model": "gpt-4",
+  "fixture": "long-context",
+  "latencyMs": 123.45,
+  "tokens": 512,
+  "status": "ok",
+  "ts": 1712345678901
+}
+```
+
+Validation rules (hand-rolled):
+- Each line must be valid JSON (parse with JSON.parse, catch errors → malformed input error).
+- Object (not array or primitive).
+- Required fields: `runId` (string, matching pattern `^[A-Za-z0-9_-]{1,64}$`), `model` (string, non-empty, length cap), `fixture` (string, non-empty), `latencyMs` (finite number >= 0), `tokens` (integer >= 0), `status` (enum: "ok" | "error" | "timeout"), `ts` (integer or finite number).
+- No unknown fields? Maybe reject unknown keys for strictness — that's a good strictness point. Allow a whitelist.
+- Line length cap (e.g., 64 KB) → malformed input.
+- Duplicate handling: should each record have a unique sequence? Keep it simple: no per-record ID.
+
+**Endpoints:**
+
+- `POST /runs/:id/ingest`? Wait — the spec says "consume newline-delimited request metrics" and "expose /health, /summary, /runs/:id endpoints." So how do metrics get consumed? Options:
+  1. HTTP endpoint that accepts an NDJSON stream: `POST /ingest` (with `Content-Type: application/x-ndjson`). The service reads the request stream incrementally (line by line), validating and buffering/aggregating.
+  2. Tail a file.
+
+  The cleanest is: `POST /ingest` streaming NDJSON. The phrase "runs/:id" suggests grouping by run. Ingest could take the run ID as a path parameter: `POST /runs/:id/ingest` — the runId in the record must match (or the path runId takes precedence / be validated to match). Hmm, let me think.
+
+  Actually simpler and consistent: `POST /ingest` accepts NDJSON lines where each line has its own `runId`. And `GET /runs/:id` returns the statistics for that run (grouped by model/fixture). `GET /summary` returns aggregates across all runs. `GET /health` returns liveness + memory stats.
+
+  But "consume newline-delimited request metrics" — NDJSON over HTTP is the natural way. I'll implement `POST /ingest` with incremental (streaming) parsing: buffer the incoming bytes, split by `\n`, keep the partial tail line, enforce a max line length, and validate each complete line immediately. Aggregate incrementally (running sums, counts, quantile sketches?).
+
+**Bounded memory:**
+
+Full per-record statistics (mean/median/sample std) require all data points unless we use summaries. Options:
+
+- Running sum/count for the mean and variance (Welford's) — O(1) per group, but **not** the median.
+- Median requires storage. Bounded approach: per (model, fixture) group, keep a bounded reservoir/sorted structure. To truly bound memory: per group cap the number of stored latency samples (e.g., max 10,000). If exceeded, either use a reservoir sample (median estimate) or reject/fold.
+
+  To keep the math exact within the bound: use a bounded reservoir sample (per group, with a deterministic seed so tests are reproducible) for the median, and Welford for exact mean/variance on *all* records (that's O(1)). Hmm, but sample standard deviation over all records is computable exactly with Welford. The median from the reservoir is an estimate — but the spec asks us to compute mean/median/sample std, and bounded memory means we can't keep everything. A clean, defensible design:
+
+  - Per (model, fixture) group, exact count, sum (mean), Welford M2 (sample variance) over **all** ingested records.
+  - Per group, a bounded reservoir sample (capacity, e.g., default 4096, configurable) for the median. When capacity is exceeded, use the standard reservoir-sampling algorithm with a seeded PRNG so it's deterministic.
+
+  Actually, a simpler alternative for the median within a hard memory cap: keep a sorted structure, and once full, drop… but that biases. Reservoir sampling is the right tool and shows off. Or: bounded "capped" storage where we stop storing once we hit the cap and report that the median is unavailable? That's worse.
+
+  I'll go with reservoir. Document that with `capacity` ≥ ingested count, the median is exact; otherwise it's an estimate from a uniform reservoir sample. Actually — hmm, let me reconsider. There's an even more deterministic bounded approach that yields an **exact** median with a bounded structure: keep a sliding window of the most recent N values? That's biased to recent values, but it's exact for the window. The spec says "compute mean/median/sample standard deviation" — with bounded memory, reservoir sampling is the classic, defensible answer. I'll clearly document that behavior.
+
+  Actually, on reflection: is the simpler approach better for unit-test predictability? A seeded PRNG (e.g., mulberry32) reservoir is deterministic given the ingest order, so tests can assert exact expected medians. Good.
+
+  Alternative: since it's a per-group sample buffer with a cap C, when it fills we replace via reservoir sampling. Implement with Vitter's Algorithm R:
+  - For item i (0-indexed) with buffer capacity k:
+    - If buffer.length < k: push.
+    - Else: j = nextRandom() % (i+1); if j < k: buffer[j] = value.
+
+  With a seeded PRNG, it's deterministic.
+
+  Per-group mean: sum/count (floating-point) or Kahan summation for precision. Kahan is a nice touch — "strict" quality. Use Kahan for the latency sum, and Welford with Kahan correction… Welford doesn't directly take Kahan. I can use parallel variance algorithm, or two passes: since we need sample variance, we could also store a second bounded… no. Welford is fine and numerically reasonable. Or: store sum and sumSquares and compute variance = (sumSq - n*mean²)/(n-1) — numerically bad for large magnitudes. Welford is better. I'll use Welford.
+
+  Also track: total tokens (integer — can it overflow? Max token count per record… Node's Number is safe up to 2^53. A single record's tokens is an integer ≤ 1_000_000; count ≤ memory bound… sum of tokens can exceed 2^53 with a huge count. Use a bigint-ish guard: if a Number sum exceeds Number.MAX_SAFE_INTEGER → malformed? No — better to track in BigInt for the sum? Adds complexity. I can compute the token sum as a Number and cap: if it exceeds MAX_SAFE_INTEGER, clamp the count and mark… simpler: store per group, and on overflow (sum > MAX_SAFE_INTEGER - tokens) → increment `overflow` counter and keep the last safe value? That's ugly.
+
+  Simpler approach: token count per record is validated ≤ some cap (e.g., 10^7). Group token total is computed as a Number; document that the safe range is ~9e15. Or use a BigInt just for the token total — clean and exact, JSON-serializes fine (BigInt serializes as a number, but for large values it'll be a big-number string in JSON output — JSON.stringify(BigInt) throws! Right: JSON.stringify(BigInt) throws a TypeError. So I'd need to convert via .toString() or Number() on serialization. I can serialize as strings in the response to preserve exactness. Adds complexity.
+
+  Decision: keep token totals in Number, and guard: if next value would exceed MAX_SAFE_INTEGER, set flag `tokenTotalOverflow: true` and keep the total as a sentinel? Hmm. Simpler: cap on total records? "Bounded memory" implies record count per group is unbounded (only the sample buffer is bounded). But I can set a hard cap: per group, aggregate over **all** records (O(1) per group, memory is bounded by the number of distinct groups — that's the real memory risk!).
+
+  Real memory bound considerations:
+  1. Sample buffer: capped by capacity (fixed).
+  2. Group map: number of distinct (model, fixture, runId) combinations is unbounded from input. Bounded memory means I must also cap the number of groups. Enforce `maxGroups` (default e.g. 10_000); when exceeded with a new group → reject that record with a 4xx error (malformed? no — that's a capacity error, distinct from malformed; I can return 413/422 and report). Actually, for a streaming ingest, if a request includes an unknown group beyond the cap: reject the whole request with 413 (Payload Too Large) or a specific error code `GROUPS_EXHAUSTED`. Since I process incrementally, the request completes with an error status and reports how many lines were accepted before failure. That's honest and bounded.
+  
+  3. In-flight line buffer: capped by max line length (64 KB) → malformed error if exceeded.
+  4. In-flight request body: total ingest bytes cap per request (e.g., 16 MiB) → 413.
+
+  So memory is truly bounded: O(maxGroups * (O(1) aggregates + capacity samples)).
+
+  Token sum overflow: enforce max per record, and per-group record count… the count itself is unbounded (bounded only by maxGroups*recordsPerGroup? no, per-group record count is unbounded). To keep the total safe: track record count as a Number (safe up to 9e15 records — unrealistic). Token sum: with the per-record cap of 10^7 and, say, 1e9 records, the sum is 1e16 > 9e15 possible. Use Kahan summation for the token sum and check `Number.isSafeInteger` on the running sum; if it becomes unsafe, set overflow flag and stop updating (keep last safe + flag). Honestly, cleanest: store token total as `bigint` internally and serialize via `String(value)`. JSON response uses strings for the token total — strict and exact, no overflow. Hmm, strings in JSON might be annoying but they're accurate. Or, just guard and mark. 
+
+  I think the elegant and simple approach is: internally keep everything in Number with Kahan, and per-group cap the accepted records? No — the ingest should accept a lot.
+
+  Let's do this: internally `tokenTotal` as `bigint` (exact), serialized as string in JSON. Also, meanTokens computed as Number (fine). This is a nice "strict typing" showcase. Wait, but sample std of tokens? The spec says compute mean/median/sample std — for what metric? Presumably latency (and maybe tokens). I'll compute stats for both `latencyMs` (float) and `tokens` (int): mean, median (from reservoir), sample std. For tokens, Welford works with integer inputs too. Mean = sum/count — with a bigint sum, Number(bigint)/count for a precise mean.
+
+  Hmm, this is getting heavy. Let me trim: primary metric = latencyMs. Secondary = tokens, tracked with a total (bigint), mean, maybe skip median/std? The spec just says "compute mean/median/sample standard deviation" — I'll compute for both latency and tokens to be thorough, but keep it manageable. Actually let me compute both, since the code is a shared generic `MetricTracker` used twice per group. Generic tracker: `update(value: number)` with Kahan? No — Welford per metric + shared reservoir buffer for median. Reservoir sample per (group, metric)? The reservoir holds values; latency and tokens are separate streams → separate reservoirs per metric. That's fine: GroupState { latency: MetricTracker, tokens: MetricTracker }. MetricTracker { count, Welford (mean, M2), reservoir (bounded), rng }.
+
+  Reservoir capacity: a single configurable cap shared across all reservoirs? The bound: maxGroups * 2 reservoirs * capacity * 8 bytes. Default capacity 2048, maxGroups 1024? Let me pick reasonable defaults: reservoirCapacity = 4096 (configurable via env), maxGroups = 10_000 (env), maxLineBytes = 64KB, maxBodyBytes = 16MB, plus an overall `maxGroups` for the total memory cap.
+
+  Also, should we support `maxGroups`? "Bounded memory" needs it. Yes.
+
+**Incremental parsing:**
+
+HTTP request body stream (Node IncomingMessage). I'll implement a `LineParser` class:
+- `push(chunk: Buffer)` returns an array of complete lines + holds remainder in an internal byte buffer (bounded by maxLineBytes; if the remainder exceeds the max → throw MalformedLineError).
+- Handling `\n` and `\r\n`? Newline-delimited conventionally uses `\n`; I'll accept `\r\n` and strip trailing `\r`. Also handle the final chunk with no newline (line pending) — `finish()` returns the pending line if non-empty.
+- Skip blank lines? Empty lines: treat as skipped (or malformed?). Many NDJSON specs: blank lines are skipped. Skip blank/whitespace-only lines but count them.
+- Enforce max line length on the accumulator (byte length) → malformed error.
+- UTF-8 boundary issue: splitting on `\n` bytes in a Buffer is safe (0x0A doesn't appear inside a multi-byte UTF-8 sequence) — correct. But if I cut a line exactly at the newline, it's complete, so no partial-character problem.
+
+- Validation per line: `JSON.parse` → strict validator.
+
+- Per-request incremental ingest: process lines as they arrive; validate each line; aggregate immediately. If any line is malformed → record error, and per policy: stop processing and fail the request (422) with details (line number, reason) or continue processing valid lines (report both accepted and rejected)? Which is better? "Malformed input error" requirement — cleanest semantics: fail-fast with a detailed error JSON (line number, column-ish info, field name, expected vs actual). Fail-fast is predictable for tests and simpler. But I could also offer strict mode (fail-fast, default) — keep it single-mode for simplicity: fail-fast. Hmm, "incremental parsing" suggests streaming; fail-fast on first bad line is fine and common (e.g., NDJSON APIs).
+
+  Actually, let me reconsider: fail-fast on first malformed line, response 422 with `{ error: { code: "MALFORMED_LINE", line: N, message } }`. Lines already aggregated before the error — should they roll back? For atomicity, ideally yes… rolling back Welford/reservoir is hard (Welford has an inverse, but reservoir replacement is hard to undo cleanly… actually, undo: I recorded which index was replaced and the old value, so I could log a per-line inverse op and replay in reverse — feasible but complex). Simpler: make the ingest atomic: buffer aggregate updates? No — that defeats incremental. Alternative: process the whole request and only commit on success — but then we need to buffer the records → memory unbounded by the request… we already have maxBodyBytes (16MB), so buffering the whole body is bounded. Hmm!
+
+  Wait — if I buffer the whole request body anyway (for atomicity), what does "incremental parsing" mean? I can still parse incrementally (line-by-line, streaming, no full-body buffer) and maintain in-flight per-request pending aggregates… simplest, robust design:
+  
+  - Incremental line parsing from the stream (no full-body buffer) → memory bounded by line length.
+  - On malformed line: 422 error; records before the bad line were already committed. Document: ingest is "best-effort streaming; a malformed line halts the request; preceding lines are committed." This is honest and typical for streaming ingestion (like Kafka-like semantics). Tests will assert this behavior.
+  
+  Alternatively, provide a transactional mode… nah, keep it simple and documented. I'll document clearly in the operations guide and README: "ingest is not transactional."
+
+  Hmm, but is committing partial data acceptable? Many real ingest endpoints (e.g., statsd, Prometheus remote write) aren't transactional per request. Fine.
+
+  Actually, let me reconsider atomicity by having a per-request shadow aggregator and committing at end-of-success. Per-request shadow: parse lines into validated records (buffer records → bounded by maxBodyBytes, fine), aggregate into a shadow group map (new groups are counted against maxGroups with rollback? if a new group would exceed the cap → error; shadow groups

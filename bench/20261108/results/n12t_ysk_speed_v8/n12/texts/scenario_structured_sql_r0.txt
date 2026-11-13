@@ -1,0 +1,123 @@
+We need answer user: "Return one PostgreSQL script with no Markdown fences. Define normalized tables for models, fixtures, runs, and request_metrics; include primary/foreign keys, checks, useful indexes, two views, one transaction-safe upsert function, and at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. The script must run in dependency order."
+
+Need produce final only SQL script no markdown fences. Must be PostgreSQL. Need tables normalized: models, fixtures, runs, request_metrics. Include PK/FK, checks, useful indexes, two views, one transaction-safe upsert function, at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Script run dependency order.
+
+Need think through schema.
+
+Maybe domain: benchmarking LLMs? Models, fixtures (test prompts/kinds), runs (benchmark executions), request_metrics (per request metrics). Need analytical queries for throughput, variability, long-context retention, and MTP acceptance. MTP = multi-token prediction? acceptance rate? Need metrics fields: tokens_generated, prompt_tokens, request_duration_ms, tokens_per_second, accepted_mtp_tokens? maybe mtp_acceptance_rate. Long-context retention maybe exact_match, retention_score, context_length.
+
+Need 80 INSERT rows spanning two models and four fixture kinds. Could insert into runs and request_metrics? User says at least 80 realistic INSERT rows spanning two models and four fixture kinds. Could mean total rows across tables? Maybe request_metrics rows at least 80? To be safe, produce 80+ INSERT rows in request_metrics, plus some model/fixture/run rows. "spanning two models and four fixture kinds" likely request_metrics rows distributed. Could do 4 models? No two models. Four fixture kinds. Need at least 80 INSERT rows maybe all tables? We can produce 2 models + 4 fixtures + maybe 8 runs + 80 metrics = 94 rows. That's okay.
+
+Need normalized: models table (model_id, name, variant? context_length, mtp_enabled?). fixtures table (fixture_id, kind, description, context_tokens?). runs table (run_id, model_id, fixture_id, run_number? maybe config, started_at, finished_at, notes). request_metrics (metric_id, run_id, request_id, prompt_tokens, completion_tokens, total_tokens, duration_ms, tokens_per_sec, mtp_candidate_tokens, mtp_accepted_tokens, long_context_retention_score? or exact_match). Need checks: tokens non-negative, duration > 0, retention 0-1, acceptance between 0-1? If compute acceptance from accepted/candidates checks accepted <= candidate. Need useful indexes: on runs(model_id, fixture_id), request_metrics(run_id, request_id), request_metrics(model_id? can't FK to model? Could include model_id denormal? Normalized suggests avoid, but could index via join. Maybe request_metrics has run_id only; indexes on run_id and duration/tokens. Could add materialized? No. Two views: v_model_fixture_summary, v_long_context_retention_by_fixture or v_throughput_by_run. One transaction-safe upsert function: CREATE OR REPLACE FUNCTION upsert_request_metric(...) RETURNS request_metrics using INSERT ... ON CONFLICT (run_id, request_id) DO UPDATE. Need set search_path? Use schema public.
+
+Need script no markdown fences, dependency order. Can include DROP? Better create if not exists? For rerunnable maybe DROP tables? User says define, insert, finish with queries. We can create fresh. But if run in existing DB with data, DROP? Could use CREATE TABLE IF NOT EXISTS and ON CONFLICT. But foreign keys dependency: create tables in order, drop dependent? If using IF NOT EXISTS okay. For deterministic script maybe DROP views/functions/tables in reverse, then create. But user says define, no requirement idempotent except transaction-safe upsert. Could do:
+SET client_min_messages = notice;
+DROP VIEW IF EXISTS ...; DROP FUNCTION IF EXISTS ...; DROP TABLE IF EXISTS request_metrics CASCADE; ... Then create. That ensures dependency order. But if we drop models after? reverse dependency: views, function, request_metrics, runs, fixtures, models. Then create models, fixtures, runs, request_metrics, indexes, views, function. Then inserts. Then analytical queries. If script includes queries at end, no problem.
+
+Need "one PostgreSQL script" no fences. Can include BEGIN/COMMIT? It can run. If we use DROP with CASCADE in script, okay. Maybe wrap DDL+DML in transaction? PostgreSQL allows DDL transaction. But if script includes SELECT queries at end, transaction would return? psql executes? If BEGIN then queries then COMMIT, SELECT output okay. But function uses transaction-safe. Better not wrap entire script? Could use DO? No need. "transaction-safe upsert function" means function uses ON CONFLICT or exception block. We can create function that does INSERT ... ON CONFLICT ... RETURNING, and maybe set client to use serializable? Transaction-safe maybe no race conditions. We can implement:
+CREATE OR REPLACE FUNCTION upsert_request_metric(... ) RETURNS request_metrics LANGUAGE sql VOLATILE AS $$
+  INSERT INTO request_metrics (...) VALUES (...)
+  ON CONFLICT (run_id, request_id) DO UPDATE SET ... RETURNING *;
+$$;
+Need ensure if run_id FK check? The function can take run_id uuid, request_id int, etc. To be transaction-safe under concurrency, maybe include SELECT? ON CONFLICT works in a single statement, safe if unique constraint. Need default values? We'll define request_metrics PK maybe id BIGINT generated, but upsert conflict on run_id, request_id unique. Need unique constraint.
+
+Potential types: UUID for ids, timestamp with time zone, numeric for tokens? Tokens integer. Use bigint for tokens. Duration_ms numeric or integer. Check tokens_per_sec? If compute in view or insert? Could store. Need check tokens_per_sec = total_tokens/duration? floating. Simpler store generated? No. We can include generated columns? Maybe not needed. Use numeric(10,3) tps. Check positive.
+
+Need MTP acceptance. Fields: mtp_candidates integer, mtp_accepted integer. Check accepted >=0 and <= candidates. If candidates 0, accepted 0. Or acceptance_rate numeric. Could store rate, check 0-1. But to be realistic: MTP acceptance = accepted speculative tokens / proposed tokens. Query can compute avg(accepted::float/candidates). Need handle null/zero. Include both? Could include mtp_candidates, mtp_accepted. Check not null. For non-MTP models, candidates 0 accepted 0. Good.
+
+Long-context retention: metric for accuracy retention maybe long_context_retention numeric between 0 and 1. Could be null for short context? Check if context_tokens > 8000 then not null? Hard. Simpler check retention between 0 and 1 and not null for all. Realistic values 0.8-1. Could store exact_match? For long-context retention, query filters fixtures context_tokens >= 8192.
+
+Need fixture kinds four: e.g. 'qa_short', 'summarization', 'code_edit', 'needle_in_haystack'? Spanning four fixture kinds. Context length varies. Models two: 'model-alpha' and 'model-beta', one with MTP enabled? Could make alpha MTP true, beta false or both true. Need MTP acceptance query meaningful: maybe one model has MTP. Could have both but beta less. Let's define model_alpha mtp_enabled true, model_beta mtp_enabled false. MTP acceptance for alpha only.
+
+Need 80 realistic INSERT rows. We can write explicit INSERT rows. Need avoid too many repeated? Could use VALUES with generated? Need at least 80 INSERT rows. Could do one INSERT INTO request_metrics VALUES (multiple rows) with 80 tuples. That counts rows? Yes. But "at least 80 realistic INSERT rows" likely rows inserted, not statements. One multi-row insert okay. Need span two models and four fixture kinds. We can create 8 runs: 2 models * 4 fixtures. 80 request metrics: 10 per run. Need generate realistic values. We can manually produce 80 rows. Need keep SQL manageable. We can use arrays? But explicit VALUES 80 rows. Need ensure FK to run_id. Use UUIDs fixed. Use request_id 1..10 per run. Need metrics vary. Need ensure checks pass.
+
+Need think schema details.
+
+Tables:
+models:
+  model_id uuid pk default gen_random_uuid()? But for explicit inserts use fixed UUIDs. Need pgcrypto? gen_random_uuid() built-in PG13? In PG, gen_random_uuid() in pgcrypto? Actually PostgreSQL 13 built-in? To avoid dependency, define fixed uuid values and no default. Or use default gen_random_uuid() if available; but explicit inserts provide. Could include CHECK length? no.
+  name text not null unique
+  vendor text
+  context_length int not null check >0
+  max_new_tokens int not null
+  mtp_enabled boolean not null
+  notes text
+
+fixtures:
+  fixture_id uuid pk
+  kind text not null check kind in ('qa_short','summarization','code_edit','needle_in_haystack') maybe use enum? Check list.
+  description text
+  context_tokens int not null check >0
+  min_expected_retention numeric? maybe.
+
+runs:
+  run_id uuid pk
+  model_id uuid not null references models(model_id)
+  fixture_id uuid not null references fixtures(fixture_id)
+  run_number int not null check >=1
+  started_at timestamptz not null
+  finished_at timestamptz not null
+  config jsonb default '{}'? Could be useful.
+  check finished_at >= started_at
+  unique(model_id, fixture_id, run_number)? Could.
+
+request_metrics:
+  metric_id bigint generated always as identity primary key? Or uuid. Use bigint identity. But upsert conflict on run_id, request_id. Need unique(run_id, request_id). If identity primary key and unique conflict on run_id/request_id. Good.
+  run_id uuid not null references runs(run_id) on delete cascade
+  request_id int not null check >0
+  prompt_tokens int not null check >=0
+  completion_tokens int not null check >0? Could be zero? requests likely >0. check >0.
+  total_tokens generated? Can define as prompt_tokens + completion_tokens? Generated always as (prompt_tokens + completion_tokens) stored? PG generated columns can be stored. But if upsert update prompt/completion, generated updates. Could do total_tokens bigint generated always as (prompt_tokens + completion_tokens) stored. But inserting explicit total tokens not allowed. Maybe simpler not generated; store total_tokens int not null and check total = prompt+completion. But if we use generated, no need insert. Need in upsert set prompt/completion only. For analytic throughput: completion_tokens/duration. Need duration_ms int/numeric. Use duration_ms numeric(12,3) check >0.
+  tokens_per_sec numeric(12,3) not null check >=0. Could be generated from completion_tokens/duration_ms? But duration_ms in ms; if generated always as completion_tokens/(duration_ms/1000) maybe numeric. But if generated, upsert update duration. It can be generated. But checks? We can avoid storing tps; views compute. But user request metrics maybe include throughput. We can store tokens_per_sec numeric. But generated column can't be updated. For upsert, set prompt_tokens, completion_tokens, duration_ms, etc; tps generated. Let's use generated column? PostgreSQL supports generated columns in PG12. total_tokens generated always as prompt_tokens + completion_tokens stored; tokens_per_sec numeric generated always as (completion_tokens / (duration_ms / 1000.0)) stored? Generated column expression must be immutable? Division is immutable? I think numeric operations immutable, yes. But generated column with (completion_tokens / (duration_ms / 1000.0)) might be okay. However if duration_ms numeric, result numeric. Could be precision. But if duration_ms zero? check >0. Fine. But generated columns cannot be used in unique? no.
+Maybe easier: no generated, store total_tokens and tokens_per_sec with checks. Upsert sets all. Realistic. But normalized and checks: total_tokens = prompt+completion; tokens_per_sec >=0. Need check token counts non-negative.
+
+Long-context retention: long_context_retention numeric(6,4) not null check between 0 and 1.
+MTP: mtp_candidates int not null default 0 check >=0; mtp_accepted int not null default 0 check between 0 and mtp_candidates. In PostgreSQL check can reference columns? Yes CHECK (mtp_accepted <= mtp_candidates). Need if candidates=0 accepted=0.
+Also maybe latency percentiles? Not needed.
+
+Useful indexes:
+CREATE INDEX idx_runs_model_fixture ON runs(model_id, fixture_id);
+CREATE INDEX idx_runs_started ON runs(started_at);
+CREATE INDEX idx_metrics_run ON request_metrics(run_id);
+CREATE INDEX idx_metrics_run_request ON request_metrics(run_id, request_id); but unique already creates. Maybe unique constraint does. Add idx_metrics_duration ON request_metrics(duration_ms); idx_metrics_prompt_tokens? For long context: idx_metrics_fixture via join? request_metrics has no fixture_id. Could index request_metrics(prompt_tokens, completion_tokens). For MTP: idx_metrics_mtp ON request_metrics(mtp_candidates, mtp_accepted). For views: index on runs(model_id) etc.
+Maybe create partial index for long-context: CREATE INDEX idx_metrics_long_context ON request_metrics(prompt_tokens) WHERE prompt_tokens >= 8000; but prompt_tokens is from metrics, fixture context maybe. Good.
+
+Two views:
+1. v_throughput_by_run: join runs, models, fixtures, aggregate avg tps, p95? PG percentile_cont? Need simple. View can compute avg tokens_per_sec, min, max, total_requests, total_completion_tokens, avg_duration_ms, fixture_kind, model_name. For variability: stddev tokens_per_sec. Could view include variability. Maybe one view for throughput/variability: v_run_throughput.
+2. v_long_context_mtp: maybe retention and MTP acceptance by model/fixture. Join metrics to runs/fixtures/models, filter prompt_tokens >= 8000 or fixture context_tokens >= 8000. Compute avg retention, min retention, mtp_acceptance = sum accepted / nullif(sum candidates,0). Also count.
+Need two views. Could:
+CREATE VIEW v_run_summary AS SELECT ... avg_tokens_per_sec, stddev_tokens_per_sec, throughput_p95? Could use percentile_cont(0.95) WITHIN GROUP. View can include aggregate subquery? Yes.
+CREATE VIEW v_model_fixture_long_context AS SELECT model_name, fixture_kind, fixture_context_tokens, count, avg_retention, min_retention, mtp_acceptance, avg_completion_tokens.
+
+Analytical SELECT queries six:
+1 throughput by model and fixture kind: select model_name, fixture_kind, avg(t.tokens_per_sec), median? percentile_cont? total completion tokens, request count.
+2 variability by model and fixture: stddev_pop tokens_per_sec, coefficient of variation? Maybe standard deviation and p50/p95.
+3 long-context retention by model for long context fixtures: avg retention, min, count, filter prompt_tokens >= 8192.
+4 MTP acceptance by model: sum accepted / sum candidates for models with mtp_enabled.
+5 maybe retention vs context length buckets: bucket fixture context_tokens (short/mid/long) avg retention.
+6 MTP acceptance by fixture kind for MTP model? Or request-level acceptance percentiles? Need six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Could cover all. Let's plan six:
+Q1 Throughput by model and fixture kind: AVG(tokens_per_sec), median tokens_per_sec (percentile_cont), total completion tokens, requests.
+Q2 Throughput variability by model and fixture kind: stddev_pop(tokens_per_sec), min/max, coefficient of variation (stddev/avg), p05/p95 maybe.
+Q3 Long-context retention by model: avg(long_context_retention), min, count where prompt_tokens >= 8192, maybe by fixture kind.
+Q4 Long-context retention by context-length bucket: buckets (0-4k,4k-8k,8k+) avg retention and throughput maybe.
+Q5 MTP acceptance by model: sum(mtp_accepted) / nullif(sum(mtp_candidates),0), count candidates, model name.
+Q6 MTP acceptance by fixture kind for models with MTP enabled: maybe acceptance and avg tokens_per_sec impact. Or request-level top/bottom acceptance? Could be "MTP acceptance by fixture kind and model" with only rows candidates>0.
+Need ensure queries run after inserts. Use schema public. No fences.
+
+Need 80 rows. Need design data. Use fixed UUIDs:
+models:
+'0a...'? Let's choose readable UUIDs:
+Model A: '10000000-0000-0000-0000-000000000001' name 'alpha-72b', mtp true.
+Model B: '10000000-0000-0000-0000-000000000002' name 'beta-34b', mtp false.
+fixtures:
+1 '20000000-...-0001' kind 'qa_short', context 2048.
+2 '20000000-...-0002' kind 'summarization', context 8192.
+3 '20000000-...-0003' kind 'code_edit', context 4096.
+4 '20000000-...-0004' kind 'needle_in_haystack', context 32768.
+runs:
+8 runs: model A each fixture, model B each fixture. Use UUIDs 30000000...-0001..0008.
+Run details:
+r1 A qa_short, r2 A summarization, r3 A code_edit, r4 A needle, r5 B qa_short, r6 B summarization, r7 B code_edit, r8 B needle.
+Started at 2025-01-01 10:00 etc.
+
+Metrics 80: 10 per run. Need realistic values. Need ensure prompt_tokens around fixture context. For each fixture: qa_short prompt_tokens ~2k; summarization ~8k; code_edit ~4k; needle ~32k. Completion tokens vary. Duration based on tokens_per

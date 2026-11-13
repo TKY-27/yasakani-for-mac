@@ -1,0 +1,133 @@
+We need answer user's request: produce complete Python 3.11 package for deterministic asynchronous job runner. Need read JSON manifest, enforce one active GPU job, persist atomic state, resume completed work, stream structured JSONL events, handle SIGINT, redact configured secrets, include pytest tests for success, failure, cancellation, resume. Present every source file in separate fenced block with path and include pyproject.toml.
+
+Need produce final with code files. Need ensure runnable, deterministic async. Let's design package.
+
+Package name maybe gpu_job_runner. Need Python 3.11. Use asyncio. Manifest JSON: list of jobs? Deterministic order. Each job maybe id, command? But GPU job? We can define job as task with command? To be self-contained, jobs can be functions? Manifest JSON cannot contain Python functions. Need a deterministic asynchronous job runner reads JSON manifest, enforces one active GPU job. Could use commands as executable list? But tests can simulate by using command paths? Need success/failure/cancellation tests. Simpler: jobs are shell commands? But async subprocess may be platform-dependent. Alternative: manifest includes tasks with "type" and "parameters" and package has built-in deterministic job implementations: e.g., "sleep" with duration, "exit" with code, "fail", "raise". But GPU job? Maybe jobs represent GPU work by having resource gpu. We can have built-in job types: "noop", "sleep", "fail", "compute" etc. Or command with script? Tests need no external. So define manifest schema:
+{
+ "schema_version":1,
+ "redact_secrets": ["SECRET"],
+ "jobs": [
+   {"id":"job-1","kind":"sleep","duration":0.01,"metadata":{"gpu":"0"}}
+ ]
+}
+Runner: deterministic asynchronous job runner. Enforces one active GPU job: semaphore or active_gpus set, max_active_gpu_jobs=1. Jobs declare gpu: true? or resource gpu? We'll have job.gpu = True or field "gpu": "0". Only one active GPU job at a time. Could also enforce by locking before running job if job.requires_gpu.
+
+Persist atomic state: state.json in state directory with atomic write tmp+rename. State contains version, started, completed job ids, failed, cancelled? events? Need resume completed work: on startup load state, skip completed jobs (and maybe failed? resume completed work means skip jobs already completed; failed maybe can retry? The request says resume completed work, not retry failed. We'll skip completed only; failed remain failed unless reset. Could include status per job. Atomic state after each job/event maybe.
+
+Stream structured JSONL events: emit events to stdout or log file? Need redact configured secrets. JSONL events: job_started, job_completed, job_failed, job_cancelled, runner_start, runner_completed, state_saved, secret_redacted? Redaction should redact configured secrets in payloads. We can have Redactor replace secret values in strings. Configured secrets via manifest field "redact" list or environment? We'll support manifest: "redact_secrets": list strings. Also environment variable RUNNER_REDACT_SECRETS maybe. Need tests verify redaction.
+
+Handle SIGINT: graceful cancellation. In asyncio, set signal handler to request cancellation. Runner catches asyncio.CancelledError and emits cancelled events. For jobs, cancel active task and mark cancelled? Need tests for cancellation: send SIGINT to process? But pytest tests can call runner with a fake signal? Better expose async run with cancellation via asyncio task cancellation, and signal handler integration. Tests can simulate by cancelling runner task or calling request_stop. Need include tests for cancellation. Could have test using asyncio.wait_for timeout? Or test SIGINT by subprocess? We can write pytest tests in-process by monkeypatching signal? But must handle SIGINT. We can implement install_signal_handlers that registers SIGINT. In test, can send SIGINT to current process? Risk. Better test that signal handler cancels runner: use threading.Timer to call os.kill(os.getpid(), SIGINT) during run, but in pytest can be messy but okay if handled. Or test by directly calling runner.request_stop and verifying CancelledEvent. But user specifically handle SIGINT; test should be robust. We can write test_cancel_via_sigint that runs runner in separate subprocess? But then need package installed? In tests can use sys.executable -m gpu_job_runner run --manifest ... maybe. Subprocess test easier, deterministic. But package might not be installed; if run from repo, sys.executable -m can find if current dir. But tests are in package; can rely on root in sys.path? We can add import module. Or use asyncio.run in process and send signal? Let's think.
+
+Need produce complete package. Let's plan file layout:
+gpu_job_runner/
+  __init__.py
+  __main__.py
+  config.py
+  events.py
+  redaction.py
+  state.py
+  jobs.py
+  runner.py
+  cli.py
+pyproject.toml
+tests/
+  __init__.py? maybe not
+  conftest.py
+  test_success.py
+  test_failure.py
+  test_cancellation.py
+  test_resume.py
+  test_redaction.py? Could include in success or separate. User requires pytest tests for success, failure, cancellation, resume. We can include additional redaction test. Need all files separate fenced block with path.
+
+Need ensure Python 3.11. Use pathlib, json, asyncio, dataclasses, typing, signal, os, sys, tempfile, uuid? deterministic: no timestamps? For deterministic, maybe avoid wall clock? State can include monotonic? But resume needs not depend on time. Events can have event_id sequential, no timestamps? "deterministic" maybe same order and events for same manifest. Use monotonic counter, no random, no timestamps. But JSONL events may include timestamp? Avoid nondeterminism: no timestamp, or optional omitted. Use deterministic sequence numbers.
+
+Jobs: deterministic execution. Built-in kinds:
+- noop: metadata can include "output": string? Return result dict.
+- sleep: duration float, uses asyncio.sleep. For tests small.
+- fail: exit_code integer? Raise JobFailure with exit_code and message.
+- raise? maybe fail enough.
+- compute: simple deterministic expression? Could simulate GPU work.
+But enforce one active GPU job: jobs can have "requires_gpu": true or "gpu": "A100". We'll make JobSpec.gpu: bool or string? Manifest job can include "gpu": true or "gpu": "0". If truthy requires GPU. Runner uses GPU semaphore max 1.
+
+Job result: return dict. JobFailure with exit_code and message. Cancellation: if asyncio.CancelledError raised, runner marks job cancelled? We need emit job_cancelled and state. If a job itself handles cancellation? We'll wrap.
+
+State schema:
+{
+ "version":1,
+ "manifest_hash": "...",
+ "status": "running"|"completed"|"failed"|"cancelled"|"interrupted"?,
+ "completed": {job_id: {"status":"completed","result":{...},"event_seq":...}}? But resume completed work: skip completed. If state has completed job ids.
+ "failed": {job_id: {...}} maybe.
+ "cancelled": {job_id: {...}}
+ "events_emitted": int? Not necessary.
+ "updated_at"? avoid.
+}
+Atomic write: json dump to temp file in same directory, os.replace. Also flush/fchmod. State directory: --state-dir default ./.gpu_job_runner. State file state.json.
+
+Manifest: include "name", "jobs". Need deterministic hash to validate resume matches manifest? If state manifest_hash differs, maybe error to prevent resuming different manifest. Could include manifest_hash in state. Tests resume with same manifest. If mismatch, Runner raises ManifestMismatchError. Good.
+
+Events JSONL: each line JSON object with "event": "...", "seq": n, "job_id" optional, "data": {...}. Redaction applied to entire event object. Print to stdout by default. Could also log to file --events-file. For tests capture stdout. Use json.dumps sort_keys=True ensure deterministic. Redaction: traverse object, replace strings equal to secret? Or containing secret? Configured secrets are values; we can redact exact matches and also substring? Safer: if string contains secret, replace with "[REDACTED]". But if secret is common substring like "a", bad. We'll do exact match and also maybe values from environment? The request says redact configured secrets. Could configure list of secret values. We'll redact exact string equality and also if string is JSON with secret? Simpler exact. But tests can set secret value in metadata and assert output does not contain it. Need if secret appears within larger string? We can offer both: exact match and optional substring if length >= 4? Hmm. For robust redaction, replace occurrences of secret in any string. Could be dangerous but okay. Use str.replace(secret, "[REDACTED]") for all secrets sorted by length descending. If secret empty ignore. If secret appears in JSON dumps after redaction. Good.
+
+CLI: `python -m gpu_job_runner run --manifest manifest.json --state-dir ... --max-gpu 1 --no-redact?`. It installs signal handlers. For tests, can call cli main? We can test via subprocess for SIGINT.
+
+Need package deterministic async. Enforce one active GPU job: use asyncio.Semaphore(1). Also track active_gpu_job id. For non-GPU jobs can run concurrently? The phrase "deterministic asynchronous job runner" and "enforce one active GPU job". Could run jobs sequentially to be deterministic? Asynchronous but deterministic. If multiple jobs can run concurrently, event order may be nondeterministic unless controlled. To guarantee deterministic events, run jobs in sequential order with await. But asynchronous job runner can still be async. If we run all sequentially, enforcement one GPU trivial. But maybe they expect async concurrency? Deterministic asynchronous job runner: could process jobs concurrently but deterministic order by scheduling. To be safe, run jobs sequentially in manifest order; async jobs await. That ensures deterministic event stream. But "asynchronous job runner" maybe should use async tasks. We can still use tasks with gather? But if concurrent, event ordering depends on timing. We can schedule in deterministic order and use queue? But simplest: for each job in order, execute; only one active job at a time, so one GPU enforced. But if only one active job, why need enforce one active GPU job? It could be because non-GPU jobs can overlap? The requirement specifically one active GPU job, not one job. Maybe we should support concurrent non-GPU jobs while GPU exclusive. Deterministic could be achieved by event ordering using global sequence assigned at event creation but if concurrent, order of creation may be deterministic if tasks start sequentially and complete by time? With sleep durations deterministic if no OS jitter? Tests may be flaky. Better to run sequentially but document deterministic. Yet "one active GPU job" still enforced by semaphore.
+
+Could implement runner with worker pool? For deterministic, use a single scheduler that starts jobs in manifest order but if GPU job running, GPU semaphore blocks; non-GPU can proceed. But if we gather all tasks, event order can vary. We can enforce deterministic by only starting a new job after previous job either completed or if non-GPU? Hmm.
+
+Maybe design: Runner processes jobs in deterministic pipeline: maintain active tasks, but max_workers? For deterministic tests, default max_workers=1? But one active GPU job separate. Could have `--max-active-jobs` default 1 for deterministic. But requirement only one GPU. We can set default concurrency 1 to be deterministic; still async. Then one GPU enforced. But if max_active_jobs=1, no concurrency. Is that acceptable? It says deterministic asynchronous job runner, not necessarily concurrent. I'd choose deterministic sequential execution by default, with option to allow concurrency but event ordering maybe sequence assigned via lock. However tests need deterministic. We can set default `max_workers=1`. But then why one GPU? Still enforce if job requires GPU.
+
+Could implement an event emitter with lock to assign seq and write. If multiple tasks emit simultaneously, order by lock acquisition, may depend. But deterministic if same timing? Not guaranteed. So sequential best.
+
+But maybe "one active GPU job" means if jobs declare GPU, only one at a time even if runner has multiple workers. We can implement both: default `max_workers=1` for deterministic; GPU semaphore 1. In code, if max_workers >1, event order still maybe deterministic if we process jobs from queue and emit start before await? But completion order may vary. We can avoid by setting max_workers default 1. The requirement does not demand concurrent non-GPU.
+
+Let's decide: Runner has `max_workers: int = 1` and `max_gpu_jobs: int = 1`. It will create asyncio.Semaphore(max_workers) and GPU semaphore. It starts tasks for jobs not completed. To ensure deterministic, tasks are created in order, but if worker semaphore >1, completion order can vary. But default 1. For tests, use default. We can also force `deterministic=True` by max_workers=1? We'll set max_workers=1 default.
+
+State resume: if state has completed jobs, skip. If state status is completed and all jobs completed, runner can still emit runner_completed? For resume, if no pending jobs, emit runner_resumed and runner_completed. Tests: run a manifest with state completed for first job, then run again; expect no execution of completed job (maybe event job_skipped). Need event job_skipped with data reason "already_completed". That proves resume. State after first run has completed. Second run should emit job_skipped and runner_completed. Could also test partial: run with one failing job and then resume? But resume completed work only. We can create state file manually with first job completed, then run manifest with two jobs; expect first skipped, second runs.
+
+Failure: job kind fail. Runner should mark failed, continue? Or stop? A job runner may stop on first failure by default. For deterministic and resume, maybe `continue_on_error` option. For failure test, can manifest with one fail and one sleep; runner stops after failure? If continue, failure event and then next job. Need test failure: assert exit code nonzero, event job_failed, state status failed. We can choose runner stops on first failure unless `continue_on_error`. Simpler. But resume completed work: if a later job completed before failure? sequential so no. Could have continue_on_error to test multiple? Not necessary.
+
+Cancellation: handle SIGINT. If SIGINT received while job running, runner cancels active job, emits job_cancelled and runner_cancelled, state status cancelled, exit code 130? CLI should exit 130. In-process runner raise CancelledError? We'll design Runner.run returns RunnerResult with status. Signal handler sets `self._stop_event` and cancels current task? With asyncio, signal handler can call `loop.call_soon_threadsafe`? Actually signal handler runs in main thread between bytecode; if in asyncio running, Python signal handler can call loop.call_soon_threadsafe? Signal handlers are invoked in main thread, but asyncio is running event loop; can call self._signal_requested. Better use loop.add_signal_handler(signal.SIGINT, handler) which schedules callback in event loop. In handler, set stop_event and cancel main task? We need avoid canceling everything abruptly. We can have handler set `self._sigint_count += 1`; if second, hard cancel. Then runner main loop awaits stop_event with timeout? Or job execution can check stop_event. For graceful, when signal received, we don't cancel job immediately? But to handle SIGINT, need cancel active job. We can have runner create task for job and wait on either job task or stop_event. If stop_event set, cancel job task, await, mark cancelled. Good.
+
+Implementation details:
+Runner:
+- __init__(manifest, state_dir, stdout=TextIO, redact_secrets=None, max_gpu_jobs=1, max_workers=1, job_factory=None)
+- validate manifest.
+- state = State.load(state_dir) or new with manifest_hash.
+- emitter = EventEmitter(out, redactor, state_dir? events_file? We can just stdout)
+- install signal handlers? Maybe Runner.run installs if `install_signal_handlers=True`. In tests in-process, can disable to avoid interfering. CLI enables.
+- For each job in manifest.jobs (in order): if job.id in state.completed: emit job_skipped, continue. Else: emit job_started; acquire worker sem; if job.gpu acquire gpu sem; try execute job via JobFactory.create(job). If stop requested before start? mark cancelled? We'll check.
+- To allow SIGINT while executing, create task = loop.create_task(_execute_job(job)); stop_task = loop.create_task(stop_event.wait()); then wait first. But if using await job_task directly, signal handler can't interrupt? It can set event but await will wait until job completes. Need wait on both. We'll implement:
+  async def _run_job(self, job):
+     task = asyncio.create_task(self._execute_job(job))
+     stop_task = asyncio.create_task(self._stop_event.wait())
+     done, pending = await asyncio.wait({task, stop_task}, return_when=FIRST_COMPLETED)
+     if stop_task in done and task not in done:
+        task.cancel()
+        with suppress(asyncio.CancelledError): await task
+        return JobOutcome.cancelled
+     # cancel stop_task
+     stop_task.cancel()
+     with suppress: await stop_task
+     return await task (should have completed)
+But if task raises, await task will raise. We need handle exceptions in _execute_job and return outcome? Better _execute_job catches JobFailure and CancellationError? But if cancelled by us, it will raise CancelledError. We can return outcome by catching.
+  async def _execute_job(self, job):
+     try:
+        result = await self._job_factory.execute(job)
+        return JobOutcome.completed, result
+     except JobFailure as exc:
+        return JobOutcome.failed, exc
+     except asyncio.CancelledError:
+        return JobOutcome.cancelled, None
+     except Exception as exc:
+        return JobOutcome.failed, JobFailure(message=repr(exc), exit_code=1)
+Then _run_job can await task without raising. But careful: if task returns after cancellation, CancelledError swallowed. Good.
+But if we cancel task, it should return cancelled. Need ensure _execute_job catches CancelledError; however if cancel occurs while awaiting asyncio.sleep, it raises at sleep, caught, returns tuple. Good.
+
+But using asyncio.wait with stop_task: stop_event is asyncio.Event. On signal handler, set. If second signal, maybe hard_cancel: cancel task immediately. We can implement handler:
+  def _handle_sigint(self):
+     self._stop_event.set()
+     self._sigint_count +=1
+     if self._sigint_count > 1:
+        # hard cancel current task
+        if self._current_job_task: self._current_job_task.cancel()
+In normal case, wait picks stop_task, cancels current task

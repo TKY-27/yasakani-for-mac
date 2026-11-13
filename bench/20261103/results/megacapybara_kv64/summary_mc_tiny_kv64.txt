@@ -1,0 +1,15 @@
+label mc_tiny_kv64  model qwen3.8-27b  temperature 0.00
+cat         fixture                            mean      min      max   ntok
+code        scenario_code_cuda                446.3    405.7    486.9   4096
+code        scenario_code_python              450.1    440.6    459.5   4096
+code        scenario_code_typescript         1935.6    532.7   3338.4   2122
+story       scenario_story_zh_scifi           126.7    126.7    126.7   2885
+story       scenario_story_en_mystery         246.8    243.5    250.2   3687
+story       scenario_story_zh_dialogue        119.7    118.9    120.5   2786
+translation scenario_translation_zh_en        390.5    389.0    391.9    895
+translation scenario_translation_en_zh        211.3    211.1    211.6    984
+translation scenario_translation_markdown     203.4    201.4    205.4    754
+structured  scenario_structured_jsonl         633.0    632.5    633.4   4096
+structured  scenario_structured_csv           646.8    636.3    657.4   4096
+structured  scenario_structured_sql           515.9    501.2    530.6   4096
+per category (mean of runs): code 944.0, story 164.4, translation 268.4, structured 598.6

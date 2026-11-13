@@ -1,0 +1,148 @@
+The user wants a complete TypeScript 5 service. Let me think carefully about the requirements:
+
+1. **Consumes newline-delimited request metrics** — NDJSON input. Probably from stdin, or an endpoint that POSTs NDJSON, or a file. Should design an endpoint that accepts NDJSON (e.g. POST /ingest), or also stdin. Let me think. "Consumes newline-delimited request metrics" — make it a service with an HTTP endpoint that accepts NDJSON, and maybe also support reading from stdin or file via CLI args. Keep it simple: POST /ingest with NDJSON body, plus support for a seed file via env var or CLI argument.
+
+2. **Validates without third-party schema libraries** — hand-written validator that returns typed errors with line numbers.
+
+3. **Group records by model and fixture** — Map with composite key `model|fixture`, or nested maps.
+
+4. **Compute mean/median/sample standard deviation** — Sample standard deviation means denominator n-1 (n ≥ 2 required; return null or 0 for n<2 — better: null / undefined and document).
+
+5. **Expose /health, /summary, /runs/:id endpoints** — HTTP server. Since no third-party libraries, use Node's built-in `http` module (or `node:http`). No Express.
+
+6. **Strict types** — tsconfig with strict: true, noUncheckedIndexedAccess, exactOptionalPropertyTypes, etc.
+
+7. **Incremental parsing** — stream parsing: handle partial lines, buffer, process line by line. Ingest endpoint accepts a chunk, appends to buffer, processes completed lines. Bounded memory: cap buffer size, cap number of stored records (e.g. keep statistics incrementally and discard raw records, or keep only recent N records for run listing).
+
+8. **Malformed input errors** — per-line error reporting with line number, field, message; HTTP 400 with structured error body.
+
+9. **Unit tests** — use Node's built-in test runner `node:test` to avoid third-party dependencies (ts-node also not needed if we run tests with `node --test` after building, or via `tsx`? To keep zero dependencies, tests can run against compiled JS with `node --test dist/test/`). This is clean: package.json scripts `build`, `test`: `node --test dist/test`.
+
+Actually, does Node's test runner support TS natively with --experimental-strip-types in Node 22.6+? That's experimental and version-dependent. Safer: compile tests to dist/test with tsc, then `node --test "dist/test/**/*.test.js"`. Node 20+ test runner supports glob patterns via `node --test <path>`. Use `node --test dist/test` — Node 20 supports directory argument: `node --test <dir>` scans for test files (files ending in .test.js, etc). Yes, when given a directory, the Node test runner recursively searches for files matching the test file naming convention (.test.js, -test.js, _test.js, or files inside test directories?). Let me recall: `node --test` with no arg looks for files matching `**/*.test.js`, `**/*-test.js`, `**/*_test.js`, and directories named test? Default test file patterns: `**/*.test.{js,cjs,mjs}`, `**/*-test.{js,cjs,mjs}`, `**/*_test.{js,cjs,mjs}`, `**/test-*.js`, `**/test.js`, `**/test/**/*.js`? Hmm. Node docs: when path is omitted, recursively searches from cwd, looking for: files named test, test-* etc in the test directory? The actual default glob (Node 20): `**/test{,-*}.{js,cjs,mjs}`, `**/test/*.{js,cjs,mjs}`, `**/*.test.{js,cjs,mjs}`, `**/*-test.{js,cjs,mjs}`, `**/*_test.{js,cjs,mjs}`, `**/test-*.{js,cjs,mjs}`. Something like that. To be safe, pass an explicit file path list in a script: `node --test dist/test/validator.test.js dist/test/stats.test.js dist/test/service.test.js`. Explicit is better and version-resistant. Or `node --test dist/test/` which works in Node ≥ 20.x I think (when a directory is provided, it recursively looks for test files in that directory). Let's use explicit file paths to be safe and deterministic.
+
+Alternatively, allow devDependency tsx for dev. But "no placeholders" and completeness — zero-dep is elegant: devDependencies only typescript + @types/node. That's fine; those are dev-only, and the "no third-party schema libraries" requirement is about schema validation specifically. Using @types/node is standard.
+
+Let me design the domain:
+
+**Record schema** (request metrics):
+
+```json
+{
+  "runId": "run-2024-01-01-a",
+  "model": "bert-base-uncased",
+  "fixture": "fixture-a",
+  "requestId": "req-123",
+  "latencyMs": 142.5,
+  "tokens": 512,
+  "status": 200,
+  "timestamp": "2024-01-01T00:00:00Z"
+}
+```
+
+Validation rules:
+- line must be non-empty after trim (blank lines ignored? Better: silently skip blank lines but count them? Or error? Design decision: skip empty/whitespace-only lines but count; report in ingest response's `skipped`.)
+- must be a JSON object (not array, not primitive)
+- Required fields: runId (non-empty string), model (non-empty string, length limit), fixture (non-empty string, length limit), latencyMs (finite number ≥ 0, maybe ≤ some upper bound), status (integer 100-599), requestId (non-empty string), timestamp (ISO 8601 string that parses to a valid date)?
+
+Keep the field set reasonable: `runId`, `model`, `fixture`, `requestId`, `latencyMs`, `tokens`, `status`, `timestamp`.
+
+Types:
+- `RequestMetricsRecord` (raw valid record)
+- Group key: `${model}::${fixture}`
+- Statistics: count, mean, median, sampleStdDev, min, max, sum maybe.
+
+**Incremental aggregation**: For each group keep a running sum (for mean) and collect latencies for median/std. Sample standard deviation needs sum of squares and count: s = sqrt((Σx² − (Σx)²/n)/(n−1)). This is one-pass O(1) memory per group. Median needs sorted data — needs all values, or use a two-heap / order statistic. Bounded memory: if we discard raw values, median can't be computed incrementally exactly with bounded memory... Options:
+
+1. Store latencies per group but cap: keep the last N (sliding window) per group for median/std — "bounded memory" satisfied.
+2. Compute mean and std incrementally exactly (Welford's algorithm), and median from the stored (bounded) window — document the trade-off.
+
+Cleanest approach that meets "bounded memory":
+- Exact mean + sample std via Welford's online algorithm per group (O(1) per group).
+- Median: maintain a bounded reservoir/sorted window per group? Median from a bounded sample is approximate. Or: discard raw values and keep sorted insertion with an upper cap — if we exceed the cap, fall back to approximation or discard oldest with a simple sorted array (O(n) insertion per new item — bad).
+
+Alternative: keep all latencies per group, but cap the total number of records in memory (e.g. MAX_STORED_RECORDS = 50_000); once exceeded, discard oldest (ring buffer) — stats (mean/std) remain exact over all records seen (via Welford), and median is computed over the retained window (documented as "median over retained window"). This is a defensible engineering design with clear semantics. Let me implement:
+
+- `GroupAccumulator`:
+  - count (total)
+  - sum? use Welford: count, mean, M2 → sampleStd = sqrt(M2/(n−1))
+  - min, max
+  - retainedValues: ring buffer of most recent `windowSize` latencies for median; sorted insertion via binary search; when full, remove oldest. Sorted insertion is O(n) per item in the worst case with array move; at window size 4096, worst case ~4096 moves per insert — tolerable for a service. Alternative: use two heaps for true O(log n) median — more code, but doable. Hmm, ring buffer + binary insertion is simpler and more readable. Let's cap window at, say, 2048.
+
+Actually let me reconsider: maybe simpler and more honest: store latencies per group in a bounded ring buffer; mean/std are exact over all observations (online), median is computed over retained window; when count > windowSize, response notes `medianBasis: "window"` and `retainedCount`. Good.
+
+**Bounded memory for request bodies**: limit raw line buffer size (e.g. 64KB per pending line), cap total body size per request (e.g. 1MB), cap total number of stored runs/groups (e.g. 10_000 groups → reject? Or evict? Simpler: cap number of runs; if a new run would exceed the cap, evict the oldest run? That invalidates /runs/:id for evicted runs. Better: reject ingestion for unknown/new runs once the cap is reached? That would break legitimate continuous ingestion. Hmm. Alternative: cap the cap and if exceeded, evict the least-recently-used run and 409 for that line? Too complex.
+
+Let me keep it defensible: `MAX_TRACKED_RUNS` (e.g. 1000). When adding a new run would exceed the cap, evict the oldest run (by firstSeen) and include an `evictedRunId` in the ingest response. LRU-ish eviction by insertion order — simple FIFO. /runs/:id returns 404 for evicted runs. Document in ops guide. That's complete and bounded.
+
+**Endpoints**:
+- `GET /health` → 200 `{status:"ok", uptimeSec, version, ingestedRecords, trackedRuns, memory: process.memoryUsage()` (maybe rss/heapUsed)}.
+- `GET /summary` → 200 summary across all groups: per-group stats (model, fixture, count, mean, median, sampleStdDev, min, max), totals, and maybe overall mean of latencies? Keep: `groups: [{model, fixture, ...stats}]` sorted by model, fixture; `totalRecords`, `totalRuns`.
+- `GET /runs/:id` → 200 run detail: `{runId, recordCount, firstSeen, lastSeen, groups: [{model, fixture, count, mean, median, sampleStdDev, min, max}]}`, 404 with `{error, message, code:"RUN_NOT_FOUND"}` if unknown.
+- `POST /ingest` → body NDJSON; 200 response `{accepted, rejected, skipped, errors: [{line, code, message}]}`; 400 when errors exist? Design: if any line invalid → 422 or 400 with all line errors and accepted count (atomic per line: valid lines applied, invalid ones reported). Common pattern: accept valid lines, report invalid; if at least one invalid, HTTP 400 (or 422), else 200. Let's do: 200 with `rejected: 0` if all valid; 400 with error list if any rejected. Also 413 for oversized payload, 415 for wrong content-type? Accept application/x-ndjson and application/json and text/plain — be lenient: accept if content-type is one of the allowed list, else 415. And 400 for malformed payload-level issues (e.g. pending incomplete line at EOF — that's malformed: `truncatedLine` error).
+
+Also support `GET /` returning service info? Not required; skip to keep scope tight. Maybe add small index with endpoint list. Well — not required; skip.
+
+**CLI / bootstrap**: `src/main.ts` reads env: `PORT` (default 8787), `HOST` (default 127.0.0.1), `DATA_FILE` (optional path to an NDJSON file to ingest on startup — demonstrates incremental file streaming), `WINDOW_SIZE`, `MAX_BODY_BYTES`, `MAX_TRACKED_RUNS`, `VERSION`. Support stdin ingestion too? If no DATA_FILE, then the server just runs; can also stream stdin if process.stdin is not a TTY — that's a nice touch: `if (!process.stdin.isTTY) pipe stdin to the incremental parser`. Let me include this.
+
+**File layout**:
+
+```
+package.json
+tsconfig.json
+README.md (ops guide — "short ops guide")
+src/
+  types.ts          — strict domain types
+  validator.ts      — line parsing + field validation, ValidationError type
+  stats.ts          — Welford group accumulator, median, pure functions
+  store.ts          — MetricsStore: runs, groups, bounded eviction
+  ingest.ts         — incremental NDJSON parser (line buffer, byte caps), IngestResult
+  http.ts           — request routing, body reading with cap, JSON response
+  server.ts         — createServer wiring
+  main.ts           — entry: env config, data file, stdin, graceful shutdown
+test/
+  validator.test.ts
+  stats.test.ts
+  ingest.test.ts
+  store.test.ts
+  service.test.ts   — spin up server on ephemeral port, exercise endpoints via fetch
+```
+
+package.json scripts:
+- `build`: `tsc -p tsconfig.json`
+- `start`: `node dist/src/main.js` — depends on rootDir/outputDir layout. Let me set tsconfig: `"rootDir": "."`, `"outDir": "dist"`, include `src` and `test`. Then dist/src/main.js, dist/test/*.test.js.
+- `test`: `tsc -p tsconfig.json && node --test dist/test/validator.test.js dist/test/stats.test.js dist/test/ingest.test.js dist/test/store.test.js dist/test/service.test.js` — better: `npm run build && node --test ...`. Or a pretest script. Let's do `"pretest": "npm run build"`, `"test": "node --test dist/test/*.test.js"` — shell glob expansion works in sh. Cross-platform concern (Windows cmd doesn't expand globs). For the answer, POSIX assumption is fine, but Node ≥ 21 supports globs in --test natively? Node 21+ supports glob patterns for the test runner: `node --test 'dist/test/*.test.js'`? Actually, Node's --test accepts globs starting Node v21? Let me recall: I think Node 21.0.0 added glob support to --test paths. To be safe, explicit file list.
+
+Let me just write the explicit list — deterministic.
+
+- `check`: `tsc --noEmit`
+- engines: node >= 20.
+
+**tsconfig**: TS 5.4+, strict true, noUncheckedIndexedAccess, exactOptionalPropertyTypes, noImplicitOverride, forceConsistentCasingInFileNames, verbatimModuleSyntax? verbatimModuleSyntax requires `import type` for type-only imports — I can handle that; but also affects emit: with verbatimModuleSyntax, value imports of types get elided... it forces explicit `import type`. I'll enable it and be disciplined with `import type`. Hmm, exactOptionalPropertyTypes makes it a pain to write `error: undefined` etc — I need to be careful. Let's include exactOptionalPropertyTypes and make sure all optional fields are handled with explicit undefined only where types allow undefined. Simpler: skip exactOptionalPropertyTypes to reduce risk of compile errors in the provided code? The user asked for "strict types" — strict:true + noUncheckedIndexedAccess + noImplicitReturns + noFallthroughCasesInSwitch + noUncheckedSideEffectImports + strictNullChecks. Include exactOptionalPropertyTypes but write code compliant. Actually, with exactOptionalPropertyTypes, an object literal assigning `errors: []` is fine; assigning `undefined` to an optional field is not allowed. Just avoid `field: undefined` in object literals. OK, include.
+
+verbatimModuleSyntax: with NodeNext module and .ts files, this requires `import type` where applicable. I'll write `import type` for type-only imports. But `import { ... } from './types'` where only types are imported must be `import type`. Let me be careful. Or use `"module": "NodeNext"`, `"moduleResolution": "NodeNext"` and verbatimModuleSyntax true. That's modern TS 5 style. Node 20+ runs CommonJS by default for .js without "type":"module". In package.json, without `"type": "module"`, compiled .js is CJS — fine for Node http + node:test.
+
+But with verbatimModuleSyntax + CJS emit: type-only imports need import type — fine. Regular imports of values get emitted as require. OK.
+
+Simpler alternative: `"module": "commonjs"`. But NodeNext is the recommended TS 5 setup. Let's do NodeNext. One gotcha: with NodeNext, file extension is required for relative imports? No — that's only for ESM (.mts or "type":"module"). In CJS under NodeNext, extensionless relative imports work (CommonJS resolution). Our files compile to CJS (no "type":"module" in package.json) → extensionless fine. Good.
+
+Wait — but NodeNext CJS: `.ts` files treated as CJS since package.json doesn't have "type":"module". Yes.
+
+Also need `"types": ["node"]`? With @types/node installed, it's auto-included. Fine.
+
+lib: ["ES2022"] or ES2023 (we might use findLast?). Let me avoid findLast. ES2022 is safe. target ES2022.
+
+**Now code details.**
+
+### types.ts
+
+```ts
+/** Raw validated metrics record. */
+export interface RequestMetricsRecord {
+  readonly runId: string;
+  readonly model: string;
+  readonly fixture: string;
+  readonly requestId: string;
+  readonly latencyMs: number;
+  readonly tokens: number;
+  readonly status: number;
+  readonly timestamp: string; // normalized to UTC ISO 8601

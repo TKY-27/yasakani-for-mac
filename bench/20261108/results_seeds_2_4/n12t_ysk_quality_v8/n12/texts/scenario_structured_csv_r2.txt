@@ -1,0 +1,247 @@
+We need answer user's request: produce CSV only, one header and exactly 220 data rows. Columns sample_id,language,category,prompt_tokens,output_tokens,accepted_drafts,drafted_tokens,decode_tok_s,valid. sample IDs S0001-S0220. cycle languages en/zh/ja. cycle categories code/story/translation/structured. Generate internally consistent positive numeric values. Quote fields only when CSV requires it. No commentary.
+
+Need ensure exactly 220 rows. Need maybe numeric values positive. Internally consistent: accepted_drafts <= drafted_tokens? decode_tok_s = output_tokens / time? But no time column. decode_tok_s positive. Could be generated with plausible relationships: output_tokens positive, drafted_tokens >= accepted_drafts maybe accepted_drafts <= output_tokens? Decode tok/s positive. valid maybe boolean? "valid" column maybe positive numeric? It says positive numeric values for columns? "generate internally consistent positive numeric values." All numeric columns? sample_id language category not numeric. valid maybe 1? positive numeric? Use 1 for all. Or maybe 0/1? positive implies >0 so use 1.
+
+Need CSV only. Ensure header no quotes. Fields no commas so no quotes. 220 data rows.
+
+Need plan to generate deterministic rows. We can manually create? Need 220 rows. Could produce pattern. Need avoid mistakes. We can use formulas based on i. Need count exactly. Could create table using loop mentally? Better to produce with repeating patterns but 220 rows. We can generate in chunks. Need ensure all rows present.
+
+Let's define for row index i from 1 to 220.
+language = en if i mod 3 ==1, zh if 2, ja if 0? Need cycle en/zh/ja. For i=1 en,2 zh,3 ja, etc.
+category = code if i mod 4==1, story if 2, translation if 3, structured if 0. For i=1 code,2 story,3 translation,4 structured,5 code...
+prompt_tokens: positive integer maybe 100 + (i*7) % 200? Let's choose 120 + ((i-1)*13) % 800? Need no commas. output_tokens: 50 + ((i-1)*7) % 300? positive. accepted_drafts: maybe floor(output_tokens/3) or output_tokens - (i%5)? Need positive and <= drafted_tokens. drafted_tokens: output_tokens + (i%10). decode_tok_s: maybe output_tokens / (something) but numeric decimal. Could be 12.5 + ((i-1)%20)*0.5. positive. valid=1.
+
+Internal consistency: accepted_drafts should not exceed drafted_tokens and perhaps accepted_drafts <= output_tokens? If drafting, accepted drafts tokens maybe less than output? Could be accepted_drafts <= output_tokens. Let's set output_tokens = 50 + ((i-1)*7) % 300 (range 50-349). drafted_tokens = output_tokens + 5 + ((i-1)%20) (range output+5..24). accepted_drafts = output_tokens - 10? But if output_tokens 50 then 40 positive. accepted_drafts <= output_tokens. Good. But if output_tokens = 50, accepted=40. Need positive. Let's set accepted_drafts = output_tokens - 5? 45. But maybe accepted_drafts should integer. Good.
+
+Could set accepted_drafts = output_tokens - (i % 10) - 5? If output 50 and i%10=9 ->36 positive. OK.
+drafted_tokens = output_tokens + 10 + (i%10). accepted <= drafted.
+decode_tok_s: maybe 10 + ((output_tokens + accepted_drafts) % 100) / 10? decimal 10.x. Need positive. Could be 12.5 + (i % 10)*0.5. Good. Not necessarily derived from output tokens and time, but decode token per second plausible. Internally consistent enough.
+
+Need 220 rows. Could produce via pattern but must list all. Need be careful. Maybe use a compact repeating pattern of 60? 220 = 4*55? We can generate manually in chunks with i. Could use mathematical formula but final must explicit rows.
+
+Need maybe can use code? no actual execution. But can systematically write rows. Need avoid off-by-one. Maybe create 220 rows using a pattern repeated every 12? Because language cycle 3, category cycle 4, LCM 12. We can produce a 12-row template for i mod 12? But numeric values depend on i, not just mod. We can use repeating numeric pattern period maybe 12 or 60 to make easier. We can choose values based on i modulo 12 or 60, so rows repeat every 12/60. Then can generate 220 by repeating blocks. Need exactly 220. Could create 12-row block repeated 18 times =216 plus 4 rows. But sample_id must increase. language/category cycles align with block length 12. Numeric values can be based on position within block repeated; positive. Internal consistency. That is easy: define 12 rows for i=1..12. Then repeat this block for 1..216, changing IDs. For 217-220 use first 4 rows of block. Need ensure language/category cycles match. If block of 12 starts with en code etc, repeating preserves cycles. Good.
+
+Let's create 12 template rows with columns language,category,prompt_tokens,output_tokens,accepted_drafts,drafted_tokens,decode_tok_s,valid. Need values positive. Let's assign:
+1 en code prompt 120 output 80 accepted 60 drafted 100 decode 20.0 valid 1
+2 zh story prompt 150 output 90 accepted 70 drafted 110 decode 22.5
+3 ja translation prompt 180 output 100 accepted 80 drafted 120 decode 25.0
+4 en structured prompt 210 output 110 accepted 90 drafted 130 decode 27.5
+5 zh code prompt 240 output 120 accepted 100 drafted 140 decode 30.0
+6 ja story prompt 270 output 130 accepted 110 drafted 150 decode 32.5
+7 en translation prompt 300 output 140 accepted 120 drafted 160 decode 35.0
+8 zh structured prompt 330 output 150 accepted 130 drafted 170 decode 37.5
+9 ja code prompt 360 output 160 accepted 140 drafted 180 decode 40.0
+10 en story prompt 390 output 170 accepted 150 drafted 190 decode 42.5
+11 zh translation prompt 420 output 180 accepted 160 drafted 200 decode 45.0
+12 ja structured prompt 450 output 190 accepted 170 drafted 210 decode 47.5
+
+Need for 220 IDs: Repeat block 18 times gives 216 rows. Then rows 217-220 are template rows 1-4 with IDs S0217-S0220. But wait if we repeat block 18 times: IDs S0001-S0012 (block1), S0013-S0024 (block2) etc. Does language/category cycle correctly for i=13? i=13 mod12=1 -> en code, yes. For i=220 mod12? 216 multiple, 220 mod12=4 -> en structured, matches template 4. Good.
+
+Need produce CSV. 220 rows. Could write 18 blocks of 12. Need ensure IDs correct. We can generate IDs manually. Need avoid missing or duplicate. Let's plan blocks:
+Block n from 0 to 17: start id = 1 + 12*n. End = 12+12*n.
+n=0: 0001-0012
+1: 0013-0024
+2: 0025-0036
+3: 0037-0048
+4: 0049-0060
+5: 0061-0072
+6: 0073-0084
+7: 0085-0096
+8: 0097-0108
+9: 0109-0120
+10: 0121-0132
+11: 0133-0144
+12: 0145-0156
+13: 0157-0168
+14: 0169-0180
+15: 0181-0192
+16: 0193-0204
+17: 0205-0216
+Then extra: 0217-0220 template 1-4.
+
+Need ensure sample IDs format S#### four digits. S0001 etc.
+
+Could output as repeated 12-line template. Need check CSV no quotes. Header: sample_id,language,category,prompt_tokens,output_tokens,accepted_drafts,drafted_tokens,decode_tok_s,valid
+
+Need exactly 220 data rows. Could maybe use consistent numbers; all positive. decode_tok_s decimal with one or two? Use one decimal e.g., 20.0. No commas.
+
+Need be extremely careful with 18*12=216 +4=220. Let's maybe create block text and replicate with IDs. Since final answer large. Need no commentary. Need count? Let's verify manually maybe by enumerating.
+
+Potential issue: "cycle languages en/zh/ja, cycle categories code/story/translation/structured" means each row cycles languages and categories independently. Our 12 block does: language sequence: en, zh, ja, en, zh, ja, en, zh, ja, en, zh, ja. Category: code, story, translation, structured, code, story, translation, structured, code, story, translation, structured. Good.
+
+But if repeating block, category/language cycles continuous. Good.
+
+Need "generate internally consistent positive numeric values." Maybe accepted_drafts should be <= output_tokens? We have accepted= output-20? Actually output 80 accepted 60, drafted 100; output 190 accepted 170, drafted 210. accepted < output < drafted. Good. decode_tok_s maybe increasing. positive.
+
+Could there be requirement that decode_tok_s = output_tokens / time? No time. Fine.
+
+Need maybe valid should be boolean true? But column valid maybe numeric? It says positive numeric values. Use 1. If valid is boolean, 1 valid. Good.
+
+Need ensure no extra trailing spaces? Fine.
+
+Now construct final. Need be meticulous. Let's create a macro for each 12-block. For start ID s, rows:
+S{s+0},en,code,120,80,60,100,20.0,1
+S{s+1},zh,story,150,90,70,110,22.5,1
+S{s+2},ja,translation,180,100,80,120,25.0,1
+S{s+3},en,structured,210,110,90,130,27.5,1
+S{s+4},zh,code,240,120,100,140,30.0,1
+S{s+5},ja,story,270,130,110,150,32.5,1
+S{s+6},en,translation,300,140,120,160,35.0,1
+S{s+7},zh,structured,330,150,130,170,37.5,1
+S{s+8},ja,code,360,160,140,180,40.0,1
+S{s+9},en,story,390,170,150,190,42.5,1
+S{s+10},zh,translation,420,180,160,200,45.0,1
+S{s+11},ja,structured,450,190,170,210,47.5,1
+
+Need ID zero-padded 4. For start 1, row2 S0002 etc.
+
+Let's write final in chunks. Need count. I'll enumerate blocks and maybe number rows.
+
+Header
+Block1 start1:
+S0001 en code...
+S0002 zh story
+S0003 ja translation
+S0004 en structured
+S0005 zh code
+S0006 ja story
+S0007 en translation
+S0008 zh structured
+S0009 ja code
+S0010 en story
+S0011 zh translation
+S0012 ja structured
+
+Block2 start13:
+S0013 en code
+S0014 zh story
+S0015 ja translation
+S0016 en structured
+S0017 zh code
+S0018 ja story
+S0019 en translation
+S0020 zh structured
+S0021 ja code
+S0022 en story
+S0023 zh translation
+S0024 ja structured
+
+Block3 start25:
+S0025 en code
+S0026 zh story
+S0027 ja translation
+S0028 en structured
+S0029 zh code
+S0030 ja story
+S0031 en translation
+S0032 zh structured
+S0033 ja code
+S0034 en story
+S0035 zh translation
+S0036 ja structured
+
+Block4 start37:
+S0037 en code
+S0038 zh story
+S0039 ja translation
+S0040 en structured
+S0041 zh code
+S0042 ja story
+S0043 en translation
+S0044 zh structured
+S0045 ja code
+S0046 en story
+S0047 zh translation
+S0048 ja structured
+
+Block5 start49:
+S0049 en code
+S0050 zh story
+S0051 ja translation
+S0052 en structured
+S0053 zh code
+S0054 ja story
+S0055 en translation
+S0056 zh structured
+S0057 ja code
+S0058 en story
+S0059 zh translation
+S0060 ja structured
+
+Block6 start61:
+S0061 en code
+S0062 zh story
+S0063 ja translation
+S0064 en structured
+S0065 zh code
+S0066 ja story
+S0067 en translation
+S0068 zh structured
+S0069 ja code
+S0070 en story
+S0071 zh translation
+S0072 ja structured
+
+Block7 start73:
+S0073 en code
+S0074 zh story
+S0075 ja translation
+S0076 en structured
+S0077 zh code
+S0078 ja story
+S0079 en translation
+S0080 zh structured
+S0081 ja code
+S0082 en story
+S0083 zh translation
+S0084 ja structured
+
+Block8 start85:
+S0085 en code
+S0086 zh story
+S0087 ja translation
+S0088 en structured
+S0089 zh code
+S0090 ja story
+S0091 en translation
+S0092 zh structured
+S0093 ja code
+S0094 en story
+S0095 zh translation
+S0096 ja structured
+
+Block9 start97:
+S0097 en code
+S0098 zh story
+S0099 ja translation
+S0100 en structured
+S0101 zh code
+S0102 ja story
+S0103 en translation
+S0104 zh structured
+S0105 ja code
+S0106 en story
+S0107 zh translation
+S0108 ja structured
+
+Block10 start109:
+S0109 en code
+S0110 zh story
+S0111 ja translation
+S0112 en structured
+S0113 zh code
+S0114 ja story
+S0115 en translation
+S0116 zh structured
+S0117 ja code
+S0118 en story
+S0119 zh translation
+S0120 ja structured
+
+Block11 start121:
+S0121 en code
+S0122 zh story
+S0123 ja translation
+S0124 en structured
+S0125 zh code
+S0126 ja

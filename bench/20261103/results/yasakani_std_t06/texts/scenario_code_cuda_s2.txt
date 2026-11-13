@@ -1,0 +1,470 @@
+# BF16 Row‑Normalization Benchmark (sm_120a)
+
+Below is a complete, self‑contained C++20/CUDA program plus a CMake project. It:
+
+- Parses CLI arguments (matrix shape, seed, iterations, tolerance, warmup).
+- Generates deterministic input on the host (and a matching device copy).
+- Allocates RAII device buffers with CUDA error checking.
+- Computes a **numerically stable FP32 reference** (two‑pass: mean, then variance, then normalize) on the CPU.
+- Runs a **vectorized CUDA kernel** that normalizes each row in BF16 using FP32 intermediates.
+- Performs warm‑up, CUDA‑event timing, and tolerance‑based verification.
+- Builds for `sm_120a` (Blackwell) via CMake.
+
+```
+bf16_norm/
+├── CMakeLists.txt
+└── src/
+    ├── main.cpp
+    ├── bf16_utils.hpp
+    ├── device_buffer.hpp
+    ├── error.hpp
+    ├── matrix_generator.hpp
+    ├── reference.hpp
+    └── normalize.cu
+```
+
+---
+
+## `src/error.hpp`
+
+```cpp
+#pragma once
+
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
+// ---------------------------------------------------------------------------
+// CUDA error checking helpers
+// ---------------------------------------------------------------------------
+
+#define CUDA_CHECK(expr)                                                       \
+    do {                                                                       \
+        cudaError_t _err = (expr);                                             \
+        if (_err != cudaSuccess) {                                             \
+            std::fprintf(stderr,                                              \
+                         "CUDA error at %s:%d: %s\n",                         \
+                         __FILE__, __LINE__,                                  \
+                         cudaGetErrorString(_err));                           \
+            std::exit(EXIT_FAILURE);                                          \
+        }                                                                      \
+    } while (0)
+
+#define CUDNN_CHECK(expr)                                                      \
+    do {                                                                       \
+        cudnnStatus_t _err = (expr);                                           \
+        if (_err != CUDNN_STATUS_SUCCESS) {                                   \
+            std::fprintf(stderr,                                              \
+                         "cuDNN error at %s:%d: %s\n",                        \
+                         __FILE__, __LINE__,                                  \
+                         cudnnGetErrorString(_err));                          \
+            std::exit(EXIT_FAILURE);                                          \
+        }                                                                      \
+    } while (0)
+
+inline void cuda_fatal(const char *msg, cudaError_t err) {
+    std::fprintf(stderr, "%s: %s\n", msg, cudaGetErrorString(err));
+    std::exit(EXIT_FAILURE);
+}
+```
+
+---
+
+## `src/bf16_utils.hpp`
+
+```cpp
+#pragma once
+
+#include <cuda_bf16.h>
+#include <cstdint>
+#include <cstring>
+
+namespace bf16 {
+
+// ---------------------------------------------------------------------------
+// Bit-level conversions (no __nv_bfloat16 dependency on host, but we use it
+// on device; on host we do manual bit manipulation for portability).
+// ---------------------------------------------------------------------------
+
+// Convert float -> bfloat16 (round-to-nearest-even).
+inline __host__ __device__ uint16_t f2bf16(float f) {
+    // Use the CUDA intrinsic when available on device; on host we do it
+    // manually to avoid pulling in device-only intrinsics in host code.
+    // The bit layout of BF16 is the upper 16 bits of FP32.
+    uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    // Round-to-nearest-even: add 0x7FFF + LSB for rounding.
+    uint32_t rounded = bits + 0x7FFFu + (bits >> 16u & 1u);
+    return static_cast<uint16_t>(rounded >> 16u);
+}
+
+// Convert bfloat16 -> float.
+inline __host__ __device__ float bf16f2f(uint16_t b) {
+    uint32_t bits = static_cast<uint32_t>(b) << 16u;
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+// Convert float -> __nv_bfloat16 (device path).
+inline __device__ __nv_bfloat16 f2bf16_dev(float f) {
+    return __float2bfloat16(f);
+}
+
+// Convert __nv_bfloat16 -> float (device path).
+inline __device__ float bf16f2f_dev(__nv_bfloat16 b) {
+    return __bfloat162float(b);
+}
+
+// Pack two BF16 values into a 32-bit word (low = element 0, high = element 1).
+inline __host__ __device__ uint32_t pack2(uint16_t lo, uint16_t hi) {
+    return static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16u);
+}
+
+// Unpack low 16 bits.
+inline __host__ __device__ uint16_t unpack_lo(uint32_t v) {
+    return static_cast<uint16_t>(v & 0xFFFFu);
+}
+
+// Unpack high 16 bits.
+inline __host__ __device__ uint16_t unpack_hi(uint32_t v) {
+    return static_cast<uint16_t>(v >> 16u);
+}
+
+// Pack four BF16 values into a 64-bit word.
+inline __host__ __device__ uint64_t pack4(uint16_t a, uint16_t b, uint16_t c,
+                                           uint16_t d) {
+    return static_cast<uint64_t>(a) | (static_cast<uint64_t>(b) << 16u) |
+           (static_cast<uint64_t>(c) << 32u) | (static_cast<uint64_t>(d) << 48u);
+}
+
+}  // namespace bf16
+```
+
+---
+
+## `src/device_buffer.hpp`
+
+```cpp
+#pragma once
+
+#include "error.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+
+// ---------------------------------------------------------------------------
+// RAII wrapper for a CUDA device buffer.
+// ---------------------------------------------------------------------------
+class DeviceBuffer {
+public:
+    DeviceBuffer() = default;
+
+    explicit DeviceBuffer(std::size_t bytes) : size_(bytes) {
+        if (bytes == 0) return;
+        CUDA_CHECK(cudaMalloc(&ptr_, bytes));
+    }
+
+    // Non-copyable.
+    DeviceBuffer(const DeviceBuffer &) = delete;
+    DeviceBuffer &operator=(const DeviceBuffer &) = delete;
+
+    // Movable.
+    DeviceBuffer(DeviceBuffer &&other) noexcept
+        : ptr_(other.ptr_), size_(other.size_) {
+        other.ptr_ = nullptr;
+        other.size_ = 0;
+    }
+
+    DeviceBuffer &operator=(DeviceBuffer &&other) noexcept {
+        if (this != &other) {
+            free();
+            ptr_ = other.ptr_;
+            size_ = other.size_;
+            other.ptr_ = nullptr;
+            other.size_ = 0;
+        }
+        return *this;
+    }
+
+    ~DeviceBuffer() { free(); }
+
+    // Allocate (or re-allocate) a buffer of the given size.
+    void allocate(std::size_t bytes) {
+        free();
+        size_ = bytes;
+        if (bytes == 0) return;
+        CUDA_CHECK(cudaMalloc(&ptr_, bytes));
+    }
+
+    // Copy from host to device.
+    void copyFromHost(const void *host_ptr, std::size_t bytes) {
+        if (bytes == 0) return;
+        CUDA_CHECK(cudaMemcpy(ptr_, host_ptr, bytes, cudaMemcpyHostToDevice));
+    }
+
+    // Copy from device to host.
+    void copyToHost(void *host_ptr, std::size_t bytes) const {
+        if (bytes == 0) return;
+        CUDA_CHECK(cudaMemcpy(host_ptr, ptr_, bytes, cudaMemcpyDeviceToHost));
+    }
+
+    // Zero-initialise the buffer.
+    void zero(std::size_t bytes) {
+        if (bytes == 0) return;
+        CUDA_CHECK(cudaMemset(ptr_, 0, bytes));
+    }
+
+    void *data() { return ptr_; }
+    const void *data() const { return ptr_; }
+    std::size_t size() const { return size_; }
+    bool valid() const { return ptr_ != nullptr; }
+
+    // Typed accessors.
+    template <typename T>
+    T *data_as() {
+        return static_cast<T *>(ptr_);
+    }
+
+    template <typename T>
+    const T *data_as() const {
+        return static_cast<const T *>(ptr_);
+    }
+
+private:
+    void free() {
+        if (ptr_) {
+            CUDA_CHECK(cudaFree(ptr_));
+            ptr_ = nullptr;
+            size_ = 0;
+        }
+    }
+
+    void *ptr_ = nullptr;
+    std::size_t size_ = 0;
+};
+```
+
+---
+
+## `src/matrix_generator.hpp`
+
+```cpp
+#pragma once
+
+#include "bf16_utils.hpp"
+
+#include <cstdint>
+#include <random>
+#include <vector>
+
+// ---------------------------------------------------------------------------
+// Deterministic BF16 matrix generator.
+//
+// We generate values in the range [-1, 1] using a standard normal distribution,
+// then clamp to [-1, 1] and convert to BF16. The same seed produces the same
+// matrix on every run, enabling reproducible verification.
+// ---------------------------------------------------------------------------
+class MatrixGenerator {
+public:
+    MatrixGenerator(std::size_t rows, std::size_t cols, uint64_t seed)
+        : rows_(rows), cols_(cols), seed_(seed) {}
+
+    // Generate the matrix as a flat vector of uint16_t (BF16 bit patterns).
+    // Layout: row-major, i.e. element (r, c) is at index r * cols + c.
+    std::vector<uint16_t> generate() const {
+        std::mt19937_64 rng(seed_);
+        std::normal_distribution<float> dist(0.0f, 1.0f);
+
+        std::vector<uint16_t> data(rows_ * cols_);
+        for (std::size_t i = 0; i < data.size(); ++i) {
+            float v = dist(rng);
+            // Clamp to [-1, 1] to keep values in a well-behaved range.
+            if (v > 1.0f) v = 1.0f;
+            if (v < -1.0f) v = -1.0f;
+            data[i] = bf16::f2bf16(v);
+        }
+        return data;
+    }
+
+    std::size_t rows() const { return rows_; }
+    std::size_t cols() const { return cols_; }
+
+private:
+    std::size_t rows_;
+    std::size_t cols_;
+    uint64_t seed_;
+};
+```
+
+---
+
+## `src/reference.hpp`
+
+```cpp
+#pragma once
+
+#include "bf16_utils.hpp"
+
+#include <cmath>
+#include <cstddef>
+#include <vector>
+
+// ---------------------------------------------------------------------------
+// Numerically stable FP32 reference implementation.
+//
+// For each row we:
+//   1. Compute the mean in FP32.
+//   2. Compute the variance (E[x^2] - mean^2) in FP32.
+//   3. Normalize: (x - mean) / sqrt(var + eps)
+//
+// This is a two-pass algorithm which is numerically stable for the input
+// range we generate. The result is stored as BF16 (the same dtype as the
+// CUDA kernel output) so we can compare directly.
+// ---------------------------------------------------------------------------
+class Reference {
+public:
+    // Compute the row-normalized reference for a BF16 matrix.
+    // input: flat vector of uint16_t (BF16), row-major.
+    // rows, cols: matrix dimensions.
+    // output: flat vector of uint16_t (BF16), same layout.
+    static void compute(const std::vector<uint16_t> &input, std::size_t rows,
+                        std::size_t cols, std::vector<uint16_t> &output,
+                        float eps = 1e-5f) {
+        output.resize(rows * cols);
+
+        for (std::size_t r = 0; r < rows; ++r) {
+            const uint16_t *row_in = input.data() + r * cols;
+            uint16_t *row_out = output.data() + r * cols;
+
+            // Pass 1: compute mean.
+            float sum = 0.0f;
+            for (std::size_t c = 0; c < cols; ++c) {
+                sum += bf16::bf16f2f(row_in[c]);
+            }
+            float mean = sum / static_cast<float>(cols);
+
+            // Pass 2: compute variance.
+            float sum_sq = 0.0f;
+            for (std::size_t c = 0; c < cols; ++c) {
+                float v = bf16::bf16f2f(row_in[c]);
+                sum_sq += v * v;
+            }
+            float var = sum_sq / static_cast<float>(cols) - mean * mean;
+            // Guard against negative variance due to FP rounding.
+            if (var < 0.0f) var = 0.0f;
+            float inv_std = 1.0f / std::sqrt(var + eps);
+
+            // Pass 3: normalize and convert to BF16.
+            for (std::size_t c = 0; c < cols; ++c) {
+                float v = bf16::bf16f2f(row_in[c]);
+                float normalized = (v - mean) * inv_std;
+                row_out[c] = bf16::f2bf16(normalized);
+            }
+        }
+    }
+};
+```
+
+---
+
+## `src/normalize.cu`
+
+```cpp
+#include "bf16_utils.hpp"
+#include "error.hpp"
+
+#include <cuda_bf16.h>
+#include <cstdint>
+
+// ---------------------------------------------------------------------------
+// Vectorized row-normalization kernel for BF16 on sm_120a.
+//
+// Each thread block processes one row.
+// Each thread processes VEC elements per iteration (VEC = 4, i.e. 8 bytes).
+// The kernel:
+//   1. Loads the row into shared memory (as BF16).
+//   2. Computes mean and variance in FP32 using a warp-level reduction.
+//   3. Normalizes each element and stores back.
+//
+// Launch geometry:
+//   gridDim.x = rows
+//   blockDim.x = min(cols / VEC, max_threads_per_block)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int VEC = 4;  // 4 BF16 elements per thread per iteration (8 bytes).
+constexpr int MAX_THREADS = 256;
+
+// Warp-level reduction for FP32.
+__device__ __forceinline__ float warpReduceSum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
+// Block-level reduction for FP32.
+__device__ __forceinline__ float blockReduceSum(float val, float *shared) {
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int num_warps = (blockDim.x + 31) / 32;
+
+    // Reduce within each warp.
+    val = warpReduceSum(val);
+
+    // Write warp results to shared memory.
+    if (lane == 0) shared[warp_id] = val;
+    __syncthreads();
+
+    // First warp reduces the warp results.
+    if (warp_id == 0) {
+        val = (lane < num_warps) ? shared[lane] : 0.0f;
+        val = warpReduceSum(val);
+        if (lane == 0) shared[0] = val;
+    }
+    __syncthreads();
+
+    return shared[0];
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Kernel: normalize each row of a BF16 matrix.
+//
+// Parameters:
+//   input:  pointer to input BF16 matrix (row-major, rows x cols).
+//   output: pointer to output BF16 matrix (row-major, rows x cols).
+//   rows:   number of rows.
+//   cols:   number of columns.
+//   eps:    epsilon for numerical stability.
+// ---------------------------------------------------------------------------
+__global__ void normalize_rows_kernel(const __nv_bfloat16 *input,
+                                      __nv_bfloat16 *output, std::size_t rows,
+                                      std::size_t cols, float eps) {
+    const std::size_t row = blockIdx.x;
+    if (row >= rows) return;
+
+    const __nv_bfloat16 *row_in = input + row * cols;
+    __nv_bfloat16 *row_out = output + row * cols;
+
+    // Number of elements this block handles.
+    const std::size_t total_vecs = (cols + VEC - 1) / VEC;
+    const int num_threads = static_cast<int>(min(total_vecs,
+                                                 (std::size_t)MAX_THREADS));
+
+    // Shared memory for reduction.
+    extern __shared__ float shared_mem[];
+
+    // Each thread processes one or more vectors.
+    float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
+
+    for (std::size_t i = threadIdx.x; i < total_vecs; i += blockDim.x) {
+        // Load VEC BF1

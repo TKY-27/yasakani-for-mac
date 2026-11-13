@@ -1,0 +1,48 @@
+第一节 —— 所有权。可靠的推理服务为每个可变边界指定唯一的所有者。程序可以将数学运算委托给内核，但内核不会静默地推进请求状态。这种分离使得成功的轮次、被拒绝的推测性草稿、取消操作以及前缀恢复，都能被观测为完整的状态转换。
+
+第二节 —— 测量。加载时间、提示词准备、预填充（prefill）、解码（decode）和网络传输分别回答不同的问题。基准测试应当明确标注每个报告速率所对应的测量区间。在本引擎中，首个生成的令牌属于预填充阶段，而其余生成的令牌属于解码阶段，因此令牌计数必须遵循相同的边界划分。
+
+第三节 —— 可复现性。在正式运行之前，输入数据被冻结。请求体、解析后的采样参数、模型标识、上下文容量、缓存格式以及原始计时字段均予以保留。预热请求会被明确标记并排除在外，而不是混入被测量的重复运行中。
+
+第四节 —— 长上下文。分配最大缓存容量并不等同于呈现最大长度的提示词。引擎可以维持 262,144 个令牌的分配量，同时测试中实际准备的提示词长度可以变化。这样可以在不改变各测试用例间内存计划的前提下，隔离出可见上下文的成本。
+
+第五节 —— 推测。草稿的接受率取决于工作负载。代码、散文、翻译和结构化记录具有不同的局部可预测性，因此既需要接受草稿的百分比，也需要每轮输出的令牌数。吞吐量仍然是用户可见的结果；接受率统计数据用于解释而非取代它。
+
+第六节 —— 报告。发布完整的配置、重复测量结果、变异情况以及实质性限制。不要丢弃有效的慢速运行，也不要将内部计时器描述为客户端观察到的延迟。清晰的边界使优异的结果更值得信赖。
+
+英中术语表：
+
+1.  inference service — 推理服务
+2.  mutable frontier — 可变边界
+3.  owner — 所有者
+4.  kernel — 内核
+5.  request state — 请求状态
+6.  speculative draft — 推测性草稿
+7.  prefix restoration — 前缀恢复
+8.  loading time — 加载时间
+9.  prompt preparation — 提示词准备
+10. prefill — 预填充
+11. decode — 解码
+12. network transport — 网络传输
+13. benchmark — 基准测试
+14. generated token — 生成的令牌
+15. token count — 令牌计数
+16. sampling parameters — 采样参数
+17. model identity — 模型标识
+18. context capacity — 上下文容量
+19. cache format — 缓存格式
+20. raw timing fields — 原始计时字段
+21. warm-up requests — 预热请求
+22. long context — 长上下文
+23. cache capacity — 缓存容量
+24. allocation — 分配
+25. visible context — 可见上下文
+26. memory plan — 内存计划
+27. draft acceptance — 草稿接受
+28. workload — 工作负载
+29. local predictability — 局部可预测性
+30. accepted-draft percentage — 接受草稿百分比
+31. output tokens per round — 每轮输出令牌数
+32. throughput — 吞吐量
+33. client-observed latency — 客户端观察到的延迟
+34. internal timer — 内部计时器<|im_end|>

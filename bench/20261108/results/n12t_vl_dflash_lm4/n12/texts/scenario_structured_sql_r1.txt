@@ -1,0 +1,125 @@
+We need answer user: "Return one PostgreSQL script with no Markdown fences. Define normalized tables for models, fixtures, runs, and request_metrics; include primary/foreign keys, checks, useful indexes, two views, one transaction-safe upsert function, and at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. The script must run in dependency order."
+
+Need output only a PostgreSQL script, no markdown fences. Must be one script. Need ensure dependency order. Tables: models, fixtures, runs, request_metrics. Normalized. Include PK/FKs, checks, useful indexes, two views, one transaction-safe upsert function, at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Script must run in dependency order.
+
+Need produce SQL. Need think carefully about syntax PostgreSQL. No markdown. We can include DROP? If script run in dependency order. Could create schema? Use create table if not exists? Maybe for idempotent? Need transaction-safe upsert function. In PostgreSQL, a function to upsert request_metrics? Transaction-safe likely uses ON CONFLICT, maybe with advisory lock? Could define function upsert_request_metrics(...) returns void, transaction-safe (PL/pgSQL, uses INSERT ... ON CONFLICT DO UPDATE). Need ensure works with unique constraint. Need maybe request_metrics unique key (run_id, request_index, token_class?)? Let's design.
+
+Tables:
+models: model_id PK, name, family, architecture, context_length, max_batch_size, mtp_supported boolean, created_at.
+fixtures: fixture_id PK, name, fixture_type (maybe fixture_kind), input_tokens_min, input_tokens_max, output_tokens, concurrency, is_long_context boolean, notes.
+runs: run_id PK, model_id FK, fixture_id FK, started_at, ended_at, status check in ('running','completed','failed'), seed int, config jsonb check, notes.
+request_metrics: metric_id bigserial PK? or run_id + request_id? To allow upsert, unique constraint (run_id, request_index, metric_key?) maybe. Simpler: request_metrics(run_id PK? no). We need normalized. request_metrics per run per request? Could have request_id bigserial, run_id FK, request_index int, timestamp? Need realistic rows 80 spanning two models and four fixture kinds. 80 INSERT rows. Could insert 80 rows into request_metrics. Need normalized: maybe runs table has few rows, request_metrics has 80 rows referencing runs. Need at least 80 realistic INSERT rows spanning two models and four fixture kinds. "at least 80 realistic INSERT rows spanning two models and four fixture kinds" likely all INSERT rows? Could be insert rows into models/fixtures/runs/request_metrics? At least 80 INSERT rows total? The phrase likely means the dataset includes at least 80 INSERT rows. To be safe, include at least 80 INSERT statements? Or INSERT with multiple VALUES rows? It says rows, not statements. Could use one INSERT INTO request_metrics ... VALUES (... 80 rows). That's 80 rows. Also have inserts for models/fixtures/runs. But "at least 80 realistic INSERT rows spanning two models and four fixture kinds" maybe wants data spanning two models and four fixture kinds. If only 80 request_metrics rows, need mapping to models/fixtures via runs. Need two models, four fixture kinds. Need runs for combinations. Need ensure foreign keys: need insert models, fixtures, runs before request_metrics. Need create indexes. Views and function after tables.
+
+Need analytical SELECT queries: six for throughput, variability, long-context retention, MTP acceptance. Need final six SELECTs. Ensure they use views maybe. Views:
+- v_run_summary: join models, fixtures, runs, aggregate metrics? Use LEFT JOIN to request_metrics. Include model, fixture_kind, throughput_tokens_per_s, avg_ttft_ms, p95_itl_ms, avg_mtp_acceptance? But request_metrics may have metric_key/metric_value to store various metrics. Need design that supports MTP acceptance, long-context retention, variability, throughput.
+
+Option request_metrics table: metric_id, run_id, request_index, metric_key, metric_value numeric, metric_unit, recorded_at. Unique (run_id, request_index, metric_key). Metric_key values: 'ttft_ms', 'throughput_tokens_per_s', 'itl_ms', 'long_context_retention', 'mtp_acceptance', 'output_tokens', 'input_tokens', 'latency_ms', 'error_count'? Then views can pivot or filter. For variability, std_dev of itl or throughput. For long-context retention: avg(long_context_retention) where fixture is_long_context. For MTP acceptance: avg(metric_value) where metric_key='mtp_acceptance'. For throughput: avg throughput. Need at least 80 rows: We can generate 80 request_metrics rows. Need realistic values. Could use 10 runs (2 models x 4 fixtures x 2 seeds?) and 8 request metrics each = 80. Need request_index? Maybe each request metric row is one sampled metric for a run/request. For 10 runs, 8 metric rows each = 80. That spans models/fixtures. Good.
+
+But request_metrics unique (run_id, request_index, metric_key). If we have 8 metric rows per run with request_index 0? Or request_index 1..8? We can make 8 rows per run, each row with request_index 1..8 and metric_key maybe 'throughput_tokens_per_s', 'itl_ms', 'mtp_acceptance', etc. But one row per metric_key per request. Could use 8 rows: request_index 1..8, metric_key = 'itl_ms' only? But need MTP acceptance etc. Better: request_metrics one row per request with key 'request_summary'? But then metric_key not useful. Could have one row per request with multiple columns? But normalized? A metric table with metric_key/value is normalized. For upsert, unique run_id, request_index, metric_key. Need 80 rows; can have 10 runs x 8 metric keys for request_index=0? That's 80 rows, request_index 0 for aggregate per run? But request_metrics table should maybe per request not aggregate. Could use request_index 1..8 and each has metric_key chosen cyclic? To have 80 rows and all metric types, perhaps 10 runs x 8 requests, each request has one metric row? But then not all metric types. We can set metric_key based on request_index: 1 throughput, 2 ttft, 3 itl, 4 mtp, 5 long_context_retention, 6 output_tokens, 7 latency, 8 p95_itl. 80 rows across 10 runs gives each run 8 request samples, one metric per request sample. That's realistic? It is odd. Alternatively 20 runs x 4 metric keys = 80. But need 4 fixture kinds and 2 models, 20 runs can be combinations. Simpler: 20 runs (2 models x 4 fixtures x 5 seeds? Actually 2*4*? = 20 if 5 seeds? Or 2*4*2=16 plus extras) and 4 metric rows each = 80. Metric keys: throughput_tokens_per_s, itl_ms, mtp_acceptance, long_context_retention. That's enough. But request_index could be 1..4 per run, each one metric. Still not request-level. Maybe request_index 0 for aggregate metric? But table name request_metrics suggests request-level. Could have request_id as sample index, not necessarily actual request. But okay.
+
+Alternative: request_metrics table with columns: request_id bigserial, run_id, request_index, input_tokens, output_tokens, ttft_ms, itl_ms, throughput_tokens_s, mtp_accepted, mtp_proposed, long_context_retention, latency_ms, completed_at. Then 80 INSERT rows into request_metrics with 80 request samples. This is less normalized? It is fact table. Views easier. But "normalized tables" likely prefer separate tables. request_metrics could be fact with one row per request, not metric_key. It can have metric columns. PK request_id. But upsert function can upsert by run_id+request_index? Need unique (run_id, request_index). Then 80 rows are realistic. But "request_metrics" table may have multiple numeric columns, still normalized because separate entities. Could include checks: output_tokens >=0, ttft_ms >=0, itl_ms >=0, mtp_accepted between 0 and mtp_proposed? mtp_acceptance? Maybe store mtp_proposed int, mtp_accepted int. MTP acceptance query computes accepted/proposed. Throughput = (output_tokens *? per second?) Could store latency_ms, output_tokens, throughput_tokens_s. Variability can use std_dev_samp(itl_ms) or throughput. Long-context retention could store retention_score? Or compute from input_tokens? Let's decide.
+
+Normalized:
+- models (model_id, name, family, context_length, max_batch_size, mtp_supported)
+- fixtures (fixture_id, fixture_key, fixture_kind, input_tokens, output_tokens, concurrency, is_long_context)
+- runs (run_id, model_id, fixture_id, status, seed, started_at, ended_at, config)
+- request_metrics (request_id bigserial PK, run_id FK, request_index, input_tokens, output_tokens, latency_ms, ttft_ms, itl_ms, throughput_tokens_s, mtp_proposed, mtp_accepted, long_context_retention, recorded_at)
+Unique constraint (run_id, request_index). Indexes on model/fixture through runs? request_metrics run_id, mtp columns, etc.
+Views:
+1. v_run_performance: join models, fixtures, runs, aggregate request_metrics: run_id, model, fixture_kind, status, requests, avg_ttft, avg_itl, avg_throughput, p95? percentile? Could use percentile_cont(0.95) WITHIN GROUP (ORDER BY itl_ms). For each run. Include variability? maybe std_dev.
+2. v_mtp_acceptance: model, fixture_kind, run, avg mtp_acceptance_rate = sum(mtp_accepted)/sum(mtp_proposed), total proposed/accepted. Or request level? We need two views; one can be for MTP acceptance and one for performance summary. But six queries include MTP acceptance; can use view.
+
+Need upsert function: create function upsert_request_metric(run_id uuid?, request_index int, input_tokens int, output_tokens int, latency_ms numeric, ttft_ms numeric, itl_ms numeric, throughput_tokens_s numeric, mtp_proposed int, mtp_accepted int, long_context_retention numeric, recorded_at timestamptz default now()) returns request_metrics? Transaction-safe? Use INSERT ... ON CONFLICT (run_id, request_index) DO UPDATE SET ... where excluded.mtp_accepted <= excluded.mtp_proposed? Need check constraints. Function in PL/pgSQL. To be transaction-safe: use a single CTE? In PostgreSQL, function transaction-safe if uses SQL statements that are transaction-safe? Maybe means upsert can be safely called in a transaction. Could include BEGIN/END, use ON CONFLICT. But to avoid locking issues, could use INSERT ... ON CONFLICT ...; That is transaction-safe. Maybe add `SELECT pg_advisory_xact_lock(hashtext('upsert_request_metric' || run_id::text || ':' || request_index));`? But if called many times, lock per row. Could make deterministic. But "transaction-safe" maybe just no partial writes. We can implement function with `INSERT ... ON CONFLICT ... DO UPDATE ... WHERE EXCLUDED.mtp_proposed >= 0 AND EXCLUDED.mtp_accepted BETWEEN 0 AND EXCLUDED.mtp_proposed AND ...` and RETURN query? To return row: `RETURNING *` in plpgsql. Need handle check constraints? Could validate in function.
+
+Need data types: run_id uuid or bigint? Use text? Simpler uuid for realistic. Need generate UUIDs in INSERTs. Could use literal UUIDs. Need dependency order: create tables, indexes, views, function, insert data? Usually insert data before views? Views can be after data or before; but if views depend on request_metrics aggregates, can create before data. But script run in dependency order: create tables, indexes, function? Function doesn't depend on data. Views after tables. INSERT data after tables (and after functions maybe no issue). But analytical SELECTs last. We can use `BEGIN;` transaction? If script run in psql, one script can be inside transaction. But if errors, all rollback. Could start `BEGIN;` and `COMMIT;`? User didn't ask. Could include transaction for upsert? But one script with BEGIN/COMMIT maybe okay. However if using `DO`? Need script runs. If we wrap entire script in transaction and create indexes etc, okay. But some clients execute statements one by one? psql executes whole file as one transaction if BEGIN/COMMIT. Good. But if `CREATE INDEX` inside transaction can be okay but may lock. Could not use `CONCURRENTLY`. Use normal.
+
+Need no Markdown fences. Output raw SQL. Need ensure script valid PostgreSQL.
+
+Let's design detailed schema.
+
+models:
+CREATE TABLE models (
+  model_id uuid PRIMARY KEY,
+  name text NOT NULL UNIQUE,
+  family text NOT NULL CHECK (family <> ''),
+  architecture text NOT NULL DEFAULT 'transformer',
+  context_length integer NOT NULL CHECK (context_length > 0),
+  max_batch_size integer NOT NULL CHECK (max_batch_size > 0),
+  mtp_supported boolean NOT NULL DEFAULT false,
+  quantization text NOT NULL DEFAULT 'fp16',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+fixtures:
+CREATE TABLE fixtures (
+  fixture_id uuid PRIMARY KEY,
+  fixture_key text NOT NULL UNIQUE,
+  fixture_kind text NOT NULL CHECK (fixture_kind IN ('short_chat','summarization','code_completion','long_document')),
+  description text,
+  input_tokens integer NOT NULL CHECK (input_tokens >= 0),
+  output_tokens integer NOT NULL CHECK (output_tokens >= 0),
+  concurrency integer NOT NULL CHECK (concurrency > 0),
+  is_long_context boolean NOT NULL DEFAULT false CHECK (is_long_context = (fixture_kind = 'long_document') OR input_tokens >= 32768?)? Maybe no.
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+But fixture kinds four: short_chat, summarization, code_completion, long_document.
+
+runs:
+CREATE TABLE runs (
+  run_id uuid PRIMARY KEY,
+  model_id uuid NOT NULL REFERENCES models(model_id) ON DELETE CASCADE,
+  fixture_id uuid NOT NULL REFERENCES fixtures(fixture_id) ON DELETE CASCADE,
+  status text NOT NULL DEFAULT 'completed' CHECK (status IN ('queued','running','completed','failed','cancelled')),
+  seed integer NOT NULL CHECK (seed >= 0),
+  started_at timestamptz NOT NULL DEFAULT now(),
+  ended_at timestamptz,
+  config jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(config) = 'object'),
+  notes text,
+  CHECK (ended_at IS NULL OR ended_at >= started_at)
+);
+Useful index: (model_id, fixture_id, started_at), (status).
+
+request_metrics:
+CREATE TABLE request_metrics (
+  request_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, -- or bigserial. But identity okay. If using ON CONFLICT on run_id+request_index, request_id unique.
+  run_id uuid NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  request_index integer NOT NULL CHECK (request_index >= 0),
+  input_tokens integer NOT NULL CHECK (input_tokens >= 0),
+  output_tokens integer NOT NULL CHECK (output_tokens >= 0),
+  latency_ms numeric(12,3) NOT NULL CHECK (latency_ms >= 0),
+  ttft_ms numeric(12,3) NOT NULL CHECK (ttft_ms >= 0),
+  itl_ms numeric(12,3) NOT NULL CHECK (itl_ms >= 0),
+  throughput_tokens_s numeric(12,3) NOT NULL CHECK (throughput_tokens_s >= 0),
+  mtp_proposed integer NOT NULL DEFAULT 0 CHECK (mtp_proposed >= 0),
+  mtp_accepted integer NOT NULL DEFAULT 0 CHECK (mtp_accepted >= 0 AND mtp_accepted <= mtp_proposed),
+  long_context_retention numeric(6,4) CHECK (long_context_retention IS NULL OR (long_context_retention >= 0 AND long_context_retention <= 1)),
+  recorded_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT uq_request_metrics_run_index UNIQUE (run_id, request_index)
+);
+Need check that if mtp_proposed=0 accepted=0 okay. Good.
+
+Indexes:
+CREATE INDEX idx_request_metrics_run_index ON request_metrics (run_id, request_index); -- unique already creates? Unique constraint creates index. But maybe extra for run_id. Actually unique constraint creates index. Could create on mtp, throughput:
+CREATE INDEX idx_request_metrics_mtp ON request_metrics (mtp_proposed, mtp_accepted) WHERE mtp_proposed > 0;
+CREATE INDEX idx_request_metrics_throughput ON request_metrics (throughput_tokens_s);
+CREATE INDEX idx_request_metrics_long_retention ON request_metrics (long_context_retention) WHERE long_context_retention IS NOT NULL;
+CREATE INDEX idx_runs_model_fixture ON runs (model_id, fixture_id, started_at);
+CREATE INDEX idx_runs_status ON runs (status) WHERE status <> 'completed';
+For models fixtures no.
+
+Views:
+CREATE VIEW v_run_performance AS
+SELECT r.run_id, m.name AS model_name, m.family AS model_family, f.fixture_kind, f.is_long_context,
+ r.status, r.seed,
+ COUNT(q.request_id) AS request_count,
+ AVG(q.ttft_ms) AS avg_ttft_ms,
+ AVG(q.itl_ms) AS avg_itl_ms,
+ PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY q.itl_ms) AS p95_itl_ms,
+ AVG(q.throughput_tokens_s) AS avg_throughput_tokens_s,
+ STDDEV_SAMP(q.throughput_tokens_s) AS throughput_stddev,
+ STDDEV_SAMP(q.itl_ms) AS itl_stddev,
+ COALESCE(AVG(q.long_context_retention), 0) AS avg_long_context_retention,
+ CASE WHEN SUM(q.mtp_proposed) = 0 THEN 0 ELSE SUM(q.mtp_accepted)::numeric / SUM(q.mtp_proposed)::numeric END AS mtp_acceptance_rate
+FROM runs r
+JOIN models m ON m.model_id = r.model_id
+JOIN fixtures f ON f.fixture_id = r

@@ -1,0 +1,539 @@
+# Metrics Service — complete, runnable TypeScript 5
+
+Below is a full, self-contained project. Everything is real code — no stubs, no `TODO`s, no `any`-leak. Drop the files into a folder, `npm install`, `npm start`, then `curl` the endpoints.
+
+```
+metrics-service/
+├── package.json
+├── tsconfig.json
+├── README.md
+├── src/
+│   ├── index.ts          # entry point
+│   ├── config.ts
+│   ├── types.ts
+│   ├── errors.ts
+│   ├── parser.ts
+│   ├── ingest.ts
+│   ├── stats.ts
+│   ├── aggregator.ts
+│   ├── server.ts
+│   └── __tests__/
+│       ├── stats.test.ts
+│       ├── parser.test.ts
+│       ├── aggregator.test.ts
+│       └── server.test.ts
+```
+
+---
+
+## `package.json`
+
+```json
+{
+  "name": "metrics-service",
+  "version": "1.0.0",
+  "description": "NDJSON request-metrics ingestion, validation, grouping, and statistics service.",
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "node --import tsx --test src/__tests__/*.test.ts",
+    "test:watch": "node --import tsx --test --watch src/__tests__/*.test.ts"
+  },
+  "dependencies": {
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}
+```
+
+> `tsx` is used only to run the dev server and the test suite directly from TypeScript. The production build (`npm run build`) compiles to plain JS with no runtime dependencies.
+
+---
+
+## `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "sourceMap": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "src/__tests__"]
+}
+```
+
+---
+
+## `src/types.ts`
+
+Strict domain types. Note the use of a **branded `RunId`** so a raw string can't be passed where a validated run id is expected.
+
+```ts
+/** A validated, non-empty run identifier. */
+export type RunId = string & { readonly __brand: "RunId" };
+
+/** A validated, non-empty model name. */
+export type ModelName = string & { readonly __brand: "ModelName" };
+
+/** A validated, non-empty fixture name. */
+export type FixtureName = string & { readonly __brand: "FixtureName" };
+
+/** A single validated request-metrics record. */
+export interface MetricsRecord {
+  readonly runId: RunId;
+  readonly model: ModelName;
+  readonly fixture: FixtureName;
+  readonly latencyMs: number;   // finite, >= 0
+  readonly tokens: number;     // finite, integer, >= 0
+  readonly timestamp: number;  // epoch milliseconds
+}
+
+/** A malformed / out-of-contract record, with the reason. */
+export interface MalformedRecord {
+  readonly line: number;
+  readonly raw: string;
+  readonly reason: string;
+}
+
+/** A single (model, fixture) group with its computed statistics. */
+export interface GroupStats {
+  readonly model: ModelName;
+  readonly fixture: FixtureName;
+  readonly count: number;
+  readonly mean: number;
+  readonly median: number;
+  readonly sampleStdDev: number | null; // null when count < 2
+  readonly min: number;
+  readonly max: number;
+  readonly totalTokens: number;
+  readonly firstSeen: number;
+  readonly lastSeen: number;
+}
+
+/** The full /summary payload. */
+export interface SummaryPayload {
+  readonly groups: GroupStats[];
+  readonly totalRecords: number;
+  readonly totalMalformed: number;
+  readonly totalRuns: number;
+  readonly totalModels: number;
+  readonly totalFixtures: number;
+  readonly windowStart: number | null;
+  readonly windowEnd: number | null;
+}
+
+/** The /runs/:id payload. */
+export interface RunSummary {
+  readonly runId: RunId;
+  readonly exists: boolean;
+  readonly groups: GroupStats[];
+  readonly recordCount: number;
+  readonly malformedCount: number;
+  readonly firstSeen: number | null;
+  readonly lastSeen: number | null;
+}
+
+/** The /health payload. */
+export interface HealthPayload {
+  readonly status: "ok";
+  readonly uptimeSec: number;
+  readonly version: string;
+  readonly recordsInWindow: number;
+  readonly malformedInWindow: number;
+  readonly windowSize: number;
+  readonly windowFull: boolean;
+  readonly memory: {
+    readonly rssMB: number;
+    readonly heapUsedMB: number;
+    readonly heapTotalMB: number;
+  };
+}
+
+/** Ingest result for a single line. */
+export type IngestResult =
+  | { readonly kind: "ok"; readonly record: MetricsRecord }
+  | { readonly kind: "malformed"; readonly record: MalformedRecord }
+  | { readonly kind: "empty"; readonly line: number };
+
+/** Group key used to bucket records. */
+export interface GroupKey {
+  readonly model: ModelName;
+  readonly fixture: FixtureName;
+}
+```
+
+---
+
+## `src/errors.ts`
+
+```ts
+/** Base error for all service-specific failures. */
+export class ServiceError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly details?: Record<string, unknown>
+  ) {
+    super(message);
+    this.name = "ServiceError";
+  }
+}
+
+/** A record failed validation. Carries the offending line + reason. */
+export class MalformedRecordError extends ServiceError {
+  constructor(
+    readonly line: number,
+    readonly raw: string,
+    readonly reason: string
+  ) {
+    super("MALFORMED_RECORD", `Line ${line}: ${reason}`, {
+      line,
+      raw,
+      reason,
+    });
+    this.name = "MalformedRecordError";
+  }
+}
+
+/** A run id was not found. */
+export class RunNotFoundError extends ServiceError {
+  constructor(readonly runId: string) {
+    super("RUN_NOT_FOUND", `Run "${runId}" not found`, { runId });
+    this.name = "RunNotFoundError";
+  }
+}
+
+/** The request body exceeded the configured byte limit. */
+export class PayloadTooLargeError extends ServiceError {
+  constructor(readonly limit: number, readonly received: number) {
+    super(
+      "PAYLOAD_TOO_LARGE",
+      `Body of ${received} bytes exceeds limit of ${limit} bytes`
+    );
+    this.name = "PayloadTooLargeError";
+  }
+}
+```
+
+---
+
+## `src/config.ts`
+
+All tunables, with sane defaults and env overrides.
+
+```ts
+export interface Config {
+  readonly port: number;
+  /** Maximum bytes accepted in a single POST /ingest body. */
+  readonly maxBodyBytes: number;
+  /** Bounded ring buffer size for the recent-record window. */
+  readonly windowSize: number;
+  /** Version string reported by /health. */
+  readonly version: string;
+}
+
+function intFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (Number.isNaN(n)) {
+    throw new Error(`Env ${name} must be an integer, got "${raw}"`);
+  }
+  return n;
+}
+
+export function loadConfig(): Config {
+  const port = intFromEnv("PORT", 8080);
+  const maxBodyBytes = intFromEnv("MAX_BODY_BYTES", 1_000_000);
+  const windowSize = intFromEnv("WINDOW_SIZE", 10_000);
+  const version = process.env["METRICS_VERSION"] ?? "1.0.0";
+
+  if (port < 0 || port > 65_535) {
+    throw new Error(`PORT out of range: ${port}`);
+  }
+  if (windowSize < 1) {
+    throw new Error(`WINDOW_SIZE must be >= 1, got ${windowSize}`);
+  }
+
+  return {
+    port,
+    maxBodyBytes,
+    windowSize,
+    version,
+  };
+}
+```
+
+---
+
+## `src/parser.ts`
+
+Incremental, dependency-free validation. No JSON schema library — just structural checks and a strict field validator.
+
+```ts
+import {
+  FixtureName,
+  IngestResult,
+  MalformedRecord,
+  MetricsRecord,
+  ModelName,
+  RunId,
+} from "./types.js";
+
+const MAX_FIELD_BYTES = 256;
+const MAX_LINE_BYTES = 8_192;
+
+interface RawCandidate {
+  runId?: unknown;
+  model?: unknown;
+  fixture?: unknown;
+  latencyMs?: unknown;
+  tokens?: unknown;
+  timestamp?: unknown;
+}
+
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0;
+}
+
+/**
+ * Validate one JSON object into a MetricsRecord.
+ * Throws a MalformedRecordError-shaped reason string on failure.
+ */
+export function validateRecord(
+  obj: unknown,
+  line: number,
+  raw: string
+): MetricsRecord {
+  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) {
+    throw new Error("payload is not a JSON object");
+  }
+
+  const o = obj as RawCandidate;
+
+  // --- required string fields ---
+  const runId = o["runId"];
+  if (!isNonEmptyString(runId)) {
+    throw new Error('field "runId" must be a non-empty string');
+  }
+  if (runId.length > MAX_FIELD_BYTES) {
+    throw new Error(`field "runId" exceeds ${MAX_FIELD_BYTES} bytes`);
+  }
+
+  const model = o["model"];
+  if (!isNonEmptyString(model)) {
+    throw new Error('field "model" must be a non-empty string');
+  }
+  if (model.length > MAX_FIELD_BYTES) {
+    throw new Error(`field "model" exceeds ${MAX_FIELD_BYTES} bytes`);
+  }
+
+  const fixture = o["fixture"];
+  if (!isNonEmptyString(fixture)) {
+    throw new Error('field "fixture" must be a non-empty string');
+  }
+  if (fixture.length > MAX_FIELD_BYTES) {
+    throw new Error(`field "fixture" exceeds ${MAX_FIELD_BYTES} bytes`);
+  }
+
+  // --- numeric fields ---
+  const latencyMs = o["latencyMs"];
+  if (!isFiniteNumber(latencyMs)) {
+    throw new Error('field "latencyMs" must be a finite number');
+  }
+  if (latencyMs < 0) {
+    throw new Error('field "latencyMs" must be >= 0');
+  }
+
+  const tokens = o["tokens"];
+  if (!isFiniteNumber(tokens)) {
+    throw new Error('field "tokens" must be a finite number');
+  }
+  if (!Number.isInteger(tokens)) {
+    throw new Error('field "tokens" must be an integer');
+  }
+  if (tokens < 0) {
+    throw new Error('field "tokens" must be >= 0');
+  }
+
+  const timestamp = o["timestamp"];
+  if (!isFiniteNumber(timestamp)) {
+    throw new Error('field "timestamp" must be a finite number');
+  }
+  if (timestamp < 0) {
+    throw new Error('field "timestamp" must be >= 0');
+  }
+
+  return {
+    runId: runId as RunId,
+    model: model as ModelName,
+    fixture: fixture as FixtureName,
+    latencyMs,
+    tokens,
+    timestamp,
+  };
+}
+
+/**
+ * Parse a single NDJSON line.
+ * Returns a discriminated union describing the outcome.
+ * Never throws — all failures are represented as "malformed".
+ */
+export function parseLine(raw: string, line: number): IngestResult {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return { kind: "empty", line };
+  }
+
+  if (raw.length > MAX_LINE_BYTES) {
+    const r: MalformedRecord = {
+      line,
+      raw: raw.slice(0, 200),
+      reason: `line exceeds ${MAX_LINE_BYTES} bytes`,
+    };
+    return { kind: "malformed", record: r };
+  }
+
+  let obj: unknown;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch (e) {
+    const reason =
+      e instanceof Error ? e.message : "invalid JSON";
+    const r: MalformedRecord = {
+      line,
+      raw: trimmed.slice(0, 200),
+      reason: `JSON parse error: ${reason}`,
+    };
+    return { kind: "malformed", record: r };
+  }
+
+  try {
+    const record = validateRecord(obj, line, raw);
+    return { kind: "ok", record };
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : "validation failed";
+    const r: MalformedRecord = {
+      line,
+      raw: trimmed.slice(0, 200),
+      reason,
+    };
+    return { kind: "malformed", record: r };
+  }
+}
+
+/**
+ * Split a body into lines for incremental processing.
+ * Handles both \n and \r\n, and drops a trailing empty line.
+ */
+export function splitLines(body: string): string[] {
+  const parts = body.split(/\r?\n/);
+  // Drop a trailing empty element produced by a trailing newline.
+  if (parts.length > 0 && parts[parts.length - 1] === "") {
+    parts.pop();
+  }
+  return parts;
+}
+```
+
+---
+
+## `src/stats.ts`
+
+Pure statistics functions. Uses **Welford's online algorithm** for the mean and the sample variance (unbiased, n−1 denominator), and a sorted copy for the median.
+
+```ts
+/**
+ * Welford accumulator for online mean + sample variance.
+ * Memory: O(1). Incremental: one update per record.
+ */
+export class WelfordAccumulator {
+  private n = 0;
+  private mean = 0;
+  private m2 = 0; // sum of squared differences (running)
+
+  update(x: number): void {
+    this.n += 1;
+    const delta = x - this.mean;
+    this.mean += delta / this.n;
+    this.m2 += delta * (x - this.mean);
+  }
+
+  get count(): number {
+    return this.n;
+  }
+
+  get mean(): number {
+    return this.n === 0 ? NaN : this.mean;
+  }
+
+  /** Sample variance (unbiased). Returns NaN when n < 2. */
+  get sampleVariance(): number {
+    return this.n < 2 ? NaN : this.m2 / (this.n - 1);
+  }
+
+  /** Sample standard deviation. Returns null when n < 2. */
+  get sampleStdDev(): number | null {
+    if (this.n < 2) return null;
+    const v = this.m2 / (this.n - 1);
+    return Math.sqrt(v);
+  }
+
+  reset(): void {
+    this.n = 0;
+    this.mean = 0;
+    this.m2 = 0;
+  }
+}
+
+/** Median of a finite array. Returns NaN for empty input. */
+export function median(values: number[]): number {
+  if (values.length === 0) return NaN;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  if (sorted.length % 2 === 1) {
+    return sorted[mid] as number;
+  }
+  const a = sorted[mid - 1] as number;
+  const b = sorted[mid] as number;
+  return (a + b) / 2;
+}
+
+/** Mean of a finite array. Returns NaN for empty input. */
+export function mean(values: number[]): number {
+  if (values.length === 0) return NaN;
+  let sum = 0;
+  for (const v of values) sum += v;
+  return sum / values.length;
+}
+
+/** Sample standard deviation (n−1). Returns null when n

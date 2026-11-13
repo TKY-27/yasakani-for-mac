@@ -1,0 +1,250 @@
+# Request Metrics Service
+
+Below is a complete, self-contained TypeScript 5 service. It uses **only Node built-ins** (`node:http`, `node:fs`, `node:stream`) — no third-party runtime dependencies. The test suite uses Node's built-in `node:test` runner, so `npm test` works with zero installs.
+
+---
+
+## `package.json`
+
+```json
+{
+  "name": "request-metrics-service",
+  "version": "1.0.0",
+  "description": "Stateless request-metrics ingestion, validation, aggregation and HTTP API (Node built-ins only).",
+  "type": "module",
+  "main": "dist/server.js",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsc && node dist/server.js",
+    "test": "tsc && node --test dist/test/",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "@types/node": "^20.11.0"
+  }
+}
+```
+
+## `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "rootDir": "src",
+    "outDir": "dist",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
+```
+
+---
+
+## `src/types.ts`
+
+Strict domain types, the wire record, and the API response shapes.
+
+```ts
+/**
+ * Domain types for the request-metrics service.
+ *
+ * A "record" is one newline-delimited request-metric line. A "run" is a
+ * collection of records sharing the same runId. Aggregation is grouped by
+ * (model, fixture) within a run.
+ */
+
+/** A single validated request-metric record. */
+export interface RequestMetricRecord {
+  /** Unique identifier for the run this record belongs to. */
+  runId: string;
+  /** Model identifier (e.g. "gpt-4", "llama-3-70b"). */
+  model: string;
+  /** Fixture / dataset identifier (e.g. "sft-v2", "eval-holdout"). */
+  fixture: string;
+  /** Latency in milliseconds (non-negative finite number). */
+  latencyMs: number;
+  /** Token count (non-negative integer). */
+  tokens: number;
+  /** HTTP status code (integer 100..599). */
+  statusCode: number;
+  /** Unix epoch milliseconds (integer). */
+  timestampMs: number;
+  /** Optional free-form error message (present when the request failed). */
+  error?: string;
+}
+
+/** A single (model, fixture) aggregation group within a run. */
+export interface GroupStats {
+  model: string;
+  fixture: string;
+  count: number;
+  mean: number;
+  median: number;
+  /** Sample standard deviation (n-1). 0 when count < 2. */
+  sampleStdDev: number;
+  min: number;
+  max: number;
+  /** Sum of tokens across the group. */
+  totalTokens: number;
+  /** Count of records whose statusCode >= 400. */
+  errorCount: number;
+}
+
+/** Aggregated statistics for a single run. */
+export interface RunSummary {
+  runId: string;
+  /** Total number of records in the run. */
+  recordCount: number;
+  /** Distinct (model, fixture) groups. */
+  groups: GroupStats[];
+  /** Sum of tokens across all records. */
+  totalTokens: number;
+  /** Count of records whose statusCode >= 400. */
+  errorCount: number;
+  /** Earliest record timestamp (ms) or null if empty. */
+  firstTimestampMs: number | null;
+  /** Latest record timestamp (ms) or null if empty. */
+  lastTimestampMs: number | null;
+}
+
+/** The /summary response body. */
+export interface SummaryResponse {
+  service: string;
+  version: string;
+  /** Total records ingested across all runs. */
+  totalRecords: number;
+  /** Distinct run ids observed. */
+  runCount: number;
+  /** Distinct models observed. */
+  modelCount: number;
+  /** Distinct fixtures observed. */
+  fixtureCount: number;
+  /** Per-run summaries, sorted by runId. */
+  runs: RunSummary[];
+}
+
+/** The /health response body. */
+export interface HealthResponse {
+  status: 'ok';
+  service: string;
+  version: string;
+  uptimeSec: number;
+  totalRecords: number;
+  runCount: number;
+  memory: {
+    rssBytes: number;
+    heapUsedBytes: number;
+    heapTotalBytes: number;
+  };
+}
+
+/** The /runs/:id response body. */
+export interface RunResponse {
+  runId: string;
+  recordCount: number;
+  groups: GroupStats[];
+  totalTokens: number;
+  errorCount: number;
+  firstTimestampMs: number | null;
+  lastTimestampMs: number | null;
+}
+
+/** A malformed-input error carries a machine-readable code and line context. */
+export interface MalformedInputError {
+  code: 'MALFORMED_INPUT';
+  message: string;
+  line: number;
+  field?: string;
+  value?: string;
+}
+
+/** A run that has not been observed yet. */
+export interface NotFoundError {
+  code: 'NOT_FOUND';
+  message: string;
+  runId: string;
+}
+
+/** A request body that exceeds the configured byte limit. */
+export interface PayloadTooLargeError {
+  code: 'PAYLOAD_TOO_LARGE';
+  message: string;
+  limitBytes: number;
+}
+```
+
+---
+
+## `src/validate.ts`
+
+Hand-rolled validation (no schema libraries). Produces a `RequestMetricRecord` or a `MalformedInputError`.
+
+```ts
+import type { MalformedInputError, RequestMetricRecord } from './types.js';
+
+/** Maximum length for string fields (runId, model, fixture, error). */
+const MAX_STRING_LEN = 256;
+/** Maximum length for the error message field. */
+const MAX_ERROR_LEN = 1024;
+/** Maximum magnitude for numeric fields (guards against absurd values). */
+const MAX_NUMERIC = 1e15;
+
+/**
+ * Validate a single newline-delimited record (a JSON object).
+ *
+ * Returns the parsed record on success, or a MalformedInputError-shaped
+ * object on failure. This is intentionally synchronous and pure so it can
+ * be unit-tested without I/O.
+ */
+export function validateRecord(
+  raw: string,
+  line: number
+): RequestMetricRecord | MalformedInputError {
+  const fail = (field: string, message: string, value?: string): MalformedInputError => ({
+    code: 'MALFORMED_INPUT',
+    message,
+    line,
+    field,
+    value,
+  });
+
+  // 1) Must be valid JSON.
+  let obj: unknown;
+  try {
+    obj = JSON.parse(raw);
+  } catch {
+    return fail('json', `line ${line}: not valid JSON`);
+  }
+
+  // 2) Must be a plain object (not null, array, or primitive).
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) {
+    return fail('json', `line ${line}: expected a JSON object`);
+  }
+  const o = obj as Record<string, unknown>;
+
+  // 3) Required string fields.
+  const runId = o['runId'];
+  if (typeof runId !== 'string' || runId.length === 0) {
+    return fail('runId', `line ${line}: "runId" must be a non-empty string`, typeof runId);
+  }
+  if (runId.length > MAX_STRING_LEN) {
+    return fail('

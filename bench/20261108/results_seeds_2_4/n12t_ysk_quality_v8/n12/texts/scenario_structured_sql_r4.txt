@@ -1,0 +1,151 @@
+We need respond to user: "Return one PostgreSQL script with no Markdown fences. Define normalized tables for models, fixtures, runs, and request_metrics; include primary/foreign keys, checks, useful indexes, two views, one transaction-safe upsert function, and at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. The script must run in dependency order."
+
+Need produce single PostgreSQL script, no Markdown fences. Need ensure runs in dependency order. Need include normalized tables: models, fixtures, runs, request_metrics. Primary/foreign keys, checks, indexes. Two views. One transaction-safe upsert function. At least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance.
+
+Need think about schema and data. Need likely no DROP? "run in dependency order" means CREATE TABLE then functions/views/inserts/selects? If run once, order fine. Could use CREATE TABLE IF NOT EXISTS to be idempotent? But "run in dependency order" likely just create tables before inserts, functions, views. We can use DROP TABLE ... CASCADE? Might be okay but dependency order? If drop, then create. But to be safe, use CREATE TABLE IF NOT EXISTS, CREATE OR REPLACE FUNCTION, CREATE OR REPLACE VIEW. Inserts should not duplicate if re-run? Could use ON CONFLICT maybe, but at least 80 realistic INSERT rows. If re-run, duplicates? Could set unique constraints and use upsert? But they ask include upsert function, maybe use it to insert rows? Could insert via function? Need at least 80 realistic INSERT rows. Could use explicit INSERT INTO ... VALUES (multi-row). If re-running, primary key conflict. We can design with deterministic IDs and maybe DROP/DELETE? But if we DROP tables, no conflict. But "run in dependency order" maybe not require idempotent. We can use CREATE TABLE (not IF NOT) and DROP? A script that runs in dependency order can include DROP TABLE request_metrics, runs, fixtures, models CASCADE; then create. But if user runs in dependency order, okay. However if they have other deps, cascade. Maybe use CREATE TABLE IF NOT EXISTS and before inserts use DELETE FROM ... or TRUNCATE? But TRUNCATE violates FK unless restart identity? Could use DELETE FROM request_metrics; DELETE FROM runs; DELETE FROM fixtures; DELETE FROM models; then inserts. That makes re-runnable. But if no tables initially, delete no-op. Need primary/foreign keys. Use serial or identity. For deterministic data, explicit IDs. Use integer primary keys. If we delete, sequence values not reset, but explicit ids avoid conflict after delete. Good.
+
+Need normalized tables:
+models: model_id, model_name, organization, base_model?, architecture, context_length, dtype, notes. unique model_name maybe.
+fixtures: fixture_id, fixture_key, fixture_kind, description, maybe input_tokens, output_tokens, dataset_name? Four fixture kinds. Need realistic.
+runs: run_id, model_id FK, fixture_id FK, run_name, started_at, finished_at, seed, hardware, batch_size, max_tokens, config_json? checks: finished_at > started_at, token counts positive maybe. Could include request_metrics per run? request_metrics: metric_id? run_id FK, request_id, input_tokens, output_tokens, latency_ms, first_token_ms, prompt_tokens? throughput? mtp_acceptance_rate? Need analytical queries for throughput, variability, long-context retention, MTP acceptance. So request_metrics should include fields for each request: run_id, request_id (maybe sequence), input_tokens, output_tokens, latency_ms, first_token_ms, total_tokens, mtp_accepted_tokens, mtp_proposed_tokens? Could include error_status? Need MTP acceptance: accepted / proposed. Need long-context retention: fixture_kind or input_tokens long context, maybe long_context_retention_score? Could include exact match? Let's design.
+
+Tables:
+CREATE TABLE models (
+  model_id serial PRIMARY KEY,
+  model_name text NOT NULL UNIQUE,
+  organization text NOT NULL,
+  architecture text NOT NULL,
+  max_context_tokens integer NOT NULL CHECK (max_context_tokens > 0),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+fixtures:
+ fixture_id serial PK,
+ fixture_key text NOT NULL UNIQUE,
+ fixture_kind text NOT NULL CHECK (fixture_kind IN ('short_qa','medium_summarization','long_context','code_generation')),
+ description text NOT NULL,
+ reference_input_tokens integer NOT NULL CHECK (reference_input_tokens > 0),
+ reference_output_tokens integer NOT NULL CHECK (reference_output_tokens > 0)
+);
+
+runs:
+ run_id serial PK,
+ run_name text NOT NULL,
+ model_id integer NOT NULL REFERENCES models(model_id),
+ fixture_id integer NOT NULL REFERENCES fixtures(fixture_id),
+ started_at timestamptz NOT NULL,
+ finished_at timestamptz NOT NULL,
+ seed integer NOT NULL DEFAULT 0,
+ hardware text NOT NULL,
+ batch_size integer NOT NULL CHECK (batch_size > 0),
+ max_output_tokens integer NOT NULL CHECK (max_output_tokens > 0),
+ created_at timestamptz DEFAULT now(),
+ UNIQUE (run_name)
+ CHECK (finished_at >= started_at);
+Maybe unique(model_id, fixture_id, seed, hardware)? But multiple runs possible. Use unique run_name.
+
+request_metrics:
+ metric_id bigserial PK? run_id int FK ON DELETE CASCADE,
+ request_key text NOT NULL,
+ input_tokens int NOT NULL CHECK >=0,
+ output_tokens int NOT NULL CHECK >=0,
+ latency_ms numeric(12,2) NOT NULL CHECK >=0,
+ first_token_ms numeric(12,2) NOT NULL CHECK >=0,
+ mtp_proposed_tokens int NOT NULL DEFAULT 0 CHECK >=0,
+ mtp_accepted_tokens int NOT NULL DEFAULT 0 CHECK >=0,
+ long_context_retention_score numeric(4,3) CHECK (long_context_retention_score BETWEEN 0 AND 1) maybe null? For long context only? Could be null for others. Use numeric(4,3) CHECK (long_context_retention_score IS NULL OR between 0 and1).
+ CHECK (mtp_accepted_tokens <= mtp_proposed_tokens), CHECK (output_tokens > 0 or latency >0?), maybe CHECK (first_token_ms <= latency_ms).
+ UNIQUE(run_id, request_key).
+
+Useful indexes:
+models: pk, unique name maybe index.
+fixtures: kind, fixture_key unique.
+runs: (model_id, fixture_id), started_at, run_name unique.
+request_metrics: run_id, request_key unique; (run_id, input_tokens), (run_id, output_tokens), (run_id, latency_ms), (run_id, long_context_retention_score), (run_id, mtp_proposed_tokens, mtp_accepted_tokens). Also GIN? Not necessary.
+
+Two views:
+v_run_summary: per run aggregate throughput, variability, etc.
+v_fixture_model_comparison: per model fixture.
+
+One transaction-safe upsert function:
+CREATE OR REPLACE FUNCTION upsert_request_metric(
+ p_run_id integer,
+ p_request_key text,
+ p_input_tokens integer,
+ p_output_tokens integer,
+ p_latency_ms numeric,
+ p_first_token_ms numeric,
+ p_mtp_proposed_tokens integer DEFAULT 0,
+ p_mtp_accepted_tokens integer DEFAULT 0,
+ p_long_context_retention_score numeric DEFAULT NULL
+) RETURNS request_metrics LANGUAGE plpgsql AS $$
+DECLARE rec request_metrics;
+BEGIN
+  PERFORM 1 FROM runs WHERE run_id = p_run_id;
+  IF NOT FOUND THEN RAISE EXCEPTION ...; END IF;
+  -- validate
+  IF p_output_tokens <=0 OR ... THEN RAISE EXCEPTION;
+  IF p_mtp_accepted_tokens > p_mtp_proposed_tokens THEN RAISE EXCEPTION;
+  IF p_first_token_ms > p_latency_ms THEN RAISE EXCEPTION;
+  INSERT INTO request_metrics (...) VALUES (...)
+  ON CONFLICT (run_id, request_key) DO UPDATE SET ...
+  RETURNING * INTO rec;
+  RETURN rec;
+END $$;
+Need transaction-safe: function by default runs in caller transaction. Add SET TRANSACTION? No. We can mention not. It should be transaction-safe: uses atomic upsert. Could add SELECT FOR UPDATE? Not necessary.
+
+Need at least 80 realistic INSERT rows spanning two models and four fixture kinds. Could insert models 2, fixtures 4, runs maybe 8? Need 80 request_metrics rows. "INSERT rows" likely means rows inserted, could include 2+4+8+80 = 94 rows. Need at least 80 realistic INSERT rows spanning two models and four fixture kinds. Could have 80 request_metrics rows distributed across models/fixtures. Need ensure spans two models and four fixture kinds. Need maybe include runs for each model/fixture: 2 models x 4 fixtures = 8 runs, each 10 request metrics = 80 request metrics rows. That is good. Need INSERT rows: 2 models, 4 fixtures, 8 runs, 80 metrics = 94. But "at least 80 realistic INSERT rows spanning two models and four fixture kinds" could mean at least 80 rows total. We'll do 80 request_metrics plus other rows. Need script not too huge but okay. Need generate 80 metric rows realistically. Need ensure all constraints pass. Need maybe use multi-row INSERT to reduce lines. But "INSERT rows" not necessarily line count. Could have 80 rows in values. Need realistic: input/output tokens, latency, mtp, retention.
+
+Need analytical SELECT queries: six queries for throughput, variability, long-context retention, and MTP acceptance.
+- Throughput: tokens per second per run, maybe output tokens / latency? Need throughput: (sum output_tokens) / (sum latency_ms/1000)? But requests may concurrent? Simpler: average tokens per request per second: sum(output_tokens) / (sum(latency_ms)/1000). Could also request throughput. Need six queries.
+1. Per model+fixture average output throughput (tokens/sec per request) and request throughput.
+2. Throughput distribution quantiles? Or per run p50/p95 latency and throughput.
+3. Variability: coefficient of variation of latency and output tokens per run/model fixture.
+4. Long-context retention: average retention score by model and fixture kind for long_context fixture, maybe degrade vs input length.
+5. MTP acceptance: average acceptance rate by model/fixture/run.
+6. Combined: MTP acceptance vs throughput or long-context? Need exactly six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Could include multiple aspects. Need finish with six SELECTs. Could be:
+-- 1. throughput per run
+SELECT ...;
+-- 2. throughput quantiles per model fixture
+SELECT ...;
+-- 3. variability latency/output tokens per run (stddev, cv)
+-- 4. variability of MTP acceptance rate per run? But user asks variability generally; okay.
+-- 5. long-context retention by model and fixture kind/input length
+-- 6. MTP acceptance by model and fixture kind with sample counts and acceptance vs latency.
+Need ensure queries use views maybe? Could use views. Need six SELECT statements after data.
+
+Need script dependency order. If we do DROP TABLE ... CASCADE; then CREATE TABLE; CREATE INDEX; CREATE FUNCTION; INSERT data; CREATE VIEW? Views can be before or after data; dependency order: tables first, then function, inserts, views? Views depend on tables only. But if views are created before inserts fine. The upsert function depends on runs table. Could create function after tables, before inserts. Views after tables, before or after inserts. The user says finish with six analytical SELECT queries. So order: DROP? CREATE TABLEs; indexes; function; insert models/fixtures/runs/request_metrics; views; SELECTs. Or create views after inserts. Fine.
+
+Need no Markdown fences. Just SQL text.
+
+Need ensure PostgreSQL syntax. Multi-row INSERT with numeric values. Need maybe use explicit IDs for all to make deterministic and FK references. Use INSERT INTO models (model_id, model_name,...) VALUES (1,...),(2,...); But if sequence starts 1 and we insert explicit 1, sequence remains 1? Actually with serial, if we insert explicit values, sequence is not advanced. Future default nextval could conflict. But script only these inserts. If re-run with DELETE, sequence remains, but explicit values okay. If using default, conflict? We won't. But if function inserts with default metric_id? metric_id bigserial, if we use explicit IDs? We can either explicit metric IDs or default. If explicit, no sequence issues. But if function uses default, sequence may not be advanced. Could use explicit metric ids for 80 rows. But if function later used, nextval may return 1 and conflict if explicit ids include 1? To avoid, use DEFAULT for metric_id and not explicit. But for deterministic re-run with delete, default after sequence maybe high, okay. We can use multi-row insert with metric_id DEFAULT by not including metric_id. But if run_id+request_key unique, no duplicate after delete. If no delete and re-run, conflict. We'll include DELETE before inserts to allow re-run. If using default, re-run after delete okay, sequence increments. No conflict. But if user runs script twice without delete? We have delete, so okay. Need if script run before tables? We drop/create.
+
+Potential issue: DELETE FROM models with FK from runs? Need order: request_metrics, runs, fixtures, models. Use ON DELETE CASCADE for request_metrics/runs maybe but delete explicit order safe. Use TRUNCATE? DELETE okay.
+
+If we DROP TABLE ... CASCADE, then create. Could be destructive. Maybe safer: CREATE TABLE IF NOT EXISTS and DELETE. But if tables exist with different schema, not adapt. For a script, use DROP? "must run in dependency order" maybe doesn't want destructive? Could use CREATE TABLE IF NOT EXISTS; but if re-run, data deletion. However if constraints changed, not. Since user asks return one script, likely expected to create. I can use DROP TABLE IF EXISTS ... CASCADE; to ensure clean. Dependency order: drop child tables first. That's fine.
+
+Need maybe use CREATE SCHEMA? Not necessary.
+
+Need check: request_metrics.long_context_retention_score numeric(4,3) allows 1.000? numeric precision 4 scale 3: max 9.999? Actually precision 4 scale 3 means one digit before decimal, so 0.000 to 9.999. For 1.000 okay. But better numeric(3,3) (max 0.999) not include 1. Use numeric(4,3) or numeric(5,3). Use numeric(4,3) check between 0 and1. 1.000 fits. Good.
+
+Need data generation. Need 80 request_metrics rows across 8 runs. Need each run 10 rows. Need ensure mtp_accepted <= proposed. first_token_ms <= latency_ms. input/output tokens positive. retention score for long_context rows? Could include for all rows maybe null for non-long context. Query long-context retention can filter fixture_kind = 'long_context' or retention score not null. Need for long_context retention by model and fixture kind? If only long_context has scores. Good.
+
+Need two models: e.g., "nova-7b-instruct-v1" and "atlas-13b-chat-v2". Fixture kinds: short_qa, medium_summarization, long_context, code_generation. Need four fixture rows: maybe one per kind. But "spanning four fixture kinds" could each model/fixture. We'll have 4 fixtures. Runs: 8, each model+fixture. Run names like "nova7b_short_qa_r1" etc. Need timestamps. Use fixed timestamptz literals. started_at 2026-02-10 09:00:00+00, finished later. But current date maybe 2026? okay. Could use '2026-01-01 09:00:00+00'. Need realistic.
+
+Need runs fields: seed, hardware, batch_size, max_output_tokens.
+Runs:
+run_id 1 model 1 fixture 1 (short_qa) started 2026-02-10 09:00:00+00 finished 09:02:31 seed 11 hardware 'NVIDIA A100 80GB' batch_size 8 max_output_tokens 256
+run_id 2 model 1 fixture 2 medium_summ ... etc
+Need maybe different seeds/hardware? Two models maybe same hardware. Use 4 fixtures. We can make 8 runs with varied batch sizes, seeds, hardware. For request metrics, need 10 rows each. Need maybe request_key 'req-01' to 'req-10'. Unique per run.
+
+Need at least 80 realistic INSERT rows. If we do 80 rows in one INSERT INTO request_metrics (run_id, request_key, ...) VALUES (...), (...); That's 80 rows. Good. But need ensure "INSERT rows" maybe they count VALUES row count. We'll include exactly 80 rows in metrics plus other inserts. Could be okay.
+
+Need make data realistic:
+- short_qa: input tokens ~50-250, output ~20-120, latency 300-1200 ms, first_token 80-400.
+- medium_summarization: input 800-2500, output 150-600, latency 1200-4500, first_token 200-800.
+- long_context: input 8000-24000, output 80-350, latency 3000-9000, first_token 500-1500, retention score 0.72-0.96 for model1, 0.78-0.98 for model2 maybe.
+- code_generation: input 1000-3500, output 300-900, latency 1800-6000, first_token 300-900.
+
+Need MTP proposed/accepted: for model1 lower acceptance, model2 higher. mtp_proposed_tokens maybe output_tokens * 1.5? accepted less. E.g., proposed 120, accepted 48 (40%). Need accepted <= proposed.
+
+Need maybe output_tokens should match mtp? Not necessarily. MTP proposed tokens are speculative tokens, accepted tokens. Acceptance rate = accepted/proposed. If proposed 0? Could be 0? Check maybe >=

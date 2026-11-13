@@ -1,0 +1,70 @@
+[12:44:32] engine settings: {"YSKN_ATX_PK3_PLUT": "1", "YSKN_ATX_PKV": "3", "YSKN_ATX_VSP": "7", "YSKN_BDR_SHEAD_M": "512", "YSKN_Q35_ATX": "1", "YSKN_Q35_G6": "1", "YSKN_Q35_KV8": "1", "YSKN_Q35_KV_FP16": "0", "YSKN_Q35_LAYER_OVERLAP": "1", "YSKN_Q35_LAYER_ROWS": "4096", "YSKN_Q35_PFALT": "1", "YSKN_Q35_PMAX": "1024", "YSKN_Q35_SHARED_WEIGHTS": "1", "YSKN_TB_CAP": "1", "YSKN_TB_VIT2": "1"}
+[q35_g6] prefill only, temporary workspace 111543640 bytes
+[KV-PROTOCOL] target_kv=int8-row-f32-scale
+[TB-CAP] capacity mode (k=5): packed K streams 16/16, packed V streams 13/16; KV of the attention layers 5536.0 MiB (INT8 containers: 8320.0 MiB); staging 4096 rows
+[qwen3_5] 64 layers loaded, LNORD codes 9.76 GB, free 13.5 / 34.2 GB
+[qwen3_5] SHEAD drafter head loaded (<model_dir_fast>\bdraft2_k8.shead): rank 512, 1.41 GB, score grid 340 blocks; GPU free 10.6 / 34.2 GB
+[12:44:37] engine ready in 5.0 s, max_ctx 262144
+[12:44:37] sampling: temperature 0.60 (<=0 is greedy), top-p 0.95, top-k 20, label fast_t06, overrides {}
+[12:44:38] warm-up done
+[12:44:47] code        scenario_code_cuda             s0:   471.8 tok/s,  4096 tokens in    8.68 s (length), 843 passes, 4.86 tok/pass, 10.30 ms/pass, prompt 144
+[12:44:55] code        scenario_code_cuda             s1:   501.7 tok/s,  4096 tokens in    8.16 s (length), 805 passes, 5.09 tok/pass, 10.14 ms/pass, prompt 144
+[12:45:04] code        scenario_code_cuda             s2:   462.1 tok/s,  4096 tokens in    8.86 s (length), 876 passes, 4.68 tok/pass, 10.12 ms/pass, prompt 144
+[12:45:12] code        scenario_code_cuda             s3:   480.4 tok/s,  4096 tokens in    8.53 s (length), 831 passes, 4.93 tok/pass, 10.26 ms/pass, prompt 144
+[12:45:21] code        scenario_code_cuda             s4:   491.5 tok/s,  4096 tokens in    8.33 s (length), 812 passes, 5.04 tok/pass, 10.26 ms/pass, prompt 144
+[12:45:30] code        scenario_code_python           s0:   456.0 tok/s,  4096 tokens in    8.98 s (length), 881 passes, 4.65 tok/pass, 10.19 ms/pass, prompt 122
+[12:45:38] code        scenario_code_python           s1:   495.5 tok/s,  4096 tokens in    8.26 s (length), 804 passes, 5.09 tok/pass, 10.28 ms/pass, prompt 122
+[12:45:46] code        scenario_code_python           s2:   506.5 tok/s,  4096 tokens in    8.08 s (length), 789 passes, 5.19 tok/pass, 10.25 ms/pass, prompt 122
+[12:45:54] code        scenario_code_python           s3:   506.1 tok/s,  4096 tokens in    8.09 s (length), 786 passes, 5.21 tok/pass, 10.29 ms/pass, prompt 122
+[12:46:03] code        scenario_code_python           s4:   492.5 tok/s,  4096 tokens in    8.31 s (length), 808 passes, 5.07 tok/pass, 10.29 ms/pass, prompt 122
+[12:46:10] code        scenario_code_typescript       s0:   570.0 tok/s,  4096 tokens in    7.18 s (length), 690 passes, 5.94 tok/pass, 10.41 ms/pass, prompt 122
+[12:46:18] code        scenario_code_typescript       s1:   536.5 tok/s,  4096 tokens in    7.63 s (length), 723 passes, 5.67 tok/pass, 10.56 ms/pass, prompt 122
+[12:46:25] code        scenario_code_typescript       s2:   523.3 tok/s,  4096 tokens in    7.83 s (length), 747 passes, 5.48 tok/pass, 10.48 ms/pass, prompt 122
+[12:46:33] code        scenario_code_typescript       s3:   535.7 tok/s,  4096 tokens in    7.64 s (length), 741 passes, 5.53 tok/pass, 10.32 ms/pass, prompt 122
+[12:46:41] code        scenario_code_typescript       s4:   511.8 tok/s,  4096 tokens in    8.00 s (length), 767 passes, 5.34 tok/pass, 10.43 ms/pass, prompt 122
+[12:46:53] story       scenario_story_zh_scifi        s0:   251.6 tok/s,  2879 tokens in   11.44 s (stop), 1156 passes, 2.49 tok/pass, 9.90 ms/pass, prompt 127
+[12:47:06] story       scenario_story_zh_scifi        s1:   233.1 tok/s,  3197 tokens in   13.71 s (stop), 1374 passes, 2.33 tok/pass, 9.98 ms/pass, prompt 127
+[12:47:22] story       scenario_story_zh_scifi        s2:   232.0 tok/s,  3567 tokens in   15.37 s (stop), 1543 passes, 2.31 tok/pass, 9.96 ms/pass, prompt 127
+[12:47:36] story       scenario_story_zh_scifi        s3:   245.2 tok/s,  3620 tokens in   14.76 s (stop), 1519 passes, 2.38 tok/pass, 9.72 ms/pass, prompt 127
+[12:47:49] story       scenario_story_zh_scifi        s4:   252.3 tok/s,  3220 tokens in   12.76 s (stop), 1319 passes, 2.44 tok/pass, 9.67 ms/pass, prompt 127
+[12:48:00] story       scenario_story_en_mystery      s0:   392.3 tok/s,  4096 tokens in   10.44 s (length), 1076 passes, 3.81 tok/pass, 9.70 ms/pass, prompt 131
+[12:48:08] story       scenario_story_en_mystery      s1:   480.0 tok/s,  4096 tokens in    8.53 s (length), 866 passes, 4.73 tok/pass, 9.85 ms/pass, prompt 131
+[12:48:17] story       scenario_story_en_mystery      s2:   463.4 tok/s,  4096 tokens in    8.84 s (length), 897 passes, 4.57 tok/pass, 9.85 ms/pass, prompt 131
+[12:48:25] story       scenario_story_en_mystery      s3:   354.4 tok/s,  2781 tokens in    7.84 s (stop), 812 passes, 3.42 tok/pass, 9.66 ms/pass, prompt 131
+[12:48:34] story       scenario_story_en_mystery      s4:   440.4 tok/s,  4096 tokens in    9.30 s (length), 952 passes, 4.30 tok/pass, 9.77 ms/pass, prompt 131
+[12:48:48] story       scenario_story_zh_dialogue     s0:   221.0 tok/s,  2970 tokens in   13.43 s (stop), 1397 passes, 2.13 tok/pass, 9.61 ms/pass, prompt 135
+[12:49:06] story       scenario_story_zh_dialogue     s1:   221.8 tok/s,  4096 tokens in   18.46 s (length), 1914 passes, 2.14 tok/pass, 9.64 ms/pass, prompt 135
+[12:49:21] story       scenario_story_zh_dialogue     s2:   215.2 tok/s,  3164 tokens in   14.70 s (stop), 1528 passes, 2.07 tok/pass, 9.62 ms/pass, prompt 135
+[12:49:34] story       scenario_story_zh_dialogue     s3:   226.9 tok/s,  2960 tokens in   13.04 s (stop), 1357 passes, 2.18 tok/pass, 9.61 ms/pass, prompt 135
+[12:49:49] story       scenario_story_zh_dialogue     s4:   217.4 tok/s,  3244 tokens in   14.91 s (stop), 1545 passes, 2.10 tok/pass, 9.65 ms/pass, prompt 135
+[12:49:51] translation scenario_translation_zh_en     s0:   578.9 tok/s,   803 tokens in    1.39 s (stop), 141 passes, 5.70 tok/pass, 9.83 ms/pass, prompt 401
+[12:49:52] translation scenario_translation_zh_en     s1:   609.2 tok/s,   890 tokens in    1.46 s (stop), 148 passes, 6.01 tok/pass, 9.86 ms/pass, prompt 401
+[12:49:53] translation scenario_translation_zh_en     s2:   660.6 tok/s,   851 tokens in    1.29 s (stop), 127 passes, 6.70 tok/pass, 10.13 ms/pass, prompt 401
+[12:49:55] translation scenario_translation_zh_en     s3:   617.5 tok/s,   813 tokens in    1.32 s (stop), 133 passes, 6.11 tok/pass, 9.89 ms/pass, prompt 401
+[12:49:56] translation scenario_translation_zh_en     s4:   620.1 tok/s,   716 tokens in    1.15 s (stop), 114 passes, 6.28 tok/pass, 10.11 ms/pass, prompt 401
+[12:49:58] translation scenario_translation_en_zh     s0:   519.7 tok/s,   929 tokens in    1.79 s (stop), 183 passes, 5.08 tok/pass, 9.76 ms/pass, prompt 395
+[12:49:59] translation scenario_translation_en_zh     s1:   491.4 tok/s,   834 tokens in    1.70 s (stop), 171 passes, 4.88 tok/pass, 9.91 ms/pass, prompt 395
+[12:50:01] translation scenario_translation_en_zh     s2:   499.0 tok/s,   745 tokens in    1.49 s (stop), 153 passes, 4.87 tok/pass, 9.75 ms/pass, prompt 395
+[12:50:03] translation scenario_translation_en_zh     s3:   484.7 tok/s,   822 tokens in    1.69 s (stop), 174 passes, 4.72 tok/pass, 9.73 ms/pass, prompt 395
+[12:50:04] translation scenario_translation_en_zh     s4:   530.6 tok/s,   910 tokens in    1.71 s (stop), 172 passes, 5.29 tok/pass, 9.96 ms/pass, prompt 395
+[12:50:06] translation scenario_translation_markdown  s0:   482.6 tok/s,   624 tokens in    1.29 s (stop), 133 passes, 4.69 tok/pass, 9.71 ms/pass, prompt 360
+[12:50:08] translation scenario_translation_markdown  s1:   412.4 tok/s,   774 tokens in    1.87 s (stop), 194 passes, 3.99 tok/pass, 9.66 ms/pass, prompt 360
+[12:50:10] translation scenario_translation_markdown  s2:   407.1 tok/s,   747 tokens in    1.83 s (stop), 190 passes, 3.93 tok/pass, 9.64 ms/pass, prompt 360
+[12:50:12] translation scenario_translation_markdown  s3:   413.9 tok/s,   980 tokens in    2.37 s (stop), 244 passes, 4.02 tok/pass, 9.70 ms/pass, prompt 360
+[12:50:13] translation scenario_translation_markdown  s4:   448.3 tok/s,   683 tokens in    1.52 s (stop), 157 passes, 4.35 tok/pass, 9.69 ms/pass, prompt 360
+[12:50:17] structured  scenario_structured_jsonl      s0:  1211.4 tok/s,  4096 tokens in    3.38 s (length), 285 passes, 14.37 tok/pass, 11.86 ms/pass, prompt 130
+[12:50:20] structured  scenario_structured_jsonl      s1:  1205.5 tok/s,  4096 tokens in    3.40 s (length), 287 passes, 14.27 tok/pass, 11.84 ms/pass, prompt 130
+[12:50:24] structured  scenario_structured_jsonl      s2:  1207.4 tok/s,  4096 tokens in    3.39 s (length), 286 passes, 14.32 tok/pass, 11.86 ms/pass, prompt 130
+[12:50:27] structured  scenario_structured_jsonl      s3:  1220.3 tok/s,  4096 tokens in    3.36 s (length), 284 passes, 14.42 tok/pass, 11.82 ms/pass, prompt 130
+[12:50:31] structured  scenario_structured_jsonl      s4:  1186.2 tok/s,  4096 tokens in    3.45 s (length), 291 passes, 14.08 tok/pass, 11.86 ms/pass, prompt 130
+[12:50:36] structured  scenario_structured_csv        s0:   773.1 tok/s,  4096 tokens in    5.30 s (length), 459 passes, 8.92 tok/pass, 11.54 ms/pass, prompt 113
+[12:50:40] structured  scenario_structured_csv        s1:  1110.5 tok/s,  4096 tokens in    3.69 s (length), 315 passes, 13.00 tok/pass, 11.71 ms/pass, prompt 113
+[12:50:46] structured  scenario_structured_csv        s2:   617.8 tok/s,  4096 tokens in    6.63 s (length), 656 passes, 6.24 tok/pass, 10.10 ms/pass, prompt 113
+[12:50:52] structured  scenario_structured_csv        s3:   754.5 tok/s,  4096 tokens in    5.43 s (length), 488 passes, 8.39 tok/pass, 11.12 ms/pass, prompt 113
+[12:50:56] structured  scenario_structured_csv        s4:   904.1 tok/s,  4096 tokens in    4.53 s (length), 405 passes, 10.11 tok/pass, 11.18 ms/pass, prompt 113
+[12:51:02] structured  scenario_structured_sql        s0:   698.2 tok/s,  4096 tokens in    5.87 s (length), 527 passes, 7.77 tok/pass, 11.13 ms/pass, prompt 101
+[12:51:07] structured  scenario_structured_sql        s1:   900.1 tok/s,  4096 tokens in    4.55 s (length), 409 passes, 10.02 tok/pass, 11.12 ms/pass, prompt 101
+[12:51:12] structured  scenario_structured_sql        s2:   781.0 tok/s,  4096 tokens in    5.24 s (length), 494 passes, 8.29 tok/pass, 10.61 ms/pass, prompt 101
+[12:51:18] structured  scenario_structured_sql        s3:   727.2 tok/s,  4096 tokens in    5.63 s (length), 524 passes, 7.82 tok/pass, 10.75 ms/pass, prompt 101
+[12:51:23] structured  scenario_structured_sql        s4:   754.4 tok/s,  4096 tokens in    5.43 s (length), 494 passes, 8.29 tok/pass, 10.99 ms/pass, prompt 101
+[12:51:25] done

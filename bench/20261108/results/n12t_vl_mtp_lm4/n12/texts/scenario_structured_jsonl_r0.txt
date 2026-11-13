@@ -1,0 +1,174 @@
+We need to output exactly 160 JSONL records, no markdown. Fields: id RUN-0001..RUN-0160, model alternating qwen3.6-27b and qwen3.6-35b-a3b. prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance, status, tags. Use deterministic arithmetic progressions, status values ok/warn in 4:1 pattern, two tags per record. Every line strict JSON.
+
+Need decide patterns. 160 records. ids sequential. model alternate: likely odd? "alternating qwen3.6-27b and qwen3.6-35b-a3b" start with first? We can set model = "qwen3.6-27b" for odd id? If RUN-0001 is odd index 1 -> 27b, even -> 35b-a3b. Or start 27b at first. Fine.
+
+Arithmetic progressions deterministic for numeric fields. Need ensure strict JSON. JSONL each line object. Tags two per record. Could use two tags from arrays rotating. Need status ok/warn in 4:1 pattern. 160 records, 4:1 means 4 ok then 1 warn? That gives 128 ok, 32 warn (5 per block of 5 -> 32 blocks of 5). Or 4 ok 1 warn repeated. Good.
+
+Need deterministic arithmetic progressions: maybe prompt_tokens = 128 + 4*i? But i 0-based? Let's define n from 0 to 159.
+prompt_tokens = 512 + 16*n
+completion_tokens = 64 + 8*n
+decode_tok_s = 24 + 0.5*n? Could be float. mtp_acceptance = 0.92 + 0.0005*n? Need maybe within 0-1. 0.92 + 0.0005*159 = 1.000? 0.92+0.0795=0.9995. Good.
+But "deterministic arithmetic progressions" all numeric fields AP. Could use integer for tokens. decode_tok_s maybe decimal. Need exact JSON numbers. Fine.
+
+Status 4:1 pattern: for index i 0-based, warn if (i % 5) == 4? Then sequence positions 5,10,... warn. 160 % 5 = 0 => 32 warn, 128 ok. 4:1 ok:warn. Good.
+
+Tags two per record. Could tags = ["bench", "latency"]? Two tags maybe deterministic progressions? Tags not arithmetic? Need two tags per record. Could choose arrays of 4 tags and rotate? But "two tags per record" just array length 2. Could use two tags that vary deterministically. Maybe tags: [ "mtp-" + (1+n%4), "decode-" + (1+(n%3)) ]? But must be JSON string. Simpler: ["run","bench"] constant. Is that okay? likely. But maybe better two tags per record with deterministic values. Could use tag1 = "seq-"+String(n%7+1), tag2 = "load-"+String(n%5+1). But no need? The requirement says two tags per record; constant two tags satisfies. But to be safe, make two tags per record and deterministic: tags: ["tag-" + ((n%5)+1), "tag-" + ((n%7)+1)]? But then some duplicates. Strict JSON okay. However "tags" perhaps expected array of strings. Fine.
+
+Need output exactly 160 lines, no markdown. Need ensure no trailing extra? We can output lines only. Need generate all 160. Could manually create via pattern. Need be careful. We can produce using reasoning maybe construct all lines. Need count 160. Could produce 10 lines per block? Need verify numeric progression. Let's define n=1..160? Better use i=1..160 to align id. Then:
+prompt_tokens = 512 + 16*(i-1). i=1 ->512; i=160 ->512+2528=3040.
+completion_tokens = 64 + 8*(i-1). i=160 ->64+1272=1336.
+decode_tok_s = 24 + 0.5*(i-1). i=160 ->24+79.5=103.5.
+mtp_acceptance = 0.92 + 0.0005*(i-1). i=160 ->0.9995.
+Model: if i odd qwen3.6-27b else qwen3.6-35b-a3b.
+Status: warn if (i-1)%5==4, i.e. i%5==0 (5,10,...,160). ok otherwise.
+Tags: maybe ["alpha", "beta"]? If constant, okay. But "deterministic arithmetic progressions" only numeric? tags two per record. Could constant. If want deterministic AP for tags not possible. Use two tags with values maybe "A"+(i%5) and "B"+(i%7). But no requirement. To minimize risk of invalid? Simple ["primary","secondary"].
+
+Need ensure strict JSON: keys strings, string values quoted, numbers unquoted. Each line independent. No commas outside. For arrays: ["primary","secondary"].
+
+Need 160 records. Could generate manually with pattern. Need avoid mistakes. Let's plan generation.
+
+Option: produce 160 lines in chunks. Need exact. Could use formula to compute values. Since numeric progressions, can list. Need ensure all lines. Maybe create with 10 lines per i block. Let's create a table.
+
+For i from 1 to 160.
+Model odd = A = qwen3.6-27b; even = B = qwen3.6-35b-a3b.
+Status: warn at i multiple of 5; else ok.
+Prompt p = 512 + 16*(i-1)
+Completion c = 64 + 8*(i-1)
+Decode d = 24 + 0.5*(i-1)
+mtp a = 0.92 + 0.0005*(i-1)
+
+Need output JSON. Let's generate all 160. Need high accuracy.
+
+Let's precompute sequences.
+
+i, p, c, d, a, model, status
+1 p512 c64 d24 a0.92 A ok
+2 p528 c72 d24.5 a0.9205 B ok
+3 p544 c80 d25 a0.921 A ok
+4 p560 c88 d25.5 a0.9215 B ok
+5 p576 c96 d26 a0.922 A warn
+6 p592 c104 d26.5 a0.9225 B ok
+7 p608 c112 d27 a0.923 A ok
+8 p624 c120 d27.5 a0.9235 B ok
+9 p640 c128 d28 a0.924 A ok
+10 p656 c136 d28.5 a0.9245 B warn
+...
+
+Need 160. Could maybe use formula and write programmatically mentally? Need ensure no missing. Let's create groups of 10. For each group, i range. We can compute p increments 16, c 8, d 0.5, a 0.0005.
+
+Maybe use zero-based n easier. But i from 1.
+
+Let's produce groups:
+1-10 as above.
+11-20:
+11 p672 c144 d29 a0.925 A ok
+12 p688 c152 d29.5 a0.9255 B ok
+13 p704 c160 d30 a0.926 A ok
+14 p720 c168 d30.5 a0.9265 B ok
+15 p736 c176 d31 a0.927 A warn
+16 p752 c184 d31.5 a0.9275 B ok
+17 p768 c192 d32 a0.928 A ok
+18 p784 c200 d32.5 a0.9285 B ok
+19 p800 c208 d33 a0.929 A ok
+20 p816 c216 d33.5 a0.9295 B warn
+
+Check i=15 multiple 5 warn, 20 warn. Good.
+
+21-30:
+21 p832 c224 d34 a0.93 A ok
+22 p848 c232 d34.5 a0.9305 B ok
+23 p864 c240 d35 a0.931 A ok
+24 p880 c248 d35.5 a0.9315 B ok
+25 p896 c256 d36 a0.932 A warn
+26 p912 c264 d36.5 a0.9325 B ok
+27 p928 c272 d37 a0.933 A ok
+28 p944 c280 d37.5 a0.9335 B ok
+29 p960 c288 d38 a0.934 A ok
+30 p976 c296 d38.5 a0.9345 B warn
+
+31-40:
+31 p992 c304 d39 a0.935 A ok
+32 p1008 c312 d39.5 a0.9355 B ok
+33 p1024 c320 d40 a0.936 A ok
+34 p1040 c328 d40.5 a0.9365 B ok
+35 p1056 c336 d41 a0.937 A warn
+36 p1072 c344 d41.5 a0.9375 B ok
+37 p1088 c352 d42 a0.938 A ok
+38 p1104 c360 d42.5 a0.9385 B ok
+39 p1120 c368 d43 a0.939 A ok
+40 p1136 c376 d43.5 a0.9395 B warn
+
+41-50:
+41 p1152 c384 d44 a0.94 A ok
+42 p1168 c392 d44.5 a0.9405 B ok
+43 p1184 c400 d45 a0.941 A ok
+44 p1200 c408 d45.5 a0.9415 B ok
+45 p1216 c416 d46 a0.942 A warn
+46 p1232 c424 d46.5 a0.9425 B ok
+47 p1248 c432 d47 a0.943 A ok
+48 p1264 c440 d47.5 a0.9435 B ok
+49 p1280 c448 d48 a0.944 A ok
+50 p1296 c456 d48.5 a0.9445 B warn
+
+51-60:
+51 p1312 c464 d49 a0.945 A ok
+52 p1328 c472 d49.5 a0.9455 B ok
+53 p1344 c480 d50 a0.946 A ok
+54 p1360 c488 d50.5 a0.9465 B ok
+55 p1376 c496 d51 a0.947 A warn
+56 p1392 c504 d51.5 a0.9475 B ok
+57 p1408 c512 d52 a0.948 A ok
+58 p1424 c520 d52.5 a0.9485 B ok
+59 p1440 c528 d53 a0.949 A ok
+60 p1456 c536 d53.5 a0.9495 B warn
+
+61-70:
+61 p1472 c544 d54 a0.95 A ok
+62 p1488 c552 d54.5 a0.9505 B ok
+63 p1504 c560 d55 a0.951 A ok
+64 p1520 c568 d55.5 a0.9515 B ok
+65 p1536 c576 d56 a0.952 A warn
+66 p1552 c584 d56.5 a0.9525 B ok
+67 p1568 c592 d57 a0.953 A ok
+68 p1584 c600 d57.5 a0.9535 B ok
+69 p1600 c608 d58 a0.954 A ok
+70 p1616 c616 d58.5 a0.9545 B warn
+
+71-80:
+71 p1632 c624 d59 a0.955 A ok
+72 p1648 c632 d59.5 a0.9555 B ok
+73 p1664 c640 d60 a0.956 A ok
+74 p1680 c648 d60.5 a0.9565 B ok
+75 p1696 c656 d61 a0.957 A warn
+76 p1712 c664 d61.5 a0.9575 B ok
+77 p1728 c672 d62 a0.958 A ok
+78 p1744 c680 d62.5 a0.9585 B ok
+79 p1760 c688 d63 a0.959 A ok
+80 p1776 c696 d63.5 a0.9595 B warn
+
+81-90:
+81 p1792 c704 d64 a0.96 A ok
+82 p1808 c712 d64.5 a0.9605 B ok
+83 p1824 c720 d65 a0.961 A ok
+84 p1840 c728 d65.5 a0.9615 B ok
+85 p1856 c736 d66 a0.962 A warn
+86 p1872 c744 d66.5 a0.9625 B ok
+87 p1888 c752 d67 a0.963 A ok
+88 p1904 c760 d67.5 a0.9635 B ok
+89 p1920 c768 d68 a0.964 A ok
+90 p1936 c776 d68.5 a0.9645 B warn
+
+91-100:
+91 p1952 c784 d69 a0.965 A ok
+92 p1968 c792 d69.5 a0.9655 B ok
+93 p1984 c800 d70 a0.966 A ok
+94 p2000 c808 d70.5 a0.9665 B ok
+95 p2016 c816 d71 a0.967 A warn
+96 p2032 c824 d71.5 a0.9675 B ok
+97 p2048 c832 d72 a0.968 A ok
+98 p2064 c840 d72.5 a0.9685 B ok
+99 p2080 c848 d73 a0.969 A ok
+100 p2096 c856 d73.5 a0.9695 B warn
+
+101-110:
+101 p2112 c864 d74 a

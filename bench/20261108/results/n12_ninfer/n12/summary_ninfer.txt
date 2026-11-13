@@ -1,0 +1,15 @@
+label ninfer  model qwen3.8-27b  temperature 0.00
+cat         fixture                            mean      min      max   ntok
+code        scenario_code_cuda                268.8    268.8    268.8   4096
+code        scenario_code_python              285.9    285.7    286.0   4096
+code        scenario_code_typescript          314.3    314.2    314.4     94
+story       scenario_story_zh_scifi           100.8    100.8    100.8   3129
+story       scenario_story_en_mystery         163.6    163.6    163.6   4096
+story       scenario_story_zh_dialogue        100.4    100.3    100.4   2991
+translation scenario_translation_zh_en        324.2    323.9    324.5    798
+translation scenario_translation_en_zh        233.3    233.0    233.5    762
+translation scenario_translation_markdown     189.0    188.9    189.2    762
+structured  scenario_structured_jsonl         441.5    440.9    442.1   4096
+structured  scenario_structured_csv           380.9    380.8    381.1   4096
+structured  scenario_structured_sql           336.4    336.1    336.6   4096
+per category (mean of runs): code 289.7, story 121.6, translation 248.8, structured 386.3

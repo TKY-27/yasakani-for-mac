@@ -1,0 +1,254 @@
+The user wants a complete TypeScript 5 service like the following:
+1. Consume newline-delimited request metrics (NDJSON)
+2. Validate without a third-party schema library (i.e., hand-written validation)
+3. Group records by model and fixture
+4. Compute mean / median / sample standard deviation
+5. Expose `/health`, `/summary`, and `/runs/:id` endpoints
+6. Include strict types
+7. Incremental parsing (streaming, bounded memory)
+8. Bounded memory
+9. Errors for malformed input
+10. Unit tests
+11. package.json
+12. tsconfig.json
+13. A short operations guide
+14. No placeholders
+
+Design decisions:
+
+- Use Node.js's built-in `http` module rather than Express? The requirements say "no third-party schema libraries" — this only forbids schema libraries (Zod, Joi, etc.), not HTTP frameworks. But to minimize dependencies, using the built-in `node:http` keeps dependencies to a minimum. Tests need a framework — I could use Node's built-in `node:test` runner (Node 18+) to avoid third-party dependencies entirely. That would be a good choice: zero runtime dependencies, use node:test for unit tests. That keeps package.json clean.
+
+- TypeScript 5: use `strict: true`, and maybe also `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`, etc. Target ES2022, module is NodeNext or CommonJS. If using node:test with tsx or ts-node... actually, to keep it simple and executable, I can compile with tsc and run the compiled JS with node --test. package.json scripts: build, test, start.
+
+- Incremental parsing: consume NDJSON from HTTP request body streams. The service should "consume newline-delimited request metrics" — that is, clients POST NDJSON to an ingestion endpoint? The endpoints to expose are /health, /summary, /runs/:id. But the service has to consume metrics somewhere — probably POST /ingest or POST /runs/:id/metrics. Let me think: "group records by model and fixture" and a "/runs/:id" endpoint — so records have a runId, model, fixture, and metrics like latency, tokenCount, etc. The service groups by model and fixture and computes statistics. `/runs/:id` probably returns statistics for a specific run (per model/fixture group within the run), or records for that run.
+
+Design:
+
+POST /ingest (or POST /metrics) receives NDJSON. Each line is a JSON object like:
+```json
+{"runId":"run-1","model":"gpt-4o","fixture":"fixture-a","latencyMs":123.4,"tokens":250,"ts":"2024-..."}
+```
+
+Validation (hand-written):
+- runId: non-empty string, pattern? max length
+- model: non-empty string
+- fixture: non-empty string
+- latencyMs: finite number > 0, max limit
+- Maybe tokenCount: non-negative integer
+- ts: optional ISO-8601?
+
+Grouping: key = `${runId}|${model}|${fixture}`. Compute running stats: count, sum, sumSq (for sample standard deviation), and for median: bounded memory problem — median typically requires all values, or an approximate algorithm (t-digest). For bounded memory: use a sampling approach, e.g., keep a bounded reservoir / fixed-size sorted buffer, and compute an approximate median from the sample. Or keep all values up to a cap per group, and then use reservoir sampling to keep a bounded sample; the median is computed from the sample (documented as approximate when group size exceeds cap). That satisfies "bounded memory" and "compute mean/median/sample standard deviation" — the median is computed from a bounded sample. Document that.
+
+Also a global bounded memory: cap total number of groups; if exceeded, reject with 413, or LRU-evict? Simplest: hard cap, return 413 "capacity exceeded". Also cap request body size.
+
+Incremental parsing: stream request body chunks, split on \n, keep a remainder buffer (bounded — if the remainder exceeds max line length, abort with 400). Validate each line; accumulate statistics for valid lines; count malformed lines; respond with {accepted, rejected, errors: first N errors}. Or all-or-nothing? "Errors for malformed input" — collect per-line errors with line numbers, return 400 with a list of errors if there are any invalid lines? Or partial acceptance. I'll do: per-line validation; report accepted + rejected + details of rejected (bounded list, e.g., first 10). If any lines are invalid, HTTP 400 but valid lines are ingested? That's awkward. Better: two modes... Simplest and robust approach: 422/400 with all rejected, but that's not great either. Let me decide: partial ingestion with per-line errors reported; status 200 if accepted > 0, 400 if none accepted. Actually, cleaner semantics: any malformed line → whole request is rejected with 400 and a list of errors (at most 20), nothing ingested. That's transactional per request and simpler to reason about; validation is done after parsing the whole stream, but statistics are only committed after full validation. But incremental parsing with bounded memory: to hold validated records in memory before commit, it needs to be bounded — bounded by the max request size (e.g., 1 MB → about 10k records, fine). Or validate and buffer; if buffer exceeds max lines, abort. Then commit. That gives atomicity per request. I'll implement that: a max bytes per request (e.g., 2 MB), max lines per request (e.g., 50,000). During streaming, validate each line and push to an array (bounded by line cap). On completion, commit valid records into the store. If any line is invalid → 400 with structured errors, no commit. If there are blank lines — treat as invalid? Typically NDJSON allows trailing newlines. Skip trailing empty content; a fully blank line → error (or ignore?). I'll skip empty lines (lines containing only whitespace) with an "skipped" counter, and error on lines that are non-empty and invalid. That's operator-friendly.
+
+Endpoints:
+
+- GET /health → 200 {status:"ok", uptimeSec, received, rejected, groups, capacity:{...}}
+- GET /summary → all groups: [{runId, model, fixture, count, mean, median, sampleStdDev, min, max, lastSeen}], bounded by number of groups; include generatedAt.
+- GET /runs/:id → groups for that runId; 404 if no groups exist for the run.
+- POST /ingest → NDJSON.
+
+Additionally, maybe OPTIONS or HEAD? Keep it minimal, but handle GET to unknown paths with 404. Handle JSON responses with Content-Type. Handle malformed JSON bodies. Also handle URL parsing with URL.
+
+Structure (files):
+
+```
+package.json
+tsconfig.json
+README.md (operations guide)
+src/
+  types.ts        — strict domain types
+  validator.ts    — hand-written line validation
+  stats.ts        — running stats (mean, sample stddev, median via bounded reservoir)
+  store.ts        — bounded grouping store
+  ingest.ts       — incremental NDJSON parser/stream processor
+  server.ts       — HTTP server, routing, handlers
+  index.ts        — entry point
+test/
+  validator.test.ts
+  stats.test.ts
+  store.test.ts
+  ingest.test.ts
+  server.test.ts  — spin up the server on an ephemeral port, test endpoints
+```
+
+Use `node:test` and `node:assert/strict`. Test script: `npm test` → `tsc -p tsconfig.test.json`? Simpler: compile everything to dist with tsc (including tests), then `node --test dist/test/`. Include test files in the build; or a single tsconfig that includes both src and test. Output dist preserving structure. Then `node --test dist/test` works because node --test recursively discovers *.test.js? Node's test runner discovers files matching `*.test.js` etc. Yes, `node --test` recursively scans directories for test files by naming convention. Good.
+
+tsconfig:
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": ".",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*", "test/**/*"]
+}
+```
+
+With verbatimModuleSyntax and NodeNext, type imports must use `import type`. Also, do we need `.js` extensions on imports under NodeNext ESM? If package.json has `"type": "module"`, then yes, relative imports require the `.js` extension. That's modern and fine. Let me set `"type": "module"` and use `.js` extensions on relative imports. tsconfig module NodeNext handles it.
+
+Do we need `@types/node`? Yes, devDependency. TypeScript 5 devDependency. That's it — no runtime dependencies.
+
+Now details:
+
+types.ts:
+
+```ts
+export interface RequestMetric {
+  runId: string;
+  model: string;
+  fixture: string;
+  latencyMs: number;
+  tokens: number;
+  ts: string; // normalized ISO-8601
+}
+
+export interface GroupKey { runId: string; model: string; fixture: string; }
+
+export interface GroupStats {
+  key: GroupKey;
+  count: number;
+  sum: number;
+  sumSq: number;
+  min: number;
+  max: number;
+  lastSeen: string;
+  reservoir: number[]; // bounded sample for median
+  reservoirSize: number;
+  reservoirCapacity: number;
+}
+
+export interface GroupStatsSnapshot {
+  runId: string; model: string; fixture: string;
+  count: number;
+  mean: number;
+  median: number;
+  sampleStdDev: number | null; // null when count < 2
+  min: number; max: number;
+  lastSeen: string;
+  approximations: { medianApproximate: boolean };
+}
+
+export interface ValidationError { line: number; message: string; }
+```
+
+validator.ts: hand-written validation without schema libraries.
+
+Limits:
+- MAX_ID_LENGTH = 128 for runId/model/fixture
+- Allowed characters? Maybe restrict to `^[A-Za-z0-9._:-]+$` for safety. Reasonable and I'll document it.
+- latencyMs: number, finite, > 0, <= MAX_LATENCY_MS (e.g., 600_000 = 10 minutes). Reject NaN/Infinity. Reject non-numeric strings. Reject out-of-range integers.
+- tokens: integer >= 0, <= MAX_TOKENS (e.g., 1_000_000). Must be integer (no fractional) — check Number.isInteger.
+- ts: optional ISO-8601; if present must be a string parseable by Date and format-like check (regex + Date roundtrip). If missing, use ingest time.
+
+Also validate top-level: must be a JSON object (not array, not null). Unknown extra fields: allow but ignore (documented). Or strict — reject unknown keys? Allowing is friendlier; document that unknown keys are ignored.
+
+Return type: `type ValidationResult = { ok: true; value: RequestMetric } | { ok: false; message: string }`.
+
+Implementation:
+
+```ts
+export const VALIDATOR = {
+  maxKeyLength: 128,
+  maxLatencyMs: 600_000,
+  maxTokens: 1_000_000,
+  keyPattern: /^[A-Za-z0-9._:-]+$/,
+};
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+export function validateMetricLine(line: string): {ok:true, value: RequestMetric} | {ok:false, message:string} {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) return {ok:false, message:'blank line'}; // or caller skips
+  let parsed: unknown;
+  try { parsed = JSON.parse(line); } catch (e) { return {ok:false, message:'invalid JSON: ' + (e as Error).message} }
+  ...
+}
+```
+
+Better: caller skips blank lines, and validator assumes non-empty. But defensive is fine.
+
+Key validation helper:
+
+```ts
+function validateKey(field: string, value: unknown, maxLen: number, pattern: RegExp): string | null {
+  if (typeof value !== 'string') return `${field} must be a string`;
+  if (value.length === 0) return `${field} must be non-empty`;
+  if (value.length > maxLen) return `${field} exceeds ${maxLen} characters`;
+  if (!pattern.test(value)) return `${field} contains invalid characters (allowed: A-Z a-z 0-9 . _ : -)`;
+  return null;
+}
+```
+
+latency:
+
+```ts
+if (typeof v.latencyMs !== 'number' || !Number.isFinite(v.latencyMs)) return 'latencyMs must be a finite number';
+if (v.latencyMs <= 0) return 'latencyMs must be > 0';
+if (v.latencyMs > maxLatencyMs) return ...
+```
+
+tokens: `typeof number && Number.isInteger && >= 0 && <= max`.
+
+ts: optional; if present: `typeof string` and `isValidIso8601`. Validation: `/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/` and `!Number.isNaN(Date.parse(value))` and roundtrip? The roundtrip check is strict (formatting and comparing) but might fail on some valid inputs. Simpler: regex + Date.parse is finite. Also check that the date components are valid (e.g., month 13 — Date.parse("2024-13-01T00:00:00Z") returns NaN, good). That's sufficient.
+
+Actually, JSON.parse can only parse valid JSON, so numbers won't be Infinity/NaN (JSON has no such literals) — but a hand-crafted string "1e400" parses as Infinity? JSON.parse("1e400") → in some implementations Infinity? In V8, JSON.parse("1e400") returns Infinity (per the ECMAScript spec, out-of-range numeric literals become Number::ParseFloat, which produces Infinity). Yes! JSON.parse("1e400") === Infinity. So the Number.isFinite check matters. Good to have it.
+
+stats.ts: RunningStats class or a plain object with functions.
+
+Mean = sum/count. Sample standard deviation: use the online formula to avoid holding all values: var = (sumSq - (sum*sum)/count) / (count-1). There's numerical cancellation risk; more stable is Welford's algorithm: hold M2 (sum of squared differences). Welford:
+```
+delta = x - mean; mean += delta / n; delta2 = x - mean; M2 += delta * delta2;
+variance = M2 / (n - 1)
+```
+That's the standard approach; use Welford for numerical stability. Document it.
+
+Median: bounded reservoir sampling. When adding value x to a group with current n (n is the group's count including x): standard reservoir: when n <= capacity, add to reservoir (keep it nearly sorted? keep as array and sort at snapshot time). When n > capacity, with probability capacity/n, replace a random index. To avoid the dependency on Math.random in tests... well, it's fine; in tests, seed via a dependency-injected rng function, defaulting to Math.random. Good design: `createReservoir(capacity, rng)`.
+
+Actually, a simpler and more deterministic approach: a fixed-capacity circular buffer (ring) storing the last K values; the median is computed from those K — approximating the median of the recent window. This is deterministic and simpler, but biased toward the most recent values. Reservoir sampling gives a uniform random sample of all values → better approximation of the overall median. Use reservoir sampling with injectable RNG, defaulting to Math.random. Keep capacity at, e.g., 512 per group.
+
+Also track count so we know when the median is approximate (count > reservoir.length? After sampling, the reservoir stays at capacity; approximation flag = count > capacity).
+
+Functions:
+
+```ts
+export interface StatsState { count: number; sum: number; m2: number; min: number; max: number; reservoir: number[]; }
+export function createStats(capacity: number): StatsState
+export function pushValue(s: StatsState, x: number, capacity: number, rng: () => number): void
+export function snapshot(s: StatsState): { mean, median, sampleStdDev (null if count<2), min, max, medianApproximate }
+```
+
+Wait: for Welford we hold mean internally. Keep mean and m2 in state.
+
+Reservoir replacement:
+```
+if (s.reservoir.length < capacity) s.reservoir.push(x);
+else { const j = Math.floor(rng() * count); if (j < capacity) s.reservoir[j] = x; }
+```
+where count includes the current x (standard algorithm: for the i-th item (1-indexed), when i > k, j = floor(rand * i); if j < k, replace). Implement with n = count (after incrementing).
+
+median: copy the reservoir, sort ascending, take the middle value (even length: average of the two middle values).
+
+store.ts:
+
+```ts
+export interface StoreLimits { max

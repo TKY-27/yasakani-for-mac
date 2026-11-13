@@ -1,0 +1,297 @@
+We need answer user: "Implement a complete CUDA 13.1/C++20 command-line program that normalizes a large BF16 matrix row by row on an sm_120a GPU. Include argument parsing, RAII device buffers, a numerically stable FP32 reference, a vectorized CUDA kernel, warm-up, CUDA-event timing, deterministic input generation, error checking, tolerance-based verification, and a CMakeLists.txt. Explain the memory layout and launch geometry after the code. Do not omit implementations or replace sections with comments."
+
+Need produce final answer with code complete, CMakeLists, explanation memory layout and launch geometry. Need think details.
+
+CUDA 13.1? As of my knowledge maybe CUDA 12.9? But user asks 13.1. We can use CMake properties for CUDA 13.1? Maybe set CUDA_ARCHITECTURES 120 (sm_120a). Need C++20.
+
+Need normalize large BF16 matrix row by row. What normalization? Could be row-wise normalization: divide each row by its norm? Or normalize to zero mean unit variance? The phrase "normalizes a large BF16 matrix row by row" ambiguous. Need pick a well-defined normalization. Maybe row-wise L2 normalization: for each row x, output y = x / ||x||. Numerically stable FP32 reference: compute sum of squares in FP32, maybe use two-pass or Kahan? Need tolerance. For CUDA kernel, vectorized BF16 (e.g., __nv_bfloat162 or float4 loads of 8 BF16? On sm_120a supports 128-bit? Could use __nv_bfloat162 and maybe vector loads of 4? Since BF16 is 16-bit, 8 elements = 16 bytes. CUDA has __nv_bfloat162; can pack into uint4? For vectorized loads, define struct of 8 bfloat16? We can use CUDA's __nv_bfloat162 for 32-bit, or custom BFloat16_8 align 16 containing __nv_bfloat162 x[4]; but need be careful with alignment and vector load. For 128-bit vectorized loads, use uint4 load and reinterpret as BF16. Could implement using uint4 to load 8 bf16 values, convert to float, compute. Or use __nv_bfloat162 for 2-element vectorization. For performance and large matrix, use uint4 128-bit. Need memory layout: contiguous row-major [M rows, N cols], N multiple of 8, aligned to 16 bytes. Each row processed by a threadblock; maybe one block per row or multiple blocks per row? For large matrix with many rows, likely one block per row? But if row length huge, block per row may have too many threads? Launch geometry: grid dimensions: rows, maybe 1. Block size: 256 or 512. Each block handles one row; threads iterate columns with stride blockDim.x, vector loads 8 elements. Need reduce sum of squares in block, stable: each thread accumulates local sum in FP32, maybe use fmaf; warp reduce, shared memory, block reduce, then normalize and write. To avoid division by zero, if norm == 0 output zeros (or original? Typically x/0 -> 0). Need stable FP32 reference: maybe compute norm in FP32 with Kahan summation per row, and maybe use long double? But FP32 reference numerically stable: For each row, compute sum squares using FP32 with two-level? Since BF16 input exact to 32-bit? BF16 to float exact. Sum squares can overflow? BF16 values around 1? Need deterministic input generation: fill with deterministic pseudo random in [ -1,1 ] BF16. Maybe use LCG or splitmix64. Reference compute in FP32 using Kahan summation over each row sequentially. Could also compute row norm in FP32; if sumsq zero, norm 0. Need tolerance-based verification: compare FP32 output to BF16 output after converting output to float, or compute both in FP32? CUDA kernel likely outputs BF16 normalized matrix. Reference FP32 matrix maybe stored in host? For large, memory. Need command-line: --rows, --cols, --blocks? --iterations? --seed, --tol, --verify? Could parse with simple manual or boost? Need complete. We can implement manual argument parsing to avoid external dependencies. Include error checking macros for CUDA and host.
+
+Need "complete CUDA 13.1/C++20 command-line program". Could produce one .cu file. CMakeLists.txt with project, add_executable, CUDA 13.1? CMake maybe not know 13.1; we can set CMAKE_CUDA_ARCHITECTURES "120-a"? For sm_120a. Need C++20. Maybe:
+cmake_minimum_required(VERSION 3.27)
+project(row_norm_bf16 LANGUAGES CXX CUDA)
+set(CMAKE_CUDA_ARCHITECTURES 120)
+# if want PTX for sm_120a? Use 120-a? CMake CUDA_ARCHITECTURES supports 120-a? In CMake 3.27? For CUDA 12.8 sm_120a? Actually CMake's CUDA_ARCHITECTURES values can include native, real, virtual, PTX. For compute capability 12.0, "120". To target sm_120a, use "120-a"? In CMake 3.25? Need check. CMake 3.27 supports CUDA_ARCHITECTURES <value>-a? likely. But if CUDA 13.1 maybe. Could also set CMAKE_CUDA_FLAGS "-gencode arch=compute_120a,code=sm_120a". That is safe. Need C++20: set(CMAKE_CXX_STANDARD 20) and CMAKE_CUDA_STANDARD 20. For nvcc, -std=c++20 maybe. Use CMAKE_CUDA_STANDARD 20. Also maybe CMAKE_CUDA_COMPILER_LAUNCHER.
+
+Need include <cuda_bf16.h>. In CUDA 11.8? CUDA 13 includes. __nv_bfloat16, __float2bfloat16, __bfloat162float? There are functions. But for vectorized loads, easiest: use uint4 for 8 BF16, manually convert? Need convert BF16 to float. Could use __nv_bfloat162 and __bfloat1622float2? For 8 values, pack uint4 into 4 __nv_bfloat162? Or cast uint4 to __nv_bfloat162? Need safe.
+
+Define struct BFloat16_8 {
+    __nv_bfloat162 x[4];
+};
+But alignment? sizeof = 16. However loading as BFloat16_8 from void* with reinterpret_cast may be okay if aligned 16. But to perform a 128-bit load, compiler may generate ld.global.v4? If struct is 16 bytes, maybe. But if using reinterpret_cast<BFloat16_8*>(ptr), each element is __nv_bfloat162 (two bf16) maybe compiler vectorizes. To ensure 128-bit, maybe use uint4 and manually unpack? Let's think.
+
+Simpler and complete: Define using Bf16 = __nv_bfloat16; using Bf162 = __nv_bfloat162;
+struct alignas(16) Bf16x8 { Bf162 v[4]; };
+In kernel:
+const Bf16x8* rowIn = reinterpret_cast<const Bf16x8*>(input + blockIdx.x * cols + threadIdx.x * 8);
+Need N multiple 8. For each vector index: Bf16x8 x = rowIn[step]; Then convert 4 Bf162 to float2 using __bfloat162float2? There is __bfloat162float2? CUDA provides __bfloat1622float2? Need exact names. In cuda_bf16.h:
+__host__ __device__ float2 __bfloat1622float2(const __nv_bfloat162 a);
+__host__ __device__ __nv_bfloat162 __float22bfloat162_rn(const float2 a);
+Maybe __bfloat162float2? I think __bfloat1622float2. But to avoid relying on exact function? Could do scalar conversion using __bfloat162float for each of 8. That may be okay. But vectorized load is still via Bf16x8; conversion scalar maybe not too bad. Could implement conversion via bit ops: BF16 to float: reinterpret bits as 16 bits, shift left 16. For NaN? Could use:
+inline __device__ float bf16_to_float(__nv_bfloat16 x) { return __bfloat162float(x); }
+But for speed, maybe use __bfloat1622float2.
+
+Need store output: Bf16x8 out
+
+My thinking time is over. I must now write the complete final answer from what I already have, without calling any more tools.Below is a complete, self-contained CUDA/C++20 command-line program that normalizes a large BF16 row-major matrix on `sm_120a` by dividing every row by its L2 norm. The output is BF16. An FP32 reference implementation is included for deterministic verification.
+
+The program:
+
+- Parses command-line arguments.
+- Generates deterministic BF16 input.
+- Allocates RAII CUDA device buffers.
+- Runs a vectorized `uint4`/8-element BF16 CUDA kernel.
+- Uses warm-up plus CUDA-event timing.
+- Computes a numerically stable FP32 reference using Kahan summation.
+- Verifies the CUDA result against the FP32 reference within a tolerance.
+- Includes CUDA and host error checking.
+- Ships with a `CMakeLists.txt` targeting CUDA and `sm_120a`.
+
+---
+
+# `bfloat16_row_norm.cu`
+
+```cpp
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <exception>
+#include <iostream>
+#include <map>
+#include <numeric>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+constexpr int kDefaultRows = 4096;
+constexpr int kDefaultCols = 4096;
+constexpr int kDefaultSeed = 0x5EEDull;
+constexpr int kDefaultWarmups = 1;
+constexpr int kDefaultIterations = 10;
+constexpr float kDefaultTolerance = 1.5e-2f;
+
+[[noreturn]] void fail(const std::string& message)
+{
+    std::cerr << "Error: " << message << '\n';
+    std::exit(1);
+}
+
+void require(bool condition, const std::string& message)
+{
+    if (!condition) {
+        fail(message);
+    }
+}
+
+template <typename T, typename... Args>
+T check_cuda(T result, Args&&... args)
+{
+    (void)args...;
+    if (result != cudaSuccess) {
+        const char* message = cudaGetErrorString(result);
+        fail(std::string("CUDA error: ") + (message ? message : "unknown"));
+    }
+    return result;
+}
+
+template <typename T, typename... Args>
+T check_cuda(T result, const char* file, int line, Args&&... args)
+{
+    (void)args...;
+    if (result != cudaSuccess) {
+        const char* message = cudaGetErrorString(result);
+        fail(std::string(file) + ":" + std::to_string(line) +
+             ": CUDA error: " + (message ? message : "unknown"));
+    }
+    return result;
+}
+
+#define CUDA_CHECK(x) ::check_cuda((x), __FILE__, __LINE__)
+
+template <typename T>
+struct DeviceBuffer {
+    T* data = nullptr;
+
+    DeviceBuffer() noexcept = default;
+
+    explicit DeviceBuffer(std::size_t count)
+    {
+        allocate(count);
+    }
+
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer(DeviceBuffer&& other) noexcept = default;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept = default;
+
+    ~DeviceBuffer()
+    {
+        if (data) {
+            CUDA_CHECK(cudaFree(data));
+        }
+    }
+
+    T* data() const noexcept
+    {
+        return data;
+    }
+
+    T* operator->() const noexcept
+    {
+        return data;
+    }
+
+    T* operator*() const noexcept
+    {
+        return data;
+    }
+
+    explicit operator bool() const noexcept
+    {
+        return data != nullptr;
+    }
+
+    void allocate(std::size_t count)
+    {
+        if (data) {
+            CUDA_CHECK(cudaFree(data));
+            data = nullptr;
+        }
+
+        if (count == 0) {
+            return;
+        }
+
+        CUDA_CHECK(cudaMalloc(&data, count * sizeof(T)));
+    }
+};
+
+void* get_device_pointer(const DeviceBuffer<void>& buffer)
+{
+    return buffer.data();
+}
+
+struct Options {
+    int rows = kDefaultRows;
+    int cols = kDefaultCols;
+    std::uint64_t seed = kDefaultSeed;
+    int warmups = kDefaultWarmups;
+    int iterations = kDefaultIterations;
+    float tolerance = kDefaultTolerance;
+    bool verify = true;
+    bool verbose = true;
+
+    void validate() const
+    {
+        require(rows > 0, "rows must be positive");
+        require(cols > 0, "cols must be positive");
+        require((cols % 8) == 0, "cols must be a multiple of 8 for 128-bit BF16 vectorization");
+        require(warmups >= 0, "warmups must be non-negative");
+        require(iterations > 0, "iterations must be positive");
+        require(tolerance >= 0.0f, "tolerance must be non-negative");
+    }
+};
+
+std::optional<std::string> parse_next_argument(int argc, char* argv[], int& i, const std::string& option)
+{
+    if (i + 1 >= argc) {
+        fail("Missing value for " + option);
+    }
+    i += 1;
+    return std::string(argv[i]);
+}
+
+std::string trim(const std::string& value)
+{
+    const std::string whitespace = " \t\n\r";
+    const auto begin = value.find_first_not_of(whitespace);
+    if (begin == std::string::npos) {
+        return {};
+    }
+    const auto end = value.find_last_not_of(whitespace);
+    return value.substr(begin, end - begin + 1);
+}
+
+bool parse_uint64(const std::string& text, std::uint64_t& value)
+{
+    std::uint64_t parsed = 0;
+    bool any = false;
+
+    for (char raw_char : text) {
+        if (std::isdigit(static_cast<unsigned char>(raw_char)) == 0) {
+            return false;
+        }
+        const std::uint64_t digit = static_cast<std::uint64_t>(raw_char - '0');
+        if (parsed > (std::numeric_limits<std::uint64_t>::max() - digit) / 10ull) {
+            return false;
+        }
+        parsed = parsed * 10ull + digit;
+        any = true;
+    }
+
+    if (!any) {
+        return false;
+    }
+
+    value = parsed;
+    return true;
+}
+
+bool parse_float(const std::string& text, float& value)
+{
+    if (text.empty()) {
+        return false;
+    }
+
+    char* end = nullptr;
+    const float parsed = std::strtof(text.c_str(), &end);
+    if (end == text.c_str()) {
+        return false;
+    }
+    if (*end != '\0') {
+        return false;
+    }
+    if (!std::isfinite(parsed)) {
+        return false;
+    }
+
+    value = parsed;
+    return true;
+}
+
+Options parse_arguments(int argc, char* argv[])
+{
+    Options options;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = trim(argv[i]);
+
+        if (arg == "--help" || arg == "-h") {
+            std::cout <<
+                "Usage:\n"
+                "  bfloat16_row_norm [options]\n"
+                "\n"
+                "Options:\n"
+                "  --rows <int>             Number of rows, default " << kDefaultRows << '\n'
+                "  --cols <int>             Number of columns, multiple of 8, default " << kDefaultCols << '\n'
+                "  --seed <uint64>         Deterministic seed, default " << kDefaultSeed << '\n'
+                "  --warmups <int>         Warm-up launches, default " << kDefaultWarmups << '\n'
+                "  --iterations <int>      Timed launches, default " << kDefaultIterations << '\n'
+                "  --tolerance <float>     Verification tolerance, default " << kDefaultTolerance << '\n'
+                "  --verify                Enable verification, default enabled\n"
+                "  --no-verify             Disable verification\n"
+                "  --quiet                 Disable non-error output\n"
+                "  --help                  Print this message\n";
+            std::exit(0);
+        }
+
+        if (arg.rfind("--rows=", 0) == 0

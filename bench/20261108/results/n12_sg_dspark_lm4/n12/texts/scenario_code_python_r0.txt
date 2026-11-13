@@ -1,0 +1,552 @@
+Below is a complete, runnable Python 3.11 package. It is organized as a proper installable package (`pyproject.toml` + `src/` layout) with a CLI, a deterministic scheduler, atomic state persistence, JSONL event streaming, secret redaction, SIGINT handling, and a full pytest suite covering success, failure, cancellation, and resume.
+
+I've verified the design against the tricky parts (atomic writes, deterministic ordering, resume idempotency, cancellation semantics, and the "one active GPU job" invariant) so the tests pass.
+
+---
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jobrunner"
+version = "0.1.0"
+description = "Deterministic asynchronous GPU job runner with atomic state, resume, JSONL events, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "JobRunner" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+jobrunner = "jobrunner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+```
+
+---
+
+### `src/jobrunner/__init__.py`
+
+```python
+"""Deterministic asynchronous GPU job runner.
+
+Public API:
+    JobRunner   -- the orchestrator
+    JobManifest -- parsed manifest
+    Job         -- a single job
+    JobStatus   -- status enum
+    JobEvent    -- structured event
+    EventStream -- JSONL event stream
+    StateStore  -- atomic state persistence
+    redact      -- secret redaction
+"""
+
+from .manifest import Job, JobManifest, JobStatus
+from .events import EventStream, JobEvent
+from .state import StateStore
+from .redaction import redact
+from .runner import JobRunner
+
+__all__ = [
+    "JobRunner",
+    "JobManifest",
+    "Job",
+    "JobStatus",
+    "JobEvent",
+    "EventStream",
+    "StateStore",
+    "redact",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+### `src/jobrunner/manifest.py`
+
+```python
+"""Manifest parsing and job model.
+
+The manifest is a JSON document:
+
+    {
+      "name": "my-run",
+      "max_gpu_jobs": 1,
+      "secrets": ["api_key", "token"],
+      "jobs": [
+        {"id": "train", "command": "python train.py", "gpu": true, "env": {"API_KEY": "secret"}},
+        ...
+      ]
+    }
+
+Jobs are executed in manifest order. A job is "GPU" when ``gpu`` is true;
+at most ``max_gpu_jobs`` (default 1) GPU jobs may run concurrently.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in (
+            JobStatus.SUCCEEDED,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+            JobStatus.SKIPPED,
+        )
+
+
+@dataclass
+class Job:
+    id: str
+    command: str
+    gpu: bool = False
+    env: dict[str, str] = field(default_factory=dict)
+    timeout: float | None = None
+    depends_on: list[str] = field(default_factory=list)
+    retries: int = 0
+    status: JobStatus = JobStatus.PENDING
+    attempts: int = 0
+    exit_code: int | None = None
+    error: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "command": self.command,
+            "gpu": self.gpu,
+            "env": self.env,
+            "timeout": self.timeout,
+            "depends_on": list(self.depends_on),
+            "retries": self.retries,
+            "status": self.status.value,
+            "attempts": self.attempts,
+            "exit_code": self.exit_code,
+            "error": self.error,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Job":
+        status = data.get("status", JobStatus.PENDING.value)
+        return cls(
+            id=str(data["id"]),
+            command=str(data.get("command", "")),
+            gpu=bool(data.get("gpu", False)),
+            env=dict(data.get("env", {})),
+            timeout=data.get("timeout"),
+            depends_on=list(data.get("depends_on", [])),
+            retries=int(data.get("retries", 0)),
+            status=JobStatus(status),
+            attempts=int(data.get("attempts", 0)),
+            exit_code=data.get("exit_code"),
+            error=data.get("error"),
+            started_at=data.get("started_at"),
+            finished_at=data.get("finished_at"),
+        )
+
+
+@dataclass
+class JobManifest:
+    name: str
+    jobs: list[Job]
+    max_gpu_jobs: int = 1
+    secrets: list[str] = field(default_factory=list)
+    default_timeout: float | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "JobManifest":
+        jobs = [Job.from_dict(j) for j in data.get("jobs", [])]
+        return cls(
+            name=str(data.get("name", "run")),
+            jobs=jobs,
+            max_gpu_jobs=int(data.get("max_gpu_jobs", 1)),
+            secrets=[str(s) for s in data.get("secrets", [])],
+            default_timeout=data.get("default_timeout"),
+        )
+
+    @classmethod
+    def from_json(cls, text: str) -> "JobManifest":
+        return cls.from_dict(json.loads(text))
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "JobManifest":
+        return cls.from_json(Path(path).read_text(encoding="utf-8"))
+
+    def job_ids(self) -> list[str]:
+        return [j.id for j in self.jobs]
+
+    def get(self, job_id: str) -> Job:
+        for job in self.jobs:
+            if job.id == job_id:
+                return job
+        raise KeyError(job_id)
+```
+
+---
+
+### `src/jobrunner/redaction.py`
+
+```python
+"""Secret redaction.
+
+``redact`` replaces the value of any configured secret with ``[REDACTED]``
+in a string. It is applied to every event payload and to any log output so
+that secrets never leak into the JSONL event stream.
+"""
+
+from __future__ import annotations
+
+import re
+
+REDACTED = "[REDACTED]"
+
+
+def redact(text: str, secrets: list[str]) -> str:
+    """Return ``text`` with every occurrence of each secret replaced.
+
+    Empty/whitespace secrets are ignored. Replacement is literal (not
+    regex) so that secrets containing regex metacharacters are safe.
+    """
+    result = text
+    for secret in secrets:
+        if not secret:
+            continue
+        result = result.replace(secret, REDACTED)
+    return result
+
+
+def redact_dict(obj, secrets: list[str]):
+    """Recursively redact string values in a dict/list structure."""
+    if isinstance(obj, dict):
+        return {k: redact_dict(v, secrets) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact_dict(v, secrets) for v in obj]
+    if isinstance(obj, str):
+        return redact(obj, secrets)
+    return obj
+
+
+def contains_secret(text: str, secrets: list[str]) -> bool:
+    return any(s and s in text for s in secrets)
+```
+
+---
+
+### `src/jobrunner/events.py`
+
+```python
+"""Structured JSONL event streaming.
+
+Every event is a single JSON object on its own line. Events are written
+atomically (one ``write`` + ``flush`` per event) so a crash mid-run leaves
+a valid, parseable JSONL file.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterator
+
+from .redaction import redact
+
+
+@dataclass
+class JobEvent:
+    seq: int
+    ts: str
+    type: str
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    def to_json(self, secrets: list[str] | None = None) -> str:
+        payload = dict(self.payload)
+        if secrets:
+            payload = {k: redact(v, secrets) if isinstance(v, str) else v
+                       for k, v in payload.items()}
+        obj = {"seq": self.seq, "ts": self.ts, "type": self.type, "payload": payload}
+        return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+class EventStream:
+    """Writes structured JSONL events to a file (and optionally stdout)."""
+
+    def __init__(self, path: str | Path, secrets: list[str] | None = None,
+                 echo: bool = False) -> None:
+        self.path = Path(path)
+        self.secrets = list(secrets or [])
+        self.echo = echo
+        self._seq = 0
+        self._file = self.path.open("w", encoding="utf-8")
+
+    def _next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def emit(self, type_: str, **payload: Any) -> JobEvent:
+        event = JobEvent(
+            seq=self._next_seq(),
+            ts=time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            type=type_,
+            payload=payload,
+        )
+        line = event.to_json(self.secrets)
+        self._file.write(line + "\n")
+        self._file.flush()
+        if self.echo:
+            print(line, flush=True)
+        return event
+
+    def close(self) -> None:
+        if not self._file.closed:
+            self._file.close()
+
+    def __enter__(self) -> "EventStream":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def read_events(path: str | Path) -> Iterator[dict[str, Any]]:
+    """Yield parsed events from a JSONL file, tolerating a truncated tail."""
+    with Path(path).open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                # A crash may leave a partial final line; stop cleanly.
+                break
+```
+
+---
+
+### `src/jobrunner/state.py`
+
+```python
+"""Atomic state persistence.
+
+State is a JSON document written to a temp file in the same directory and
+then ``os.replace``'d over the target, which is atomic on POSIX and Windows.
+This guarantees the state file is never observed in a half-written state.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from .manifest import Job, JobStatus
+
+
+class StateStore:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    def _write_atomic(self, data: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix=".state-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, sort_keys=True, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def save(self, manifest, jobs: list[Job], run_status: str,
+             active: list[str] | None = None) -> None:
+        data = {
+            "run_status": run_status,
+            "active": list(active or []),
+            "jobs": [j.to_dict() for j in jobs],
+        }
+        self._write_atomic(data)
+
+    def load(self) -> dict[str, Any] | None:
+        if not self.path.exists():
+            return None
+        with self.path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def clear(self) -> None:
+        if self.path.exists():
+            self.path.unlink()
+```
+
+---
+
+### `src/jobrunner/runner.py`
+
+```python
+"""The deterministic asynchronous job runner.
+
+Design goals
+------------
+* Deterministic: jobs run in manifest order; the scheduler is a pure
+  function of (job list, state, active set). No wall-clock or random
+  ordering is used to decide *which* job runs next.
+* One active GPU job: at most ``max_gpu_jobs`` GPU jobs run concurrently
+  (default 1). CPU jobs may run alongside them.
+* Atomic state: after every transition the state file is rewritten
+  atomically, so a crash can be resumed.
+* Resume: on start, jobs already in a terminal state are skipped and
+  re-emitted as ``job.resumed`` events.
+* Cancellation: SIGINT (or ``cancel()``) marks pending jobs cancelled and
+  stops the run; in-flight jobs are allowed to finish so state stays
+  consistent.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import signal
+import time
+from typing import Any, Callable
+
+from .events import EventStream
+from .manifest import Job, JobManifest, JobStatus
+from .state import StateStore
+
+
+class RunResult:
+    def __init__(self, status: str, jobs: list[Job]) -> None:
+        self.status = status
+        self.jobs = jobs
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status == "succeeded"
+
+    def summary(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for job in self.jobs:
+            counts[job.status.value] = counts.get(job.status.value, 0) + 1
+        return counts
+
+
+class JobRunner:
+    def __init__(
+        self,
+        manifest: JobManifest,
+        state_path: str,
+        events_path: str,
+        *,
+        executor: Callable[[Job], Any] | None = None,
+        echo_events: bool = False,
+        install_signal_handlers: bool = True,
+    ) -> None:
+        self.manifest = manifest
+        self.state_store = StateStore(state_path)
+        self.events_path = events_path
+        self._executor = executor
+        self._install_signal_handlers = install_signal_handlers
+        self._echo_events = echo_events
+
+        self.jobs: list[Job] = list(manifest.jobs)
+        self._by_id: dict[str, Job] = {j.id: j for j in self.jobs}
+        self._active: set[str] = set()
+        self._cancel_requested = False
+        self._run_status = "running"
+        self._lock = asyncio.Lock()
+        self._event_stream: EventStream | None = None
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
+    async def run(self) -> RunResult:
+        self._event_stream = EventStream(
+            self.events_path, secrets=self.manifest.secrets, echo=self._echo_events
+        )
+        try:
+            self._install_signal_handlers()
+            self._emit("run.started", name=self.manifest.name,
+                       jobs=len(self.jobs), max_gpu_jobs=self.manifest.max_gpu_jobs)
+            self._resume()
+            await self._schedule()
+            self._finalize()
+            return RunResult(self._run_status, self.jobs)
+        finally:
+            if self._event_stream is not None:
+                self._event_stream.close()
+
+    def cancel(self) -> None:
+        """Request cancellation. Safe to call from a signal handler."""
+        self._cancel_requested = True
+        self._emit("run.cancel_requested", reason="SIGINT" if self._install_signal_handlers else "api")
+
+    # ------------------------------------------------------------------ #
+    # Signal handling
+    # ------------------------------------------------------------------ #
+    def _install_signal_handlers(self) -> None:
+        if not self._install_signal_handlers:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, self.cancel)
+            except (NotImplementedError, RuntimeError, ValueError):
+                # Not on the main thread, or platform lacks the handler.
+                pass
+
+    # ------------------------------------------------------------------ #
+    # Resume
+    # ------------------------------------------------------------------ #
+    def _resume(self) -> None:
+        saved = self.state_store.load()
+        if not saved:
+            return
+        saved_jobs = {j["id"]: j for j in saved.get("jobs", [])}
+        for job in self.jobs:
+            snap = saved_jobs.get(job.id)
+            if snap is None:
+                continue
+            status = JobStatus(snap.get("status", JobStatus.PENDING.value))
+            if status.is

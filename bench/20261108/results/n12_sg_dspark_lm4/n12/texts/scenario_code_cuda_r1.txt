@@ -1,0 +1,366 @@
+```cpp
+// bf16_row_norm.cu
+//
+// CUDA 13.1 / C++20 command-line program that normalizes a large BF16 matrix
+// row-by-row on an sm_120a GPU.
+//
+// Build:
+//   cmake -B build -DCMAKE_CUDA_ARCHITECTURES=120a
+//   cmake --build build
+//   ./build/bf16_row_norm --rows 4096 --cols 8192
+//
+// The program:
+//   1. Parses command-line arguments.
+//   2. Generates a deterministic input matrix on the host.
+//   3. Allocates RAII-managed device buffers.
+//   4. Runs a warm-up kernel launch.
+//   5. Times the main kernel with CUDA events.
+//   6. Computes a numerically stable FP32 reference on the host.
+//   7. Verifies the GPU result against the reference with a tolerance.
+//   8. Prints timing and verification results.
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <cstdint>
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <algorithm>
+#include <numeric>
+#include <random>
+#include <chrono>
+#include <limits>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+
+// ---------------------------------------------------------------------------
+// CUDA error-checking macro
+// ---------------------------------------------------------------------------
+#define CUDA_CHECK(call)                                                       \
+    do {                                                                        \
+        cudaError_t err = (call);                                              \
+        if (err != cudaSuccess) {                                              \
+            fprintf(stderr, "CUDA error at %s:%d: %s (%s)\n",                \
+                    __FILE__, __LINE__,                                        \
+                    cudaGetErrorString(err),                                    \
+                    cudaGetErrorName(err));                                    \
+            exit(EXIT_FAILURE);                                                \
+        }                                                                      \
+    } while (0)
+
+// ---------------------------------------------------------------------------
+// RAII device buffer
+// ---------------------------------------------------------------------------
+template <typename T>
+class DeviceBuffer {
+public:
+    DeviceBuffer() = default;
+
+    explicit DeviceBuffer(size_t count) {
+        allocate(count);
+    }
+
+    ~DeviceBuffer() {
+        if (ptr_) {
+            cudaFree(ptr_);
+            ptr_ = nullptr;
+        }
+    }
+
+    // Non-copyable
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+    // Movable
+    DeviceBuffer(DeviceBuffer&& other) noexcept
+        : ptr_(other.ptr_), count_(other.count_) {
+        other.ptr_ = nullptr;
+        other.count_ = 0;
+    }
+
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            if (ptr_) cudaFree(ptr_);
+            ptr_ = other.ptr_;
+            count_ = other.count_;
+            other.ptr_ = nullptr;
+            other.count_ = 0;
+        }
+        return *this;
+    }
+
+    T* data() const { return ptr_; }
+    size_t size() const { return count_; }
+    bool empty() const { return count_ == 0; }
+
+    void allocate(size_t count) {
+        if (ptr_) {
+            cudaFree(ptr_);
+            ptr_ = nullptr;
+        }
+        count_ = count;
+        if (count_ > 0) {
+            CUDA_CHECK(cudaMalloc(&ptr_, count_ * sizeof(T)));
+        }
+    }
+
+    void copyFromHost(const T* src, size_t count) {
+        if (count > count_) {
+            allocate(count);
+        }
+        CUDA_CHECK(cudaMemcpy(ptr_, src, count * sizeof(T),
+                               cudaMemcpyHostToDevice));
+    }
+
+    void copyToHost(T* dst, size_t count) const {
+        CUDA_CHECK(cudaMemcpy(dst, ptr_, count * sizeof(T),
+                               cudaMemcpyDeviceToHost));
+    }
+
+private:
+    T* ptr_ = nullptr;
+    size_t count_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+struct Args {
+    int rows = 4096;
+    int cols = 8192;
+    int warmup_iters = 3;
+    int timed_iters = 10;
+    double tolerance = 1e-2;  // relative tolerance for BF16 comparison
+    bool verbose = false;
+    unsigned int seed = 42;
+};
+
+void printUsage(const char* prog) {
+    fprintf(stderr,
+        "Usage: %s [options]\n"
+        "  --rows <N>        Number of rows (default: 4096)\n"
+        "  --cols <N>        Number of columns (default: 8192)\n"
+        "  --warmup <N>      Number of warm-up iterations (default: 3)\n"
+        "  --iters <N>       Number of timed iterations (default: 10)\n"
+        "  --tolerance <F>   Relative tolerance for verification (default: 1e-2)\n"
+        "  --seed <N>        RNG seed for deterministic input (default: 42)\n"
+        "  --verbose         Print detailed output\n"
+        "  --help            Show this help\n",
+        prog);
+}
+
+Args parseArgs(int argc, char** argv) {
+    Args args;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        auto needValue = [&](const char* name) -> std::string {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: option %s requires a value\n", name);
+                exit(EXIT_FAILURE);
+            }
+            return argv[++i];
+        };
+
+        if (arg == "--rows") {
+            args.rows = std::stoi(needValue("--rows"));
+        } else if (arg == "--cols") {
+            args.cols = std::stoi(needValue("--cols"));
+        } else if (arg == "--warmup") {
+            args.warmup_iters = std::stoi(needValue("--warmup"));
+        } else if (arg == "--iters") {
+            args.timed_iters = std::stoi(needValue("--iters"));
+        } else if (arg == "--tolerance") {
+            args.tolerance = std::stod(needValue("--tolerance"));
+        } else if (arg == "--seed") {
+            args.seed = std::stoul(needValue("--seed"));
+        } else if (arg == "--verbose") {
+            args.verbose = true;
+        } else if (arg == "--help" || arg == "-h") {
+            printUsage(argv[0]);
+            exit(0);
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", arg.c_str());
+            printUsage(argv[0]);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    if (args.rows <= 0 || args.cols <= 0) {
+        fprintf(stderr, "Error: rows and cols must be positive\n");
+        exit(EXIT_FAILURE);
+    }
+    if (args.warmup_iters < 0 || args.timed_iters < 1) {
+        fprintf(stderr, "Error: warmup_iters >= 0 and timed_iters >= 1\n");
+        exit(EXIT_FAILURE);
+    }
+    return args;
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic input generation
+// ---------------------------------------------------------------------------
+// Generate a matrix of BF16 values using a deterministic PRNG.
+// Values are drawn from a normal distribution (mean=0, std=1) and
+// converted to BF16.
+std::vector<__nv_bfloat16> generateInput(int rows, int cols,
+                                          unsigned int seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+
+    size_t total = static_cast<size_t>(rows) * cols;
+    std::vector<__nv_bfloat16> data(total);
+
+    for (size_t i = 0; i < total; ++i) {
+        float val = dist(rng);
+        data[i] = __float2bfloat16(val);
+    }
+    return data;
+}
+
+// ---------------------------------------------------------------------------
+// Vectorized CUDA kernel: row-wise L2 normalization
+//
+// Each block handles one row.
+// Within a block, threads cooperate to:
+//   1. Compute the L2 norm of the row (in FP32 for numerical stability).
+//   2. Divide each element by the norm.
+//
+// Vectorization: we load 4 BF16 values (8 bytes) per thread per iteration
+// using float2 loads (each float2 = 8 bytes = 4 x BF16).
+//
+// Layout:
+//   Input:  __nv_bfloat16 matrix[rows][cols]  (row-major)
+//   Output: __nv_bfloat16 matrix[rows][cols]  (row-major, in-place or separate)
+//
+// Launch geometry:
+//   gridDim.x = rows
+//   blockDim.x = min(cols / 4, 1024)  (each thread handles 4 elements)
+//   If cols is not a multiple of 4, the last few threads handle the remainder.
+// ---------------------------------------------------------------------------
+
+// Convert 4 packed BF16 values (stored in a float2) to 4 FP32 values.
+__device__ __forceinline__ void unpackBF16x4(float2 packed,
+                                              float& v0, float& v1,
+                                              float& v2, float& v3) {
+    // A float2 holds two 32-bit words. Each 32-bit word holds two BF16 values.
+    // Layout of a 32-bit word: [bf16_hi | bf16_lo] where bf16_hi is bits 31-16
+    // and bf16_lo is bits 15-0.
+    uint32_t lo_word = *reinterpret_cast<const uint32_t*>(&packed.x);
+    uint32_t hi_word = *reinterpret_cast<const uint32_t*>(&packed.y);
+
+    // Extract BF16 values and convert to FP32.
+    // BF16 -> FP32: shift left by 16 bits (BF16 is the upper 16 bits of FP32).
+    v0 = __uint_as_float(lo_word << 16);
+    v1 = __uint_as_float(hi_word << 16);
+    // Wait, we need to be careful about the packing.
+    // Actually, let's use the CUDA intrinsics properly.
+    // __nv_bfloat162 is a 32-bit type holding two BF16 values.
+    // We can reinterpret the float2 as two __nv_bfloat162 values.
+    // But the simplest approach: treat the 8 bytes as 4 BF16 values.
+    //
+    // Let's redo this more carefully.
+    //
+    // A float2 is 8 bytes. We want to interpret those 8 bytes as 4 BF16 values.
+    // The 8 bytes are: byte0 byte1 byte2 byte3 byte4 byte5 byte6 byte7
+    // BF16 value 0: byte0 byte1  (little-endian: low byte first)
+    // BF16 value 1: byte2 byte3
+    // BF16 value 2: byte4 byte5
+    // BF16 value 3: byte6 byte7
+    //
+    // In a float2, .x is the first 4 bytes, .y is the next 4 bytes.
+    // So .x contains BF16 values 0 and 1, .y contains BF16 values 2 and 3.
+    //
+    // For .x (a 32-bit word):
+    //   bits 15-0  = BF16 value 0
+    //   bits 31-16 = BF16 value 1
+    //
+    // To convert BF16 to FP32: take the 16-bit value and shift left by 16.
+    // This works because BF16 has the same sign and exponent fields as FP32,
+    // just a shorter mantissa. Shifting left by 16 pads the mantissa with zeros.
+
+    // Redo:
+    uint32_t w0 = *reinterpret_cast<const uint32_t*>(&packed.x);
+    uint32_t w1 = *reinterpret_cast<const uint32_t*>(&packed.y);
+
+    // w0: bits 15-0 = bf16[0], bits 31-16 = bf16[1]
+    // w1: bits 15-0 = bf16[2], bits 31-16 = bf16[3]
+
+    v0 = __uint_as_float(w0 << 16);
+    v1 = __uint_as_float((w0 & 0xFFFF0000u) | ((w0 & 0xFFFF0000u) >> 32));
+    // That's wrong. Let me think again.
+    //
+    // w0 is a 32-bit integer.
+    // bf16[0] is in the lower 16 bits: w0 & 0x0000FFFF
+    // bf16[1] is in the upper 16 bits: (w0 >> 16) & 0x0000FFFF
+    //
+    // To convert a 16-bit BF16 to FP32:
+    //   fp32 = static_cast<uint32_t>(bf16_16bit) << 16
+    //
+    // So:
+    //   v0 = __uint_as_float((w0 & 0x0000FFFFu) << 16);
+    //   v1 = __uint_as_float((w0 >> 16) << 16);  // = __uint_as_float(w0 & 0xFFFF0000u)
+    //
+    // Similarly for w1:
+    //   v2 = __uint_as_float((w1 & 0x0000FFFFu) << 16);
+    //   v3 = __uint_as_float(w1 & 0xFFFF0000u);
+
+    v0 = __uint_as_float((w0 & 0x0000FFFFu) << 16);
+    v1 = __uint_as_float(w0 & 0xFFFF0000u);
+    v2 = __uint_as_float((w1 & 0x0000FFFFu) << 16);
+    v3 = __uint_as_float(w1 & 0xFFFF0000u);
+}
+
+// Pack 4 FP32 values into 4 BF16 values stored in a float2.
+__device__ __forceinline__ float2 packBF16x4(float v0, float v1,
+                                              float v2, float v3) {
+    // Convert FP32 to BF16 (round to nearest even).
+    uint32_t b0 = static_cast<uint32_t>(__float_as_uint(v0)) >> 16;
+    uint32_t b1 = static_cast<uint32_t>(__float_as_uint(v1)) >> 16;
+    uint32_t b2 = static_cast<uint32_t>(__float_as_uint(v2)) >> 16;
+    uint32_t b3 = static_cast<uint32_t>(__float_as_uint(v3)) >> 16;
+
+    // Use proper rounding: __float2bfloat16 does round-to-nearest-even.
+    // For simplicity and correctness, use the intrinsic.
+    __nv_bfloat16 h0 = __float2bfloat16(v0);
+    __nv_bfloat16 h1 = __float2bfloat16(v1);
+    __nv_bfloat16 h2 = __float2bfloat16(v2);
+    __nv_bfloat16 h3 = __float2bfloat16(v3);
+
+    // Pack into float2.
+    uint32_t w0 = (static_cast<uint32_t>(__bfloat16_as_ushort(h1)) << 16) |
+                  static_cast<uint32_t>(__bfloat16_as_ushort(h0));
+    uint32_t w1 = (static_cast<uint32_t>(__bfloat16_as_ushort(h3)) << 16) |
+                  static_cast<uint32_t>(__bfloat16_as_ushort(h2));
+
+    float2 result;
+    result.x = __uint_as_float(w0);
+    result.y = __uint_as_float(w1);
+    return result;
+}
+
+// Kernel: normalize each row in-place.
+//
+// gridDim.x = number of rows
+// blockDim.x = number of threads per block (each thread handles 4 elements)
+//
+// The kernel:
+//   1. Each thread loads 4 BF16 values (as a float2) from its position.
+//   2. Converts to FP32.
+//   3. Computes partial sum of squares.
+//   4. Reduces within the block to get the full row norm.
+//   5. Each thread divides its 4 values by the norm.
+//   6. Packs back to BF16 and stores.
+__global__ void rowNormalizeKernel(const __nv_bfloat16* __restrict__ input,
+                                   __nv_bfloat16* __restrict__ output,
+                                   int rows, int cols) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int totalThreads = blockDim.x;
+
+    // Pointer to the start of this row.
+    const __nv_bfloat16* rowPtr

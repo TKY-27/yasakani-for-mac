@@ -1,0 +1,115 @@
+We need answer user's request. Need produce final: one PostgreSQL script with no Markdown fences. Need include normalized tables models, fixtures, runs, request_metrics; PK/FK checks useful indexes; two views; one transaction-safe upsert function; at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Script must run in dependency order.
+
+Need think about PostgreSQL specifics. No markdown fences: raw SQL text. Need ensure runs cleanly. We need design schema.
+
+Entities:
+models: model_id PK, model_name, family, context_length, mtp_enabled? etc checks.
+fixtures: fixture_id PK, fixture_name, fixture_kind (maybe check in four kinds), maybe max_context, tokens? Need four fixture kinds. Could be 'short', 'medium', 'long', 'multi_turn'? But user says four fixture kinds. Maybe fixture_kind values: 'qa_short', 'document_long', 'conversation', 'structured'. Need realistic.
+runs: benchmark runs: run_id PK, model_id FK, fixture_id FK, started_at, finished_at, config jsonb? checks finish >= start, maybe mtp enabled? Could include run_type.
+request_metrics: per request metrics: metric_id PK? run_id FK, request_id int, prompt_tokens, completion_tokens, latency_ms, ttft_ms, itl_ms, accepted_tokens? mtp_acceptance? maybe speculative decoding? Need MTP acceptance. Need columns for long-context retention: maybe fixture_kind and position? Could have input_tokens, output_tokens, first_token_ms, total_ms, throughput_tokens_per_sec, error? MTP accepted tokens, proposed tokens, acceptance_rate? For MTP maybe model has mtp_enabled. request_metrics: mtp_proposed_tokens, mtp_accepted_tokens, mtp_acceptance_rate check between 0 and 1 if not null.
+
+Need at least 80 INSERT rows. Could insert using explicit rows for 80. Span two models and four fixture kinds. Need maybe 80 rows in request_metrics only? "at least 80 realistic INSERT rows spanning two models and four fixture kinds." Could refer total INSERT rows? Likely need >=80 rows of data across tables? They say normalized tables; include at least 80 realistic INSERT rows spanning two models and four fixture kinds. To be safe, have 2 models, 4 fixtures, 80 request_metrics rows? But if request_metrics 80 rows spanning two models/four fixtures via runs, good. Could also have INSERT rows for models/fixtures/runs. Total >80. Need run in dependency order. Need transaction-safe upsert function: maybe fn_upsert_request_metrics(p_run_id uuid, p_request_id int, ... ) uses INSERT ... ON CONFLICT (run_id, request_id) DO UPDATE. Function transaction-safe: within transaction by caller; function can be called inside transaction; can include exception? Transaction-safe upsert function: maybe uses plpgsql and performs atomic upsert; if conflict update. "transaction-safe" maybe means uses INSERT ON CONFLICT and no manual locks. Could be CREATE OR REPLACE FUNCTION upsert_request_metrics(...). It can accept record? Simpler: function with parameters. Need not call? Maybe script includes function definition; can test with SELECT? If call function, it will insert rows? But we already have INSERT rows. Could include a DO block? But final queries should be last? User says finish with six analytical SELECT queries. So after data and function, final six selects. Could include no test calls. Function can be defined before inserts. Need dependency order: tables, indexes, views? Views depend on tables, can define before inserts or after? Dependency order for execution: create tables, indexes, function, views, insert data? If views defined before inserts fine. But if function used? not. Maybe better: DROP? To make script re-runnable? Could use CREATE TABLE IF NOT EXISTS? But dependency order and normalized tables. If run multiple times, PK conflicts on inserts. Could use DROP TABLE IF EXISTS ... CASCADE; but user didn't ask. Could make script run once. But robust: use DROP VIEW, FUNCTION, TABLE in reverse dependency? However "run in dependency order" likely create tables then inserts. If include drop, need drop views first. But might be okay. If no DROP, running twice fails. Could use ON CONFLICT in inserts? Many explicit inserts can't easily. Could use INSERT ... ON CONFLICT DO NOTHING for deterministic ids. But 80 rows with explicit PK can conflict if rerun. To be safe, use fixed IDs and ON CONFLICT DO NOTHING? But request_metrics 80 rows could use ON CONFLICT (run_id, request_id) DO NOTHING. But if function defined, can use it? But 80 rows via function would be many calls. Explicit INSERT with ON CONFLICT DO NOTHING is okay. But if rerun, no changes. Need normalized tables.
+
+Potential issue: if use DROP TABLE, all data removed; then insert deterministic. Simpler and re-runnable. But "run in dependency order" with drops? Could do:
+DROP VIEW IF EXISTS ...;
+DROP FUNCTION IF EXISTS ...;
+DROP TABLE IF EXISTS request_metrics CASCADE;
+DROP TABLE IF EXISTS runs CASCADE;
+DROP TABLE IF EXISTS fixtures CASCADE;
+DROP TABLE IF EXISTS models CASCADE;
+Then create. But drops not dependency order? dropping reverse dependency is fine. But if they strictly want dependency order, maybe avoid DROP to not complicate. However one PostgreSQL script should run cleanly from scratch; if existing objects fail. We can include DROP in reverse order then create dependency order. That's still script runs. Need no markdown.
+
+Need six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Could be:
+1. Throughput by model and fixture kind: AVG/sum tokens per second? Use completion_tokens / latency.
+2. Variability: standard deviation of latency or tokens/sec by model fixture.
+3. Long-context retention: for long fixture kind, performance by prompt token bucket (e.g., 8k-16k, 16k-32k) avg latency/tokens/sec, maybe compare.
+4. MTP acceptance: acceptance rate by model, average accepted/proposed, maybe where mtp_enabled.
+Need six queries, covering these topics. Could have:
+Q1: Throughput per model: SUM(completion_tokens)/(SUM(latency_ms)/1000), requests, avg tps.
+Q2: Throughput by model and fixture kind.
+Q3: Variability of latency and tokens/sec by model/fixture: stddev, coefficient variation.
+Q4: Long-context retention: for fixture_kind = 'long_document', bucket prompt_tokens and compare mean TTFT/ITL/throughput, maybe retention score? Could compute avg output length? Need long-context retention: maybe use fixture with retrieval questions and metric accuracy? But request_metrics doesn't have correctness. Could include "retention_score"? Maybe we need long-context retention analysis. Add column to request_metrics: retention_score numeric? Or long context fixture includes "needle_depth"? Better: fixtures have "long_context_enabled" maybe. request_metrics can include "context_tokens" and "retention_metric" or "answer_accuracy". But normalized tables: request_metrics can include "retention_score" for long-context retention queries. Let's add: request_metrics.retention_score NUMERIC(5,4) CHECK (retention_score BETWEEN 0 AND 1) maybe null for non-long. Then query long-context retention by model and prompt token bucket: AVG(retention_score), count, maybe slope.
+MTP acceptance: mtp_proposed_tokens, mtp_accepted_tokens, acceptance_rate. Need query by model and fixture, maybe overall and by prompt length.
+
+Need at least 80 realistic INSERT rows. Could insert models 2, fixtures 4, runs maybe 8, request_metrics 80. That's 94 INSERT statements? They said at least 80 realistic INSERT rows, likely rows not statements. We can have 2+4+8+80=94 rows. But if using multi-row INSERT, still rows. Need maybe each row realistic. We can generate data manually or with generated_series? User says INSERT rows; using generate_series might be less explicit but rows generated. Need realistic; could use INSERT ... SELECT with generate_series to produce 80 rows deterministically, spanning two models and four fixture kinds. Is that acceptable? "at least 80 realistic INSERT rows" likely expects literal rows? Could be safer to write literal 80 rows in request_metrics. But final script long. We can produce 80 literal rows with plausible values. Need ensure dependency order, not too error-prone. We can use fixed UUIDs? Could use integer IDs for simplicity. PostgreSQL. Let's design integer PKs: models(model_id int PK, model_name text not null unique), fixtures(fixture_id int PK, fixture_name, fixture_kind text not null check in four values), runs(run_id int PK, model_id int FK, fixture_id int FK, started_at timestamptz, finished_at timestamptz, batch_size int, mtp_enabled bool, notes text), request_metrics(metric_id int PK, run_id int FK, request_id int, prompt_tokens int, completion_tokens int, latency_ms numeric, ttft_ms numeric, itl_ms numeric, tps numeric? mtp_proposed_tokens int, mtp_accepted_tokens int, mtp_acceptance_rate numeric, retention_score numeric, created_at timestamptz). Checks: prompt_tokens >0, completion_tokens >=0, latency>0, ttft>0, itl>=0, mtp rates 0..1, retention 0..1. Unique (run_id, request_id). Indexes: runs(model_id), runs(fixture_id), runs(started_at); request_metrics(run_id, request_id) unique, request_metrics(run_id), prompt_tokens, mtp fields maybe partial indexes for mtp_enabled? Useful indexes: request_metrics(run_id, request_id) UNIQUE; request_metrics(prompt_tokens), request_metrics(mtp_accepted_tokens) etc. But not too many.
+
+Need upsert function transaction-safe. Could be:
+CREATE OR REPLACE FUNCTION upsert_request_metrics(
+  p_run_id integer,
+  p_request_id integer,
+  p_prompt_tokens integer,
+  p_completion_tokens integer,
+  p_latency_ms numeric,
+  p_ttft_ms numeric,
+  p_itl_ms numeric,
+  p_mtp_proposed_tokens integer DEFAULT 0,
+  p_mtp_accepted_tokens integer DEFAULT 0,
+  p_retention_score numeric DEFAULT NULL
+) RETURNS request_metrics
+LANGUAGE plpgsql AS $$
+DECLARE v_row request_metrics; v_rate numeric;
+BEGIN
+  v_rate := CASE WHEN p_mtp_proposed_tokens > 0 THEN ROUND(p_mtp_accepted_tokens::numeric / p_mtp_proposed_tokens::numeric, 6) ELSE NULL END;
+  INSERT INTO request_metrics (...) VALUES (...)
+  ON CONFLICT (run_id, request_id) DO UPDATE SET ...
+  RETURNING * INTO v_row;
+  RETURN v_row;
+END;
+$$;
+This is transaction-safe if called inside a transaction; ON CONFLICT atomic. Could include validation and RAISE EXCEPTION if invalid. But if exception aborts transaction; that's expected. "transaction-safe" maybe means use ON CONFLICT and not SELECT FOR UPDATE? We can comment.
+
+Need no Markdown fences. Just SQL. Comments allowed. Need finish with six analytical SELECT queries. The last line should be SELECT; no extra text. We can include comments before queries. Ensure no markdown.
+
+Data plan:
+Models:
+1 'Aurora-7B' family 'aurora' context 32768 mtp_enabled true maybe.
+2 'Borealis-13B' family 'borealis' context 131072 mtp_enabled true.
+Could include mtp_heads? not needed.
+
+Fixtures four kinds:
+1 'short_qa' kind 'short_qa'
+2 'long_document' kind 'long_document'
+3 'multi_turn' kind 'multi_turn'
+4 'structured_extraction' kind 'structured_extraction'
+Checks kind in ('short_qa','long_document','multi_turn','structured_extraction'). Need four fixture kinds. Maybe fixtures: one per kind, or more. User says spanning four fixture kinds. At least one fixture each. Could have 4 fixtures.
+
+Runs: Need maybe 8 runs to map models x fixtures with some variations. 2 models x 4 fixtures = 8. Each run 10 requests => 80 request_metrics. Perfect. Run IDs 1-8. model 1 fixtures 1-4; model 2 fixtures 1-4. Realistic timestamps, batch_size, mtp_enabled maybe true for both; maybe some runs mtp_enabled false? To analyze MTP acceptance maybe need true. Could have all true but MTP metrics only some. If mtp_enabled false, accepted=0 proposed=0 rate null. But at least some. Maybe model 2 has stronger MTP. Could have runs: model 1 mtp_enabled true but acceptance lower; model 2 true higher. Or one run per model fixture with MTP true. That's fine.
+
+Need 80 request_metrics. We can generate literal rows. Need realistic values:
+For short_qa: prompt_tokens 200-500, completion 50-150, latency_ms 800-2000, ttft 50-150, itl 5-15 ms, tps = completion/latency? We can compute tps maybe not necessary; can store. MTP proposed maybe completion*1.5? accepted maybe 60-80%. For model1 acceptance 0.55-0.75, model2 0.70-0.90. For long_document: prompt_tokens 12000-30000 (model1 context 32k) and 20000-80000? model2 context 131k; but runs maybe model1 long fixture prompt 16k-32k; model2 long 32k-100k. completion 100-300. latency_ms higher: 3000-15000 model1, 6000-30000 model2. ttft 500-2000. itl 15-40. retention_score: for long_document, maybe degrades with prompt length: 0.90 down to 0.60. For other fixtures retention_score null or 1? Could set null for non-long. MTP acceptance lower for long maybe. Structured extraction: prompt 800-2500, completion 150-400, latency 1500-5000, ttft 100-400, itl 8-25, retention null. Multi_turn: prompt grows 1000-8000, completion 50-200, latency 1200-6000.
+
+Need ensure checks: latency positive; ttft <= latency? Could add check? Maybe not, but realistic. Could add CHECK (ttft_ms >= 0 AND latency_ms > ttft_ms) maybe ensure. Itl maybe average time per output token; if completion >0, latency ~ ttft + completion*itl; but we don't need strict. Could add check latency_ms > ttft_ms. mtp_proposed >= mtp_accepted >=0. acceptance_rate = accepted/proposed if proposed>0. Could add check mtp_acceptance_rate between 0 and 1. retention between 0 and 1.
+
+Need 80 literal rows. We can use run_id and request_id 1-10. Need ensure run IDs correspond model/fixture. Let's define runs:
+1 model 1 fixture short_qa started 2026-01-01 10:00 finished 10:01, batch_size 4, mtp true
+2 model1 long_document 10:10
+3 model1 multi_turn 10:20
+4 model1 structured_extraction 10:30
+5 model2 short_qa 11:00
+6 model2 long_document 11:10
+7 model2 multi_turn 11:20
+8 model2 structured_extraction 11:30
+
+Need INSERT rows. Could write:
+INSERT INTO request_metrics (run_id, request_id, prompt_tokens, completion_tokens, latency_ms, ttft_ms, itl_ms, mtp_proposed_tokens, mtp_accepted_tokens, mtp_acceptance_rate, retention_score) VALUES
+(1,1,312,84,1420,92,12.4,126,78,0.619048,NULL),
+...
+Need 80. Need calculate acceptance rate consistent? It can be accepted/proposed. We can choose rates and compute. To reduce errors, can set acceptance rate as literal approximate; not strictly checked. But if check mtp_acceptance_rate between 0 and 1 fine. Could set proposed/accepted integers and rate rounded. Need not exact but plausible. But if we have check maybe no cross-column check except proposed>=accepted. We can include CHECK (mtp_proposed_tokens >= mtp_accepted_tokens). Good.
+
+Could use INSERT ... SELECT generate_series to make 80 rows easier and ensure consistency. But user asks realistic INSERT rows; generated rows can be realistic with deterministic formulas. But "at least 80 realistic INSERT rows" maybe literal rows. Yet final answer can be long; 80 literal rows is okay. Need avoid mistakes. Could generate data in my head with patterns. Let's design systematic data with 10 rows per run.
+
+Need maybe use tps column? Could compute via expression? Store tps? If store, need consistent. Could omit tps; queries can compute throughput_tokens_per_sec = completion_tokens / (latency_ms/1000). That's fine. No tps column needed. But maybe include "output_tps" not needed.
+
+Columns:
+request_metrics(
+  metric_id serial primary key? If serial, inserting without metric_id. But for ON CONFLICT we need run_id,request_id. serial okay. If using explicit inserts no metric_id. But upsert function can use serial. However if script re-run with drops fine. Use bigserial? integer. For deterministic, we can omit metric_id.
+  run_id int not null references runs(run_id),
+  request_id int not null,
+  prompt_tokens int not null,
+  completion_tokens int not null,
+  latency_ms numeric(12,3) not null,
+  ttft_ms numeric(12,3) not null,
+  itl_ms numeric(12,3) not null,
+  mtp_proposed_tokens int not null default 0,
+  mtp_accepted_tokens int not null default 0,
+  mtp_acceptance_rate numeric

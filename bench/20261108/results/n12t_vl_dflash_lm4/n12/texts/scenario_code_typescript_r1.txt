@@ -1,0 +1,102 @@
+The user is asking for a complete TypeScript 5 service with the following features:
+
+1. Consumes newline-delimited (NDJSON) request metrics
+2. Validates without third-party schema libraries (i.e., hand-written validation)
+3. Groups records by model and fixture
+4. Computes mean/median/sample standard deviation (n−1 denominator)
+5. Exposes `/health`, `/summary`, and `/runs/:id` endpoints
+6. Strict typing
+7. Incremental parsing (i.e., streaming NDJSON, handling partial lines, buffering)
+8. Memory limit (e.g., cap on number of records retained / ring buffer or bounded aggregation)
+9. Malformed-input errors (400 with details on bad input)
+10. Unit tests
+11. package.json
+12. tsconfig.json
+13. Concise operations guide
+14. No placeholders
+
+Design decisions:
+
+- **Runtime**: Node.js with TypeScript. Use Node's built-in `http` module to avoid third-party dependencies (keeps the "no third-party schema libraries" constraint in spirit — zero external dependencies is best). Or use Express? Express is a third-party library but not a schema library. To keep it fully self-contained and runnable, zero-dependency `node:http` is safer and cleaner. Use Node's built-in `http` and `stream` modules.
+
+- **Tests**: Use Node's built-in test runner (`node:test`) with `node:assert/strict` — zero external deps. This works with TypeScript on Node 18+/20+. Or tsx. To run TS tests directly: Node 22.6+ can strip types with `node --experimental-strip-types`, Node 23.6+ can do it without a flag. As an alternative, compile with `tsc` and run the compiled tests with `node --test` (test files compile to dist too). Safest: compile with tsc and run `node --test dist/tests/`. That's robust across Node versions. Write tests that import source from compiled output or source. Structure: `src/` contains library modules, compiled to `dist/`. Tests in `src/tests/*.test.ts` imported from relative source paths, compiled to `dist/tests/*.test.js`, run with `node --test dist/tests/`.
+
+Actually a cleaner approach that avoids path issues: use `tsx`? That's a third-party dep but not a schema library — acceptable. But zero deps is more elegant. Let's go zero-deps: `package.json` with `type: module`, scripts: `build` (tsc), `test` (npm run build && node --test dist/tests/), `start` (npm run build && node dist/server.js).
+
+Hmm, `node --test dist/tests/` — when given a directory does it recursively discover files matching the test pattern? The `node --test` flag accepts a path; directories are scanned for test files (files matching the test file naming convention: `*.test.js` etc., or inside `test` directory... let me recall). Node docs: "When a path is provided, node --test runs those files... if a directory is specified, files matching the test file naming convention are executed." The naming convention includes `*.test.js`, `*-test.js`, `test-*.js`, `test.js`, and files inside directories named `test`. So `node --test dist/tests` will pick up `metrics.test.js` files if named `*.test.js`. Yes: "Files that are within the test file naming convention: files named test.js/mjs/cjs, files inside directories named test (in CJS the directory test is treated specially...)" hmm, there's a caveat: in ESM, the "test" directory convention is CJS-only? Let me be careful.
+
+From Node docs (v20+): Test runner execution: "If the test runner is invoked with an explicit path... For each directory specified... files matching the test file naming convention." Convention: `**/*.test.{js,ts,mjs...}`? The docs say: "Files with the test.js, test.mjs, test.cjs filenames; files with the *.test.js etc naming conventions; files in test directories." To be safe, I can pass explicit file paths: `node --test dist/tests/metrics.test.js dist/tests/server.test.js ...` or use a glob. Node 22 supports globs in CLI args. Simplest and most robust: name test files `*.test.js` after compilation and run `node --test dist/tests/` — in Node 20+, directory paths are searched recursively for `*.test.js` files (and also `test.js` files). The special "test" directory is CJS only, but the `*.test.js` pattern is applied recursively to any given directory. I believe in ESM, when a directory is given, only files matching the naming convention are run, and `*.test.js` is in the convention. So: "when a directory is specified, the module runner will recursively search for all files matching the test file naming convention... Files that match the naming convention: **/test/**/*.{cjs,mjs,js}? no..."
+
+Let me recall precisely. Node docs for test runner: "test files are identified... In CommonJS, a directory named test is treated as a directory of test files, and all .js/.cjs/.mjs files are treated as test files. In ES modules, files ending in .test.js / -test.js / _test.js etc."
+
+The docs (v20/22): "Test file naming conventions: In ESM, files must end in .test.js, .test.cjs, .test.mjs, or begin with test-, or be named test.js / test.mjs / test.cjs, or be in a directory with..." Hmm.
+
+To eliminate doubt, I'll just pass explicit file names in the test script. That's bulletproof. But if I add test files, I'd have to update the script. Or use `node --test 'dist/tests/*.test.js'` — CLI glob support was added in Node 20.x? Glob support in `--test` was added in Node 21/22. For safety: `node --test dist/tests` will work with the `*.test.js` naming in any directory when given a directory (fairly confident: docs say "if the path is a directory, all files in that directory (and subdirectories) matching the test file naming convention are executed"). And convention includes `*.test.{js,mjs,cjs}`. Sufficient; but to be extra safe I'll name test files explicitly and list them: `node --test dist/tests/`. Going with directory + `*.test.ts` naming.
+
+- **Node version**: target ES2022, Node >= 18. Set `"engines": { "node": ">=18" }`. node:test is stable in 18.
+
+- **Incremental parsing**: implement `NdjsonParser` class: `feed(chunk: string | Buffer): ParsedLine[]` — maintain an internal line buffer; split on `\n` and `\r\n`; keep last incomplete line in the buffer; enforce per-line byte limit (memory limit); emit complete lines. `flush()` for end-of-stream. Also handle CRLF.
+
+- **Validation (no schema lib)**: each NDJSON line is JSON of a record. Fields:
+  - `runId`: string, non-empty, e.g., 1–128 chars, pattern `[A-Za-z0-9._-]+`
+  - `model`: string, 1–128
+  - `fixture`: string, 1–128
+  - `latencyMs`: number, finite, >= 0, <= some upper bound (e.g., 3_600_000 ms = 1 hour)
+  - `tokens`?: integer >= 0
+  - `outcome`: enum, e.g., "succeeded" | "failed" | "error"
+  - `ts` (ISO timestamp) optional? Keep it simple: `ts` string, ISO 8601 optional; if present, validate Date.parse is finite.
+  - Duplicate lines / empty lines? Empty line: skip or error? Decision: trailing empty line at end of input is allowed (lenient), interior empty lines → skip or error. Make empty line a soft skip (documented), whitespace-only lines also skipped. Hmm, "malformed input error" — the spec should be deterministic: blank lines are ignored (documented), all other parse failures are 400 with line number and reason.
+
+  Per-field errors: `MALFORMED_LINE` with line number, path, expected vs received. `UNKNOWN_FIELD`? Strictness: unknown fields allowed or rejected? Rejection makes validation strict; allow unknown keys (forward compatibility) — but the user said strict types. Unknown fields ignored (documented), or reject? For strictness, reject unknown fields — that's a defensible strict choice. Hmm, could break real users; but spec is self-contained. Let's be strict: unknown properties rejected. That gives more meaningful validation errors and a stronger "strict types" story. Document it.
+
+- **Memory limit**:
+  - Per-line max bytes (e.g., 64 KiB).
+  - Global record limit: after N records processed (e.g., default 100k, configurable), retain only *aggregates* per (model, fixture, run?) — actually per-group aggregates (mean/median/stddev) require full data for median and stddev. Memory limit options:
+    - Cap total ingested records; when exceeded, reject further ingest (413 / 422 `CAPACITY_EXCEEDED`)? Or evict?
+    - Use streaming statistics: mean and stddev can be updated online (Welford's method), median can be approximated with a bounded structure (e.g., P² or reservoir / sorted insertion at cap). But the user explicitly asked for median and sample standard deviation — exact median needs the data or a heavy structure. Options: keep all values per group up to cap, and when per-group cap is exceeded, drop samples and mark the group's statistics as "truncated"? Complicated.
+
+  Practical and clean approach: service retains full numeric samples up to a global hard cap `maxRecords` (default e.g., 250k — bounded memory ~ 250k numbers × 8B ≈ 2 MB for latency + 250k × 8 for tokens ≈ manageable). Ingest beyond the cap → 422 `CAPACITY_EXCEEDED` error with clear message, and `/summary` reports `recordsTruncated: true` / capacity info. Also `maxRuns` cap on number of distinct (run) or (model, fixture) groups (e.g., 4096) → `GROUP_CAPACITY_EXCEEDED`. This gives clear "memory limit" semantics. Per-line limit and per-request body limit (e.g., 16 MiB) also limit memory. All documented.
+
+  Alternatively, when per-group cap is exceeded, store samples but cap median to approximate? No — deterministic is better. Go with global cap + error. Also expose `capacity: { maxRecords, maxGroups, records, groups }` in summary/health.
+
+  Also, runs are identified: records have `runId`; grouping is by model+fixture. Should groups be keyed by `runId`? "Group records by model and fixture" — so summary groups by `${model}/${fixture}` across all ingested data? Or per run? The `/runs/:id` endpoint suggests per-run data exists. Design: maintain `byGroup` (model,fixture) across all accepted records (global summary), and `byRun` map runId → record indexes per group? That doubles memory. Simpler: single canonical store: `Map<runId, Record[]>` plus a per-group index `Map<model|fixture, Set<runId>>`? To compute per-run group statistics for `/runs/:id`, we need to filter records of that run by (model, fixture) and compute statistics. And `/summary` computes global (model, fixture) groups across all records of all runs.
+
+  Efficient enough: store records in an array (capped), index by runId → array of record indexes (or record references), index by groupKey → array of indexes. Compute statistics on demand (O(n log n) sort for median; stddev O(n)). For up to 250k records, sort on demand is fine. Or cache statistics per group key per run... unnecessary complexity; compute on demand. Note in guide that statistics are computed on request and worst-case O(n log n).
+
+  Data model:
+  ```ts
+  interface MetricRecord {
+    runId: string;
+    model: string;
+    fixture: string;
+    latencyMs: number;
+    tokens: number; // integer, default 0? Optional?
+    outcome: 'succeeded' | 'failed' | 'error';
+    ts: string; // ISO-8601, optional
+  }
+  ```
+  Is `tokens` required? Make it optional, defaulting to 0? Defaulting changes semantics; let `tokens?: number` (non-negative integer) and include it in stats if present (mean/tokensPerSec is overkill). To keep the stats trio focused, compute mean/median/stddev only for `latencyMs`; token stats: total + mean? Spec says "compute mean/median/sample stddev" — for a group of records, latency statistics + count, meanLatencyMs/medianLatencyMs/stddevLatencyMs (sample, n−1), outcome breakdown (counts), meanTokens (only if tokens present, else undefined). Simpler: make `tokens` required as a non-negative integer. Hmm, real metrics: tokens per request is plausible. Keep it optional; include `meanTokens` in group stats only if any record has tokens... getting complicated. Decision: `tokens` optional; group stats include `tokens: { total, mean }` only when at least one record has `tokens`. Or always compute: treat missing tokens as absent → stats report `tokenRecords: k` and total over those k. Hmm.
+
+  Simplest and robust: make `tokens` optional; stats report `tokensTotal` and `tokensMean` computed over records that include tokens, plus `tokensCoverage` (count that had it). Actually I'm over-engineering. Final: `tokens` optional. GroupStats: `{ count, latency: {mean, median, sampleStddev, min, max}, outcomeCounts, tokens?: { total, mean, sampleStddev? no — total and mean, records } }`. Compute total tokens and mean over the provided subset.
+
+  Sample standard deviation: n−1 (Bessel). If n<2 → stddev undefined (null). Document it.
+
+- **Run store**: `MetricStore` class:
+  - `add(record): void` (throws CapacityError)
+  - `records: Array<MetricRecord>` capped
+  - `runIndex: Map<string, number[]>` (record indexes)
+  - `groupIndex: Map<string, number[]>` where groupKey = `${model}::${fixture}` — need delimiter-safe: model/fixture patterns disallow `::`? Model/fixture patterns: `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` (no slashes or colons) so the key `model/fixture` is unambiguous. OK, enforce a charset that excludes `/` and `:`.
+  - `run(id)` / `groupsInRun(id)` etc.
+
+- **Statistics**: pure functions `mean(xs)`, `median(xs)` (even → average of middle two; odd → middle), `sampleStddev(xs)` (n−1), `sum`. Sort a copy for median (or in-place on a slice). NaN handling: input validated finite, so safe. Empty array → undefined.
+
+- **Server**: zero-dep `node:http`:
+  - `POST /ingest` — body: NDJSON (multiple lines) or a single JSON object? "Consume newline-delimited request metrics" — NDJSON is the format. Accept a stream: read body incrementally (per chunk), parser feeds lines, validate each line, and store. Errors: first error → abort, respond 400 with `{ error: { code, line, reason, ... } }` and total records accepted so far? If some lines were accepted before the bad one and the stream fails midway, do we keep them (at-most-once not guaranteed) or roll back? Rollback across a Map is possible: record accepted records and remove on failure. Cleaner semantics: atomic per request — if any line is malformed, the whole request is rejected and previously stored records are removed. Implement rollback: `store` returns added indexes; on failure, splice. Array splice in the middle is O(n) — fine. Also decrement counters. Atomic per request is a strong guarantee that's easy to test.
+    - If body is truncated/EOF with an incomplete final line (no trailing newline) → treat the final partial line as a complete line at flush? NDJSON convention: final line may lack a trailing newline. Parser `finish()` flushes the remainder as a line (if non-empty). If the flushed line is malformed → 400. OK.
+    - Empty body → 400 `EMPTY_BODY`? Or 200 with 0 records? Empty is malformed → 400 EMPTY_BODY. Documented.
+    - Body limit (default 16 MiB) → 413 PAYLOAD_TOO_LARGE.
+    - Content-Type: accept `application/json` and `application/x-ndjson` and `text/plain`? Just check if present, and if present must be JSON-like? Loosen: ignore content-type, or if present validate against an allowed set. Simpler: don't enforce; document.
+    - Success: 200/202 `{ accepted: n, runIds: k, groups: m, capacity: {...}, truncated: bool }`. 200 OK is fine.
+  - `GET /health` → 200 `{ status: 'ok', uptimeSec, capacity, memory: process.memoryUsage() summary? }`. Include `version`. If capacity exceeded, status 'degraded'? Health check semantics: always 200 while the process is up, but include `recordsAtCapacity` flag. If at capacity, could make it 503 since ingest will fail — good operational signal: `GET /health` returns 503 when the record or group cap is reached (cannot accept ingest). Document it. Nice touch.
+  - `GET /summary` → 200: `{ recordCount, runCount, capacity, groups: [ { model, fixture, count, latency: {...}, outcomes: {...}, tokens?: {...} } ] }`. Sorted deterministically (model, fixture ascending).
+  - `GET /runs/:id` → 404 `UNKNOWN_RUN` if not present; else `{ runId, recordCount

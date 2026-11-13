@@ -1,0 +1,169 @@
+The user is asking for a complete TypeScript 5 service that satisfies the following:
+1. Consumes newline-delimited request metrics
+2. Validates them without a third-party schema library (i.e., a hand-rolled validator)
+3. Groups records by model and fixture
+4. Computes mean / median / sample standard deviation
+5. Exposes /health, /summary, and /runs/:id endpoints
+6. Strict typing
+7. Incremental parsing
+8. Bounded memory
+9. Malformed-input errors
+10. Unit tests
+11. package.json, tsconfig.json
+12. A short operational guide
+13. No placeholders
+
+This is a large deliverable. I should produce a complete, runnable set of files:
+
+- `package.json`
+- `tsconfig.json`
+- `src/types.ts` — strict types for records, metrics, statistics
+- `src/validation.ts` — hand-rolled validator
+- `src/parser.ts` — incremental NDJSON parser with bounded buffer
+- `src/statistics.ts` — mean/median/sample stddev computation (with bounded-memory constraint — since it's incremental, we can't store all values for median… hmm. Median needs the full dataset or an approximation. Bounded memory for median: options:
+  - Store values in a bounded structure: e.g., t-digest (approximate), or
+  - Since grouping is by (model, fixture), we can retain raw values per group in a capped deque: if the group's value count exceeds a cap, we sample (e.g., keep the first N values) — a documentable approximation.
+  - Or maintain min-heap + max-heap median structure — but that's unbounded too (needs all values).
+  - Practical approach: maintain exact mean/stddev incrementally (sum, sum of squares, count — numerically stable enough for a service like this, or use Welford's online algorithm for mean+variance). For median, keep a bounded reservoir of values (reservoir sampling) to approximate the median. Or, more simply: retain up to `maxValuesPerGroup` values per group (e.g., 10,000) — if exceeded, downsample by keeping every other value? A documented approach: store at most `maxValuesPerGroup` values per group, and when exceeded, decimate (drop odd-indexed values) preserving the sorted structure and bounding memory while keeping the median reasonably accurate. That's a nice technique.
+
+  Simpler, robust approach: per group, maintain:
+  - count, sum (for mean)
+  - M2 (for variance) via Welford or E[x^2] - mean^2 (risk of catastrophic cancellation). Welford is stable. Sample stddev = sqrt(M2/(n-1)).
+  - For median: a bounded sorted structure. To make median exact under a bounded cap: use a decimating reservoir. I'll implement "bounded quantile store": keep up to K values; when full, replace every 2nd value (downsample by 2: keep the first, drop the second, …). Median computed from the retained set (approximate if downsampled). Document it.
+
+  Actually a cleaner design: `BoundedGroupStats`:
+  - n: number (actual count)
+  - mean via Welford (mean, M2)
+  - values: bounded array with decimation.
+  - Compute median from the values array (sorted copy or binary search) — O(k log k) per summary call, bounded by k ≤ cap. Fine.
+
+- `src/store.ts` — run registry with bounded runs (LRU eviction), bounded per-run records, etc.
+- `src/app.ts` — HTTP server using Node's `http` module (avoid third-party deps: no Express). Node built-in `http` keeps dependency-free except for test runner. Use Node's built-in test runner (`node:test`) for unit tests — this completely avoids a third-party test framework. tsconfig targets ES2022, module NodeNext. Tests via `node --test` against compiled JS, or tsx? To keep it dependency-free, compile with `tsc` then run `node --test dist`. This is clean: devDependencies only typescript + @types/node. That's acceptable — "no third-party schema library" refers to validation; using @types/node and typescript is fine.
+
+- Endpoints:
+  - `GET /health` → { status: "ok", uptimeSec, version, runCount }
+  - `GET /summary` → aggregated stats across all runs, grouped by model+fixture.
+  - `GET /runs/:id` → stats for a specific run.
+  - Ingestion: `POST /ingest`? The service "consumes newline-delimited request metrics" — the consumer may be a stdin/file pipeline or an HTTP endpoint. To make it runnable and testable, I'll support both: `POST /ingest` (accepts a body of NDJSON lines, a stream), and a `--stdin` mode? Keep the scope sane: implement an ingest endpoint that accepts a chunked NDJSON body (incrementally parsed), and also a CLI mode that reads from a file or stdin via `src/main.ts`. This demonstrates incremental parsing and bounded memory (buffer cap: if a single line exceeds max line length, return 413 / emit a MalformedInputError).
+
+  Error semantics: malformed input → HTTP 400 with structured error `{"error":"malformed_input","code":"..."}`. For a stream containing a single malformed line among good lines: policy options: (a) reject the whole payload with 400; (b) accept the good lines and report rejected-line metadata in 200/207. Implementation: per line, validate; collect accepted records and an array of rejection reports; if there are zero accepted lines and at least one rejection, return 400; if mixed, return 200 with `accepted` and `rejected` arrays (document it). Actually a simpler, deterministic contract: a single line with invalid JSON → 400 for the whole request? The requirement says "malformed-input errors" — I'll define clear behavior: parse errors and validation errors are reported per line; if at least one line was accepted → 200 with the rejection list; if none accepted → 400 with details. If the body exceeds the max size → 413. This is defensible and testable.
+
+- Strict types: interfaces with exact field types, `Readonly`, `as const`, discriminated unions for validation results, `satisfies`, etc. Avoid `any`; use `unknown` with narrowing.
+
+- Bounded memory:
+  - Max line length (e.g., 64 KiB)
+  - Max body size (e.g., 8 MiB)
+  - Max records per run (e.g., 100k), after which further records are rejected with an explicit error
+  - Max concurrent runs (LRU eviction, e.g., 1024)
+  - Per-group median buffer cap (e.g., 8192 values) with decimation
+  - Rejection report is capped (e.g., first 100)
+
+- Incremental parsing: `NdjsonParser` class with `push(chunk: string)`, flushing complete lines, retaining a trailing partial line; detects oversized lines; emits `{kind: "record", line, text}` or errors. Handles `\r\n` and `\n`, skips blank lines.
+
+- Statistics: mean, median, sample stddev (n-1), count. Edge case: n<2 → stddev is null.
+
+- Tests (node:test):
+  - Parser: split across chunk boundaries, CRLF, blank lines, oversized lines, empty input, partial lines retained.
+  - Validator: valid record, missing fields, wrong types, out of range, NaN/Infinity (JSON doesn't support Infinity, but could a numeric string arrive? No — only numeric), negative latency, duplicate? Also strict: reject unknown fields? Define a strict schema: `model: string (1..128)`, `fixture: string (1..128)`, `latency_ms: number (finite, >= 0)`, optional `tokens: number (integer >= 0)`, `run_id: string`. Actually records include run_id? The service groups by model and fixture within a run; the /runs/:id endpoint needs a run association. So the record has a `run_id`. Also `tokens` for token metrics — keep it minimal but realistic: fields: `run_id`, `model`, `fixture`, `latency_ms` (number ≥ 0, finite), `tokens` (optional, integer ≥ 0). Stats: for each group compute latency mean/median/sample stddev + tokens total? The requirement says "compute mean/median/sample stddev" — I'll compute for `latency_ms` (the primary metric), and also compute for `tokens` when present? Keep scope: compute stats for latency_ms; for tokens, compute total and mean? For consistency, I'll compute stats on latency_ms (mean/median/sample stddev), and report `tokens_total` and `tokens_mean` where tokens is present. Hmm, simpler: stats object with `latency_ms: {count, mean, median, stddev}` and `tokens: {count, total, mean}` — good.
+
+  Actually, to keep median bounded, store per-group latencies in a bounded decimating reservoir; tokens as a sum (bounded).
+
+  - Statistics: verify with known datasets (e.g., [2,4,4,4,5,5,7,9] median 5, sample stddev 2.138...), single-value case, decimation bounds.
+  - Store: run creation, record add, max-runs eviction (LRU), record cap.
+  - HTTP: use `fetch` (Node 18+ has fetch) to hit the listening server: /health 200, /summary shape, /runs/:id 200 and 404, ingest of a valid batch, mixed → 200 with rejections, all bad → 400, oversized body → 413.
+
+- Operational guide: `docs/OPERATIONS.md` or `README.md` with setup, run, config via env vars (PORT, MAX_*, etc.), example curl commands, error table, memory bounds explanation, median decimation caveat, logging.
+
+- main.ts: env config, start server, graceful shutdown on SIGTERM/SIGINT, plus `--file path` to ingest a file on startup? Keep: server mode only, ingestion via POST /ingest. Optionally support `METRICS_FILE`? Might be overkill. I'll include a `node dist/main.js` that starts the server; ingestion is via HTTP. Tests cover everything.
+
+Numeric stability: Welford's online algorithm for mean and M2. Sample variance = M2/(n-1).
+
+Median with decimation: implementation:
+```
+class BoundedQuantile {
+  private buf: number[] = [];
+  private cap: number;
+  private full = false;
+  push(v: number) {
+    if (this.buf.length < this.cap) this.buf.push(v);
+    else {
+      // decimate: keep even indices of existing + v appended?
+      // strategy: when full, replace buf with buf.filter((_, i) => i % 2 === 0) then push v
+      this.buf = this.buf.filter((_, i) => i % 2 === 0);
+      this.buf.push(v);
+    }
+  }
+}
+```
+After many pushes, the size hovers around cap/2..cap. Median from sorted copy of buf. This bounds memory at O(cap). Document as an approximate median when downsampled. Good.
+
+Alternative: exact median with two heaps grows unbounded — not acceptable under the bounded memory requirement. Decimating reservoir is the right choice.
+
+Store design:
+```
+interface RunStats {
+  id: string;
+  createdAt: number;
+  lastAccess: number;
+  totalRecords: number;
+  rejected: number;
+  groups: Map<string, GroupStats>; // key `${model}¦${fixture}`
+}
+```
+Key separator: use "\u0000" or "¦"? A model/fixture could contain any characters. Use a JSON pair key: `model + "\u0000" + fixture`. Fine.
+
+Global summary: aggregate across all runs: maintain a global GroupStats keyed by model¦fixture (independent of run) so /summary is O(groups) rather than O(runs×groups). Memory bounded by number of groups × values cap. Also cap total groups? Bounded by distinct (model, fixture) pairs — inherently data-driven; cap with a limit like maxGroups (e.g., 4096), reject further new groups? That could be surprising behavior. Simpler: groups are naturally bounded by input variety; each group's value buffer is bounded; note that total memory is bounded by maxGroups. Could add an env var `MAX_GROUPS` to cap, and when exceeded, reject new group keys with a `group_limit_exceeded` error. Hmm — that adds complexity. I think it's better to include it: it shows rigor in bounding memory. When exceeded, reject records (both at global and run level?). Keep: enforce on global groups, run-level groups are only created if the global group exists.
+
+Wait — but run-level median needs per-run per-group values. Duplicating values per run and globally doubles memory. Alternative: /runs/:id only aggregates mean/stddev/count per group exactly (online), and median computed from the bounded run-level reservoir. /summary uses the global reservoir. Both bounded. OK.
+
+Simplification: maintain both:
+- `runs: Map<string, RunRecord>` (LRU, maxRuns)
+- `global: Map<string, GroupAccumulator>` (maxGroups)
+RunRecord.groups: Map<string, GroupAccumulator> (per run, per model-fixture).
+
+Memory: maxRuns × avg groups × cap values… worst-case 1024 runs × many groups × 8192 numbers could blow up. Hmm. To really bound, cap: per-run groups also capped (maxGroupsPerRun, e.g., 256). And values per group per run bounded by medianCap (8192) — worst-case 1024*256*8192*8 bytes ≈ 16 GiB. Still huge but only in pathological cases. Realistically acceptable; document. Or store per-run median reservoirs more sparsely with a smaller cap (e.g., 1024 per run, 8192 global). I'll parameterize: `medianCapGlobal: 8192`, `medianCapRun: 1024`. Worst-case still theoretical; fine — document the bound formula.
+
+Actually, maybe I can be smarter: median needs full data only per group. Since run data is a subset of global, could /runs/:id return median from the run-specific reservoir? Yes, that's what we're doing. Fine.
+
+LRU eviction: on access (ingest or GET /runs/:id), update lastAccess; when size > maxRuns, evict the one with smallest lastAccess (naive O(n) scan — n ≤ 1024, fine; or maintain a Map insertion-order trick). Naive scan at ingest time is O(1024) — acceptable, simpler. Document it.
+
+Validation details (strict, hand-rolled):
+```
+type ValidationResult =
+  | { ok: true; value: MetricRecord }
+  | { ok: false; code: MalformedCode; message: string; field?: string };
+```
+Codes: `invalid_json`, `not_object`, `missing_field`, `wrong_type`, `out_of_range`, `unknown_field` (strict unknown-field rejection — yes, strict!), `duplicate_field`? JSON parsing doesn't allow duplicates natively (last wins) — skip.
+
+Fields:
+- run_id: string, length 1..128, ASCII? Allow any string but require non-whitespace-only? Keep length bounds.
+- model: string, 1..128
+- fixture: string, 1..128
+- latency_ms: number, finite, 0 <= x <= 1e7 (upper bound to reject absurd values, e.g., 100_000_000 ms = 100k s? Set max to 3_600_000 ms (1 hour). Document it.)
+- tokens: optional number, integer, 0 <= x <= 1e9.
+
+Strict: no unknown fields.
+
+JSON: use `JSON.parse` (built-in, not a schema library — allowed; "no third-party schema library" means no Ajv/Zod). JSON.parse accepts NaN? No — JSON.parse rejects NaN/Infinity literals, good. But numeric strings in JSON: `"latency_ms": "12"` is a string → wrong_type. Good.
+
+Parser:
+```
+interface NdjsonLine { line: number; text: string }
+class NdjsonStreamParser {
+  private buf = '';
+  private lineNo = 1;
+  push(chunk: string): NdjsonLine[] { ... split on \n, handle \r at line ends }
+  finish(): NdjsonLine[] { flush remainder if non-empty }
+}
+```
+Oversize: if a line (after \r strip) exceeds maxLineBytes (measured in string length, document as UTF-16 units/bytes ≈), return an error signal. Design: `push` returns `{ lines: [...], error?: {code: 'line_too_long', line: n} }`. Once error, the parser is poisoned (state 'error') and further pushes are no-ops. On overflow, also cap the buffer to avoid unbounded memory from a line without a newline: if buf.length > maxLineLength, error. Good — bounded memory even against hostile input.
+
+HTTP server with `http.createServer`:
+- Parse URL with `new URL(req.url, 'http://localhost')` — note the path.
+- Routing: exact match: `/health`, `/summary`; `/runs/` prefix → id = decodeURIComponent(rest); if id empty → 404/400.
+- Methods: GET for those; POST `/ingest`. Others → 405 with an Allow header. Unknown → 404.
+- Body read: gather chunks, enforce maxBodyBytes (default 8 MiB) → 413 mid-stream, destroy socket.
+- UTF-8 decode with `Buffer.concat(chunks).toString('utf8')` — decode after collecting (bounded by maxBody).
+- Response helper: `sendJson(res, status, obj)`.
+
+Concurrency: single process, in-memory; mention horizontal scaling is not shared (state is per-process

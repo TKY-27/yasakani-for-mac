@@ -1,0 +1,221 @@
+We need answer user's request: "Create a complete TypeScript 5 service that consumes newline-delimited request metrics, validates them without third-party schema libraries, groups records by model and fixture, computes mean/median/sample standard deviation, and exposes /health, /summary, and /runs/:id endpoints. Include strict types, incremental parsing, bounded memory, malformed-input errors, unit tests, package.json, tsconfig.json, and a short operational guide. No placeholders."
+
+Need produce complete runnable code. Need likely provide files in answer. Need design service. Need TypeScript 5, no third-party schema libraries. Can use built-in Node http? Maybe avoid Express? Complete service likely can use Node's http module, no dependencies except dev deps for testing/types? "unit tests" could use Node's built-in test runner (node:test) to avoid third-party. Need package.json, tsconfig.json, operational guide. Need incremental parsing, bounded memory, strict types. Consumes newline-delimited request metrics. It likely accepts POST /ingest? User says exposes /health, /summary, /runs/:id. "service that consumes newline-delimited request metrics" maybe via stdin? Or HTTP endpoint? Could be service that consumes NDJSON from an endpoint like /ingest. Need include endpoints health, summary, runs/:id. Need malformed-input errors. Could build HTTP server with POST /ingest accepts NDJSON body, processes incremental stream, bounded memory (max records per run? aggregate only, ring buffer? Need group by model and fixture; compute mean/median/sample std. Median requires sorted values or order-statistic? With bounded memory cannot store all values for median if unbounded. Need design: For each model/fixture group maintain count, sum, min/max, Welford variance (sample std) and maybe quantile summary for median. Median exactly requires all values or at least sorted reservoir. But bounded memory: we can compute median approximate? User says computes mean/median/sample standard deviation. Could maintain a bounded sorted array with reservoir sampling? For exact median with bounded memory? If number of records bounded by configurable maxRecords, we can store all up to limit. Bounded memory by limiting maxRecords per run/model? But "bounded memory" maybe max records retained for median: use streaming quantile (MRLV) approximate median? But likely tests expect exact median for small data. Need decide.
+
+Maybe service accepts newline-delimited request metrics in NDJSON, with runId field. Group by model and fixture. For each group, need mean, median, sample std. To compute median exactly with bounded memory, if records are bounded (e.g., max 10_000 per run and max groups), storing all latency values is bounded. We can enforce maxRecordsTotal and maxGroups. For each model+fixture store samples array up to maxRecords? If exceed, error or drop? Need malformed-input errors. Bounded memory: limit per request line count, body size, total stored samples. Use incremental parsing line by line.
+
+Need TypeScript 5. Could use Node 18/20. Need strict types. Need no third-party schema libs. Could use built-in crypto for hashing? No.
+
+Need unit tests: use node:test + assert. Tests for validation, stats, HTTP endpoints. Need complete runnable. Provide all file contents: package.json, tsconfig.json, src/types.ts, src/stats.ts, src/validator.ts, src/store.ts, src/server.ts, src/index.ts, test/*.test.ts, maybe .gitignore? Operational guide.
+
+Need ensure code compiles and tests pass. Need think through implementation in detail.
+
+Potential architecture:
+
+Types:
+```
+export interface RequestMetric {
+  runId: string;
+  model: string;
+  fixture: string;
+  latencyMs: number;
+  statusCode: number;
+  timestamp: string | number; // maybe ISO or epoch ms
+  error?: string | null;
+}
+```
+NDJSON each line JSON. We need validate without schema lib. Need strict types.
+
+Validation rules:
+- line must be non-empty; JSON parse.
+- object non-null.
+- runId: string, nonempty, length <= 128, maybe pattern ^[A-Za-z0-9:_-]+$.
+- model: string, nonempty, length <= 64, pattern.
+- fixture: string, nonempty, length <= 128, pattern.
+- latencyMs: finite number >= 0, maybe <= 1e6.
+- statusCode: integer 100..599.
+- timestamp: finite number (epoch ms) or ISO string? Keep simple: number finite >=0.
+- error: optional string length <=512.
+- unknown fields? Could reject unknown fields to enforce strict schema without lib. Good.
+
+Incremental parsing: accept POST /ingest body stream, split on newline (CRLF), validate each line. Need bounded memory: max body bytes (e.g., 1MB), max lines (e.g., 10k), accumulate only aggregates and samples up to max records. If invalid line: return 400 with error line info and parsed lines before? Should we partially commit? Simpler: process incrementally; if error, reject entire request without committing? But if we process and mutate store before error, could be partial. Need atomic: parse all lines into valid records then commit? But that defeats memory? Could keep parsed records in array bounded by maxLines, then commit; memory bounded by request. Or process into temporary aggregates then merge if all valid. Temporary aggregates bounded by maxLines. Or process line by line into temp store, if error discard temp. This is good.
+
+Need store per run: runId -> groups keyed by model|fixture. Each group has samples: number[] for median (latencyMs) maybe bounded; count, sum, min, max, m2. Need support commit of temp. For sample standard deviation: Welford. For median: if store samples sorted? To compute median efficiently, can sort on read. If maxSamplesPerGroup = e.g. 10000, sorting O(n log n). For many groups ok. Or maintain sorted insertion O(n) bad. We can store unsorted and sort on summary.
+
+Bounded memory: constants:
+- MAX_BODY_BYTES = 1_000_000
+- MAX_LINES_PER_REQUEST = 10_000
+- MAX_RUNS = 1000
+- MAX_GROUPS_PER_RUN = 1000
+- MAX_SAMPLES_PER_GROUP = 10_000
+- MAX_SAMPLES_TOTAL = 100_000? Need track.
+When adding sample beyond max: If strict? Could reject request if would exceed. For service operational, maybe drop beyond limit? But "malformed-input errors" not limit? Bounded memory means reject or reject run. Could enforce maxSamplesPerGroup: if adding more than limit, return 413 or 400 "run sample capacity exceeded". But incremental parsing would know. If request contains too many lines -> 413. If exceeds global total -> 503? We can choose 413 Payload Too Large.
+
+Need endpoints:
+- GET /health: returns ok, uptime, memory usage, limits, counters.
+- GET /summary: returns all runs summary: mean, median, sampleStd, count, min, max per group. Maybe include totals.
+- GET /runs/:id: returns run details.
+- POST /ingest: consumes NDJSON.
+Maybe also DELETE /runs/:id? Not required but maybe useful; can include? But complete service maybe only required endpoints. Could include DELETE to bound memory? Operational guide can say restart to reset. But bounded memory: if store grows, need cleanup? We can limit runs and reject when capacity full. Could add DELETE /runs/:id to remove. But user didn't request; adding is okay? Might be extra. Need not placeholder. Could include.
+
+Need malformed-input errors: validation errors 400 with line number and reason. JSON errors. HTTP errors 404, 405, 400 for bad params. Need structured errors.
+
+Need tests:
+- stats: mean/median/sampleStd.
+- validator: valid/invalid.
+- store: add records, limits, group, summary.
+- server HTTP: health, ingest valid, summary, run, invalid line, method not allowed, run not found, capacity.
+Need ensure tests pass with Node test runner. Use ts-node? For tests with TypeScript, can use tsx? But no third-party? dev dependencies allowed? "without third-party schema libraries" only, but maybe can have devDeps. To be safe, use Node's built-in test runner and tsx? If no third-party runtime? TypeScript needs compile. Could use `tsx` devDependency. Or use `ts-node`. But if they want complete, package.json can include `tsx` dev dep and `typescript` dev dep. That's not schema lib. Acceptable. Could also use Node's experimental type stripping? Node 22 can run TS? But TypeScript 5? Use tsx for tests and start. Simpler.
+
+Need ensure code typechecks with TS 5. Use Node types. `@types/node` dev dep.
+
+Potential code:
+
+package.json:
+```
+{
+  "name": "request-metrics-service",
+  "version": "1.0.0",
+  "description": "NDJSON request metrics aggregation service",
+  "type": "module",
+  "engines": {"node": ">=18.17.0"},
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "tsx": "^4.7.1",
+    "typescript": "^5.4.5"
+  }
+}
+```
+But `tsx --test test/*.test.ts` works? tsx supports node --test? `tsx --test test/*.test.ts` likely. Could do `node --import tsx --test test/*.test.ts`. In package script: `"test": "node --import tsx --test test/*.test.ts"`. Node 18? `--import` available 16? Node 18.17 yes? Better use `tsx --test`. I think `tsx --test` is supported. Or compile then test? Use `tsc && node --test dist/test/*.test.js`? But type checking. Simpler: `"test": "tsx --test test/*.test.ts"`.
+
+tsconfig.json:
+```
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "rootDir": ".",
+    "outDir": "dist",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}
+```
+Need if package type module, imports require `.js` extensions. We'll write imports with `.js`. Tests import from `../src/...js`.
+
+Need code details.
+
+types.ts:
+```
+export interface RequestMetric {
+  runId: string;
+  model: string;
+  fixture: string;
+  latencyMs: number;
+  statusCode: number;
+  timestamp: number;
+  error?: string;
+}
+```
+But if exactOptionalPropertyTypes, validator returns object with error only if present? We can define `error?: string` and if null? Use `error: string | null`? Better input schema optional. For validated record: `error?: string`. Validator output type:
+```
+export interface ValidatedRequestMetric { ...; error?: string; }
+```
+But validation rejects unknown fields. Need line raw.
+
+Validation:
+```
+export class ValidationError extends Error { line: number; field: string; }
+```
+Maybe `validateLine(line: string, lineNo: number): ValidatedRequestMetric`.
+
+Need JSON parse. Use JSON.parse. If invalid -> ValidationError('json', ...).
+Then `isRecord`. Check no unknown fields: expected keys set. For each key type.
+Could use types:
+```
+const EXPECTED_KEYS = new Set(['runId','model','fixture','latencyMs','statusCode','timestamp','error']);
+```
+Unknown if not in set.
+Validate runId pattern: `/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/` length <=128. model `/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/`. fixture pattern length <=128.
+latency: typeof number, Number.isFinite, >=0, <= 1_000_000? statusCode integer 100..599, `Number.isInteger`. timestamp: number finite >=0 <= Date.now()+1? No need. error: if key present, must be string length <=512. Could be empty? Maybe yes. We can require non-empty? error optional string, allow empty? For malformed maybe string only.
+
+Need stats.ts:
+```
+export interface GroupStats { count: number; mean: number; median: number; sampleStd: number; min: number; max: number; }
+export function mean(values: number[]): number
+export function median(values: number[]): number
+export function sampleStd(values: number[], mean: number): number
+```
+But store can compute incremental. Need median exact. We'll store samples array. For mean and std, we can incremental. For summary, compute mean = sum/count, median by sorted samples copy, sampleStd via Welford m2: if count<2, 0? Sample standard deviation undefined for n<2. We can return 0 for n<2? Maybe null? For strict types, sampleStd: number | null. But user's summary likely number. For n=1 sample std undefined; we can use 0? Statistical sample std requires n-1. Need decide. To avoid null, define `sampleStd: number` and if count < 2 return 0. But that's not statistically exact? Could be acceptable. Or return `null` for n<2. Strict types can be `number | null`. Operational guide can explain. Unit tests can expect null for n<2. Let's use `sampleStd: number | null` for correctness. Mean/median number.
+
+But if sampleStd null, JSON includes null. Good.
+
+Store:
+```
+export interface AggregateGroup {
+  model: string;
+  fixture: string;
+  count: number;
+  sum: number;
+  min: number;
+  max: number;
+  m2: number; // Welford
+  samples: number[];
+}
+export interface RunState { runId: string; groups: Map<string, AggregateGroup>; createdAt: number; }
+export interface SummaryGroup { model, fixture, count, mean, median, sampleStd, min, max }
+export interface RunSummary { runId, groupCount, totalRecords, groups: SummaryGroup[] }
+export interface StoreLimits { maxRuns, maxGroupsPerRun, maxSamplesPerGroup, maxSamplesTotal, maxBodyBytes, maxLinesPerRequest }
+```
+Need class MetricsStore:
+- limits
+- runs: Map<string, RunState>
+- totalSamples: number
+- totalRecords? maybe totalSamples.
+- `addRecords(records: ValidatedRequestMetric[]): { added: number }`? Need capacity check before mutating. Could check if totalSamples + records.length <= maxSamplesTotal? But group-specific. We can validate capacity in two passes? records array bounded by max lines. For atomic, do dry run: clone? Better implement `commit(records)` that first checks capacity against existing store and then mutates.
+But if records have duplicate group, need group capacity. We can count by group in temp map. Then check each group current count + added <= maxSamplesPerGroup, total current + records.length <= maxSamplesTotal, runs capacity if new runs. Then mutate.
+```
+commit(records: readonly RequestMetric[]): void {
+  if (records.length === 0) return;
+  const additions = new Map<string, number>();
+  const newRunIds = ...;
+  for rec: key = groupKey(rec.model, rec.fixture); additions.set(...); newRunIds...
+  if (this.runs.size + newRunIds.size > maxRuns) throw CapacityError('run capacity exceeded');
+  total = this.totalSamples + records.length; if total > maxSamplesTotal throw...
+  for [runId, count] of additions: run = this.runs.get(runId); groupCount = run? run.groups.size:0; if run && groupCount > maxGroupsPerRun? Need if new group and run.groups.size >= maxGroupsPerRun -> throw; if existing group count + count > maxSamplesPerGroup -> throw.
+  // mutate
+  for rec: get/create run/group; update stats.
+}
+```
+But additions map keyed by runId|model|fixture? Need group count per run. Use nested: `Map<string, Map<string, number>>` or Map<runId, Map<groupKey,count>>.
+Need group key: model and fixture can contain delimiter? We can use JSON? Better use `${model}\u0000${fixture}`; keys from validated strings no null char? Patterns allow `:` `_` `-` `.` but no null. Use `\u0000` safe. Or object Map. Use `Map<string, number>` with key.
+
+Update Welford:
+```
+function update(group, x) {
+ group.count +=1; group.sum += x;
+ if count===1: min=max=x; m2=0;
+ else: if x<min min=x; if x>max max=x; m2 += (x - group.sum / group.count) * (x - group.sum / (group.count -1)); // But need previous mean. Use standard:
+ // n previous count; mean old = sum/n; mean new = mean old + (x-mean old)/n; m2 += (x - mean old)*(x - mean new)
+```
+Need avoid mutation with count before? Do:
+```
+const n = group.count;
+group.count = n+1;
+const delta = x

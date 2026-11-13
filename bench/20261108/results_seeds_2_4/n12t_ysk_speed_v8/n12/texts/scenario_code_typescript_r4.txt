@@ -1,0 +1,215 @@
+I'll design it as follows:
+
+1. `package.json` — dependencies: express (or Node built-in http to avoid third parties? The requirement says "no third-party schema libraries" — i.e., validation should be hand-crafted, but express for the server is fine. To minimize dependencies, we could use Node's built-in http module. Tests: Node 18+ has built-in node:test. That keeps dependencies at zero — good for "runnable." Let's use Node's built-in `node:test` and `assert/strict`. TypeScript 5.
+
+Actually, using Express adds a dependency but is common. To guarantee "runnable" with zero third-party runtime dependencies, using `node:http` is cleaner and avoids install issues. But express is more ergonomic. The constraint is only "no third-party schema libraries" — express is not a schema library. However, fewer dependencies = more reliable. I'll go with Node's built-in HTTP server to keep it fully self-contained (only `typescript` and `@types/node` as devDependencies).
+
+2. `tsconfig.json` — strict mode, ES2022, NodeNext module, outDir dist.
+
+3. Core architecture:
+   - Types: `RequestMetricRecord`, `ValidationIssue`, `Aggregates` (mean/median/sample standard deviation), `RunSummary`, `RunKey`.
+   - `MetricParser` — incremental parser: takes a chunk of bytes/string, maintains internal buffer state (carries over partial lines), parses NDJSON-like or newline-delimited JSON. "Newline-delimited request metrics" — probably NDJSON (newline-delimited JSON). Since we're "validating without third-party schema libraries," each line is JSON parsed with `JSON.parse`, then validated with hand-rolled code. Or a custom delimiter format? NDJSON is a safe interpretation.
+   - Validation: strict field checks:
+     - `runId`: non-empty string, matches a pattern (e.g., `/^[A-Za-z0-9_-]{1,64}$/`).
+     - `model`: non-empty string.
+     - `fixture`: non-empty string.
+     - `latencyMs`: finite number, > 0, <= max (e.g., 3600_000).
+     - `tokensIn`/`tokensOut`: non-negative integers.
+     - `status`: enum of "ok"/"error".
+     - `timestamp`: ISO-8601 string, parseable, within a reasonable range.
+     - `errorType` is optional.
+     Return typed validation issues with path, code, message.
+   - `MetricsStore` — groups by (runId, model, fixture), bounded memory:
+     - For mean/std: keep count, sum, sumOfSquares (sufficient for mean and sample std via E[x²]−(E[x])²; sample variance: (Σx² − (Σx)²/n) / (n−1)). This is O(1) per group. Median requires all values — bounded: cap values kept per group to the most recent K (e.g., 1024). Use a ring buffer / capped array. Bounded memory: also cap total number of groups (e.g., 10_000), evict oldest group (LRU or first-insertion order).
+     - Median: compute from capped samples (most recent K). Document that when the cap is exceeded the median is computed on the most recent window, but mean/std is over all values. Actually, for consistency: mean/std computed from moments over all values (exact), median from most recent capped window. Document precisely. Or compute all statistics from the window? Better: mean and std exact over all n; median over most recent min(n, cap) samples. That's defensible and bounded.
+     - Bounded groups: Map keyed by `${runId}|${model}|${fixture}`, evict oldest-inserted when over maxGroups (keep an insertion-order list).
+   - Service: `MetricsService` with `ingestChunk(chunk: string | Buffer): IngestResult`, `getSummary()`, `getRun(runId)`, `health()` (includes uptime, counts, memory usage, parser state).
+   - HTTP layer: `createServer(service)`, routes:
+     - `GET /health` → 200 JSON.
+     - `GET /summary` → all group aggregates.
+     - `GET /runs/:id` → aggregates for that run (all models/fixtures within it), plus per group. 404 if unknown.
+     - Also `POST /ingest`? The service "consumes newline-delimited request metrics" — where do the metrics come from? Options: a stdin pipeline, or a POST endpoint for ingest. The listed endpoints are /health, /summary, /runs/:id — all GET. Ingest source: the service "consumes" metrics — let's support both: a `POST /ingest` endpoint (NDJSON body) and stdin tailing? Keep it simple: `POST /ingest` is the ingestion path; the same incremental parser processes the body chunk by chunk. Actually, to demonstrate incremental parsing, process the request body stream chunk by chunk through the parser. That naturally shows incremental parsing. But the enumerated endpoints are exactly three; adding POST /ingest is an addition but reasonable and needed to "consume." I'll include `POST /ingest` as the ingestion route and note that. Hmm — "expose /health, /summary, /runs/:id endpoints" — it doesn't forbid other endpoints. I'll add POST /ingest as the metrics intake. That makes the service actually consumable. The CLI can also pipe from stdin: `node dist/cli.js < metrics.ndjson`? I could provide `cli.ts` that reads stdin into the service and starts the server. Let's do this: `src/main.ts` starts HTTP; optionally, if `STDIN_METRICS=1`, pipe stdin. Keep it simple but complete.
+
+   - Errors: malformed input errors — parser returns per-line issues; ingest endpoint returns 200 with a `{accepted, rejected, issues: [...]}` summary (or 400 if the entire body is malformed?). Better: partial success — 2xx with rejection list (first N issues). For body-level failures (e.g., non-UTF8? chunking issues), 400.
+   - Bounded request body: cap POST body size (e.g., 2 MB), 413 when exceeded.
+   - Unknown routes → 404 JSON; method mismatch → 405.
+
+4. Statistics:
+   - mean = sum/n
+   - sample standard deviation: n>=2 ? sqrt((sumSq − sum²/n)/(n−1)) : 0 (or null if n<2?). Let's define: `stdDev` is null when n < 2 (undefined is not serializable). Strict types: use `number | null`.
+   - median: sort a copy of the window values; even/odd handling.
+   - Guard against floating-point drift: clamp std to >= 0.
+
+5. Unit tests via node:test:
+   - Parser: line splitting across chunk boundaries (incremental), CRLF handling, empty line skipping, trailing partial line held over to next chunk.
+   - Validation: each malformed case produces the correct code; valid ones accepted.
+   - Store: aggregation correctness against hand-computed values; bounded eviction behavior; median window behavior.
+   - Statistics: mean/median/std against known arrays (e.g., [2,4,4,4,5,9]: mean 4.8333, median 4, sample std is? Let me compute: values 2,4,4,4,5,9, n=6, sum=28, mean=28/6=4.6667. sumSq=4+16+16+16+25+81=158. variance=(158 − 28²/6)/5 = (158 − 784/6)/5 = (158 − 130.6667)/5 = 27.3333/5 = 5.4667; std ≈ 2.3383. Let me recompute: 784/6 = 130.66667. 158 − 130.66667 = 27.33333. /5 = 5.46667. sqrt = 2.3381. Yes.)
+   - HTTP tests: start server on ephemeral port, use fetch (Node 18+ global fetch), test /health, /summary, /runs/:id (200 and 404), /ingest (200 with accepted/rejected, 413 for too big, malformed lines → issues).
+
+6. File structure:
+```
+package.json
+tsconfig.json
+README.md (operational guide)
+src/
+  types.ts
+  validate.ts
+  parse.ts (incremental parser)
+  stats.ts
+  store.ts
+  service.ts
+  http.ts
+  main.ts
+  index.ts (exports)
+test/
+  parse.test.ts
+  validate.test.ts
+  stats.test.ts
+  store.test.ts
+  http.test.ts
+```
+
+I'll write the code carefully.
+
+**types.ts**
+
+```ts
+/** Canonical status for a single recorded request. */
+export const METRIC_STATUSES = ["ok", "error"] as const;
+export type MetricStatus = (typeof METRIC_STATUSES)[number];
+
+/** Error taxonomy recorded when `status === "error"`. */
+export const ERROR_TYPES = ["timeout", "rateLimit", "server", "client", "unknown"] as const;
+export type ErrorType = (typeof ERROR_TYPES)[number];
+
+/**
+ * One validated, normalized request-metric record.
+ * Wire format is NDJSON; each line must conform to this shape.
+ */
+export interface RequestMetricRecord {
+  runId: string;
+  model: string;
+  fixture: string;
+  status: MetricStatus;
+  latencyMs: number;
+  tokensIn: number;
+  tokensOut: number;
+  timestamp: string; // ISO-8601 UTC
+  errorType: ErrorType | null;
+}
+
+/** Machine-readable validation failure. */
+export interface ValidationIssue {
+  line: number;      // 1-based line number within the stream
+  field: string;     // dotted path, "" for line-level issues
+  code: ValidationCode;
+  message: string;
+}
+
+export type ValidationCode =
+  | "line.notObject"
+  | "line.parseError"
+  | "runId.type" | "runId.format"
+  | "model.type" | "model.empty"
+  | "fixture.type" | "fixture.empty"
+  | "status.type"
+  | "latencyMs.type" | "latencyMs.range"
+  | "tokensIn.type" | "tokensOut.type"
+  | "timestamp.type" | "timestamp.format" | "timestamp.range"
+  | "errorType.type"
+  | "unknownFields";
+```
+
+Hmm, do we reject unknown fields? Strict validation — yes, we can flag unknown fields as an issue (warning or error). Let's make it an error code "unknownFields" — strict.
+
+Also a limit: at most 8 issues per line to bound memory for pathological lines? Nice touch.
+
+**validate.ts**
+
+```ts
+export interface ValidationOutcome {
+  record: RequestMetricRecord | null;
+  issues: ValidationIssue[];
+}
+```
+
+Function `validateMetric(lineNumber: number, raw: unknown): ValidationOutcome`.
+
+Checks:
+- raw must be a plain object (typeof object, not null, not an array).
+- runId: string, matches /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
+- model: string, trimmed length 1..64? Keep length <= 128. Use non-empty, length 1..128.
+- fixture same.
+- status: in METRIC_STATUSES.
+- latencyMs: number, finite, > 0, <= 3_600_000.
+- tokensIn/tokensOut: number, integer, >= 0, <= 1_000_000_000.
+- timestamp: string, matches ISO pattern, Date parse finite, within 1990..2100.
+- errorType: if status==="error", errorType must be in ERROR_TYPES (required). If status==="ok", errorType must be absent (or must be null? Strict: absent or null allowed? Let's say: for ok, errorType must be absent). For error: required and in the set.
+- Unknown fields → issue listing the field names (single issue).
+
+Limit to 10 issues per line.
+
+**parse.ts** — incremental parser.
+
+```ts
+export interface ParseChunkResult {
+  lines: ParsedLine[];
+}
+export interface ParsedLine { line: number; text: string; }
+```
+
+Parser class `NdlineParser` (or `IncrementalLineParser`):
+- internal buffer: string
+- lineNumber counter (1-based, counting complete lines)
+- maxLineBytes guard: if a single line exceeds MAX_LINE (e.g., 64 KB), emit as malformed (code line.tooLong), reset buffer to continue. Bounded memory.
+- `push(chunk: string): ParsedLine[]` splits on "\n", handles "\r\n" (strip trailing \r on each line), skips empty lines? Or count empty lines? For line numbering consistency, empty lines count as lines but are skipped (not validated). Hmm — simpler: skip empty/whitespace-only lines and still increment line number. That keeps line numbers aligned with actual file lines.
+- `flush(): ParsedLine[]` — emit any trailing partial line at end of stream (e.g., no trailing newline). For HTTP body, we need to flush at end. For stdin continuous stream, the parser holds the partial; flush at end.
+- Also expose `pendingBytes` for health.
+- Also handle a lone "\r"? Classic Mac line endings — treat "\r" as line separator too? Might complicate. Support \n and \r\n; treat bare \r as a line separator too for robustness? Let's implement it by scanning character by character: on \r: if next is \n consume both; split. That's robust. Character-by-character scanning of a string is fine for moderate chunks.
+
+Actually a simpler and robust approach: regex split? `chunk.split(/\r\n|\n|\r/)` — but we need to carry partial state across chunks: keep leftover = buffer + chunk, then split, last element is partial (don't emit unless flushed or we know a line ended). Since the split result's last element is everything after the last newline (which may be empty), that's the partial. So:
+
+```ts
+push(chunk) {
+  this.buffer += chunk;
+  const parts = this.buffer.split(/\r\n|\n|\r/);
+  this.buffer = parts.pop() ?? "";
+  // each part is a complete line
+  // check max line length: if part.length > MAX_LINE → emit as malformed line too long
+}
+```
+
+Wait — split with a regex: `"".split(...)` returns [""], popping returns "". Good. But if the buffer is huge because the client streams one giant line, buffer grows until the line ends — the bounded memory concern. We need to bound: if buffer.length > MAX_LINE, treat as an error line (emit a synthetic line text "" with a tooLong flag?), reset buffer to empty (discard line). Implementation: after appending, check `this.buffer.length > MAX_LINE` — but the partial could legitimately... no: if the *partial* already exceeds max, the line will exceed max, so we can immediately emit a `tooLong` line and clear. But we don't have the line's text; emit with empty text and a flag. Let ParsedLine carry `tooLong: boolean` and maybe `length`. Validator handles tooLong with code "line.tooLong".
+
+Also guard: buffer grows between pushes; check after appending. If exceeded, emit tooLong line (counting as 1 line), clear buffer.
+
+Also track `lineCount` (number of complete lines emitted so far including tooLong, empty lines). Actually line number: assign a line number on emission. Empty line: still increments the counter, not emitted (or emit with empty flag? Simpler: validator receives lines and skips empty; but then line number mapping... Let me emit every line with its number; the validator skips empty lines quickly (returns {record:null, issues: []} — accepted as no-op?). Ingest result counts: accepted, rejected (with issues), skipped (empty). Good.
+
+**stats.ts**
+
+```ts
+export interface MomentAccumulator { count, sum, sumSq }
+export function mean(...)
+export function sampleStdDev(count, sum, sumSq): number | null
+export function median(values: number[]): number | null  // null for empty; caller ensures non-empty
+```
+
+Median sorts a copy. For bounded windows, we keep up to K samples per group.
+
+**store.ts**
+
+GroupKey = { runId, model, fixture }; key string `${runId}\u0000${model}\u0000${fixture}`.
+
+Per group:
+- count, latencySum, latencySumSq
+- statusCounts: { ok, error }
+- errorTypeCounts: Record<ErrorType, number>
+- tokensInSum, tokensOutSum
+- latencySamples: ring buffer (array + head index, fixed capacity e.g. 2048). Use a simple capped array: if length < cap push, else rotate (shift is O(n) — use a ring buffer). Ring buffer implementation: `data: number[]` pre-allocated? Pre-allocate cap 2048 floats * groups * ... memory is bounded: groups cap 4096 * 2048 * 8 bytes ≈ 67 MB. Hmm that's too much worst-case. Cap samples per group at 512 → 4096*512*8 = 16 MB. Acceptable; make caps configurable. Let me set default maxGroups=4096, samplesPerGroup=512, total sample cap too? Keep simple: cap groups 4096, samples per group 512. Document.
+
+Ring buffer:
+```ts
+class BoundedSamples {
+  private buf: number[]; private head = 0; private size = 0;
+  constructor(private capacity: number) { this

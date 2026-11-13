@@ -1,0 +1,585 @@
+# Metrics Service (TypeScript 5)
+
+Below is a complete, runnable service. Every file is included in full — no placeholders.
+
+```
+metrics-service/
+├── package.json
+├── tsconfig.json
+├── .gitignore
+├── README.md
+└── src/
+    ├── index.ts
+    ├── types.ts
+    ├── errors.ts
+    ├── parser.ts
+    ├── statistics.ts
+    ├── store.ts
+    ├── routes.ts
+    └── tests/
+        ├── parser.test.ts
+        ├── statistics.test.ts
+        ├── store.test.ts
+        └── api.test.ts
+```
+
+---
+
+## `package.json`
+
+```json
+{
+  "name": "metrics-service",
+  "version": "1.0.0",
+  "description": "NDJSON request-metrics ingestion, aggregation, and query service (zero runtime dependencies).",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js",
+    "test": "tsc && node --test dist/tests/",
+    "test:watch": "tsc --watch"
+  },
+  "license": "MIT"
+}
+```
+
+> Zero runtime dependencies. The only dev dependency is the TypeScript compiler, which is invoked via `tsc`. Tests use Node's built-in `node:test` runner (Node ≥ 18).
+
+---
+
+## `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "strictFunctionTypes": true,
+    "strictBindCallApply": true,
+    "strictPropertyInitialization": true,
+    "noImplicitThis": true,
+    "alwaysStrict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
+```
+
+> `noUncheckedIndexedAccess` is enabled so array/object index access is typed as `T | undefined`, forcing explicit handling.
+
+---
+
+## `.gitignore`
+
+```
+node_modules/
+dist/
+*.log
+.env
+```
+
+---
+
+## `src/types.ts`
+
+```typescript
+/**
+ * Core domain types for the metrics service.
+ * All types are strict and fully explicit.
+ */
+
+/** A single validated request-metrics record. */
+export interface MetricsRecord {
+  /** Globally unique record identifier (string). */
+  id: string;
+  /** Model name the request was served by (string). */
+  model: string;
+  /** Fixture / dataset identifier (string). */
+  fixture: string;
+  /** Request latency in milliseconds (finite number). */
+  latencyMs: number;
+  /** HTTP status code (integer 100–599). */
+  statusCode: number;
+  /** Epoch milliseconds (finite number). */
+  timestamp: number;
+  /** Optional free-form error message. */
+  error?: string;
+}
+
+/** A validated record plus its 1-based line number in the stream. */
+export interface ParsedRecord {
+  record: MetricsRecord;
+  line: number;
+}
+
+/** Result of parsing a single NDJSON line. */
+export type ParseResult =
+  | { ok: true; value: ParsedRecord }
+  | { ok: false; error: string };
+
+/** A group key: (model, fixture). */
+export interface GroupKey {
+  model: string;
+  fixture: string;
+}
+
+/** Aggregated statistics for a single group. */
+export interface GroupStats {
+  key: GroupKey;
+  count: number;
+  mean: number;
+  median: number;
+  /** Sample standard deviation (n-1 denominator); 0 when count < 2. */
+  sampleStdDev: number;
+  min: number;
+  max: number;
+  sum: number;
+}
+
+/** A run is a batch of records sharing a runId. */
+export interface RunSummary {
+  runId: string;
+  recordCount: number;
+  groupCount: number;
+  groups: GroupStats[];
+  firstTimestamp: number | null;
+  lastTimestamp: number | null;
+}
+
+/** Top-level summary across all runs. */
+export interface SummaryResponse {
+  totalRecords: number;
+  totalRuns: number;
+  totalGroups: number;
+  runs: RunSummary[];
+}
+
+/** Health endpoint response. */
+export interface HealthResponse {
+  status: "ok";
+  uptimeSeconds: number;
+  memory: {
+    rss: number;
+    heapUsed: number;
+    heapTotal: number;
+  };
+  recordCount: number;
+  runCount: number;
+}
+
+/** Error response body. */
+export interface ErrorBody {
+  error: string;
+  detail?: string;
+  line?: number;
+}
+
+/** Ingestion result for a batch. */
+export interface IngestResult {
+  accepted: number;
+  rejected: number;
+  errors: Array<{ line: number; message: string }>;
+}
+
+/** Bounded-memory configuration. */
+export interface StoreConfig {
+  /** Maximum number of raw records retained before eviction. */
+  maxRecords: number;
+  /** Maximum number of runs retained before eviction. */
+  maxRuns: number;
+}
+```
+
+---
+
+## `src/errors.ts`
+
+```typescript
+/**
+ * Application-specific error hierarchy.
+ */
+
+export class AppError extends Error {
+  public readonly statusCode: number;
+  public readonly detail?: string;
+
+  constructor(message: string, statusCode: number, detail?: string) {
+    super(message);
+    this.name = "AppError";
+    this.statusCode = statusCode;
+    this.detail = detail;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export class ValidationError extends AppError {
+  constructor(message: string, line?: number) {
+    super(message, 422, line !== undefined ? `line ${line}` : undefined);
+    this.name = "ValidationError";
+  }
+}
+
+export class NotFoundError extends AppError {
+  constructor(resource: string, id: string) {
+    super(`${resource} '${id}' not found`, 404);
+    this.name = "NotFoundError";
+  }
+}
+
+export class MemoryLimitError extends AppError {
+  constructor(message: string) {
+    super(message, 507);
+    this.name = "MemoryLimitError";
+  }
+}
+
+export class BadRequestError extends AppError {
+  constructor(message: string) {
+    super(message, 400);
+    this.name = "BadRequestError";
+  }
+}
+```
+
+---
+
+## `src/parser.ts`
+
+```typescript
+/**
+ * Incremental NDJSON parser with strict validation.
+ * No third-party schema libraries — pure TypeScript validation.
+ */
+
+import type { MetricsRecord, ParseResult, ParsedRecord } from "./types";
+
+/** Maximum allowed length for a single NDJSON line (bytes). */
+const MAX_LINE_LENGTH = 64 * 1024; // 64 KiB
+
+/** Maximum allowed length for string fields. */
+const MAX_STRING_LENGTH = 4096;
+
+/**
+ * Validate a single parsed JSON object against the MetricsRecord shape.
+ * Returns a list of field-level errors (empty if valid).
+ */
+function validateRecord(raw: unknown): string[] {
+  const errors: string[] = [];
+
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    errors.push("record must be a JSON object");
+    return errors;
+  }
+
+  const obj = raw as Record<string, unknown>;
+
+  // id: required, non-empty string
+  if (typeof obj.id !== "string" || obj.id.length === 0) {
+    errors.push("'id' must be a non-empty string");
+  } else if (obj.id.length > MAX_STRING_LENGTH) {
+    errors.push(`'id' exceeds max length ${MAX_STRING_LENGTH}`);
+  }
+
+  // model: required, non-empty string
+  if (typeof obj.model !== "string" || obj.model.length === 0) {
+    errors.push("'model' must be a non-empty string");
+  } else if (obj.model.length > MAX_STRING_LENGTH) {
+    errors.push(`'model' exceeds max length ${MAX_STRING_LENGTH}`);
+  }
+
+  // fixture: required, non-empty string
+  if (typeof obj.fixture !== "string" || obj.fixture.length === 0) {
+    errors.push("'fixture' must be a non-empty string");
+  } else if (obj.fixture.length > MAX_STRING_LENGTH) {
+    errors.push(`'fixture' exceeds max length ${MAX_STRING_LENGTH}`);
+  }
+
+  // latencyMs: required, finite number >= 0
+  if (typeof obj.latencyMs !== "number" || !Number.isFinite(obj.latencyMs)) {
+    errors.push("'latencyMs' must be a finite number");
+  } else if (obj.latencyMs < 0) {
+    errors.push("'latencyMs' must be >= 0");
+  }
+
+  // statusCode: required, integer 100–599
+  if (typeof obj.statusCode !== "number" || !Number.isInteger(obj.statusCode)) {
+    errors.push("'statusCode' must be an integer");
+  } else if (obj.statusCode < 100 || obj.statusCode > 599) {
+    errors.push("'statusCode' must be in range 100–599");
+  }
+
+  // timestamp: required, finite number
+  if (typeof obj.timestamp !== "number" || !Number.isFinite(obj.timestamp)) {
+    errors.push("'timestamp' must be a finite number");
+  }
+
+  // error: optional, if present must be a string
+  if (obj.error !== undefined && typeof obj.error !== "string") {
+    errors.push("'error' must be a string when present");
+  }
+
+  return errors;
+}
+
+/**
+ * Parse and validate a single NDJSON line.
+ *
+ * @param line - raw line (without trailing newline)
+ * @param lineNum - 1-based line number for error reporting
+ * @returns ParseResult
+ */
+export function parseLine(line: string, lineNum: number): ParseResult {
+  const trimmed = line.trim();
+
+  // Skip blank lines silently (they are not errors).
+  if (trimmed.length === 0) {
+    return { ok: false, error: "blank line" };
+  }
+
+  if (trimmed.length > MAX_LINE_LENGTH) {
+    return {
+      ok: false,
+      error: `line exceeds max length ${MAX_LINE_LENGTH}`,
+    };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return { ok: false, error: "invalid JSON" };
+  }
+
+  const fieldErrors = validateRecord(parsed);
+  if (fieldErrors.length > 0) {
+    return { ok: false, error: fieldErrors.join("; ") };
+  }
+
+  const obj = parsed as Record<string, unknown>;
+  const record: MetricsRecord = {
+    id: obj.id as string,
+    model: obj.model as string,
+    fixture: obj.fixture as string,
+    latencyMs: obj.latencyMs as number,
+    statusCode: obj.statusCode as number,
+    timestamp: obj.timestamp as number,
+  };
+  if (typeof obj.error === "string") {
+    record.error = obj.error;
+  }
+
+  return { ok: true, value: { record, line: lineNum } };
+}
+
+/**
+ * Incremental NDJSON parser that handles multi-line buffering.
+ *
+ * Feed it chunks of text via `feed()`. It buffers partial lines
+ * and emits complete lines via the callback.
+ */
+export class NdjsonParser {
+  private buffer: string = "";
+  private lineNum: number = 0;
+
+  /**
+   * Feed a chunk of text into the parser.
+   * @param chunk - raw text chunk
+   * @param onLine - callback invoked for each complete line
+   */
+  feed(chunk: string, onLine: (line: string, lineNum: number) => void): void {
+    this.buffer += chunk;
+
+    let start = 0;
+    let idx: number;
+    while ((idx = this.buffer.indexOf("\n", start)) !== -1) {
+      const line = this.buffer.slice(start, idx);
+      this.lineNum++;
+      onLine(line, this.lineNum);
+      start = idx + 1;
+    }
+
+    // Keep only the incomplete tail.
+    this.buffer = this.buffer.slice(start);
+  }
+
+  /**
+   * Flush any remaining buffered content (e.g. at stream end).
+   * @param onLine - callback for the final partial line
+   */
+  flush(onLine: (line: string, lineNum: number) => void): void {
+    if (this.buffer.length > 0) {
+      this.lineNum++;
+      onLine(this.buffer, this.lineNum);
+      this.buffer = "";
+    }
+  }
+
+  /** Reset the parser state. */
+  reset(): void {
+    this.buffer = "";
+    this.lineNum = 0;
+  }
+}
+```
+
+---
+
+## `src/statistics.ts`
+
+```typescript
+/**
+ * Statistical aggregations: mean, median, sample standard deviation.
+ * Pure functions, no side effects.
+ */
+
+export interface StatsInput {
+  values: number[];
+}
+
+export interface StatsOutput {
+  count: number;
+  mean: number;
+  median: number;
+  sampleStdDev: number;
+  min: number;
+  max: number;
+  sum: number;
+}
+
+/**
+ * Compute mean, median, sample standard deviation, min, max, sum.
+ *
+ * - mean: arithmetic mean
+ * - median: middle value (average of two middle values for even n)
+ * - sampleStdDev: sqrt(Σ(xᵢ - x̄)² / (n-1)); 0 when n < 2
+ *
+ * @param values - array of finite numbers
+ * @returns StatsOutput
+ */
+export function computeStats(values: number[]): StatsOutput {
+  const n = values.length;
+
+  if (n === 0) {
+    return {
+      count: 0,
+      mean: 0,
+      median: 0,
+      sampleStdDev: 0,
+      min: 0,
+      max: 0,
+      sum: 0,
+    };
+  }
+
+  let sum = 0;
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+
+  for (const v of values) {
+    sum += v;
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+
+  const mean = sum / n;
+
+  // Median: sort a copy.
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(n / 2);
+  const median = n % 2 === 0 ? (sorted[mid - 1]! + sorted[mid]!) / 2 : sorted[mid]!;
+
+  // Sample standard deviation (n-1 denominator).
+  let sampleStdDev = 0;
+  if (n >= 2) {
+    let ss = 0;
+    for (const v of values) {
+      const d = v - mean;
+      ss += d * d;
+    }
+    sampleStdDev = Math.sqrt(ss / (n - 1));
+  }
+
+  return {
+    count: n,
+    mean,
+    median,
+    sampleStdDev,
+    min,
+    max,
+    sum,
+  };
+}
+```
+
+---
+
+## `src/store.ts`
+
+```typescript
+/**
+ * Bounded in-memory store for metrics records and runs.
+ *
+ * Memory is bounded by:
+ *  - maxRecords: maximum raw records retained (FIFO eviction)
+ *  - maxRuns: maximum runs retained (FIFO eviction)
+ *
+ * Aggregations are computed lazily and cached per run/group.
+ */
+
+import type {
+  MetricsRecord,
+  GroupKey,
+  GroupStats,
+  RunSummary,
+  SummaryResponse,
+  StoreConfig,
+  IngestResult,
+} from "./types";
+import { computeStats } from "./statistics";
+import { MemoryLimitError } from "./errors";
+
+interface RunEntry {
+  runId: string;
+  records: MetricsRecord[];
+  firstTimestamp: number | null;
+  lastTimestamp: number | null;
+  /** Cache of group stats keyed by "model|fixture". */
+  groupCache: Map<string, GroupStats>;
+}
+
+function groupKeyString(model: string, fixture: string): string {
+  return `${model}|${fixture}`;
+}
+
+export class MetricsStore {
+  private readonly config: StoreConfig;
+  private readonly runs: Map<string, RunEntry> = new Map();
+  /** Ordered list of run IDs for FIFO eviction. */
+  private readonly runOrder: string[] = [];
+  /** Global record count (for health). */
+  private totalRecords: number = 0;
+
+  constructor(config

@@ -1,0 +1,27 @@
+[2026-11-10 08:23:52] GPU before start: 35, 2662, 14201, 83.88, 1476, 32607, 5 | median utilisation 5 %, memory used 1476 MiB
+[q35_g6] prefill only, temporary workspace 111543640 bytes
+[KV-PROTOCOL] target_kv=int8-row-f32-scale
+[TB-CAP] capacity mode (k=5): packed K streams 16/16, packed V streams 13/16; KV of the attention layers 1384.0 MiB (INT8 containers: 2080.0 MiB); staging 4096 rows
+[qwen3_5] 64 layers loaded, LNORD codes 9.76 GB, free 19.3 / 34.2 GB
+[qwen3_5] SHEAD drafter head loaded (<model_dir_fastest>\bdraft2_k8.shead): rank 512, 1.41 GB, score grid 340 blocks; GPU free 16.4 / 34.2 GB
+[2026-11-10 08:24:09] steady/jp_q1/greedy/on                       runs  8  distinct outputs 1  {'34758e5e078a226d': 8}   passes [137]
+[2026-11-10 08:24:24] steady/jp_q1/greedy/off_nodraft              runs  8  distinct outputs 2  {'34758e5e078a226d': 7, '5c2d1f6c1cc4bf6e': 1}   passes [211, 218]
+[2026-11-10 08:24:30] steady/scenario_code_cuda/greedy/on          runs  8  distinct outputs 1  {'26c0d057e2adf54a': 8}   passes [51]
+[2026-11-10 08:24:48] steady/scenario_code_cuda/greedy/off_nodraft runs  8  distinct outputs 2  {'ee044a21744f3def': 1, '26c0d057e2adf54a': 7}   passes [255]
+[2026-11-10 08:24:59] steady/jp_q5/seed1234/on                     runs  8  distinct outputs 2  {'8ae14e0f45b3202a': 7, 'b03596fbed9eff16': 1}   passes [129, 130]
+[2026-11-10 08:25:17] steady/jp_q5/seed1234/off_nodraft            runs  8  distinct outputs 2  {'8ae14e0f45b3202a': 7, '64235b18b2c7cd53': 1}   passes [255]
+[2026-11-10 08:25:26] steady/prose_en_cpu/seed1234/on              runs  8  distinct outputs 1  {'a16a3b3ee547f573': 8}   passes [94]
+[2026-11-10 08:25:44] steady/prose_en_cpu/seed1234/off_nodraft     runs  8  distinct outputs 3  {'a16a3b3ee547f573': 6, '871b611e2b9fdbcc': 1, '4a1a12d26a337818': 1}   passes [255]
+[2026-11-10 08:26:02] steady/scenario_story_zh_scifi/seed1234/off_noblock runs  8  distinct outputs 1  {'3e4d1bb231a478a4': 8}   passes [247]
+[2026-11-10 08:26:20] steady/scenario_code_cuda/seed1234/off_nodraft runs  8  distinct outputs 1  {'489b6545650b97d6': 8}   passes [255]
+[2026-11-10 08:26:34] alternate/jp_q1/greedy                       runs  8  distinct outputs 2  {'34758e5e078a226d': 7, '9cfdbc2184e052f0': 1}   passes [137, 217, 218]
+[2026-11-10 08:26:45] alternate/scenario_code_cuda/greedy          runs  8  distinct outputs 1  {'26c0d057e2adf54a': 8}   passes [51, 255]
+[2026-11-10 08:27:14] after_long/cycle1/scenario_code_cuda/greedy/on runs  3  distinct outputs 1  {'26c0d057e2adf54a': 3}   passes [51]
+[2026-11-10 08:27:43] after_long/cycle2/scenario_code_cuda/greedy/on runs  3  distinct outputs 1  {'26c0d057e2adf54a': 3}   passes [51]
+[2026-11-10 08:28:12] after_long/cycle3/scenario_code_cuda/greedy/on runs  3  distinct outputs 1  {'26c0d057e2adf54a': 3}   passes [51]
+[2026-11-10 08:28:16] after_8k/cycle1/scenario_code_cuda/greedy/on runs  2  distinct outputs 1  {'26c0d057e2adf54a': 2}   passes [51]
+[2026-11-10 08:28:19] after_8k/cycle2/scenario_code_cuda/greedy/on runs  2  distinct outputs 1  {'26c0d057e2adf54a': 2}   passes [51]
+[2026-11-10 08:28:36] selfcheck/short-answer                       runs 30  distinct outputs 1  {'18de4b801242d195': 30}   passes [1]
+[2026-11-10 08:28:36] selfcheck/thinking                           runs 30  distinct outputs 1  {'afe2fd9847111d83': 30}   passes [20]
+[2026-11-10 08:28:36] selfcheck/plain-text                         runs 30  distinct outputs 1  {'611bde9f7b74f1ed': 30}   passes [9]
+[2026-11-10 08:28:37] repeat probe: 20 arms, 199 runs; arms with more than one output: 6 ['steady/jp_q1/greedy/off_nodraft', 'steady/scenario_code_cuda/greedy/off_nodraft', 'steady/jp_q5/seed1234/on', 'steady/jp_q5/seed1234/off_nodraft', 'steady/prose_en_cpu/seed1234/off_nodraft', 'alternate/jp_q1/greedy']

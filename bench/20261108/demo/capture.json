@@ -1,0 +1,1389 @@
+{
+  "started": "2026-11-08T19:22:52.238+09:00",
+  "finished": "2026-11-08T19:22:57.794+09:00",
+  "ttft_s": 1.281498,
+  "t_last_s": 5.555668,
+  "t_end_s": 5.556058400019538,
+  "completion_tokens": 4712,
+  "decode_tok_s": 1102.2022989258733,
+  "finish": "stop",
+  "usage": {
+    "prompt_tokens": 4773,
+    "completion_tokens": 4712,
+    "total_tokens": 9485,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  },
+  "chunks": [
+    [
+      1.281498,
+      "content",
+      "\"\"\""
+    ],
+    [
+      1.312931,
+      "content",
+      "Text wrapping"
+    ],
+    [
+      1.313006,
+      "content",
+      " and filling.\n\"\"\"\n\n#"
+    ],
+    [
+      1.34391,
+      "content",
+      " Copyright (C) 1999-2001 Gregory P. Ward.\n# Copyright (C) 2002, "
+    ],
+    [
+      1.343987,
+      "content",
+      "2003 Python Software Foundation.\n# Written by Greg Ward <g"
+    ],
+    [
+      1.374378,
+      "content",
+      "ward@python.net>\n\nimport re\n\n__all__ = ['TextWrapper"
+    ],
+    [
+      1.374444,
+      "content",
+      "', 'wrap', 'fill', 'dedent', 'indent', 'short"
+    ],
+    [
+      1.389919,
+      "content",
+      "en']\n\n# Hardcode the recognized whitespace characters to the US-ASCII\n"
+    ],
+    [
+      1.421383,
+      "content",
+      "# whitespace characters.  The main reason for doing this is that\n# some Unicode spaces (like \\u00a0) are non-breaking whitespaces"
+    ],
+    [
+      1.421456,
+      "content",
+      ".\n_whitespace = '\\t\\n\\x0b\\x0c\\r '\n\n"
+    ],
+    [
+      1.453433,
+      "content",
+      "class TextWrapper:\n    \"\"\"\n    Object for wrapping/filling text."
+    ],
+    [
+      1.453504,
+      "content",
+      "  The public interface consists of\n    the wrap() and fill() methods;"
+    ],
+    [
+      1.485457,
+      "content",
+      " the other methods are just there for\n    subclasses to override in order to tweak the default behaviour.\n    If you want to completely replace the main wrapping algorithm"
+    ],
+    [
+      1.485529,
+      "content",
+      ",\n    you'll probably have to override _wrap_chunks().\n\n    Several"
+    ],
+    [
+      1.501421,
+      "content",
+      " instance attributes control various aspects of wrapping:\n      width (default: 7"
+    ],
+    [
+      1.532808,
+      "content",
+      "0)\n        the maximum width of wrapped lines (unless break_long_words\n"
+    ],
+    [
+      1.532872,
+      "content",
+      "        is false)\n      initial_indent (default: \"\")\n        string that will be prepended to the"
+    ],
+    [
+      1.564321,
+      "content",
+      " first line of wrapped\n        output.  Counts towards the line's width."
+    ],
+    [
+      1.564397,
+      "content",
+      "\n      subsequent_indent (default: \"\")\n        string that will be prepended"
+    ],
+    [
+      1.595364,
+      "content",
+      " to all"
+    ],
+    [
+      1.595488,
+      "content",
+      " lines save the first\n        of wrapped output; also counts towards each line's"
+    ],
+    [
+      1.626772,
+      "content",
+      " width.\n      expand_tabs (default: true)\n        Expand tabs in input text to spaces before further processing.\n        Each tab will become 0"
+    ],
+    [
+      1.626833,
+      "content",
+      " .. 'tabsize' spaces, depending on its position\n        in its line"
+    ],
+    [
+      1.642264,
+      "content",
+      ".  If false, each tab is treated as a single character.\n     "
+    ],
+    [
+      1.673783,
+      "content",
+      " tabsize (default: 8)\n        Expand tabs in input text to"
+    ],
+    [
+      1.673842,
+      "content",
+      " 0 .. 'tabsize' spaces, unless\n        'expand_tabs' is"
+    ],
+    [
+      1.704778,
+      "content",
+      " false.\n      replace_whitespace (default: true)\n        Replace all whitespace"
+    ],
+    [
+      1.704888,
+      "content",
+      " characters in the input text by spaces\n        after tab expansion.  Note that"
+    ],
+    [
+      1.73636,
+      "content",
+      " if expand_tabs is false and\n        replace_whitespace is true, every tab will"
+    ],
+    [
+      1.736475,
+      "content",
+      " be converted to a\n        single space!\n      fix_sentence_endings ("
+    ],
+    [
+      1.751891,
+      "content",
+      "default: false)\n        Ensure that sentence-ending punctuation is always followed\n        by two spaces.  Off by default because the algorithm is\n        (un"
+    ],
+    [
+      1.783875,
+      "content",
+      "avoidably) imperfect.\n      break_long_words (default: true)\n"
+    ],
+    [
+      1.783943,
+      "content",
+      "        Break words longer than 'width'.  If false, those words will not"
+    ],
+    [
+      1.81535,
+      "content",
+      "\n        be broken, and some lines might be longer than 'width'.\n"
+    ],
+    [
+      1.815466,
+      "content",
+      "      break_on_hyphens (default: true)\n        Allow breaking hyphenated words. If true, wrapping will occur\n        preferably on whites"
+    ],
+    [
+      1.846591,
+      "content",
+      "paces and right after hyphens part of\n        compound words.\n     "
+    ],
+    [
+      1.846664,
+      "content",
+      " drop_whitespace (default: true)\n        Drop leading and trailing whitespace from lines"
+    ],
+    [
+      1.862553,
+      "content",
+      ".\n      max_lines (default: None)\n        Truncate wrapped lines"
+    ],
+    [
+      1.894625,
+      "content",
+      ".\n      placeholder (default: ' [...]')\n        Append to the last line of truncated text.\n    \"\"\"\n\n    unicode_whitespace_trans = dict.from"
+    ],
+    [
+      1.894689,
+      "content",
+      "keys(map(ord, _whitespace), ord(' '))\n\n    # This"
+    ],
+    [
+      1.926107,
+      "content",
+      " funky little regex is just the trick for splitting\n    # text up into word"
+    ],
+    [
+      1.926216,
+      "content",
+      "-wrappable chunks.  E.g.\n    #   \"Hello there"
+    ],
+    [
+      1.9576,
+      "content",
+      " -- you goof-ball, use the -b option!\"\n    # splits into"
+    ],
+    [
+      1.957667,
+      "content",
+      "\n    #   Hello/ /there/ /--/ /you/ /goof-/"
+    ],
+    [
+      1.989638,
+      "content",
+      "ball,/ /use/ /the/ /-b/ /option!\n"
+    ],
+    [
+      1.989751,
+      "content",
+      "    # (after stripping out empty strings).\n    word_punct = r"
+    ],
+    [
+      2.021084,
+      "content",
+      "'[\\w!\"\\'&.,?]'\n    letter = r'[^\\"
+    ],
+    [
+      2.021149,
+      "content",
+      "d\\W]'\n    whitespace = r'[%s]' % re.escape(_whitespace)\n    nowhitespace = '[^' + whitespace["
+    ],
+    [
+      2.052573,
+      "content",
+      "1:]\n    wordsep_re = re.compile(r'''\n        ( #"
+    ],
+    [
+      2.052648,
+      "content",
+      " any whitespace\n          %(ws)s+\n        | # em-dash between"
+    ],
+    [
+      2.084307,
+      "content",
+      " words\n          (?<=%(wp)s) -{2,} (?"
+    ],
+    [
+      2.084367,
+      "content",
+      "=\\w)\n        | # word, possibly hyphenated\n          %("
+    ],
+    [
+      2.115395,
+      "content",
+      "nws)s+? (?:\n            # hyphenated word\n              -(?: (?<=%(lt)s{2}-) | (?<=%"
+    ],
+    [
+      2.115461,
+      "content",
+      "(lt)s-%(lt)s-))\n              (?= %(lt)s"
+    ],
+    [
+      2.14632,
+      "content",
+      " -? %(lt)s)\n            | # end of word\n              (?"
+    ],
+    [
+      2.146389,
+      "content",
+      "=%(ws)s|\\Z)\n            | # em-dash\n             "
+    ],
+    [
+      2.161903,
+      "content",
+      " (?<=%(wp)s) (?=-{2,}\\w)\n"
+    ],
+    [
+      2.193874,
+      "content",
+      "            )\n        )''' % {'wp': word_punct, 'lt': letter,\n                'ws': whitespace, 'nws': nowh"
+    ],
+    [
+      2.194095,
+      "content",
+      "itespace},\n        re.VERBOSE)\n    del word_punct, letter"
+    ],
+    [
+      2.225376,
+      "content",
+      ", nowhitespace\n\n    # This less funky little regex just split on recognized"
+    ],
+    [
+      2.225432,
+      "content",
+      " spaces. E.g.\n    #   \"Hello there -- you goof-ball"
+    ],
+    [
+      2.257445,
+      "content",
+      ", use the -b option!\"\n    # splits into\n    #   Hello/ /there/ /--/ /you/ /goof-ball"
+    ],
+    [
+      2.257524,
+      "content",
+      ",/ /use/ /the/ /-b/ /option!/\n   "
+    ],
+    [
+      2.288612,
+      "content",
+      " wordsep_simple_re = re.compile(r'(%s+)' % whitespace)"
+    ],
+    [
+      2.288688,
+      "content",
+      "\n    del whitespace\n\n    # XXX this is not locale- or charset-aware"
+    ],
+    [
+      2.320604,
+      "content",
+      " -- string.lowercase\n    # is US-ASCII only (and therefore English-only)\n    sentence_end_re = re.compile(r'[a-z]'            "
+    ],
+    [
+      2.320679,
+      "content",
+      " # lowercase letter\n                                 r'[\\.\\!\\?]'          # sentence-ending"
+    ],
+    [
+      2.336104,
+      "content",
+      " punct.\n                                 r'[\\\"\\']?'           # optional end-of-quote\n"
+    ],
+    [
+      2.367615,
+      "content",
+      "                                 r'\\Z')               # end of chunk\n\n    def __init__("
+    ],
+    [
+      2.367692,
+      "content",
+      "self,\n                 width=70,\n                 initial_indent=\"\",\n                "
+    ],
+    [
+      2.383685,
+      "content",
+      " subsequent_indent=\"\",\n                 expand_tabs=True,\n                 replace_whitespace=True,\n                 fix_sentence_endings=False,\n                 break_long_words=True,\n                "
+    ],
+    [
+      2.415156,
+      "content",
+      " drop_whitespace=True,\n                 break_on_hyphens=True,\n                "
+    ],
+    [
+      2.415221,
+      "content",
+      " tabsize=8,\n                 *,\n                 max_lines=None,\n                "
+    ],
+    [
+      2.446676,
+      "content",
+      " placeholder=' [...]'):\n        self.width = width\n        self.initial_indent ="
+    ],
+    [
+      2.44675,
+      "content",
+      " initial_indent\n        self.subsequent_indent = subsequent_indent\n        self.expand_tabs"
+    ],
+    [
+      2.462364,
+      "content",
+      " = expand_tabs\n        self.replace_whitespace = replace_whitespace\n        self.fix_sentence_endings = fix_sentence_endings\n        self.break_long_words = break_long"
+    ],
+    [
+      2.493901,
+      "content",
+      "_words\n        self.drop_whitespace = drop_whitespace\n        self.break_on_hy"
+    ],
+    [
+      2.493963,
+      "content",
+      "phens = break_on_hyphens\n        self.tabsize = tab"
+    ],
+    [
+      2.509917,
+      "content",
+      "size\n        self.max_lines = max_lines\n        self.placeholder = placeholder\n\n\n"
+    ],
+    [
+      2.509982,
+      "content",
+      "    # -- Private methods -----------------------------------------------\n    # (possibly useful for subclasses to override)\n\n    def _munge_whitespace(self, text):\n        \"\"\""
+    ],
+    [
+      2.541428,
+      "content",
+      "_munge_whitespace(text : string) -> string\n\n        Munge whitespace in"
+    ],
+    [
+      2.573023,
+      "content",
+      " text: expand tabs and convert all other\n        whitespace characters to spaces. "
+    ],
+    [
+      2.573095,
+      "content",
+      " Eg. \" foo\\\\tbar\\\\n\\\\nbaz\"\n        becomes"
+    ],
+    [
+      2.603938,
+      "content",
+      " \" foo    bar  baz\".\n        \"\"\"\n        if self.expand_tabs:\n            text = text.expandtabs(self.tabsize)\n        if self"
+    ],
+    [
+      2.604005,
+      "content",
+      ".replace_whitespace:\n            text = text.translate(self.unicode_whitespace_trans)\n"
+    ],
+    [
+      2.635442,
+      "content",
+      "        return text\n\n\n    def _split(self, text):\n        \"\"\"_"
+    ],
+    [
+      2.635556,
+      "content",
+      "split"
+    ],
+    [
+      2.651468,
+      "content",
+      "(text : string) -> [string]\n\n        Split the text to wrap into"
+    ],
+    [
+      2.682969,
+      "content",
+      " indivisible chunks.  Chunks are\n        not quite the same as words; see _wrap_chunks() for full\n        details.  As an example"
+    ],
+    [
+      2.68303,
+      "content",
+      ", the text\n          Look, goof-ball -- use the -b option!"
+    ],
+    [
+      2.713941,
+      "content",
+      "\n        breaks into the following chunks:\n          'Look,', ' ', '"
+    ],
+    [
+      2.714003,
+      "content",
+      "goof-',"
+    ],
+    [
+      2.745513,
+      "content",
+      " 'ball', ' ', '--', ' ',\n          'use', ' ',"
+    ],
+    [
+      2.745582,
+      "content",
+      " 'the', ' ', '-b', ' ', 'option!'\n        if break_on_hyphens is True, or in"
+    ],
+    [
+      2.776987,
+      "content",
+      ":\n          'Look,', ' ', 'goof-ball', ' ', '--"
+    ],
+    [
+      2.777047,
+      "content",
+      "', ' ',\n          'use', ' ', 'the', ' ', '-"
+    ],
+    [
+      2.809065,
+      "content",
+      "b', ' ', option"
+    ],
+    [
+      2.809178,
+      "content",
+      "!'\n        otherwise.\n        \"\"\"\n        if self.break_on_hy"
+    ],
+    [
+      2.839761,
+      "content",
+      "phens is True:\n            chunks = self.wordsep_re.split(text)\n        else:\n            chunks = self.wordsep_simple_re.split(text)"
+    ],
+    [
+      2.839871,
+      "content",
+      "\n        chunks = [c for c in chunks if c]\n        return"
+    ],
+    [
+      2.871325,
+      "content",
+      " chunks\n\n    def _fix_sentence_endings(self, chunks):\n        \"\"\""
+    ],
+    [
+      2.871386,
+      "content",
+      "_fix_sentence_endings(chunks : [string])\n\n        Correct for sentence"
+    ],
+    [
+      2.887309,
+      "content",
+      " endings buried in 'chunks'.  Eg. when the\n        original text contains \"... foo.\\\\nBar ...\", munge_whitespace()\n        and split"
+    ],
+    [
+      2.919353,
+      "content",
+      "() will convert that to [..., \"foo.\", \" \", \"Bar\", ..."
+    ],
+    [
+      2.919412,
+      "content",
+      "]\n        which has one too few spaces; this method simply changes the one"
+    ],
+    [
+      2.950398,
+      "content",
+      "\n        space to two.\n        \"\"\"\n        i = 0\n"
+    ],
+    [
+      2.950461,
+      "content",
+      "        patsearch = self.sentence_end_re.search\n        while i < len"
+    ],
+    [
+      2.981344,
+      "content",
+      "(chunks)-1:\n            if chunks[i+1] == \" \" and patsearch(chunks[i]):\n                chunks[i+1] = \""
+    ],
+    [
+      2.981408,
+      "content",
+      "  \"\n                i += 2\n            else:\n                i +="
+    ],
+    [
+      3.013357,
+      "content",
+      " 1\n\n    def _handle_long_word(self, reversed_chunks, cur_line"
+    ],
+    [
+      3.01342,
+      "content",
+      ", cur_len, width):\n        \"\"\"_handle_long_word(chunks :"
+    ],
+    [
+      3.029348,
+      "content",
+      " [string],\n                             cur_line : [string],\n                             cur_len : int, width : int)\n\n        Handle a chunk of text (most likely"
+    ],
+    [
+      3.06013,
+      "content",
+      " a word, not whitespace) that\n        is too long to fit in any"
+    ],
+    [
+      3.06021,
+      "content",
+      " line.\n        \"\"\"\n        # Figure out when indent is larger than the"
+    ],
+    [
+      3.091455,
+      "content",
+      " specified width, and make\n        # sure at least one character is stripped off"
+    ],
+    [
+      3.09152,
+      "content",
+      " on every pass\n        if width < 1:\n            space_left ="
+    ],
+    [
+      3.107419,
+      "content",
+      " 1\n        else:\n            space_left = width - cur_len\n\n        # If we're allowed to break long words, then do so: put"
+    ],
+    [
+      3.1389,
+      "content",
+      " as much\n        # of the next chunk onto the current line as will fit"
+    ],
+    [
+      3.138959,
+      "content",
+      ".\n        if self.break_long_words:\n            end = space_left\n"
+    ],
+    [
+      3.169919,
+      "content",
+      "            chunk = reversed_chunks[-1]\n            if self.break_on_hy"
+    ],
+    [
+      3.170033,
+      "content",
+      "phens and len(chunk) > space_left:\n                # break after last"
+    ],
+    [
+      3.200949,
+      "content",
+      " hyphen, but only if there are\n                # non-hyphens before it\n                hyphen = chunk.rfind('-', 0, space_left"
+    ],
+    [
+      3.201021,
+      "content",
+      ")\n                if hyphen > 0 and any(c != '-' for c"
+    ],
+    [
+      3.232945,
+      "content",
+      " in chunk[:hyphen]):\n                    end = hyphen + 1\n"
+    ],
+    [
+      3.233013,
+      "content",
+      "            cur_line.append(chunk[:end])\n            reversed_chunks[-1] ="
+    ],
+    [
+      3.248462,
+      "content",
+      " chunk[end:]\n\n        # Otherwise, we have to preserve the long word intact"
+    ],
+    [
+      3.279697,
+      "content",
+      ".  Only add\n        # it to the current line if there's nothing already there --\n        # that minimizes how much we violate the width constraint"
+    ],
+    [
+      3.279811,
+      "content",
+      ".\n        elif not cur_line:\n            cur_line.append(reversed_chunks"
+    ],
+    [
+      3.311652,
+      "content",
+      ".pop())\n\n        # If we're not allowed to break long words, and"
+    ],
+    [
+      3.311716,
+      "content",
+      " there's already\n        # text on the current line, do nothing. "
+    ],
+    [
+      3.327706,
+      "content",
+      " Next time through the\n        # main loop of _wrap_chunks(), we'll wind up here again, but\n        # cur_len will be zero, so"
+    ],
+    [
+      3.327768,
+      "content",
+      " the next line will be entirely\n        # devoted to the long word that we"
+    ],
+    [
+      3.358668,
+      "content",
+      " can't handle right now.\n\n    def _wrap_chunks(self, chunks):"
+    ],
+    [
+      3.390696,
+      "content",
+      "\n        \"\"\"_wrap_chunks(chunks : [string]) -> [string]"
+    ],
+    [
+      3.390791,
+      "content",
+      "\n\n        Wrap a sequence of text chunks and return a list of lines of\n"
+    ],
+    [
+      3.42227,
+      "content",
+      "        length 'self.width' or less.  (If 'break_long_words' is false,\n        some lines may be longer than this.)  Ch"
+    ],
+    [
+      3.422393,
+      "content",
+      "unks correspond roughly\n        to words and the whitespace between them: each chunk is"
+    ],
+    [
+      3.453224,
+      "content",
+      "\n        indivisible (modulo 'break_long_words'), but a line break can"
+    ],
+    [
+      3.45334,
+      "content",
+      "\n        come between any two chunks.  Chunks should not have internal\n"
+    ],
+    [
+      3.469002,
+      "content",
+      "        whitespace; ie. a chunk is either all whitespace or a \"word\"."
+    ],
+    [
+      3.500051,
+      "content",
+      "\n        Whitespace chunks will be removed from the beginning and end of\n        lines, but apart from that whitespace is preserved.\n        \"\"\"\n        lines"
+    ],
+    [
+      3.500167,
+      "content",
+      " = []\n        if self.width <= 0:\n            raise ValueError(\""
+    ],
+    [
+      3.532062,
+      "content",
+      "invalid width %r (must be > 0)\" % self.width)\n"
+    ],
+    [
+      3.53217,
+      "content",
+      "        if self.max_lines is not None:\n            if self.max_lines >"
+    ],
+    [
+      3.563016,
+      "content",
+      " 1:\n                indent = self.subsequent_indent\n            else:\n                indent = self.initial_indent\n"
+    ],
+    [
+      3.563078,
+      "content",
+      "            if len(indent) + len(self.placeholder.lstrip()) > self.width:"
+    ],
+    [
+      3.579091,
+      "content",
+      "\n                raise ValueError(\"placeholder too large for max width\")\n\n        # Arrange"
+    ],
+    [
+      3.611015,
+      "content",
+      " in reverse order so items can be efficiently popped\n        # from a stack of"
+    ],
+    [
+      3.611116,
+      "content",
+      " chucks.\n        chunks.reverse()\n\n        while chunks:\n\n            #"
+    ],
+    [
+      3.643101,
+      "content",
+      " Start the list of chunks that will make up the current line.\n            # cur_len is just the length of all the chunks in cur_line.\n           "
+    ],
+    [
+      3.643197,
+      "content",
+      " cur_line = []\n            cur_len = 0\n\n            # Figure out"
+    ],
+    [
+      3.658562,
+      "content",
+      " which static string will prefix this line.\n            if lines:\n                indent"
+    ],
+    [
+      3.689988,
+      "content",
+      " = self.subsequent_indent\n            else:\n                indent = self.initial_indent"
+    ],
+    [
+      3.690067,
+      "content",
+      "\n\n"
+    ],
+    [
+      3.721029,
+      "content",
+      "            # Maximum width for this line.\n            width = self.width - len(indent)\n\n            # First chunk on line is whitespace -- drop it, unless"
+    ],
+    [
+      3.721093,
+      "content",
+      " this\n            # is the very beginning of the text (ie. no lines"
+    ],
+    [
+      3.751511,
+      "content",
+      " started yet).\n            if self.drop_whitespace and chunks[-1].strip()"
+    ],
+    [
+      3.751574,
+      "content",
+      " == '' and lines:\n                del chunks[-1]\n\n            while chunks"
+    ],
+    [
+      3.767111,
+      "content",
+      ":\n                l = len(chunks[-1])\n\n                # Can at"
+    ],
+    [
+      3.798054,
+      "content",
+      " least squeeze this chunk onto the current line.\n                if cur_len + l <= width:\n                    cur_line.append(chunks.pop())\n                    cur_len"
+    ],
+    [
+      3.798164,
+      "content",
+      " += l\n\n                # Nope, this line is full.\n                else:"
+    ],
+    [
+      3.829568,
+      "content",
+      "\n                    break\n\n            # The current line is full, and the next chunk"
+    ],
+    [
+      3.829638,
+      "content",
+      " is too big to\n            # fit on *any* line (not just"
+    ],
+    [
+      3.845049,
+      "content",
+      " this one).\n            if chunks and len(chunks[-1]) > width"
+    ],
+    [
+      3.876046,
+      "content",
+      ":\n                self._handle_long_word(chunks, cur_line, cur_len, width)\n                cur_len = sum(map(len, cur_line))\n\n"
+    ],
+    [
+      3.876156,
+      "content",
+      "            # If the last chunk on this line is all whitespace, drop it."
+    ],
+    [
+      3.908059,
+      "content",
+      "\n            if self.drop_whitespace and cur_line and cur_line[-1].strip"
+    ],
+    [
+      3.908172,
+      "content",
+      "() == '':\n                cur_len -= len(cur_line[-1])\n"
+    ],
+    [
+      3.940058,
+      "content",
+      "                del cur_line[-1]\n\n            if cur_line:\n                if ("
+    ],
+    [
+      3.940157,
+      "content",
+      "self.max_lines is None or\n                    len(lines) + 1 < self"
+    ],
+    [
+      3.972156,
+      "content",
+      ".max_lines or\n                    (not chunks or\n                     self.drop_whitespace and\n"
+    ],
+    [
+      3.972248,
+      "content",
+      "                     len(chunks) == 1 and\n                     not chunks[0]."
+    ],
+    [
+      3.988214,
+      "content",
+      "strip()) and cur_len <= width):\n                    # Convert current line back to"
+    ],
+    [
+      4.020091,
+      "content",
+      " a string and store it in\n                    # list of all lines (return value).\n                    lines.append(indent + ''.join(cur_line))\n                else:"
+    ],
+    [
+      4.020163,
+      "content",
+      "\n                    while cur_line:\n                        if (cur_line[-1].strip"
+    ],
+    [
+      4.036168,
+      "content",
+      "() and\n                            cur_len + len(self.placeholder) <= width):\n                           "
+    ],
+    [
+      4.067356,
+      "content",
+      " cur_line.append(self.placeholder)\n                            lines.append(indent + ''.join(cur_line"
+    ],
+    [
+      4.067471,
+      "content",
+      "))\n                            break\n                        cur_len -= len(cur_line[-1])\n                        del cur"
+    ],
+    [
+      4.098303,
+      "content",
+      "_line[-1]\n                    else:\n                        if lines:\n                            prev"
+    ],
+    [
+      4.09837,
+      "content",
+      "_line = lines[-1].rstrip()\n                            if (len(prev_line)"
+    ],
+    [
+      4.113342,
+      "content",
+      " + len(self.placeholder) <=\n                                    self.width):\n                                lines[-1"
+    ],
+    [
+      4.144908,
+      "content",
+      "] = prev_line + self.placeholder\n                                break\n                        lines.append(indent +"
+    ],
+    [
+      4.144972,
+      "content",
+      " self.placeholder.lstrip())\n                    break\n\n        return lines\n\n    def _"
+    ],
+    [
+      4.1769,
+      "content",
+      "split_chunks(self, text):\n        text = self._munge_whitespace(text)\n        return self._split(text)\n\n    # -- Public interface --------------------------------"
+    ],
+    [
+      4.176956,
+      "content",
+      "--------------\n\n    def wrap(self, text):\n        \"\"\"wrap(text : string"
+    ],
+    [
+      4.207904,
+      "content",
+      ") -> [string]\n\n        Reformat the single paragraph in 'text'"
+    ],
+    [
+      4.207974,
+      "content",
+      " so"
+    ],
+    [
+      4.239957,
+      "content",
+      " it fits in lines of\n        no more than 'self.width' columns, and return a list of wrapped"
+    ],
+    [
+      4.240021,
+      "content",
+      "\n"
+    ],
+    [
+      4.271819,
+      "content",
+      "        lines.  Tabs in 'text' are expanded with string.expandtabs(),"
+    ],
+    [
+      4.271881,
+      "content",
+      "\n"
+    ],
+    [
+      4.287702,
+      "content",
+      "        and all other whitespace characters (including newline) are\n        converted to space.\n        \"\"\"\n        chunks = self._split_chunks(text)\n       "
+    ],
+    [
+      4.318749,
+      "content",
+      " if self.fix_sentence_endings:\n            self._fix_sentence_endings(ch"
+    ],
+    [
+      4.318815,
+      "content",
+      "unks)\n        return self._wrap_chunks(chunks)\n\n    def fill"
+    ],
+    [
+      4.350193,
+      "content",
+      "(self, text):\n        \"\"\"fill(text : string) -> string\n\n       "
+    ],
+    [
+      4.350257,
+      "content",
+      " Re"
+    ],
+    [
+      4.381747,
+      "content",
+      "format the single paragraph in 'text' to fit in lines of no\n        more than 'self.width' columns, and return a new string\n        containing"
+    ],
+    [
+      4.381873,
+      "content",
+      " the entire wrapped paragraph.\n        \"\"\"\n        return \"\\n\".join(self"
+    ],
+    [
+      4.397241,
+      "content",
+      ".wrap(text))\n\n\n# -- Convenience interface ---------------------------------------------\n\ndef wrap(text, width"
+    ],
+    [
+      4.428243,
+      "content",
+      "=70, **kwargs):\n    \"\"\"Wrap a single paragraph of text"
+    ],
+    [
+      4.428308,
+      "content",
+      ", returning a list of wrapped lines.\n\n    Reformat the single paragraph in"
+    ],
+    [
+      4.460235,
+      "content",
+      " 'text' so it fits in lines of no"
+    ],
+    [
+      4.460292,
+      "content",
+      "\n    more than 'width' columns, and return a list of wrapped lines"
+    ],
+    [
+      4.491467,
+      "content",
+      ".  By\n    default, tabs in 'text' are expanded with string"
+    ],
+    [
+      4.491543,
+      "content",
+      ".expandtabs(), and"
+    ],
+    [
+      4.523508,
+      "content",
+      "\n    all other whitespace characters (including newline) are converted to\n    space"
+    ],
+    [
+      4.523621,
+      "content",
+      ".  See TextWrapper class for available keyword args to customize\n    wrapping behaviour.\n    \"\"\"\n    w = TextWrapper(width=width, **kwargs"
+    ],
+    [
+      4.55553,
+      "content",
+      ")\n    return w.wrap"
+    ],
+    [
+      4.555597,
+      "content",
+      "(text)\n\ndef fill(text, width=70, **kwargs):\n"
+    ],
+    [
+      4.587534,
+      "content",
+      "    \"\"\"Fill"
+    ],
+    [
+      4.587649,
+      "content",
+      " a single paragraph of text, returning a new string.\n\n    Reformat the single paragraph in 'text' to fit in lines of no more\n    than"
+    ],
+    [
+      4.603479,
+      "content",
+      " 'width' columns, and return a new string containing the entire\n    wrapped"
+    ],
+    [
+      4.635662,
+      "content",
+      " paragraph.  As with wrap(), tabs are expanded and other\n    whitespace characters"
+    ],
+    [
+      4.63578,
+      "content",
+      " converted to space.  See TextWrapper class for\n    available keyword args to"
+    ],
+    [
+      4.667017,
+      "content",
+      " customize wrapping behaviour.\n    \"\"\"\n    w = TextWrapper(width=width, **kwargs)\n    return w.fill"
+    ],
+    [
+      4.667079,
+      "content",
+      "(text"
+    ],
+    [
+      4.698554,
+      "content",
+      ")\n\ndef shorten(text, width, **kwargs):\n    \"\"\"Collapse and"
+    ],
+    [
+      4.698667,
+      "content",
+      " truncate the given text to fit in the given width.\n\n    The text first"
+    ],
+    [
+      4.730158,
+      "content",
+      " has its whitespace collapsed.  If it then fits in\n    the *width"
+    ],
+    [
+      4.730221,
+      "content",
+      "*, it is returned as is.  Otherwise, as many words\n    as possible are joined and then the placeholder is appended::\n\n        >>> textwrap.short"
+    ],
+    [
+      4.761913,
+      "content",
+      "en(\"Hello  world!\", width=12)\n        'Hello world"
+    ],
+    [
+      4.761972,
+      "content",
+      "!'\n        >>> textwrap.shorten(\"Hello  world!\", width=1"
+    ],
+    [
+      4.792947,
+      "content",
+      "1"
+    ],
+    [
+      4.793006,
+      "content",
+      ")\n        'Hello [...]'\n    \"\"\"\n    w = TextWrapper"
+    ],
+    [
+      4.809014,
+      "content",
+      "(width=width, max_lines=1, **kwargs)\n    return w.fill(' '.join(text"
+    ],
+    [
+      4.840118,
+      "content",
+      ".strip().split()))\n\n\n# -- Loosely related functionality -------------------------------------\n\n_whitespace"
+    ],
+    [
+      4.840183,
+      "content",
+      "_only_re = re.compile('^[ \\t]+$', re.MULTILINE)\n"
+    ],
+    [
+      4.871739,
+      "content",
+      "_leading_whitespace_re = re.compile('(^[ \\t]*)(?:[^ \\"
+    ],
+    [
+      4.871799,
+      "content",
+      "t\\n])', re.MULTILINE)\n\ndef dedent(text):\n    \"\"\"Remove any common leading whitespace from every line in `text`.\n\n    This"
+    ],
+    [
+      4.902657,
+      "content",
+      " can be used to make triple-quoted strings line up with the left\n   "
+    ],
+    [
+      4.902754,
+      "content",
+      " edge of the display, while still presenting them in the source code\n    in"
+    ],
+    [
+      4.93371,
+      "content",
+      " indented form.\n\n    Note that tabs and spaces are both treated as whitespace"
+    ],
+    [
+      4.933781,
+      "content",
+      ", but they\n    are not equal: the lines \"  hello\" and"
+    ],
+    [
+      4.949714,
+      "content",
+      " \"\\\\thello\" are\n    considered to have no common leading whitespace.\n\n"
+    ],
+    [
+      4.981276,
+      "content",
+      "    Entirely blank lines are normalized to a newline character.\n    \"\"\"\n    # Look for the longest leading string of spaces and tabs common to\n   "
+    ],
+    [
+      4.981343,
+      "content",
+      " # all lines.\n    common"
+    ],
+    [
+      5.012809,
+      "content",
+      "_margin = None\n    text = _"
+    ],
+    [
+      5.012872,
+      "content",
+      "whitespace_only_re.sub('', text)\n    indents = _leading_whitespace_re.findall(text)\n    for indent in indents:\n        if common"
+    ],
+    [
+      5.044886,
+      "content",
+      "_margin is None:\n            common_margin"
+    ],
+    [
+      5.044958,
+      "content",
+      " = indent\n\n        # Current"
+    ],
+    [
+      5.076855,
+      "content",
+      " line more deeply indented than previous winner"
+    ],
+    [
+      5.076913,
+      "content",
+      ":\n        # no change (previous winner is still on top).\n        elif indent.startswith(common"
+    ],
+    [
+      5.108802,
+      "content",
+      "_margin):\n            pass\n\n        #"
+    ],
+    [
+      5.108865,
+      "content",
+      " Current line consistent with and no deeper than previous winner:\n        # it's"
+    ],
+    [
+      5.141419,
+      "content",
+      " the new winner.\n        elif common_margin.startswith(indent):\n            common_margin"
+    ],
+    [
+      5.141484,
+      "content",
+      " = indent\n\n        # Find"
+    ],
+    [
+      5.15685,
+      "content",
+      " the largest common whitespace between current line and previous\n        # winner.\n        else:\n            for i, ("
+    ],
+    [
+      5.188347,
+      "content",
+      "x, y) in enumerate(zip(common"
+    ],
+    [
+      5.188459,
+      "content",
+      "_margin, indent)):\n               "
+    ],
+    [
+      5.22038,
+      "content",
+      " if x != y:\n                    common_margin = common_margin[:i]\n"
+    ],
+    [
+      5.220453,
+      "content",
+      "                    break\n\n    # sanity check ("
+    ],
+    [
+      5.252376,
+      "content",
+      "testing/debugging only)\n    if 0 and common_margin:\n        for"
+    ],
+    [
+      5.252495,
+      "content",
+      " line in text.split(\"\\n\"):\n"
+    ],
+    [
+      5.283151,
+      "content",
+      "            assert not line or line.startswith(common"
+    ],
+    [
+      5.283207,
+      "content",
+      "_margin), \\\n                   \"line ="
+    ],
+    [
+      5.330237,
+      "content",
+      " %r, common"
+    ],
+    [
+      5.330325,
+      "content",
+      "_margin = %r\" % (line"
+    ],
+    [
+      5.330347,
+      "content",
+      ", common_margin)\n\n    if common_margin:"
+    ],
+    [
+      5.3622,
+      "content",
+      "\n        text = re"
+    ],
+    [
+      5.362297,
+      "content",
+      ".sub(r'(?m)^' +"
+    ],
+    [
+      5.393707,
+      "content",
+      " common_margin, '', text)\n   "
+    ],
+    [
+      5.393831,
+      "content",
+      " return text\n\n\ndef indent(text, prefix"
+    ],
+    [
+      5.425717,
+      "content",
+      ", predicate=None):\n    \"\"\"Adds 'prefix' to the beginning of selected"
+    ],
+    [
+      5.425782,
+      "content",
+      " lines in 'text'.\n\n    If 'predicate' is provided, 'prefix"
+    ],
+    [
+      5.441775,
+      "content",
+      "' will only be added to the lines\n    where 'predicate(line)' is True. If 'predicate' is not provided,\n    it will default to"
+    ],
+    [
+      5.471995,
+      "content",
+      " adding 'prefix' to all non-empty lines that do not\n    consist solely"
+    ],
+    [
+      5.472056,
+      "content",
+      " of whitespace characters.\n    \"\"\"\n    if predicate is None:\n       "
+    ],
+    [
+      5.503795,
+      "content",
+      " def predicate(line):\n            return line.strip()\n\n    def prefixed_lines():"
+    ],
+    [
+      5.503867,
+      "content",
+      "\n        for line in text.splitlines(True):\n            yield (prefix + line if predicate(line) else line)\n    return ''.join(prefixed_lines"
+    ],
+    [
+      5.534792,
+      "content",
+      "())\n\n\nif __name__ == \"__main__\":\n    #print ded"
+    ],
+    [
+      5.534856,
+      "content",
+      "ent(\"\\tfoo\\n\\tbar\")\n    #print dedent(\" "
+    ],
+    [
+      5.555602,
+      "content",
+      " \\thello there\\n  \\t  how are you?\")\n   "
+    ],
+    [
+      5.555668,
+      "content",
+      " print(dedent(\"Hello there.\\n  This is indented.\"))"
+    ]
+  ],
+  "trial": 1
+}

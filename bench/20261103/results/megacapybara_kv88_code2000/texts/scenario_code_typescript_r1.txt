@@ -1,0 +1,271 @@
+```typescript
+// package.json
+{
+  "name": "metrics-service",
+  "version": "1.0.0",
+  "description": "Newline-delimited request metrics service with validation, grouping, and statistics",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "jest --coverage"
+  },
+  "keywords": ["metrics", "statistics", "service"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "typescript": "^5.3.3"
+  }
+}
+```
+
+```json
+// tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "lib": ["ES2020"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "sourceMap": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}
+```
+
+```typescript
+// src/types.ts
+export interface RequestMetric {
+  id: string;
+  timestamp: number;
+  model: string;
+  fixture: string;
+  latencyMs: number;
+  status: number;
+  bytes: number;
+}
+
+export interface MetricGroup {
+  model: string;
+  fixture: string;
+  count: number;
+  mean: number;
+  median: number;
+  sampleStdDev: number;
+  minLatency: number;
+  maxLatency: number;
+  totalBytes: number;
+  errorCount: number;
+}
+
+export interface SummaryResponse {
+  totalRecords: number;
+  groups: MetricGroup[];
+  generatedAt: number;
+}
+
+export interface RunResponse {
+  id: string;
+  records: RequestMetric[];
+  stats: {
+    count: number;
+    mean: number;
+    median: number;
+    sampleStdDev: number;
+  };
+}
+
+export interface HealthResponse {
+  status: 'ok' | 'degraded';
+  memoryUsedMB: number;
+  recordCount: number;
+  uptimeSeconds: number;
+}
+
+export class MalformedInputError extends Error {
+  public readonly line: number;
+  public readonly rawLine: string;
+  public readonly reason: string;
+
+  constructor(line: number, rawLine: string, reason: string) {
+    super(`Malformed input at line ${line}: ${reason}`);
+    this.name = 'MalformedInputError';
+    this.line = line;
+    this.rawLine = rawLine;
+    this.reason = reason;
+  }
+}
+```
+
+```typescript
+// src/parser.ts
+import { RequestMetric, MalformedInputError } from './types';
+
+const MAX_LINE_LENGTH = 10_000;
+const MAX_RECORDS_IN_MEMORY = 100_000;
+
+export class MetricsParser {
+  private recordCount: number = 0;
+  private buffer: string = '';
+
+  /**
+   * Parse a single newline-delimited line into a RequestMetric.
+   * Expected format: id|timestamp|model|fixture|latencyMs|status|bytes
+   */
+  public parseLine(line: number, rawLine: string): RequestMetric {
+    const trimmed = rawLine.trim();
+
+    if (trimmed.length === 0) {
+      throw new MalformedInputError(line, rawLine, 'Empty line');
+    }
+
+    if (trimmed.length > MAX_LINE_LENGTH) {
+      throw new MalformedInputError(line, rawLine, `Line exceeds maximum length of ${MAX_LINE_LENGTH} characters`);
+    }
+
+    const parts = trimmed.split('|');
+
+    if (parts.length !== 7) {
+      throw new MalformedInputError(
+        line,
+        rawLine,
+        `Expected 7 fields separated by '|', got ${parts.length}`
+      );
+    }
+
+    const [idStr, timestampStr, model, fixture, latencyStr, statusStr, bytesStr] = parts;
+
+    // Validate ID
+    if (!idStr || idStr.trim().length === 0) {
+      throw new MalformedInputError(line, rawLine, 'ID field is empty');
+    }
+    if (idStr.length > 64) {
+      throw new MalformedInputError(line, rawLine, 'ID field exceeds 64 characters');
+    }
+
+    // Validate timestamp
+    const timestamp = Number(timestampStr);
+    if (!Number.isFinite(timestamp) || timestamp < 0) {
+      throw new MalformedInputError(line, rawLine, `Invalid timestamp: "${timestampStr}"`);
+    }
+
+    // Validate model
+    if (!model || model.trim().length === 0) {
+      throw new MalformedInputError(line, rawLine, 'Model field is empty');
+    }
+    if (model.length > 128) {
+      throw new MalformedInputError(line, rawLine, 'Model field exceeds 128 characters');
+    }
+
+    // Validate fixture
+    if (!fixture || fixture.trim().length === 0) {
+      throw new MalformedInputError(line, rawLine, 'Fixture field is empty');
+    }
+    if (fixture.length > 128) {
+      throw new MalformedInputError(line, rawLine, 'Fixture field exceeds 128 characters');
+    }
+
+    // Validate latency
+    const latencyMs = Number(latencyStr);
+    if (!Number.isFinite(latencyMs) || latencyMs < 0) {
+      throw new MalformedInputError(line, rawLine, `Invalid latency: "${latencyStr}"`);
+    }
+
+    // Validate status
+    const status = Number(statusStr);
+    if (!Number.isInteger(status) || status < 100 || status > 599) {
+      throw new MalformedInputError(line, rawLine, `Invalid HTTP status: "${statusStr}"`);
+    }
+
+    // Validate bytes
+    const bytes = Number(bytesStr);
+    if (!Number.isFinite(bytes) || bytes < 0) {
+      throw new MalformedInputError(line, rawLine, `Invalid bytes: "${bytesStr}"`);
+    }
+
+    return {
+      id: idStr.trim(),
+      timestamp,
+      model: model.trim(),
+      fixture: fixture.trim(),
+      latencyMs,
+      status,
+      bytes,
+    };
+  }
+
+  /**
+   * Incrementally feed data into the parser. Returns an array of successfully parsed metrics
+   * and any errors encountered. Handles partial lines across chunks.
+   */
+  public feed(chunk: string): { metrics: RequestMetric[]; errors: MalformedInputError[] } {
+    const metrics: RequestMetric[] = [];
+    const errors: MalformedInputError[] = [];
+
+    this.buffer += chunk;
+
+    let lineStart = 0;
+    let lineIndex = 1;
+
+    while (true) {
+      const newlineIdx = this.buffer.indexOf('\n', lineStart);
+      if (newlineIdx === -1) {
+        break;
+      }
+
+      const rawLine = this.buffer.substring(lineStart, newlineIdx);
+      lineStart = newlineIdx + 1;
+
+      try {
+        const metric = this.parseLine(lineIndex, rawLine);
+        metrics.push(metric);
+        this.recordCount++;
+      } catch (err) {
+        if (err instanceof MalformedInputError) {
+          errors.push(err);
+        } else {
+          errors.push(new MalformedInputError(lineIndex, rawLine, 'Unexpected parsing error'));
+        }
+      }
+
+      lineIndex++;
+    }
+
+    // Keep only the incomplete trailing line in the buffer
+    this.buffer = this.buffer.substring(lineStart);
+
+    return { metrics, errors };
+  }
+
+  public getRecordCount(): number {
+    return this.recordCount;
+  }
+
+  public reset(): void {
+    this.buffer = '';
+    this.recordCount = 0;
+  }
+}
+```
+
+```typescript
+// src/statistics.ts
+import { RequestMetric, MetricGroup } from './types';
+
+export

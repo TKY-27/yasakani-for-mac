@@ -1,0 +1,157 @@
+We need answer user: "Return one PostgreSQL script with no Markdown fences. Define normalized tables for models, fixtures, runs, and request_metrics; include primary/foreign keys, checks, useful indexes, two views, one transaction-safe upsert function, and at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. The script must run in dependency order."
+
+Need produce final only PostgreSQL script no markdown fences. Need include DROP? likely yes to be runnable multiple times? Dependency order. Need normalized tables: models, fixtures, runs, request_metrics. Need primary/foreign keys, checks, useful indexes. two views. one transaction-safe upsert function. at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Script must run in dependency order.
+
+Need craft SQL. Consider PostgreSQL specifics.
+
+We need likely create schema, drop existing if exists in reverse dependency. Use CREATE TABLE IF NOT EXISTS? If dropping then create.
+
+Tables:
+models (model_id pk, name unique, family, context_length, num_params, created_at maybe). checks context_length >0, num_params >0.
+fixtures (fixture_id pk, name, kind, num_tokens, temperature, max_tokens? checks kind in ('short','medium','long','streaming')? But "four fixture kinds". Need spans two models and four fixture kinds in INSERT rows. Could have fixtures table with kind: short, medium, long, mixed? Need at least 80 rows spanning two models and four fixture kinds. Could mean request_metrics rows or runs? "INSERT rows spanning two models and four fixture kinds" likely rows in runs or request_metrics. Need realistic. Maybe insert 4 fixtures of each kind? And 80 run_metric rows across two models and four fixture kinds. Need normalized: runs references model and fixture, request_metrics references run maybe per request.
+
+Normalized tables:
+- models: model_id serial, model_name, context_length, etc.
+- fixtures: fixture_id serial, fixture_name, fixture_kind, num_input_tokens, num_output_tokens, temperature, top_p? checks.
+- runs: run_id serial, model_id fk, fixture_id fk, experiment_name, started_at, ended_at, status check, seed maybe, prompt_tokens_avg? But metrics in request_metrics.
+- request_metrics: metric_id serial, run_id fk, request_seq, status (success, timeout, error) check, latency_ms, ttfb_ms, tokens_generated, prompt_tokens, mtp_accepted? MTP acceptance maybe accepted_draft_tokens / proposed_draft_tokens? For speculative decoding? Need MTP acceptance: maybe model test proposal? Let's define mtp_proposed_tokens, mtp_accepted_tokens, with check accepted <= proposed. Could include per request metrics.
+
+Need useful indexes: model_id, fixture_id, run_id, fixture_kind via index? Can't directly index fixture.kind in runs but can index in fixtures. Use partial? Index runs(model_id, fixture_id), request_metrics(run_id, request_seq unique?), status, latency. request_metrics: unique(run_id, request_seq). index by model? Need via join. Could add generated column? Maybe create index on request_metrics(run_id) and request_metrics(mtp_accepted_ratio?) Not necessary.
+
+Two views:
+1. run_summary: join runs, models, fixtures aggregate metrics: avg_latency, p95? maybe count, total tokens, throughput, mtp_accept_rate, error_rate. Use percentile_cont maybe.
+2. fixture_model_performance: group by model, fixture_kind, aggregate.
+
+One transaction-safe upsert function: function upsert_request_metrics(p_run_id, p_request_seq, p_status, p_latency_ms, p_ttfb_ms, p_prompt_tokens, p_tokens_generated, p_mtp_proposed_tokens, p_mtp_accepted_tokens) returns int. Should use ON CONFLICT(run_id, request_seq) DO UPDATE. It must be transaction-safe: called within transaction, maybe validate run exists, constraints. Use EXCEPTION? Need transaction-safe? Could mean uses ON CONFLICT and not delete. Maybe function with SERIALIZABLE? We can write:
+CREATE OR REPLACE FUNCTION upsert_request_metrics(...) RETURNS INT AS $$ ... DECLARE row; BEGIN PERFORM ... run must exist? If not raise exception. UPDATE/INSERT. RETURN NEW.metric_id; END $$ LANGUAGE plpgsql;
+But if called after INSERT in same transaction with uncommitted run? Need allow. Could just insert.
+Need ensure constraints checks. Use INSERT ... ON CONFLICT DO UPDATE SET ... RETURNING metric_id.
+Need maybe p_mtp_accepted_tokens check. If p_mtp_proposed_tokens null then accepted null. Add checks in function: if p_mtp_accepted_tokens <0 etc.
+
+At least 80 realistic INSERT rows spanning two models and four fixture kinds. We can insert models (2), fixtures (maybe 8: 2 per kind), runs (maybe 16: 2 models x 4 fixtures? need 80 metrics? If request_metrics rows at least 80. Could make 80 request_metrics rows: 2 models x 4 fixture kinds x 5 runs? Hmm. Need "INSERT rows" maybe total across tables? It says "and at least 80 realistic INSERT rows spanning two models and four fixture kinds." Likely request_metrics rows. To be safe, ensure request_metrics has 80 rows. Also runs maybe 16. We can do 80 request metrics with 16 runs x 5 requests = 80. Span two models and four fixture kinds: If fixtures are 4 kinds (one fixture per kind? but maybe multiple per kind). Runs: each model with each of 4 fixture kinds. Could have 2 models x 4 fixtures = 8 runs; need 80 metrics = 10 requests each. Or 2 models x 4 fixtures x 5 runs x 4 requests = 160? Too many. Need generate script not too massive. 80 rows can be explicit. But final answer length maybe big. Need realistic INSERT rows. Could insert 16 runs (2 models * 4 fixtures * 2 runs? but four fixture kinds means maybe one fixture kind per fixture, 2 fixtures per kind? If 8 fixtures, 16 runs (2 models*8 fixtures) and 5 metrics each? That's 80. Good: fixtures: 8 fixtures (two per kind? but "four fixture kinds" means kinds present. Could have 4 fixtures one per kind and 16 runs? Need 80 metrics: 16 runs x 5 = 80. But if only 4 fixtures, two models => 8 runs. Could have 10 requests each =80. Simpler: 4 fixtures (one per kind), 2 models => 8 runs, 10 metrics per run = 80. But "spanning two models and four fixture kinds" yes. Could use multiple fixture kinds. We need normalized tables: fixtures table can have multiple fixture rows, but 4 is enough. But "four fixture kinds" likely exactly 4 kinds. Use fixture_kind check IN ('short','medium','long','long_stream') or 'short','chat','long','streaming'. Need long-context retention: maybe fixture kinds: 'short', 'medium', 'long', 'streaming'. For long-context retention query maybe need input tokens. We can use fixture_kind='long' or input tokens > threshold. Need MTP acceptance: request_metrics mtp columns.
+
+Need analytical SELECT queries:
+1. throughput: tokens per second per model and fixture kind? Throughput = total tokens generated / sum durations? We need duration. Runs have started_at, ended_at. Could use request metrics sum tokens / (max(end)-min(start))? Or average latency: tokens_generated / latency_ms * 1000. Query: model, fixture_kind, avg tokens per second: SUM(tokens_generated)/SUM(latency_ms)*1000 maybe if latency is total request latency. Or throughput over run: tokens / run duration. Need realistic. Use request_metrics latency_ms per request; token throughput = SUM(tokens_generated)/(SUM(latency_ms)/1000). For successful only. Good.
+2. variability: latency variability per model/fixture kind: stddev/mean (coefficient of variation), p95, p50. Query using percentile_cont.
+3. long-context retention: compare accuracy/quality? Need metrics maybe not include accuracy. Could measure retention via latency? Hmm "long-context retention" in LLM evals often answer correctness on long context. Could add a metric in request_metrics: retrieval_recall or answer_correct? Normalized request_metrics can include correctness_score check 0-1. Then long-context retention query: for long fixtures, average correctness by input token bucket or position? Need realistic. Maybe include fixture input_tokens, and request_metrics has correctness_score. Then query: model, fixture_kind='long', avg correctness, maybe compare to short baseline. Or "retention decay": avg correctness for long context relative to short baseline. Need six queries total: throughput, variability, long-context retention, MTP acceptance. Could have multiple queries covering these. Need finish with six analytical SELECT queries. Need exact six SELECT statements. They can be separate queries.
+
+Need include six analytical queries maybe:
+1. Model x fixture_kind throughput (tokens/sec).
+2. Latency variability (p50/p95/mean/std/cov) model x fixture_kind.
+3. Long-context retention: average correctness_score for long fixture and context token bucket (or input token quartile) maybe by model.
+4. Long-context retention degradation: compare long vs short average correctness by model.
+5. MTP acceptance: proposed, accepted, accept rate by model and fixture kind.
+6. MTP acceptance over request sequence or per run? Maybe acceptance by model and fixture kind with tokens saved = accepted_tokens? Or acceptance by request length bucket.
+But requirement: "for throughput, variability, long-context retention, and MTP acceptance." Six queries can cover all.
+
+Need ensure queries valid after data. Use views? Can use view run_summary for some queries, but six analytical SELECT queries maybe use views or base tables.
+
+Need no markdown fences. Just script. Ensure semicolons.
+
+Potential issues: PostgreSQL syntax: create index, view, function. Use DROP VIEW IF EXISTS; DROP FUNCTION IF EXISTS; DROP TABLE IF EXISTS in reverse order. Use serial or bigint identity. Need maybe SET search_path? Not necessary. Use IF NOT EXISTS? Since drop first. Use CREATE TABLE.
+
+Let's design schema:
+
+BEGIN;
+DROP VIEW IF EXISTS v_run_summary;
+DROP VIEW IF EXISTS v_model_fixture_perf;
+DROP FUNCTION IF EXISTS upsert_request_metrics(...);
+DROP TABLE IF EXISTS request_metrics;
+DROP TABLE IF EXISTS runs;
+DROP TABLE IF EXISTS fixtures;
+DROP TABLE IF EXISTS models;
+
+But dropping function with args. Need define function after tables? If dropping before table? function depends on table but can drop function first. Use DROP FUNCTION IF EXISTS upsert_request_metrics(bigint,int,text,numeric,numeric,int,int,int,int) maybe. But if function didn't exist no issue. But parameter types need exact? Could omit? DROP FUNCTION IF EXISTS upsert_request_metrics(...); We can choose types. Or use CREATE OR REPLACE after tables. If running multiple times, DROP TABLE may fail if function depends? No, function doesn't prevent table drop? Actually dropping table used in function? In PostgreSQL, if a table is dropped, functions that reference it may become broken? I think it's allowed? It may complain? Better drop function first. But if we drop function before table, okay. Need match function signature for drop. We can define with specific types. Or not drop function, use CREATE OR REPLACE. But if schema changes? Could just CREATE OR REPLACE after tables; no need drop. But to ensure dependency order and re-run, dropping tables after function could break? If function references table and table dropped, PostgreSQL maybe leaves function but error? Let's verify: If drop table used by function? In PG, dependencies: function depends on table? I think function doesn't depend on table for SQL? PL/pgSQL function body may reference table; dependency might exist? DROP TABLE would fail if function depends on it? Actually in Postgres, functions have dependencies on referenced tables? I think yes maybe. So drop function first. We'll define function signature and drop with same.
+
+Alternative: Use DROP SCHEMA CASCADE? But user wants tables.
+
+Function signature:
+CREATE OR REPLACE FUNCTION upsert_request_metrics(
+  p_run_id bigint,
+  p_request_seq int,
+  p_status text,
+  p_latency_ms numeric,
+  p_ttfb_ms numeric,
+  p_prompt_tokens int,
+  p_tokens_generated int,
+  p_mtp_proposed_tokens int,
+  p_mtp_accepted_tokens int
+) RETURNS bigint
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM runs WHERE run_id = p_run_id) THEN
+     RAISE EXCEPTION 'run % not found', p_run_id;
+  END IF;
+  IF p_request_seq < 1 THEN RAISE EXCEPTION...;
+  IF p_status NOT IN ('success','error','timeout') THEN ...;
+  IF p_latency_ms < 0 OR p_ttfb_ms < 0 ...;
+  IF p_tokens_generated <0 ...
+  IF p_mtp_accepted_tokens IS NOT NULL AND (p_mtp_proposed_tokens IS NULL OR p_mtp_accepted_tokens > p_mtp_proposed_tokens OR p_mtp_accepted_tokens < 0) ...
+  RETURN (INSERT INTO request_metrics (...) VALUES (...) ON CONFLICT (run_id, request_seq) DO UPDATE SET ... RETURNING metric_id).metric_id? In PL/pgSQL: RETURN INSERT ... RETURNING metric_id; Works? Yes: RETURN (SELECT ...)? Actually plpgsql supports RETURN INTO? For scalar: RETURN (INSERT ... RETURNING metric_id).metric_id; Or use GET DIAG? Simpler:
+  RETURN (INSERT INTO request_metrics (...) VALUES (...) ON CONFLICT ... DO UPDATE SET ... RETURNING metric_id).metric_id;
+But if ON CONFLICT DO UPDATE, RETURNING returns updated row. Good.
+END $$;
+Need transaction-safe: It's atomic. Maybe add exception handler? "transaction-safe" could mean uses SAVEPOINT? Hmm. Could create function that wraps in a savepoint? But PL/pgSQL exception handler rolls back to savepoint, may be considered transaction-safe. But simple ON CONFLICT is atomic. To be explicit, maybe use PERFORM; no need.
+
+Could include p_status default? no.
+
+Need request_metrics columns:
+metric_id bigint generated always as identity primary key? Use bigint GENERATED ALWAYS AS IDENTITY.
+run_id bigint NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE.
+request_seq int NOT NULL CHECK >=1.
+status text NOT NULL DEFAULT 'success' CHECK in ...
+latency_ms numeric(10,2) NOT NULL CHECK >=0; total wall-clock? ttfb_ms numeric(10,2) CHECK (IS NULL OR >=0). prompt_tokens int NOT NULL CHECK >=0. tokens_generated int NOT NULL CHECK >=0. mtp_proposed_tokens int CHECK (IS NULL OR >=0); mtp_accepted_tokens int CHECK (IS NULL OR >=0 AND (mtp_proposed_tokens IS NULL OR mtp_accepted_tokens <= mtp_proposed_tokens)); correctness_score numeric(4,3) CHECK (IS NULL OR >=0 AND <=1); recorded_at timestamptz NOT NULL DEFAULT now().
+UNIQUE(run_id, request_seq).
+Index: idx_request_metrics_run_seq (run_id, request_seq) unique. idx_request_metrics_status (status). idx_request_metrics_latency (latency_ms). idx_request_metrics_mtp (mtp_proposed_tokens, mtp_accepted_tokens)? Maybe for acceptance. Could include generated? Not needed.
+
+runs:
+run_id bigint identity pk.
+model_id bigint NOT NULL REFERENCES models(model_id) ON DELETE CASCADE.
+fixture_id bigint NOT NULL REFERENCES fixtures(fixture_id) ON DELETE CASCADE.
+experiment_name text NOT NULL default 'default'
+seed int check?
+started_at timestamptz NOT NULL DEFAULT now()
+ended_at timestamptz
+status text NOT NULL CHECK IN ('completed','running','failed','cancelled')
+notes text
+CHECK (ended_at IS NULL OR ended_at >= started_at)
+Index runs_model_id, runs_fixture_id, runs_status.
+
+fixtures:
+fixture_id identity pk.
+fixture_name text NOT NULL UNIQUE.
+fixture_kind text NOT NULL CHECK IN ('short','medium','long','streaming') -- four kinds.
+input_tokens int NOT NULL CHECK >=0.
+output_tokens int NOT NULL CHECK >=0.
+temperature numeric(3,2) NOT NULL DEFAULT 0.0 CHECK >=0 and <=2? maybe <=2.
+top_p numeric(3,2) CHECK NULL OR (0,1]? Use CHECK (top_p IS NULL OR (top_p > 0 AND top_p <= 1)).
+prompt_template? no.
+created_at timestamptz default now.
+Index fixture_kind, input_tokens.
+
+models:
+model_id identity pk.
+model_name text NOT NULL UNIQUE.
+provider text NOT NULL? check maybe.
+context_length int NOT NULL CHECK >0.
+param_count int NOT NULL CHECK >0.
+quantization text default 'fp16'
+created_at.
+Index model_name? unique.
+
+Views:
+v_run_summary:
+SELECT r.run_id, m.model_name, f.fixture_name, f.fixture_kind, r.status, r.started_at, r.ended_at,
+COUNT(mq.metric_id) AS request_count,
+COUNT(*) FILTER (WHERE mq.status='success') AS successful_requests,
+AVG(mq.latency_ms) AS avg_latency_ms,
+PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY mq.latency_ms) AS p50_latency_ms,
+PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY mq.latency_ms) AS p95_latency_ms,
+SUM(mq.tokens_generated) FILTER (WHERE mq.status='success') AS total_generated_tokens,
+SUM(mq.tokens_generated) FILTER (WHERE mq.status='success') / NULLIF(SUM(mq.latency_ms) FILTER (WHERE mq.status='success'), 0) * 1000 AS tokens_per_sec,
+SUM(mq.mtp_accepted_tokens) FILTER (WHERE mq.status='success' AND mq.mtp_proposed_tokens > 0) AS mtp_accepted_tokens,
+SUM(mq.mtp_proposed_tokens) FILTER (WHERE mq.status='success' AND mq.mtp_proposed_tokens > 0) AS mtp_proposed_tokens,
+CASE WHEN SUM(mq.mtp_proposed_tokens) FILTER ... >0 THEN SUM(mq.mtp_accepted_tokens) FILTER ... / SUM(...) ELSE NULL END AS mtp_accept_rate
+FROM runs r JOIN models m ... JOIN fixtures f ... LEFT JOIN request_metrics mq ...
+GROUP BY r.run_id, m.model_name, f.fixture_name, f.fixture_kind, r.status, r.started_at, r.ended_at;
+Need check numeric division: SUM int maybe numeric? int/int yields numeric? In PG int / int -> numeric?

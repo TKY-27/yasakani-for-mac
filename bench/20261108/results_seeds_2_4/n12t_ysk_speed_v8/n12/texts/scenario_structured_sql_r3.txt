@@ -1,0 +1,190 @@
+We need answer user: "Return one PostgreSQL script with no Markdown fences. Define normalized tables for models, fixtures, runs, and request_metrics; include primary/foreign keys, checks, useful indexes, two views, one transaction-safe upsert function, and at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. The script must run in dependency order."
+
+Need produce final only PostgreSQL script, no markdown fences. Need include normalized tables: models, fixtures, runs, request_metrics. PK/FK checks, useful indexes, two views, one transaction-safe upsert function, at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Script must run in dependency order.
+
+Need craft SQL. Consider PostgreSQL syntax. Need no fences. Could start with BEGIN? Since transaction-safe upsert function. Need dependency order: create tables, constraints, indexes, views, function, inserts? Typically DDL then function then inserts then queries. But "Finish with six analytical SELECT queries" means script ends with selects. Need at least 80 INSERT rows spanning two models and four fixture kinds. Could be request_metrics rows? Or runs? It says normalized tables for models, fixtures, runs, request_metrics; include at least 80 realistic INSERT rows spanning two models and four fixture kinds. Could be rows across tables total? Likely request_metrics at least 80. To be safe insert models 2, fixtures 4, runs maybe 8 or 16, request_metrics 80+. Need realistic: model names, fixture kinds (maybe 'short_chat', 'long_doc', 'rag', 'streaming'?); spans two models and four fixture kinds. Need metrics: maybe request_id, run_id, token_in, token_out, latency_ms, queue_ms, ttft_ms, itl_ms, mtp_acceptance_rate? Need MTP acceptance: multi-token prediction acceptance rate. Throughput: tokens per second. Variability: stddev. Long-context retention: accuracy by context length? Need columns to support: context_len, output_len, total tokens, latency, status, error, maybe retention_score? MTP acceptance: accepted_speculative_tokens / proposed? Could store mtp_proposed, mtp_accepted, mtp_acceptance_rate. Need queries: six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Need include all four categories, perhaps:
+1 Throughput by model/fixture: avg output tokens/s, total tokens.
+2 Throughput by context bucket? Or model comparison.
+3 Variability: stddev latency/ttft by model fixture.
+4 Variability: coefficient of variation p95? Maybe one query.
+5 Long-context retention: retention score by context bucket and model.
+6 MTP acceptance: acceptance rate by model/fixture, correlation with output length?
+Need exactly six SELECTs. "Finish with six analytical SELECT queries" likely last six statements are SELECT. Could have previous INSERTs, function. Need ensure script run: If views before inserts? dependency order: create tables, indexes, function, inserts, views? Views can be before or after inserts; dependency on tables. But if function upsert depends on tables. We can create views after inserts? Not necessary. To run dependency order: BEGIN; create tables, constraints, indexes, views, function, inserts, commit; SELECTs after commit? If entire script transaction? If we do BEGIN and then SELECTs after COMMIT okay. But if script run as psql, BEGIN; ... COMMIT; then selects. Transaction-safe upsert function: should use ON CONFLICT? "transaction-safe upsert function" likely function that upserts request_metrics row atomically, maybe uses ON CONFLICT DO UPDATE and SERIALIZABLE? In function can use EXECUTE ON CONFLICT. Need transaction-safe: maybe function called within transaction, but we can define a function that uses ON CONFLICT and returns row; no explicit BEGIN inside function? PostgreSQL functions are transactional. To be safe, function uses ON CONFLICT and handles errors? Could be:
+CREATE OR REPLACE FUNCTION upsert_request_metric(... ) RETURNS request_metrics LANGUAGE plpgsql AS $$
+DECLARE result request_metrics;
+BEGIN
+  INSERT INTO request_metrics (...) VALUES (...)
+  ON CONFLICT (run_id, seq) DO UPDATE SET ...
+  RETURNING * INTO result;
+  RETURN result;
+END $$;
+Need PK for request_metrics maybe (run_id, seq) or request_uuid. If upsert by run_id and seq. Need normalized: models(model_id PK), fixtures(fixture_id PK), runs(run_id PK, model_id FK, fixture_id FK), request_metrics(metric_id or run_id seq). Use request_metrics PK (run_id, seq) or id. For upsert, ON CONFLICT (run_id, seq) is easy.
+
+Need at least 80 realistic INSERT rows. We can generate 2 models * 4 fixtures * 10 runs * ? metrics? If runs 16, each 5 metrics = 80. But spans two models and four fixture kinds: 2*4=8 combinations. Need 10 metrics each = 80. Could insert 20 runs? Let's design:
+models:
+(1,'Llama-3.1-8B-Instruct','Qwen? no', '8b'), (2,'GPT-OSS-20B'?) Maybe realistic open models: 'Llama-3.1-8B-Instruct', 'Qwen2.5-7B-Instruct'. Two models.
+fixtures:
+(1,'short_chat','short chat'), (2,'long_doc','long context document QA'), (3,'rag_multihop','retrieval augmented multi-hop'), (4,'streaming_tool','streaming tool-call'). Four kinds.
+runs: 8? each model+fixture = 8 runs. request_metrics: 10 per run = 80. Good. Need realistic numbers. Could use INSERT with generated values? Must be explicit? "INSERT rows" maybe explicit rows. 80 explicit is long but okay. Could use generate_series? It says at least 80 realistic INSERT rows. Maybe they expect literal rows? Could use single INSERT with 80 values. That's okay. But "realistic INSERT rows" maybe literal. Need ensure 80 rows. Could do 80 request_metrics rows, plus other tables. Need maybe total 80? We'll make 80 request_metrics plus 2+4+8=14 total. Good.
+
+Need useful indexes: models? models small. fixtures. runs index model_id, fixture_id, maybe started_at. request_metrics indexes: (run_id, seq), (run_id, status), (context_len), (latency_ms), maybe (run_id, mtp_accepted) etc. Could create unique constraint.
+
+Need checks:
+- models: param_count numeric >0, context_limit int >0? maybe max_position_embeddings.
+- fixtures: fixture_kind text check in ('short_chat','long_doc','rag_multihop','streaming_tool'), tokens_min/tokens_max positive, tokens_min <= tokens_max.
+- runs: batch_size int >0, max_batch? started_at/timestamp? maybe gpu_model text. check tokens? status? Maybe started_at < finished_at? If finished_at null okay. Use CHECK (finished_at IS NULL OR finished_at >= started_at).
+- request_metrics: seq >0, token_in >0? maybe >=0; token_out >=0; latency_ms >=0; ttft_ms >=0; itl_ms >=0; queue_ms >=0; context_len >=0; status text in ('ok','error','timeout'); error_code?; mtp_proposed >=0; mtp_accepted >=0; check mtp_accepted <= mtp_proposed? if mtp_proposed =0 accepted=0. retention_score numeric check between 0 and 1? For long-context retention. Could have retention_score null for non-long? But check if not null between 0 and1. Use CHECK (retention_score IS NULL OR retention_score >=0 AND retention_score <=1). mtp_acceptance_rate maybe derived? Could store mtp_acceptance_rate check 0..1.
+
+Need two views:
+- v_run_summary: aggregate run metrics: run, model, fixture, avg latency, p95? PostgreSQL no percentile in simple view? Could use approx? We can use avg, stddev, min, max, sum, count, throughput. But p95 would need window? View can use percentile_cont over aggregate? A view can contain aggregates with percentile_cont? Yes SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) FROM request_metrics GROUP BY run_id. But if view includes subqueries with aggregate and join. Could do.
+- v_metric_analysis or v_context_retention: bucket context_len, avg retention, acceptance, throughput.
+
+Need one transaction-safe upsert function. Could include function and test? No need. Need no markdown.
+
+Potential issues: Need ensure script runs in dependency order: If we create views before inserts, okay. Function before inserts? okay. If we include BEGIN and COMMIT, but SELECTs after commit. The function uses ON CONFLICT; if run from psql, transaction okay.
+
+Need maybe use TRUNCATE? Not needed.
+
+Need ensure no duplicate keys in inserts. We'll insert models, fixtures, runs, request_metrics. Use explicit IDs.
+
+Let's design table DDL:
+
+CREATE TABLE models (
+  model_id smallint PRIMARY KEY CHECK (model_id > 0),
+  model_name text NOT NULL UNIQUE,
+  family text NOT NULL,
+  param_count_b numeric(10,2) NOT NULL CHECK (param_count_b > 0),
+  context_limit int NOT NULL CHECK (context_limit > 0),
+  quantization text NOT NULL DEFAULT 'bf16',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE fixtures (
+  fixture_id smallint PRIMARY KEY CHECK(fixture_id >0),
+  fixture_kind text NOT NULL CHECK (fixture_kind IN ('short_chat','long_doc','rag_multihop','streaming_tool')),
+  description text NOT NULL,
+  min_context_tokens int NOT NULL CHECK(min_context_tokens >0),
+  max_context_tokens int NOT NULL CHECK(max_context_tokens >= min_context_tokens),
+  target_output_tokens int NOT NULL CHECK(target_output_tokens >0),
+  difficulty int NOT NULL CHECK(difficulty BETWEEN 1 AND 5)
+);
+
+CREATE TABLE runs (
+  run_id int PRIMARY KEY CHECK(run_id >0),
+  model_id smallint NOT NULL REFERENCES models(model_id),
+  fixture_id smallint NOT NULL REFERENCES fixtures(fixture_id),
+  batch_size int NOT NULL CHECK(batch_size >0),
+  max_tokens_per_seq int NOT NULL CHECK(max_tokens_per_seq >0),
+  speculative_tokens int NOT NULL DEFAULT 0 CHECK(speculative_tokens >=0),
+  gpu text NOT NULL DEFAULT 'A100-80GB',
+  started_at timestamptz NOT NULL,
+  finished_at timestamptz,
+  status text NOT NULL CHECK (status IN ('completed','failed','aborted')),
+  notes text,
+  CHECK (finished_at IS NULL OR finished_at >= started_at)
+);
+
+request_metrics:
+CREATE TABLE request_metrics (
+  run_id int NOT NULL REFERENCES runs(run_id),
+  seq int NOT NULL CHECK(seq >0),
+  request_id uuid NOT NULL DEFAULT gen_random_uuid(), -- need pgcrypto? gen_random_uuid is built-in PG13? Yes. Could avoid dependency by not default.
+  context_len int NOT NULL CHECK(context_len >=0),
+  token_in int NOT NULL CHECK(token_in >=0),
+  token_out int NOT NULL CHECK(token_out >=0),
+  queue_ms numeric(10,2) NOT NULL CHECK(queue_ms >=0),
+  ttft_ms numeric(10,2) NOT NULL CHECK(ttft_ms >=0),
+  itl_ms numeric(10,2) NOT NULL CHECK(itl_ms >=0),
+  latency_ms numeric(10,2) NOT NULL CHECK(latency_ms >=0),
+  status text NOT NULL CHECK(status IN ('ok','error','timeout')),
+  error_code text,
+  retention_score numeric(5,4), -- 0-1
+  mtp_proposed int NOT NULL DEFAULT 0 CHECK(mtp_proposed >=0),
+  mtp_accepted int NOT NULL DEFAULT 0 CHECK(mtp_accepted >=0),
+  mtp_acceptance_rate numeric(5,4) NOT NULL DEFAULT 0,
+  CHECK (mtp_accepted <= mtp_proposed),
+  CHECK (retention_score IS NULL OR retention_score >=0 AND retention_score <=1),
+  CHECK (mtp_acceptance_rate >=0 AND mtp_acceptance_rate <=1),
+  PRIMARY KEY (run_id, seq),
+  UNIQUE (request_id),
+  CHECK (latency_ms >= queue_ms), maybe latency includes queue? Could be not always. Use CHECK (latency_ms >= ttft_ms)? ttft is time to first token after request maybe includes queue? Could not enforce. Keep simple.
+);
+Need gen_random_uuid() requires PG13. OK. But default in INSERT if not specifying request_id. We can specify request_id to be deterministic? For upsert function maybe uses. For 80 inserts, could omit request_id and let default. But explicit rows maybe include? Could use set default? If no pgcrypto, gen_random_uuid built-in in PG13. Good.
+
+Useful indexes:
+CREATE INDEX idx_runs_model ON runs(model_id);
+CREATE INDEX idx_runs_fixture ON runs(fixture_id);
+CREATE INDEX idx_runs_started ON runs(started_at DESC);
+CREATE INDEX idx_request_metrics_run ON request_metrics(run_id, seq); PK already. Need maybe idx_request_metrics_status ON request_metrics(status); idx_request_metrics_context ON request_metrics(context_len); idx_request_metrics_latency ON request_metrics(latency_ms); idx_request_metrics_mtp ON request_metrics(mtp_acceptance_rate); Maybe partial index for ok: CREATE INDEX idx_request_metrics_ok ON request_metrics(latency_ms) WHERE status='ok'; Good.
+
+Views:
+CREATE VIEW v_run_summary AS
+SELECT r.run_id, m.model_name, f.fixture_kind,
+  COUNT(*) AS request_count,
+  SUM(rm.token_in + rm.token_out) AS total_tokens,
+  SUM(rm.token_out) AS output_tokens,
+  AVG(rm.latency_ms) AS avg_latency_ms,
+  STDDEV_POP(rm.latency_ms) AS latency_stddev_ms,
+  percentile_cont(0.95) WITHIN GROUP (ORDER BY rm.latency_ms) AS p95_latency_ms,
+  CASE WHEN SUM(CASE WHEN rm.token_out > 0 THEN rm.token_out END) > 0
+       THEN SUM(rm.token_out)::numeric / (SUM(rm.latency_ms)/10000.0) -- but SUM latency for each request, concurrency? Throughput per request output tokens/s = sum output / sum latency? Not true aggregate server throughput should sum output / wall time. We don't have wall time per request maybe latency sum is request time. For simplicity avg throughput per request: AVG(rm.token_out / (rm.latency_ms/1000.0)). Need avoid div by zero: CASE WHEN latency_ms > 0.
+  END AS avg_output_tokens_per_sec,
+  AVG(rm.mtp_acceptance_rate) AS avg_mtp_acceptance,
+  AVG(rm.retention_score) AS avg_retention
+FROM runs r
+JOIN models m ON m.model_id=r.model_id
+JOIN fixtures f ON f.fixture_id=r.fixture_id
+LEFT JOIN request_metrics rm ON rm.run_id=r.run_id
+GROUP BY r.run_id, m.model_name, f.fixture_kind;
+
+But if LEFT JOIN and no metrics, percentile with no rows null, sum zero. Need avoid division by zero. Could use FILTER (WHERE rm.token_out > 0) etc. For avg output tokens per sec: AVG(CASE WHEN rm.latency_ms > 0 THEN rm.token_out / (rm.latency_ms/1000.0) END) maybe null if zero. Good.
+
+Second view: v_fixture_model_performance:
+SELECT m.model_id, m.model_name, f.fixture_kind, f.fixture_id,
+  COUNT(DISTINCT r.run_id) AS run_count,
+  COUNT(rm.request_id) AS metric_count,
+  AVG(rm.latency_ms) ...
+  AVG(rm.itl_ms) avg_itl,
+  AVG(rm.ttft_ms) avg_ttft,
+  AVG(rm.mtp_acceptance_rate) avg_mtp,
+  AVG(CASE WHEN rm.fixture_kind = 'long_doc' THEN rm.retention_score END) avg_long_retention
+GROUP BY ...
+But view should useful. Could include context bucket? Another view: v_long_context_retention:
+SELECT m.model_name, f.fixture_kind,
+  CASE WHEN rm.context_len < 4096 THEN 'lt_4k' ... END context_bucket,
+  COUNT(*) requests, AVG(rm.retention_score) avg_retention, AVG(rm.mtp_acceptance_rate), AVG(rm.token_out) avg_out
+FROM ... GROUP BY.
+Maybe two views: v_run_summary and v_context_performance. Need only two. Good.
+
+Need upsert function. Define after tables maybe before inserts.
+CREATE OR REPLACE FUNCTION upsert_request_metric(
+  p_run_id int, p_seq int, p_context_len int, p_token_in int, p_token_out int,
+  p_queue_ms numeric, p_ttft_ms numeric, p_itl_ms numeric, p_latency_ms numeric,
+  p_status text, p_error_code text, p_retention_score numeric,
+  p_mtp_proposed int, p_mtp_accepted int, p_mtp_acceptance_rate numeric
+) RETURNS request_metrics LANGUAGE plpgsql AS $$
+DECLARE
+  v_result request_metrics;
+BEGIN
+  INSERT INTO request_metrics (run_id, seq, context_len, token_in, token_out, queue_ms, ttft_ms, itl_ms, latency_ms, status, error_code, retention_score, mtp_proposed, mtp_accepted, mtp_acceptance_rate)
+  VALUES (...)
+  ON CONFLICT (run_id, seq) DO UPDATE SET
+    context_len = EXCLUDED.context_len,
+    token_in = EXCLUDED.token_in,
+    token_out = EXCLUDED.token_out,
+    queue_ms = EXCLUDED.queue_ms,
+    ttft_ms = EXCLUDED.ttft_ms,
+    itl_ms = EXCLUDED.itl_ms,
+    latency_ms = EXCLUDED.latency_ms,
+    status = EXCLUDED.status,
+    error_code = EXCLUDED.error_code,
+    retention_score = EXCLUDED.retention_score,
+    mtp_proposed = EXCLUDED.mtp_proposed,
+    mtp_accepted = EXCLUDED.mtp_accepted,
+    mtp_acceptance_rate = EXCLUDED.mtp_acceptance_rate
+  RETURNING * INTO v_result;
+  RETURN v_result;
+END;
+$$;
+
+Transaction-safe: maybe

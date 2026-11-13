@@ -1,0 +1,496 @@
+```typescript
+// package.json
+{
+  "name": "metrics-service",
+  "version": "1.0.0",
+  "description": "Newline-delimited request metrics service with validation, grouping, and statistics",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "jest --coverage"
+  },
+  "keywords": ["metrics", "statistics", "service"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "typescript": "^5.3.3"
+  }
+}
+```
+
+```json
+// tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "lib": ["ES2020"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "sourceMap": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}
+```
+
+```typescript
+// src/types.ts
+export interface RequestMetric {
+  id: string;
+  model: string;
+  fixture: string;
+  timestamp: number;
+  latencyMs: number;
+  status: number;
+  bytesIn: number;
+  bytesOut: number;
+}
+
+export interface MetricGroupStats {
+  count: number;
+  meanLatency: number;
+  medianLatency: number;
+  sampleStdDev: number;
+  minLatency: number;
+  maxLatency: number;
+  totalBytesIn: number;
+  totalBytesOut: number;
+  successCount: number;
+  errorCount: number;
+}
+
+export interface SummaryResponse {
+  totalRecords: number;
+  groups: Record<string, MetricGroupStats>;
+  generatedAt: number;
+}
+
+export interface RunResponse {
+  id: string;
+  records: RequestMetric[];
+  stats: MetricGroupStats | null;
+}
+
+export class MalformedInputError extends Error {
+  public readonly line: number;
+  public readonly rawLine: string;
+
+  constructor(line: number, rawLine: string, message: string) {
+    super(`Malformed input at line ${line}: ${message}. Raw: "${rawLine}"`);
+    this.name = 'MalformedInputError';
+    this.line = line;
+    this.rawLine = rawLine;
+  }
+}
+
+export class ValidationError extends Error {
+  public readonly field: string;
+  public readonly value: unknown;
+
+  constructor(field: string, value: unknown, message: string) {
+    super(`Validation error for field '${field}' with value '${value}': ${message}`);
+    this.name = 'ValidationError';
+    this.field = field;
+    this.value = value;
+  }
+}
+```
+
+```typescript
+// src/parser.ts
+import { RequestMetric, MalformedInputError, ValidationError } from './types';
+
+const MAX_LINE_LENGTH = 10_000;
+const MAX_RECORDS_IN_MEMORY = 100_000;
+
+export class MetricsParser {
+  private recordCount: number = 0;
+
+  parseLine(line: string, lineNumber: number): RequestMetric {
+    const trimmed = line.trim();
+    if (trimmed === '') {
+      throw new MalformedInputError(lineNumber, line, 'Empty line');
+    }
+
+    if (trimmed.length > MAX_LINE_LENGTH) {
+      throw new MalformedInputError(lineNumber, line, `Line exceeds maximum length of ${MAX_LINE_LENGTH}`);
+    }
+
+    if (this.recordCount >= MAX_RECORDS_IN_MEMORY) {
+      throw new MalformedInputError(lineNumber, line, `Maximum in-memory records (${MAX_RECORDS_IN_MEMORY}) exceeded`);
+    }
+
+    const fields = trimmed.split('|');
+    if (fields.length !== 7) {
+      throw new MalformedInputError(
+        lineNumber,
+        line,
+        `Expected 7 pipe-delimited fields, got ${fields.length}`
+      );
+    }
+
+    const [idRaw, modelRaw, fixtureRaw, timestampRaw, latencyRaw, statusRaw, bytesRaw] = fields.map(f => f.trim());
+
+    const id = this.validateId(idRaw, lineNumber, line);
+    const model = this.validateModel(modelRaw, lineNumber, line);
+    const fixture = this.validateFixture(fixtureRaw, lineNumber, line);
+    const timestamp = this.validateTimestamp(timestampRaw, lineNumber, line);
+    const latencyMs = this.validateLatency(latencyRaw, lineNumber, line);
+    const status = this.validateStatus(statusRaw, lineNumber, line);
+    const bytesParts = this.validateBytes(bytesRaw, lineNumber, line);
+
+    this.recordCount++;
+
+    return {
+      id,
+      model,
+      fixture,
+      timestamp,
+      latencyMs,
+      status,
+      bytesIn: bytesParts[0],
+      bytesOut: bytesParts[1],
+    };
+  }
+
+  private validateId(value: string, line: number, rawLine: string): string {
+    if (!value || value.length < 1 || value.length > 64) {
+      throw new ValidationError('id', value, 'ID must be between 1 and 64 characters');
+    }
+    if (!/^[a-zA-Z0-9_-]+$/.test(value)) {
+      throw new ValidationError('id', value, 'ID must contain only alphanumeric characters, hyphens, or underscores');
+    }
+    return value;
+  }
+
+  private validateModel(value: string, line: number, rawLine: string): string {
+    if (!value || value.length < 1 || value.length > 128) {
+      throw new ValidationError('model', value, 'Model name must be between 1 and 128 characters');
+    }
+    if (!/^[a-zA-Z0-9._-]+$/.test(value)) {
+      throw new ValidationError('model', value, 'Model name must contain only alphanumeric characters, dots, hyphens, or underscores');
+    }
+    return value;
+  }
+
+  private validateFixture(value: string, line: number, rawLine: string): string {
+    if (!value || value.length < 1 || value.length > 128) {
+      throw new ValidationError('fixture', value, 'Fixture name must be between 1 and 128 characters');
+    }
+    if (!/^[a-zA-Z0-9._-]+$/.test(value)) {
+      throw new ValidationError('fixture', value, 'Fixture name must contain only alphanumeric characters, dots, hyphens, or underscores');
+    }
+    return value;
+  }
+
+  private validateTimestamp(value: string, line: number, rawLine: string): number {
+    const num = Number(value);
+    if (!Number.isFinite(num)) {
+      throw new ValidationError('timestamp', value, 'Timestamp must be a valid number');
+    }
+    if (num < 0) {
+      throw new ValidationError('timestamp', value, 'Timestamp must be non-negative');
+    }
+    if (num > 9999999999999) {
+      throw new ValidationError('timestamp', value, 'Timestamp is too large');
+    }
+    return Math.floor(num);
+  }
+
+  private validateLatency(value: string, line: number, rawLine: string): number {
+    const num = Number(value);
+    if (!Number.isFinite(num)) {
+      throw new ValidationError('latencyMs', value, 'Latency must be a valid number');
+    }
+    if (num < 0) {
+      throw new ValidationError('latencyMs', value, 'Latency must be non-negative');
+    }
+    if (num > 1_000_000) {
+      throw new ValidationError('latencyMs', value, 'Latency exceeds maximum allowed value of 1,000,000 ms');
+    }
+    return num;
+  }
+
+  private validateStatus(value: string, line: number, rawLine: string): number {
+    const num = Number(value);
+    if (!Number.isInteger(num)) {
+      throw new ValidationError('status', value, 'Status must be an integer');
+    }
+    if (num < 100 || num > 599) {
+      throw new ValidationError('status', value, 'Status must be between 100 and 599');
+    }
+    return num;
+  }
+
+  private validateBytes(value: string, line: number, rawLine: string): [number, number] {
+    const parts = value.split(',');
+    if (parts.length !== 2) {
+      throw new ValidationError('bytes', value, 'Bytes field must be two comma-separated integers (in,out)');
+    }
+    const bytesIn = Number(parts[0]);
+    const bytesOut = Number(parts[1]);
+    if (!Number.isInteger(bytesIn) || !Number.isInteger(bytesOut)) {
+      throw new ValidationError('bytes', value, 'Bytes values must be integers');
+    }
+    if (bytesIn < 0 || bytesOut < 0) {
+      throw new ValidationError('bytes', value, 'Bytes values must be non-negative');
+    }
+    if (bytesIn > 1_000_000_000 || bytesOut > 1_000_000_000) {
+      throw new ValidationError('bytes', value, 'Bytes values exceed maximum allowed value of 1,000,000,000');
+    }
+    return [bytesIn, bytesOut];
+  }
+
+  reset(): void {
+    this.recordCount = 0;
+  }
+
+  getRecordCount(): number {
+    return this.recordCount;
+  }
+}
+```
+
+```typescript
+// src/statistics.ts
+import { RequestMetric, MetricGroupStats } from './types';
+
+export function computeStats(records: RequestMetric[]): MetricGroupStats {
+  if (records.length === 0) {
+    return {
+      count: 0,
+      meanLatency: 0,
+      medianLatency: 0,
+      sampleStdDev: 0,
+      minLatency: 0,
+      maxLatency: 0,
+      totalBytesIn: 0,
+      totalBytesOut: 0,
+      successCount: 0,
+      errorCount: 0,
+    };
+  }
+
+  const latencies = records.map(r => r.latencyMs);
+  const sorted = [...latencies].sort((a, b) => a - b);
+
+  const sum = latencies.reduce((acc, val) => acc + val, 0);
+  const mean = sum / latencies.length;
+
+  const median = computeMedian(sorted);
+
+  let varianceSum = 0;
+  for (const val of latencies) {
+    const diff = val - mean;
+    varianceSum += diff * diff;
+  }
+  const sampleVariance = latencies.length > 1 ? varianceSum / (latencies.length - 1) : 0;
+  const sampleStdDev = Math.sqrt(sampleVariance);
+
+  const totalBytesIn = records.reduce((acc, r) => acc + r.bytesIn, 0);
+  const totalBytesOut = records.reduce((acc, r) => acc + r.bytesOut, 0);
+  const successCount = records.filter(r => r.status >= 200 && r.status < 400).length;
+  const errorCount = records.length - successCount;
+
+  return {
+    count: records.length,
+    meanLatency: roundTo(mean, 4),
+    medianLatency: roundTo(median, 4),
+    sampleStdDev: roundTo(sampleStdDev, 4),
+    minLatency: sorted[0],
+    maxLatency: sorted[sorted.length - 1],
+    totalBytesIn,
+    totalBytesOut,
+    successCount,
+    errorCount,
+  };
+}
+
+function computeMedian(sorted: number[]): number {
+  const n = sorted.length;
+  if (n === 0) return 0;
+  if (n % 2 === 1) {
+    return sorted[Math.floor(n / 2)];
+  }
+  return (sorted[n / 2 - 1] + sorted[n / 2]) / 2;
+}
+
+function roundTo(value: number, decimals: number): number {
+  const factor = Math.pow(10, decimals);
+  return Math.round(value * factor) / factor;
+}
+```
+
+```typescript
+// src/store.ts
+import { RequestMetric, MetricGroupStats, SummaryResponse, RunResponse } from './types';
+import { computeStats } from './statistics';
+
+interface GroupKey {
+  model: string;
+  fixture: string;
+}
+
+export class MetricsStore {
+  private records: Map<string, RequestMetric[]> = new Map();
+  private allRecords: RequestMetric[] = [];
+  private runsById: Map<string, RequestMetric[]> = new Map();
+
+  addRecord(record: RequestMetric): void {
+    const groupKey = `${record.model}|${record.fixture}`;
+    if (!this.records.has(groupKey)) {
+      this.records.set(groupKey, []);
+    }
+    this.records.get(groupKey)!.push(record);
+    this.allRecords.push(record);
+
+    if (!this.runsById.has(record.id)) {
+      this.runsById.set(record.id, []);
+    }
+    this.runsById.get(record.id)!.push(record);
+  }
+
+  getSummary(): SummaryResponse {
+    const groups: Record<string, MetricGroupStats> = {};
+    for (const [key, recs] of this.records.entries()) {
+      groups[key] = computeStats(recs);
+    }
+    return {
+      totalRecords: this.allRecords.length,
+      groups,
+      generatedAt: Date.now(),
+    };
+  }
+
+  getRun(id: string): RunResponse | null {
+    const recs = this.runsById.get(id);
+    if (!recs || recs.length === 0) {
+      return null;
+    }
+    const stats = computeStats(recs);
+    return {
+      id,
+      records: recs,
+      stats,
+    };
+  }
+
+  clear(): void {
+    this.records.clear();
+    this.allRecords = [];
+    this.runsById.clear();
+  }
+
+  getTotalRecordCount(): number {
+    return this.allRecords.length;
+  }
+}
+```
+
+```typescript
+// src/service.ts
+import { RequestMetric, SummaryResponse, RunResponse, MalformedInputError, ValidationError } from './types';
+import { MetricsParser } from './parser';
+import { MetricsStore } from './store';
+
+export class MetricsService {
+  private parser: MetricsParser;
+  private store: MetricsStore;
+
+  constructor() {
+    this.parser = new MetricsParser();
+    this.store = new MetricsStore();
+  }
+
+  ingest(input: string): { accepted: number; rejected: number; errors: string[] } {
+    const lines = input.split('\n');
+    let accepted = 0;
+    let rejected = 0;
+    const errors: string[] = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      try {
+        const record = this.parser.parseLine(line, i + 1);
+        this.store.addRecord(record);
+        accepted++;
+      } catch (err) {
+        rejected++;
+        if (err instanceof MalformedInputError) {
+          errors.push(err.message);
+        } else if (err instanceof ValidationError) {
+          errors.push(err.message);
+        } else {
+          errors.push(`Unexpected error at line ${i + 1}: ${(err as Error).message}`);
+        }
+      }
+    }
+
+    return { accepted, rejected, errors };
+  }
+
+  getHealth(): { status: string; totalRecords: number; uptime: number } {
+    return {
+      status: 'ok',
+      totalRecords: this.store.getTotalRecordCount(),
+      uptime: process.uptime(),
+    };
+  }
+
+  getSummary(): SummaryResponse {
+    return this.store.getSummary();
+  }
+
+  getRun(id: string): RunResponse | null {
+    return this.store.getRun(id);
+  }
+
+  clear(): void {
+    this.store.clear();
+    this.parser.reset();
+  }
+}
+```
+
+```typescript
+// src/app.ts
+import express, { Request, Response } from 'express';
+import { MetricsService } from './service';
+
+export function createApp(service: MetricsService): express.Express {
+  const app = express();
+
+  app.use(express.json({ limit: '1mb' }));
+
+  app.get('/health', (req: Request, res: Response) => {
+    const health = service.getHealth();
+    res.status(200).json(health);
+  });
+
+  app.post('/ingest', (req: Request, res: Response) => {
+    const body = req.body;
+    if (typeof body !== 'string') {
+      res.status(400).json({ error: 'Request body must be a newline-delimited string' });
+      return;
+    }
+    const result = service.ingest(body);
+    res.status(200).json(result);
+  });
+
+  app.get('/summary', (req: Request

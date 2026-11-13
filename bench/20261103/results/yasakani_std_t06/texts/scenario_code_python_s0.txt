@@ -1,0 +1,575 @@
+Below is a complete, runnable Python 3.11 package. It is structured as a proper package (`jobrunner`) with a `pyproject.toml`, and every source file is in its own fenced block.
+
+Design notes (so the code is easier to follow):
+
+- **Determinism:** the runner is driven by a single `asyncio` event loop. Job ordering is the manifest order; scheduling uses `asyncio.sleep(0)` rather than wall-clock time; the event stream carries a monotonic sequence number.
+- **One active GPU job:** a `Semaphore(1)` gates the GPU pool.
+- **Atomic state persistence:** state is written to a temp file in the same directory and `os.replace()`-ed into place.
+- **Resume:** on start, jobs already `completed` are skipped (their events are re-emitted) and a `pending` job is resumed.
+- **SIGINT:** a handler sets a cancellation flag, cancels the active job, and drains in-flight tasks before exiting.
+- **Secret redaction:** a `Redactor` walks JSON structures and replaces any configured secret value (and a few well-known key names) with `[REDACTED]`.
+- **JSONL events:** every event is a single-line JSON object on `stdout`.
+
+---
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jobrunner"
+version = "0.1.0"
+description = "Deterministic asynchronous GPU job runner"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "JobRunner Maintainers" }]
+keywords = ["asyncio", "gpu", "jobs", "runner", "deterministic"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = []
+
+[project.scripts]
+jobrunner = "jobrunner.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["jobrunner*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+---
+
+### `jobrunner/__init__.py`
+
+```python
+"""Deterministic asynchronous GPU job runner."""
+
+from .config import Config
+from .events import Event, EventStream, EventType
+from .manifest import Job, Manifest, load_manifest
+from .redact import Redactor
+from .runner import JobRunner, RunnerResult, RunnerState
+from .state import StateStore
+
+__all__ = [
+    "Config",
+    "Event",
+    "EventStream",
+    "EventType",
+    "Job",
+    "Manifest",
+    "load_manifest",
+    "Redactor",
+    "JobRunner",
+    "RunnerResult",
+    "RunnerState",
+    "StateStore",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+### `jobrunner/events.py`
+
+```python
+"""Structured JSONL event model and stream."""
+
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Any
+
+
+class EventType(str, Enum):
+    RUNNER_START = "runner_start"
+    RESUME = "resume"
+    JOB_START = "job_start"
+    JOB_PROGRESS = "job_progress"
+    JOB_COMPLETED = "job_completed"
+    JOB_FAILED = "job_failed"
+    JOB_CANCELLED = "job_cancelled"
+    RUNNER_COMPLETE = "runner_complete"
+    RUNNER_ERROR = "runner_error"
+    CANCEL_REQUESTED = "cancel_requested"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class Event:
+    """A single structured event.
+
+    ``seq`` is a monotonic counter assigned by the :class:`EventStream`.
+    ``ts`` is an ISO-8601 UTC timestamp.
+    """
+
+    type: EventType
+    seq: int = 0
+    ts: str = ""
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["type"] = self.type.value
+        return d
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+
+
+class EventStream:
+    """Serializes events to a single-line JSONL stream with a monotonic seq."""
+
+    def __init__(self, stream=sys.stdout, redactor: "Any | None" = None) -> None:
+        self._stream = stream
+        self._redactor = redactor
+        self._seq = 0
+        self._events: list[Event] = []
+
+    @property
+    def seq(self) -> int:
+        return self._seq
+
+    @property
+    def events(self) -> list[Event]:
+        return list(self._events)
+
+    def emit(self, etype: EventType, **payload: Any) -> Event:
+        from datetime import datetime, timezone
+
+        self._seq += 1
+        event = Event(
+            type=etype,
+            seq=self._seq,
+            ts=datetime.now(timezone.utc).isoformat(),
+            payload=dict(payload),
+        )
+        if self._redactor is not None:
+            event.payload = self._redactor.redact(event.payload)
+        self._events.append(event)
+        line = event.to_json()
+        self._stream.write(line + "\n")
+        self._stream.flush()
+        return event
+```
+
+---
+
+### `jobrunner/redact.py`
+
+```python
+"""Secret redaction for event payloads."""
+
+from __future__ import annotations
+
+from typing import Any
+
+# Key names that are always redacted regardless of value.
+SENSITIVE_KEYS = frozenset(
+    {
+        "secret",
+        "secrets",
+        "token",
+        "access_token",
+        "api_key",
+        "apikey",
+        "password",
+        "passwd",
+        "private_key",
+        "authorization",
+        "auth",
+        "credential",
+        "credentials",
+        "bearer",
+    }
+)
+
+REDACTED = "[REDACTED]"
+
+
+class Redactor:
+    """Recursively redacts configured secret values from JSON-like structures."""
+
+    def __init__(self, secrets: list[str] | None = None) -> None:
+        self._secrets: frozenset[str] = frozenset(
+            str(s) for s in (secrets or []) if str(s) != ""
+        )
+
+    def redact(self, value: Any) -> Any:
+        return self._redact(value)
+
+    def _redact(self, value: Any) -> Any:
+        if isinstance(value, str):
+            if value in self._secrets:
+                return REDACTED
+            return value
+        if isinstance(value, dict):
+            out: dict[Any, Any] = {}
+            for key, val in value.items():
+                key_str = str(key)
+                if key_str.lower() in SENSITIVE_KEYS:
+                    out[key] = REDACTED
+                else:
+                    out[key] = self._redact(val)
+            return out
+        if isinstance(value, (list, tuple)):
+            return [self._redact(item) for item in value]
+        return value
+```
+
+---
+
+### `jobrunner/manifest.py`
+
+```python
+"""Manifest and job model."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+class ManifestError(ValueError):
+    """Raised for malformed or invalid manifests."""
+
+
+@dataclass
+class Job:
+    id: str
+    name: str
+    kind: str  # "gpu" or "cpu"
+    command: list[str]
+    args: dict[str, Any] = field(default_factory=dict)
+    timeout: float | None = None
+    max_retries: int = 0
+    tags: list[str] = field(default_factory=list)
+
+    @property
+    def is_gpu(self) -> bool:
+        return self.kind == "gpu"
+
+
+@dataclass
+class Manifest:
+    version: int
+    jobs: list[Job]
+    secrets: list[str] = field(default_factory=list)
+
+    def job_ids(self) -> list[str]:
+        return [j.id for j in self.jobs]
+
+    def get(self, job_id: str) -> Job:
+        for job in self.jobs:
+            if job.id == job_id:
+                return job
+        raise KeyError(job_id)
+
+
+def _parse_job(raw: dict[str, Any], index: int) -> Job:
+    job_id = raw.get("id")
+    if not job_id or not isinstance(job_id, str):
+        raise ManifestError(f"job at index {index} is missing a string 'id'")
+    name = raw.get("name", job_id)
+    kind = raw.get("kind", "cpu")
+    if kind not in ("gpu", "cpu"):
+        raise ManifestError(f"job '{job_id}' has invalid kind '{kind}'")
+    command = raw.get("command")
+    if not command or not isinstance(command, list):
+        raise ManifestError(f"job '{job_id}' is missing a 'command' list")
+    return Job(
+        id=job_id,
+        name=str(name),
+        kind=kind,
+        command=[str(c) for c in command],
+        args=dict(raw.get("args", {})),
+        timeout=raw.get("timeout"),
+        max_retries=int(raw.get("max_retries", 0)),
+        tags=[str(t) for t in raw.get("tags", [])],
+    )
+
+
+def load_manifest(path: str | Path) -> Manifest:
+    """Load and validate a JSON manifest from disk."""
+    p = Path(path)
+    if not p.exists():
+        raise ManifestError(f"manifest not found: {p}")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ManifestError(f"invalid JSON in {p}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ManifestError("manifest root must be a JSON object")
+
+    version = data.get("version", 1)
+    if not isinstance(version, int):
+        raise ManifestError("'version' must be an integer")
+
+    raw_jobs = data.get("jobs")
+    if not isinstance(raw_jobs, list):
+        raise ManifestError("manifest must contain a 'jobs' list")
+
+    jobs = [_parse_job(raw, i) for i, raw in enumerate(raw_jobs)]
+
+    seen: set[str] = set()
+    for job in jobs:
+        if job.id in seen:
+            raise ManifestError(f"duplicate job id '{job.id}'")
+        seen.add(job.id)
+
+    secrets = [str(s) for s in data.get("secrets", [])]
+
+    return Manifest(version=version, jobs=jobs, secrets=secrets)
+```
+
+---
+
+### `jobrunner/state.py`
+
+```python
+"""Atomic, on-disk runner state."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class JobState:
+    id: str
+    status: str  # pending | running | completed | failed | cancelled
+    attempts: int = 0
+    started_at: str | None = None
+    finished_at: str | None = None
+    result: dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
+
+
+@dataclass
+class RunnerState:
+    run_id: str
+    manifest_hash: str
+    started_at: str
+    finished_at: str | None = None
+    status: str = "running"  # running | completed | failed | cancelled
+    jobs: dict[str, JobState] = field(default_factory=dict)
+
+
+class StateStore:
+    """Persists :class:`RunnerState` atomically to a JSON file.
+
+    Writes go to a temp file in the same directory, then are moved into
+    place with :func:`os.replace`, so a reader never observes a torn file.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def load(self) -> RunnerState | None:
+        if not self.path.exists():
+            return None
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        return self._from_dict(data)
+
+    def save(self, state: RunnerState) -> None:
+        payload = self._to_dict(state)
+        directory = self.path.parent
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=self.path.name + ".", suffix=".tmp", dir=directory
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _to_dict(state: RunnerState) -> dict[str, Any]:
+        return {
+            "run_id": state.run_id,
+            "manifest_hash": state.manifest_hash,
+            "started_at": state.started_at,
+            "finished_at": state.finished_at,
+            "status": state.status,
+            "jobs": {
+                job_id: {
+                    "id": job.id,
+                    "status": job.status,
+                    "attempts": job.attempts,
+                    "started_at": job.started_at,
+                    "finished_at": job.finished_at,
+                    "result": job.result,
+                    "error": job.error,
+                }
+                for job_id, job in state.jobs.items()
+            },
+        }
+
+    @staticmethod
+    def _from_dict(data: dict[str, Any]) -> RunnerState:
+        jobs = {}
+        for job_id, raw in data.get("jobs", {}).items():
+            jobs[job_id] = JobState(
+                id=raw.get("id", job_id),
+                status=raw.get("status", "pending"),
+                attempts=int(raw.get("attempts", 0)),
+                started_at=raw.get("started_at"),
+                finished_at=raw.get("finished_at"),
+                result=dict(raw.get("result", {})),
+                error=raw.get("error"),
+            )
+        return RunnerState(
+            run_id=data.get("run_id", ""),
+            manifest_hash=data.get("manifest_hash", ""),
+            started_at=data.get("started_at", ""),
+            finished_at=data.get("finished_at"),
+            status=data.get("status", "running"),
+            jobs=jobs,
+        )
+```
+
+---
+
+### `jobrunner/config.py`
+
+```python
+"""Runner configuration."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class Config:
+    manifest_path: Path
+    state_path: Path
+    run_id: str = "run-1"
+    max_retries: int = 0
+    event_stream: Any = None  # defaults to sys.stdout in the runner
+    secrets: list[str] = field(default_factory=list)
+    log_level: str = "INFO"
+
+    def effective_secrets(self, manifest_secrets: list[str]) -> list[str]:
+        merged = list(self.secrets)
+        for secret in manifest_secrets:
+            if secret not in merged:
+                merged.append(secret)
+        return merged
+```
+
+---
+
+### `jobrunner/runner.py`
+
+```python
+"""The deterministic asynchronous job runner."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import signal
+import sys
+from datetime import datetime, timezone
+from typing import Any
+
+from .config import Config
+from .events import EventStream, EventType
+from .manifest import Job, Manifest, load_manifest
+from .redact import Redactor
+from .state import JobState, RunnerState, StateStore
+
+TERMINAL = frozenset({"completed", "failed", "cancelled"})
+
+
+class JobError(RuntimeError):
+    """Raised when a job's simulated execution fails."""
+
+
+class CancellationRequested(Exception):
+    """Raised internally to unwind a running job on SIGINT."""
+
+
+@dataclass
+class RunnerResult:
+    status: str
+    completed: list[str]
+    failed: list[str]
+    cancelled: list[str]
+    skipped: list[str]
+    total: int
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _manifest_hash(manifest: Manifest) -> str:
+    blob = json.dumps(
+        {"version": manifest.version, "jobs": [j.id for j in manifest.jobs]},
+        sort_keys=True,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+class JobRunner:
+    """Runs jobs from a manifest deterministically on a single event loop."""
+
+    def __init__(self, config: Config, manifest: Manifest) -> None:
+        self.config = config
+        self.manifest = manifest
+        self.state_store = StateStore(config.state_path)
+        self.redactor = Redactor(config.effective_secrets(manifest.secrets))
+        self.events = EventStream(
+            stream=config.event_stream or sys.stdout, redactor=self.redactor
+        )
+        self.state = RunnerState(
+            run_id=config.run_id,
+            manifest_hash=_manifest_hash(manifest),
+            started_at=_now(),
+        )
+        self._cancel_requested = False
+       

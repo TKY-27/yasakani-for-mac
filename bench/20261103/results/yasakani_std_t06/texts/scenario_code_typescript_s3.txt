@@ -1,0 +1,482 @@
+# `metricsd` — a self-contained NDJSON request-metrics service
+
+Below is a complete, runnable TypeScript 5 project. It hand-rolls JSON parsing (no schema libraries), streams NDJSON with bounded memory, groups by `model`/`fixture`, computes mean/median/sample standard deviation (Welford), and exposes `/health`, `/summary`, and `/runs/:id`.
+
+```
+metricsd/
+├── package.json
+├── tsconfig.json
+├── README.md
+├── src/
+│   ├── index.ts          # entrypoint
+│   ├── server.ts         # HTTP layer + routing
+│   ├── types.ts          # strict domain types
+│   ├── errors.ts         # typed error hierarchy
+│   ├── json.ts           # hand-rolled JSON tokenizer/parser
+│   ├── validate.ts       # strict record validation (no schema libs)
+│   ├── aggregate.ts      # grouping + Welford statistics
+│   └── ingest.ts         # incremental NDJSON parser + bounded buffer
+└── test/
+    ├── json.test.ts
+    ├── validate.test.ts
+    ├── aggregate.test.ts
+    └── ingest.test.ts
+```
+
+---
+
+## `package.json`
+
+```json
+{
+  "name": "metricsd",
+  "version": "1.0.0",
+  "description": "Self-contained NDJSON request-metrics aggregation service (TypeScript 5, no third-party runtime deps).",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": { "metricsd": "dist/index.js" },
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsc -p tsconfig.json && node dist/index.js",
+    "test": "node --test dist/test/",
+    "test:watch": "tsc -p tsconfig.json && node --test --test-name-pattern=.* dist/test/"
+  },
+  "keywords": ["metrics", "ndjson", "aggregation", "statistics"],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
+```
+
+> No runtime dependencies. `@types/node` and `typescript` are dev-only. Tests use the built-in `node:test` runner.
+
+---
+
+## `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": ".",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": false,
+    "sourceMap": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
+```
+
+---
+
+## `src/types.ts`
+
+```ts
+/**
+ * Strict domain types for the metrics service.
+ * No third-party schema libraries are used; validation is performed
+ * explicitly in `validate.ts` against these shapes.
+ */
+
+/** A single validated request-metric record. */
+export interface RequestMetric {
+  /** Unique run identifier (e.g. "run-2024-05-01-0001"). */
+  runId: string;
+  /** Model identifier (e.g. "llama-3-8b"). */
+  model: string;
+  /** Fixture / scenario identifier (e.g. "fixture-a"). */
+  fixture: string;
+  /** Latency in milliseconds (non-negative finite number). */
+  latencyMs: number;
+  /** Tokens per second throughput (non-negative finite number). */
+  tokensPerSec: number;
+  /** HTTP status code (integer in [100, 599]). */
+  status: number;
+  /** ISO-8601 timestamp of the request. */
+  timestamp: string;
+  /** Optional free-form label. */
+  label?: string;
+}
+
+/** Aggregated statistics for a single (model, fixture) group. */
+export interface GroupStats {
+  model: string;
+  fixture: string;
+  count: number;
+  /** Mean latency in ms. */
+  meanLatencyMs: number;
+  /** Median latency in ms. */
+  medianLatencyMs: number;
+  /** Sample standard deviation of latency (n-1). 0 when count < 2. */
+  sampleStdDevLatencyMs: number;
+  meanTokensPerSec: number;
+  medianTokensPerSec: number;
+  sampleStdDevTokensPerSec: number;
+  /** Fraction of requests with status >= 500 (server errors). */
+  errorRate: number;
+  /** Distinct run ids observed in this group. */
+  runIds: string[];
+}
+
+/** Top-level summary document returned by GET /summary. */
+export interface Summary {
+  generatedAt: string;
+  totalRecords: number;
+  totalRuns: number;
+  groupCount: number;
+  groups: GroupStats[];
+}
+
+/** Per-run detail returned by GET /runs/:id. */
+export interface RunDetail {
+  runId: string;
+  recordCount: number;
+  groupCount: number;
+  groups: Array<{
+    model: string;
+    fixture: string;
+    count: number;
+    meanLatencyMs: number;
+    medianLatencyMs: number;
+    sampleStdDevLatencyMs: number;
+  }>;
+}
+
+/** Health document returned by GET /health. */
+export interface Health {
+  status: "ok" | "degraded";
+  uptimeSec: number;
+  totalRecords: number;
+  totalRuns: number;
+  groupCount: number;
+  bufferUsedBytes: number;
+  bufferLimitBytes: number;
+  droppedMalformed: number;
+  startedAt: string;
+}
+
+/** A single line of a malformed-input report. */
+export interface MalformedLine {
+  line: number;
+  reason: string;
+  preview: string;
+}
+
+/** Result of ingesting a batch of NDJSON text. */
+export interface IngestResult {
+  accepted: number;
+  malformed: MalformedLine[];
+}
+```
+
+---
+
+## `src/errors.ts`
+
+```ts
+/**
+ * Typed error hierarchy. Every error carries a stable `code` so clients
+ * and logs can branch on it without string matching.
+ */
+
+export type ErrorCode =
+  | "E_PARSE"        // JSON syntax error
+  | "E_SCHEMA"       // valid JSON but wrong shape / values
+  | "E_OVERFLOW"     // bounded buffer exceeded
+  | "E_NOT_FOUND"    // unknown run id
+  | "E_BAD_REQUEST"  // malformed HTTP request
+  | "E_INTERNAL";    // unexpected failure
+
+export class AppError extends Error {
+  readonly code: ErrorCode;
+  readonly httpStatus: number;
+  readonly details?: unknown;
+
+  constructor(code: ErrorCode, message: string, httpStatus = 500, details?: unknown) {
+    super(message);
+    this.name = new.target.name;
+    this.code = code;
+    this.httpStatus = httpStatus;
+    this.details = details;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/** JSON syntax error (raised by the hand-rolled parser). */
+export class JsonParseError extends AppError {
+  readonly position: number;
+  constructor(message: string, position: number) {
+    super("E_PARSE", message, 400);
+    this.position = position;
+  }
+}
+
+/** Record failed strict validation. */
+export class ValidationError extends AppError {
+  readonly field: string;
+  constructor(field: string, message: string) {
+    super("E_SCHEMA", `${field}: ${message}`, 400, { field });
+    this.field = field;
+  }
+}
+
+/** Bounded in-memory buffer was exceeded. */
+export class BufferOverflowError extends AppError {
+  constructor(message: string) {
+    super("E_OVERFLOW", message, 507);
+  }
+}
+
+/** Unknown run id. */
+export class NotFoundError extends AppError {
+  constructor(runId: string) {
+    super("E_NOT_FOUND", `run '${runId}' not found`, 404, { runId });
+  }
+}
+
+/** Malformed HTTP request (bad method/path). */
+export class BadRequestError extends AppError {
+  constructor(message: string) {
+    super("E_BAD_REQUEST", message, 400);
+  }
+}
+```
+
+---
+
+## `src/json.ts`
+
+A complete, dependency-free JSON parser. It tokenizes and parses strictly (no trailing commas, no duplicate keys, no NaN/Infinity, no control characters in strings). This is what makes the service "validate without third-party schema libraries."
+
+```ts
+import { JsonParseError } from "./errors.js";
+
+/**
+ * A strict, self-contained JSON parser.
+ *
+ * Guarantees:
+ *  - Rejects trailing commas, duplicate keys, NaN/Infinity, and
+ *    unescaped control characters in strings.
+ *  - Produces plain objects, arrays, and primitives.
+ *  - Throws `JsonParseError` with a byte offset on any syntax error.
+ */
+export function parseJson(input: string): unknown {
+  const p = new Parser(input);
+  p.skipWs();
+  const value = p.parseValue();
+  p.skipWs();
+  if (p.pos < p.src.length) {
+    throw new JsonParseError(`trailing characters at offset ${p.pos}`, p.pos);
+  }
+  return value;
+}
+
+type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+class Parser {
+  pos = 0;
+  constructor(private readonly src: string) {}
+
+  private peek(): string {
+    return this.src.charAt(this.pos);
+  }
+
+  private skipWs(): void {
+    while (this.pos < this.src.length) {
+      const c = this.src.charAt(this.pos);
+      if (c === " " || c === "\t" || c === "\n" || c === "\r") this.pos++;
+      else break;
+    }
+  }
+
+  private expect(ch: string): void {
+    if (this.pos >= this.src.length || this.src.charAt(this.pos) !== ch) {
+      throw new JsonParseError(`expected '${ch}' at offset ${this.pos}`, this.pos);
+    }
+    this.pos++;
+  }
+
+  private parseValue(): JsonValue {
+    this.skipWs();
+    if (this.pos >= this.src.length) {
+      throw new JsonParseError("unexpected end of input", this.pos);
+    }
+    const c = this.peek();
+    switch (c) {
+      case "{": return this.parseObject();
+      case "[": return this.parseArray();
+      case '"': return this.parseString();
+      case "t": return this.parseLiteral("true", true);
+      case "f": return this.parseLiteral("false", false);
+      case "n": return this.parseLiteral("null", null);
+      default:
+        if (c === "-" || (c >= "0" && c <= "9")) return this.parseNumber();
+        throw new JsonParseError(`unexpected character '${c}' at offset ${this.pos}`, this.pos);
+    }
+  }
+
+  private parseLiteral(lit: string, val: boolean | null): boolean | null {
+    if (this.src.startsWith(lit, this.pos)) {
+      this.pos += lit.length;
+      return val;
+    }
+    throw new JsonParseError(`invalid literal at offset ${this.pos}`, this.pos);
+  }
+
+  private parseObject(): { [key: string]: JsonValue } {
+    this.expect("{");
+    const obj: { [key: string]: JsonValue } = {};
+    this.skipWs();
+    if (this.peek() === "}") { this.pos++; return obj; }
+    for (;;) {
+      this.skipWs();
+      if (this.peek() !== '"') {
+        throw new JsonParseError("expected object key string", this.pos);
+      }
+      const key = this.parseString();
+      if (Object.prototype.hasOwnProperty.call(obj, key)) {
+        throw new JsonParseError(`duplicate key '${key}' at offset ${this.pos}`, this.pos);
+      }
+      this.skipWs();
+      this.expect(":");
+      const value = this.parseValue();
+      obj[key] = value;
+      this.skipWs();
+      const c = this.peek();
+      if (c === ",") { this.pos++; continue; }
+      if (c === "}") { this.pos++; break; }
+      throw new JsonParseError(`expected ',' or '}' at offset ${this.pos}`, this.pos);
+    }
+    return obj;
+  }
+
+  private parseArray(): JsonValue[] {
+    this.expect("[");
+    const arr: JsonValue[] = [];
+    this.skipWs();
+    if (this.peek() === "]") { this.pos++; return arr; }
+    for (;;) {
+      const value = this.parseValue();
+      arr.push(value);
+      this.skipWs();
+      const c = this.peek();
+      if (c === ",") { this.pos++; continue; }
+      if (c === "]") { this.pos++; break; }
+      throw new JsonParseError(`expected ',' or ']' at offset ${this.pos}`, this.pos);
+    }
+    return arr;
+  }
+
+  private parseString(): string {
+    this.expect('"');
+    let out = "";
+    while (this.pos < this.src.length) {
+      const c = this.src.charAt(this.pos);
+      if (c === '"') { this.pos++; return out; }
+      if (c === "\\") {
+        this.pos++;
+        const e = this.src.charAt(this.pos);
+        switch (e) {
+          case '"': out += '"'; this.pos++; break;
+          case "\\": out += "\\"; this.pos++; break;
+          case "/": out += "/"; this.pos++; break;
+          case "b": out += "\b"; this.pos++; break;
+          case "f": out += "\f"; this.pos++; break;
+          case "n": out += "\n"; this.pos++; break;
+          case "r": out += "\r"; this.pos++; break;
+          case "t": out += "\t"; this.pos++; break;
+          case "u": {
+            const hex = this.src.slice(this.pos + 1, this.pos + 5);
+            if (hex.length !== 4 || !/^[0-9a-fA-F]{4}$/.test(hex)) {
+              throw new JsonParseError(`invalid \\u escape at offset ${this.pos}`, this.pos);
+            }
+            out += String.fromCharCode(parseInt(hex, 16));
+            this.pos += 5;
+            break;
+          }
+          default:
+            throw new JsonParseError(`invalid escape '\\${e}' at offset ${this.pos}`, this.pos);
+        }
+        continue;
+      }
+      if (c.charCodeAt(0) < 0x20) {
+        throw new JsonParseError(`unescaped control character at offset ${this.pos}`, this.pos);
+      }
+      out += c;
+      this.pos++;
+    }
+    throw new JsonParseError("unterminated string", this.pos);
+  }
+
+  private parseNumber(): number {
+    const start = this.pos;
+    if (this.peek() === "-") this.pos++;
+    if (this.pos >= this.src.length || !/[0-9]/.test(this.peek())) {
+      throw new JsonParseError("invalid number at offset " + start, start);
+    }
+    if (this.peek() === "0") {
+      this.pos++;
+    } else {
+      while (this.pos < this.src.length && /[0-9]/.test(this.peek())) this.pos++;
+    }
+    if (this.peek() === ".") {
+      this.pos++;
+      if (this.pos >= this.src.length || !/[0-9]/.test(this.peek())) {
+        throw new JsonParseError("invalid number fraction at offset " + start, start);
+      }
+      while (this.pos < this.src.length && /[0-9]/.test(this.peek())) this.pos++;
+    }
+    if (this.peek() === "e" || this.peek() === "E") {
+      this.pos++;
+      if (this.peek() === "+" || this.peek() === "-") this.pos++;
+      if (this.pos >= this.src.length || !/[0-9]/.test(this.peek())) {
+        throw new JsonParseError("invalid number exponent at offset " + start, start);
+      }
+      while (this.pos < this.src.length && /[0-9]/.test(this.peek())) this.pos++;
+    }
+    const raw = this.src.slice(start, this.pos);
+    const n = Number(raw);
+    if (!Number.isFinite(n)) {
+      throw new JsonParseError(`non-finite number '${raw}' at offset ${start}`, start);
+    }
+    return n;
+  }
+}
+```
+
+---
+
+## `src/validate.ts`
+
+Strict, explicit validation against `RequestMetric`. No schema library — every field is checked by hand.
+
+```ts
+import { parseJson } from "./json.js";
+import { ValidationError } from "./errors.js";
+import type { RequestMetric } from "./types.js";
+
+const ISO_RE = /^\d{4}-\d{2

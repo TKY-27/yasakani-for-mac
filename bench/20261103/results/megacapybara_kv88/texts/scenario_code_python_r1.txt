@@ -1,0 +1,548 @@
+Here is a complete, runnable Python 3.11 package implementing the requirements.
+
+**Design notes (brief):**
+- **Determinism:** jobs run in manifest order; each job's "work" is derived from its `id` via SHA-256 so results are reproducible across runs and platforms.
+- **One active GPU job:** an `asyncio.Lock` (`gpu_lock`) serializes all GPU jobs; CPU jobs may overlap.
+- **Atomic state:** state file is written to a temp file then `os.replace`d (atomic on POSIX).
+- **Resume:** completed/failed/cancelled jobs are skipped on restart; pending/running jobs re-run.
+- **JSONL events:** structured events streamed to stdout (and optionally a file), with secrets redacted.
+- **SIGINT:** first signal cancels the current job (marks it cancelled) and stops scheduling new ones; second signal exits immediately.
+- **Secrets:** values listed in `secrets` config are replaced with `[REDACTED]` in all emitted event payloads.
+
+---
+
+### pyproject.toml
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "async-job-runner"
+version = "0.1.0"
+description = "Deterministic asynchronous job runner with atomic state, resume, JSONL events, SIGINT handling, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Example Author", email = "example@example.com" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+job-runner = "async_job_runner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["async_job_runner*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+---
+
+### async_job_runner/__init__.py
+
+```python
+"""Deterministic asynchronous job runner."""
+
+from .runner import JobRunner
+from .manifest import Manifest, JobSpec
+from .state import StateStore
+from .events import EventStream, Redactor
+
+__all__ = [
+    "JobRunner",
+    "Manifest",
+    "JobSpec",
+    "StateStore",
+    "EventStream",
+    "Redactor",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+### async_job_runner/manifest.py
+
+```python
+"""Manifest loading and validation."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    """A single job specification from the manifest."""
+
+    id: str
+    kind: str  # "gpu" or "cpu"
+    command: str
+    params: dict[str, Any] = field(default_factory=dict)
+    timeout_seconds: float | None = None
+
+    @property
+    def is_gpu(self) -> bool:
+        return self.kind == "gpu"
+
+
+class ManifestError(Exception):
+    """Raised when the manifest is invalid."""
+
+
+class Manifest:
+    """Loads and validates a JSON manifest describing jobs to run."""
+
+    REQUIRED_TOP_KEYS = {"jobs"}
+    REQUIRED_JOB_KEYS = {"id", "kind", "command"}
+    VALID_KINDS = {"gpu", "cpu"}
+
+    def __init__(self, path: Path | str):
+        self.path = Path(path)
+        self.jobs: list[JobSpec] = []
+        self.secrets: list[str] = []
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            raise ManifestError(f"Manifest not found: {self.path}")
+
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ManifestError(f"Invalid JSON in manifest: {exc}") from exc
+
+        if not isinstance(raw, dict):
+            raise ManifestError("Manifest root must be a JSON object")
+
+        for key in self.REQUIRED_TOP_KEYS:
+            if key not in raw:
+                raise ManifestError(f"Missing required top-level key: '{key}'")
+
+        # Optional secrets list
+        secrets_raw = raw.get("secrets", [])
+        if not isinstance(secrets_raw, list):
+            raise ManifestError("'secrets' must be a list of strings")
+        self.secrets = [str(s) for s in secrets_raw]
+
+        jobs_raw = raw["jobs"]
+        if not isinstance(jobs_raw, list):
+            raise ManifestError("'jobs' must be a list")
+
+        seen_ids: set[str] = set()
+        for i, job_raw in enumerate(jobs_raw):
+            if not isinstance(job_raw, dict):
+                raise ManifestError(f"Job at index {i} must be an object")
+
+            for key in self.REQUIRED_JOB_KEYS:
+                if key not in job_raw:
+                    raise ManifestError(
+                        f"Job at index {i} missing required key: '{key}'"
+                    )
+
+            job_id = str(job_raw["id"])
+            if job_id in seen_ids:
+                raise ManifestError(f"Duplicate job id: '{job_id}'")
+            seen_ids.add(job_id)
+
+            kind = str(job_raw["kind"]).lower()
+            if kind not in self.VALID_KINDS:
+                raise ManifestError(
+                    f"Job '{job_id}' has invalid kind: '{kind}'. Must be 'gpu' or 'cpu'."
+                )
+
+            command = str(job_raw["command"])
+            params = job_raw.get("params", {})
+            if not isinstance(params, dict):
+                raise ManifestError(f"Job '{job_id}' params must be an object")
+
+            timeout = job_raw.get("timeout_seconds")
+            if timeout is not None:
+                timeout = float(timeout)
+                if timeout <= 0:
+                    raise ManifestError(
+                        f"Job '{job_id}' timeout_seconds must be positive"
+                    )
+
+            self.jobs.append(
+                JobSpec(
+                    id=job_id,
+                    kind=kind,
+                    command=command,
+                    params=params,
+                    timeout_seconds=timeout,
+                )
+            )
+
+    def get_job(self, job_id: str) -> JobSpec | None:
+        for job in self.jobs:
+            if job.id == job_id:
+                return job
+        return None
+```
+
+---
+
+### async_job_runner/state.py
+
+```python
+"""Atomic persistent state store."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+TERMINAL_STATUSES = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
+
+
+@dataclass
+class JobState:
+    status: JobStatus = JobStatus.PENDING
+    result: Any = None
+    error: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
+@dataclass
+class RunState:
+    """Top-level run state persisted atomically."""
+
+    run_id: str
+    jobs: dict[str, JobState] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "jobs": {
+                jid: {
+                    "status": js.status.value,
+                    "result": js.result,
+                    "error": js.error,
+                    "started_at": js.started_at,
+                    "finished_at": js.finished_at,
+                }
+                for jid, js in self.jobs.items()
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RunState":
+        jobs: dict[str, JobState] = {}
+        for jid, jdata in data.get("jobs", {}).items():
+            jobs[jid] = JobState(
+                status=JobStatus(jdata["status"]),
+                result=jdata.get("result"),
+                error=jdata.get("error"),
+                started_at=jdata.get("started_at"),
+                finished_at=jdata.get("finished_at"),
+            )
+        return cls(run_id=data["run_id"], jobs=jobs)
+
+
+class StateStore:
+    """Persists run state atomically using temp-file + rename."""
+
+    def __init__(self, path: Path | str):
+        self.path = Path(path)
+        self.state: RunState | None = None
+
+    def load(self) -> RunState | None:
+        """Load existing state from disk, or return None if absent."""
+        if not self.path.exists():
+            return None
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            self.state = RunState.from_dict(data)
+            return self.state
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            raise RuntimeError(f"Corrupt state file: {exc}") from exc
+
+    def save(self) -> None:
+        """Atomically write current state to disk."""
+        if self.state is None:
+            raise RuntimeError("No state to save")
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        payload = json.dumps(self.state.to_dict(), indent=2, sort_keys=True)
+
+        # Write to a temp file in the same directory, then atomically replace.
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(self.path.parent), prefix=".state_", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, str(self.path))
+        except BaseException:
+            # Clean up temp file on failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def initialize(self, run_id: str, job_ids: list[str]) -> RunState:
+        """Create a fresh RunState with all jobs pending."""
+        self.state = RunState(
+            run_id=run_id,
+            jobs={jid: JobState(status=JobStatus.PENDING) for jid in job_ids},
+        )
+        self.save()
+        return self.state
+
+    def mark_running(self, job_id: str, timestamp: str) -> None:
+        assert self.state is not None
+        self.state.jobs[job_id].status = JobStatus.RUNNING
+        self.state.jobs[job_id].started_at = timestamp
+        self.save()
+
+    def mark_completed(self, job_id: str, result: Any, timestamp: str) -> None:
+        assert self.state is not None
+        self.state.jobs[job_id].status = JobStatus.COMPLETED
+        self.state.jobs[job_id].result = result
+        self.state.jobs[job_id].finished_at = timestamp
+        self.save()
+
+    def mark_failed(self, job_id: str, error: str, timestamp: str) -> None:
+        assert self.state is not None
+        self.state.jobs[job_id].status = JobStatus.FAILED
+        self.state.jobs[job_id].error = error
+        self.state.jobs[job_id].finished_at = timestamp
+        self.save()
+
+    def mark_cancelled(self, job_id: str, timestamp: str) -> None:
+        assert self.state is not None
+        self.state.jobs[job_id].status = JobStatus.CANCELLED
+        self.state.jobs[job_id].finished_at = timestamp
+        self.save()
+
+    def is_terminal(self, job_id: str) -> bool:
+        assert self.state is not None
+        return self.state.jobs[job_id].status in TERMINAL_STATUSES
+```
+
+---
+
+### async_job_runner/events.py
+
+```python
+"""Structured JSONL event streaming with secret redaction."""
+
+from __future__ import annotations
+
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, TextIO
+
+
+class Redactor:
+    """Redacts configured secret values from arbitrary data structures."""
+
+    REDACTED_TOKEN = "[REDACTED]"
+
+    def __init__(self, secrets: list[str]):
+        self._secrets = set(secrets)
+
+    def redact(self, obj: Any) -> Any:
+        """Recursively replace any occurrence of a secret value."""
+        if isinstance(obj, str):
+            if obj in self._secrets:
+                return self.REDACTED_TOKEN
+            # Also handle secrets embedded within longer strings
+            for secret in self._secrets:
+                if secret and secret in obj:
+                    obj = obj.replace(secret, self.REDACTED_TOKEN)
+            return obj
+        elif isinstance(obj, dict):
+            return {k: self.redact(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [self.redact(item) for item in obj]
+        else:
+            return obj
+
+
+class EventStream:
+    """Streams structured JSONL events to stdout and/or a file."""
+
+    def __init__(
+        self,
+        redactor: Redactor,
+        output_file: Path | str | None = None,
+        stream_to_stdout: bool = True,
+    ):
+        self._redactor = redactor
+        self._stdout_enabled = stream_to_stdout
+        self._file_handle: TextIO | None = None
+        if output_file is not None:
+            self._output_path = Path(output_file)
+            self._output_path.parent.mkdir(parents=True, exist_ok=True)
+            self._file_handle = open(self._output_path, "a", encoding="utf-8")
+
+    def emit(self, event_type: str, data: dict[str, Any]) -> None:
+        """Emit a single structured event as a JSON line."""
+        timestamp = datetime.now(timezone.utc).isoformat()
+        record = {
+            "timestamp": timestamp,
+            "event": event_type,
+            "data": self._redactor.redact(data),
+        }
+        line = json.dumps(record, default=str, sort_keys=True)
+
+        if self._stdout_enabled:
+            print(line, file=sys.stdout, flush=True)
+
+        if self._file_handle is not None:
+            self._file_handle.write(line + "\n")
+            self._file_handle.flush()
+
+    def close(self) -> None:
+        if self._file_handle is not None:
+            self._file_handle.close()
+            self._file_handle = None
+```
+
+---
+
+### async_job_runner/executor.py
+
+```python
+"""Job execution logic. Deterministic by design."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import time
+from typing import Any
+
+
+class JobExecutionError(Exception):
+    """Raised when a job fails during execution."""
+
+
+def _deterministic_result(job_id: str, command: str, params: dict[str, Any]) -> dict[str, Any]:
+    """
+    Produce a deterministic result based on job identity.
+    Uses SHA-256 of (job_id, command, sorted params) to ensure reproducibility.
+    """
+    canonical_params = json_dumps_sorted(params)
+    input_str = f"{job_id}|{command}|{canonical_params}"
+    digest = hashlib.sha256(input_str.encode("utf-8")).hexdigest()
+    return {
+        "job_id": job_id,
+        "command": command,
+        "checksum": digest,
+        "params": params,
+    }
+
+
+def json_dumps_sorted(obj: Any) -> str:
+    """Serialize to JSON with sorted keys for determinism."""
+    import json
+
+    return json.dumps(obj, sort_keys=True, default=str)
+
+
+async def execute_job(
+    job_id: str,
+    command: str,
+    params: dict[str, Any],
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """
+    Execute a single job deterministically.
+
+    Simulates work with a small delay proportional to a hash-derived value
+    to keep timing deterministic per job while still being async-friendly.
+    """
+    # Derive a small deterministic delay (0.01–0.05s) from the job id
+    h = int(hashlib.sha256(job_id.encode()).hexdigest()[:8], 16)
+    delay = 0.01 + (h % 4000) / 100000.0  # 0.01 to ~0.05 seconds
+
+    await asyncio.sleep(delay)
+
+    result = _deterministic_result(job_id, command, params)
+    result["executed_at"] = time.time_ns()
+    return result
+
+
+async def execute_job_with_timeout(
+    job_id: str,
+    command: str,
+    params: dict[str, Any],
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Execute a job, enforcing an optional timeout."""
+    if timeout_seconds is not None:
+        return await asyncio.wait_for(
+            execute_job(job_id, command, params, timeout_seconds),
+            timeout=timeout_seconds,
+        )
+    return await execute_job(job_id, command, params, timeout_seconds)
+```
+
+---
+
+### async_job_runner/runner.py
+
+```python
+"""Main job runner orchestrating execution, state, events, and signals."""
+
+from __future__ import annotations
+
+import asyncio
+import signal
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .events import EventStream, Redactor
+from .executor import execute_job_with_timeout, JobExecutionError
+from .manifest import Manifest
+from .state import JobStatus, StateStore
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class JobRunner:
+    """
+    Deterministic asynchronous job runner.
+
+    - Reads a JSON manifest.
+    - Enforces one active GPU job at a time (via asyncio.Lock).
+    -

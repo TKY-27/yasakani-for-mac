@@ -1,0 +1,105 @@
+We need to produce a PostgreSQL script with no Markdown fences. Need include normalized tables for models, fixtures, runs, request_metrics; primary/foreign keys, checks, useful indexes, two views, one transaction-safe upsert function, at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Script must run in dependency order.
+
+Need design schema.
+
+Tables:
+models: model_id serial pk, model_name text not null unique? maybe family, param_count, dtype, max_context, created_at.
+fixtures: fixture_id serial pk, fixture_name text, fixture_kind text check one of ('short','medium','long','code')? Need four fixture kinds. Or 'chat','code','long-context','multi-turn'? Realistic. Need checks maybe token length min max. fixture_token_count? But fixtures used in runs.
+runs: run_id serial pk, model_id fk, fixture_id fk, run_timestamp timestamptz default now(), seed int, batch_size int, max_tokens int, num_requests? Maybe status check.
+request_metrics: metric_id bigserial pk, run_id fk, request_id int, request_start? latency_ms, output_tokens, input_tokens, ttft_ms, tps, mtp_accepted? mtp_proposed? Maybe per request. Include check output_tokens >=0, latency >0. Need at least 80 INSERT rows. Could generate 80 realistic rows. Two models and four fixture kinds. Could have 2 models x 4 fixtures x 10 runs? But request_metrics at least 80 rows. "at least 80 realistic INSERT rows spanning two models and four fixture kinds" could mean all inserts total? likely request_metrics rows. We can insert 80 request_metrics rows across 8 runs (2 models*4 fixtures), 10 requests each. Need include model, fixture, run inserts. Could be many rows. Need transaction-safe upsert function. Maybe function upsert_run_metrics(run_id, request_id, ...). It should use CTE? Transaction-safe means uses BEGIN/COMMIT inside function? In PostgreSQL function can't begin/commit unless transaction control in plpgsql? You can call PERFORM? Actually PL/pgSQL cannot contain BEGIN/COMMIT except in transaction-safe? In PG, transaction control statements allowed in simple SQL and plpgsql? I think BEGIN and COMMIT not allowed inside PL/pgSQL functions because already in transaction? Let's verify: PostgreSQL: "It is not possible to execute BEGIN and COMMIT inside a PL/pgSQL function, but they are allowed in anonymous code blocks or DO? Actually plpgsql does not support transaction control statements. In functions, you can use EXCEPTION block to rollback subtransaction using SAVEPOINT? To be transaction-safe, implement using ON CONFLICT DO UPDATE and wrap in transaction by caller. But phrase "one transaction-safe upsert function" likely a function that uses INSERT ... ON CONFLICT DO UPDATE and perhaps BEGIN/COMMIT? In PostgreSQL function cannot commit. We can make function that inserts with ON CONFLICT, and returns. If called inside a transaction, caller manages. Or use a CTE with unique conflict. Could include RAISE EXCEPTION? Transaction-safe meaning it will not leave partial updates? Maybe use a single statement INSERT ... ON CONFLICT DO UPDATE that is atomic. But function itself can't start transaction. Could define function that uses a subtransaction: BEGIN ... EXCEPTION WHEN OTHERS THEN ROLLBACK? PL/pgSQL supports BEGIN/EXCEPTION/END to create savepoint? Actually in PL/pgSQL, the BEGIN ... EXCEPTION ... END block begins a subtransaction (like savepoint) and rolls back if exception, but does not commit; if no exception, subtransaction commits but outer transaction still continues. That's transaction-safe? Could wrap logic in BEGIN EXCEPTION ROLLBACK RAISE. But for upsert, if conflict update. Could use a temporary table? Better: function upsert_request_metrics(p_run_id int, p_request_id int, ...) RETURNS void AS $$ BEGIN ... INSERT ... ON CONFLICT ... EXCEPTION WHEN ... ROLLBACK; RAISE; END $$; This is transaction-safe because if error rolls back subtransaction.
+
+Need ensure script runs dependency order: create tables, indexes, functions, insert data, views? Views can be created after tables or before inserts? Usually after tables before/after inserts. Need finish with six analytical SELECT queries. Need no Markdown fences. Output only SQL text.
+
+Need be careful with INSERT rows at least 80. Could do VALUES with 80 rows. Realistic: model A: llama-3.1-70b-instruct, model B: mistral-7b-instruct? Fixture kinds: 'chat', 'code', 'long-context', 'multi-turn'. Need two models, four fixtures. We can create 8 runs, one per model-fixture combo, 10 requests each = 80 request_metrics. Need insert models (2), fixtures (4), runs (8), request_metrics (80). That is >80 total, but request_metrics exactly 80. Need all values consistent. Use fixed IDs: models 1,2; fixtures 1..4; runs 1..8; request_metrics 1..80. But with serial sequences, we can explicitly insert IDs? If using serial, can omit IDs and rely; but for FKs need IDs. Could set sequences after insert. Better use explicit IDs in inserts: INSERT INTO models (model_id, model_name, ...) VALUES (1,...); setval('models_model_id_seq', 2). But if we use serial, explicit id works and sequence remains at 1 causing nextval conflict if used later? Not used. But good to setval.
+
+Need normalized tables: request_metrics has run_id, request_id. Composite unique? unique(run_id, request_id). primary metric_id. Need check request_id between 1 and 1000? maybe.
+
+Useful indexes: models maybe unique on name; fixtures kind index; runs model+fixture; runs timestamp; request_metrics run, latency, tps, mtp accepted.
+
+Two views: v_run_summary: per run model, fixture kind, avg/median throughput, p95 latency, mtp acceptance rate. v_fixture_comparison: per fixture across models maybe avg tps. Or v_long_context_retention? But views can be simple. Need two views.
+
+Analytical SELECT queries: six. For throughput, variability, long-context retention, MTP acceptance. We need queries maybe:
+1 throughput by model and fixture kind (requests per second maybe sum output_tokens / sum latency? Throughput = avg tokens per second, or total output tokens / total wall? We only have per request latency. Use output_tokens / (latency_ms/1000).) 
+2 variability: coefficient of variation of latency/tps by model/fixture; stddev_pop, avg, percent.
+3 long-context retention: compare long-context vs short/medium? Maybe input_tokens bucket and degradation: for long-context fixture, avg tps by input_tokens decile? We can query for fixture kind 'long-context': avg output tokens per second for input_tokens ranges (e.g., 0-8k, 8k-16k, 16k-32k, >32k). Retention as ratio relative to short baseline. Need realistic.
+4 MTP acceptance: avg accepted/proposed, maybe by model and fixture.
+5 maybe p95 latency vs p50 by model fixture.
+6 maybe request-level MTP acceptance vs output tokens.
+
+Need ensure queries can run with data. We can include percentile_cont available in PG. Use median? Yes.
+
+Need realistic INSERT rows. Need create 80 request_metrics rows. Need values: run_id, request_id, input_tokens, output_tokens, ttft_ms, latency_ms, tokens_per_second, mtp_proposed, mtp_accepted. Ensure tokens_per_second consistent? We can insert tps. Maybe check tps >0. For MTP acceptance, mtp_accepted <= mtp_proposed, proposed >=0. Realistic: proposed maybe 3 or 5? MTP (multi-token prediction) acceptance maybe 1-5. Let's define columns: mtp_proposed int check >=0, mtp_accepted int check >=0 and <= mtp_proposed. Could be 0 if disabled? But for MTP acceptance, maybe model A has MTP enabled, model B not? Need both. We can set B proposed=0 accepted=0. Or both have small. Let's choose model 1: llama-3.1-70b-instruct-mtp with MTP enabled; model 2: mistral-7b-instruct-v0.3 no MTP? But if no MTP, acceptance 0. But query still works. Better both have MTP? "MTP acceptance" maybe model has multi-token prediction; can compare. Use two models: 'openai/mtp-7b' and 'openai/mtp-70b'? Hmm.
+
+Need "two models and four fixture kinds". We can define model A: 'llama-3.1-8b-instruct-mtp' and model B: 'mistral-7b-instruct-mtp'? But MTP not standard. Could be 'model-a-mtp-v1' and 'model-b-mtp-v2'. Realistic names.
+
+Maybe models:
+1: 'meta-llama/Llama-3.1-8B-Instruct-MTP' max_context 8192, dtype float16
+2: 'meta-llama/Llama-3.1-70B-Instruct-MTP' max_context 8192? But long-context maybe 32k? Let's make both 32768.
+
+Fixtures:
+1 'short-chat' kind 'short' avg_tokens 512
+2 'code-generation' kind 'code' avg 1200
+3 'long-context-qa' kind 'long-context' avg 16384
+4 'multi-turn-agent' kind 'multi-turn' avg 4096
+
+Runs: 8:
+1 model1 fixture1 batch=16, max_tokens=512, seed=1001
+2 model1 fixture2 batch=8, max_tokens=1024
+3 model1 fixture3 batch=4, max_tokens=2048
+4 model1 fixture4 batch=8, max_tokens=1024
+5 model2 fixture1
+6 model2 fixture2
+7 model2 fixture3
+8 model2 fixture4
+
+Need 10 request metrics each. For each run, generate varied values. Could do manually or generate in text. Need 80 rows realistic. Need maintain plausible ranges.
+
+We can choose per run baseline output_tokens ~ max_tokens? For fixture short: output 100-300. latency maybe 1000-3000 ms, tps 100-200. For 8B vs 70B, 70B slower? Actually larger model maybe lower tps. Need throughput by model. Model 1 small 8B faster, model 2 70B slower. Let's assign model1: tps 180-260; model2: 80-140. Long-context slower: tps lower. MTP acceptance: model1 proposed 4, accepted 2-4; model2 proposed 2, accepted 1-2. For no? We can have both.
+
+Need ensure request_metrics row includes tokens_per_second maybe computed. We can set plausible independent. Could include check tokens_per_second > 0. We can also not require consistency with latency/output; but realism good. Could compute tps = output_tokens / (latency_ms/1000). For 250 tokens in 2000ms =125. Let's choose tps consistent roughly. But manual 80 rows. Could use patterns.
+
+Maybe use INSERT ... SELECT with generate_series? Requirement "at least 80 realistic INSERT rows" maybe literal INSERT rows? It says include INSERT rows. Could use SELECT generate_series to insert 80 rows? It might be acceptable but "INSERT rows" could mean literal. Safer to provide literal VALUES with 80 rows. But generating with deterministic pseudo-random? Could be one INSERT with 80 values. Need ensure no mistakes.
+
+Could create request_metrics using a temp generator with 80 literal values? We can write one INSERT INTO request_metrics (run_id, request_id, input_tokens, output_tokens, ttft_ms, latency_ms, tokens_per_second, mtp_proposed, mtp_accepted) VALUES (...); with 80 tuples. Need format correct.
+
+Let's design 80 values. We can systematically list.
+
+Run 1 (model1, short-chat) 10 req:
+input tokens around 500, output around 120-220, ttft 80-120, latency 1500-2800, tps output/(latency/1000): e.g. 180 tokens/1.9s =94.7? Hmm tps output only. For short 150 tokens in 1.5s =100. Let's set tps 100-140. But for 8B maybe 150. Let's not overthink.
+Maybe tokens_per_second = output_tokens / (latency_ms/1000). Let's compute? Many. We can pick latency to match tps.
+For output 150, tps 120 -> latency 1250 ms. Add ttft. So latency ~1000-2000. Good.
+Run1 rows:
+1 (512, 142, 88, 1260, 112.7, 4, 3)
+2 (523, 155, 91, 1320, 117.4, 4, 3)
+3 (498, 139, 86, 1240, 112.1, 4, 4)
+4 (504, 161, 95, 1420, 113.4, 4, 3)
+5 (511, 148, 90, 1300, 113.8, 4, 2)
+6 (507, 170, 99, 1510, 112.6, 4, 3)
+7 (519, 152, 87, 1330, 114.3, 4, 4)
+8 (501, 136, 83, 1210, 112.4, 4, 3)
+9 (526, 164, 93, 1450, 113.1, 4, 3)
+10 (515, 147, 89, 1290, 113.9, 4, 2)
+
+Run2 model1 code: input ~1200, output ~500-700, latency 3500-5000, tps ~120-160. MTP proposed 4, accepted 2-4.
+1: 1220,540,112,4650,116.1,4,3
+2: 1195,575,115,4820,119.3,4,3
+3: 1240,510,108,4380,116.4,4,4
+4: 1212,588,121,5020,117.1,4,3
+5: 1233,554,113,4720,117.4,4,2
+6: 1201,596,118,5120,116.4,4,3
+7: 1247,531,107,4460,119.1,4,4
+8: 1218,579,116,4910,117.9,4,3
+9: 1236,562,111,4780,117.6,4,3
+10: 1225,545,114,4670,116.7,4,2
+
+Run3 model1 long-context: input ~16k, output ~800-1200, latency 8000-14000, tps ~80-110. MTP proposed 4 accepted 1-3 maybe lower.
+1: 16230, 845, 210, 9800, 86.2, 4, 2
+2: 16180, 892, 215, 10150, 87.9, 4, 2
+3: 16310, 812, 205, 9650, 84.1, 4, 3
+4: 16260, 918, 220, 10500, 87.4, 4, 1
+5: 16205, 874, 212, 10080, 86.7, 4, 2
+6: 16290, 903, 218, 10320, 87.5, 4, 2
+7: 16175, 837, 209, 9720, 86.1, 4, 3
+8: 16250, 926, 221, 10610, 87.3, 4, 1
+9: 16300, 881, 214, 10110, 87.2, 4, 2
+10: 16220, 859, 211, 98

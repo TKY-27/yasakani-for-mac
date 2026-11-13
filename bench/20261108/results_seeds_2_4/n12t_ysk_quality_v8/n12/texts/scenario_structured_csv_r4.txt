@@ -1,0 +1,164 @@
+We need answer user's request: produce CSV only, one header and exactly 220 data rows. Columns: sample_id,language,category,prompt_tokens,output_tokens,accepted_drafts,drafted_tokens,decode_tok_s,valid.
+Need sample IDs S0001-S0220, cycle languages en/zh/ja, cycle categories code/story/translation/structured, generate internally consistent positive numeric values. Quote fields only when CSV requires it. No commentary.
+
+Need ensure exactly 220 rows. Need decide numeric consistency. Columns positive numeric? prompt_tokens, output_tokens, accepted_drafts, drafted_tokens, decode_tok_s positive. valid? likely boolean? "positive numeric values" applies all? valid column maybe true/false? It says generate internally consistent positive numeric values. Columns include valid. Could valid be 1? positive numeric? To be safe valid=1 maybe. But valid likely boolean true. "positive numeric values" for numeric columns; valid maybe boolean? It says columns ... valid. Use positive numeric values maybe valid=1? Need internal consistency: drafted_tokens likely >= accepted_drafts? accepted_drafts <= drafted_tokens? decode_tok_s maybe output_tokens / time? Positive. Need no CSV quote unless required. No commas in fields.
+
+Need produce 220 rows. Must count exactly. Could generate deterministic pattern. Need ensure no mistakes. We can construct rows systematically.
+
+IDs S0001 to S0220. Language cycle: for sample i 1..220, language = en if i mod 3 == 1, zh if mod 3 == 2, ja if mod 3 == 0. Category cycle: code/story/translation/structured with i mod 4 ==1 code,2 story,3 translation,0 structured.
+
+Need numeric values. Could use formula:
+prompt_tokens = 100 + i*3? positive.
+output_tokens = 20 + i*2.
+drafted_tokens = output_tokens + 10 + (i mod 5)? accepted_drafts = floor(drafted_tokens/2)? Must positive, accepted_drafts <= drafted_tokens. decode_tok_s = output_tokens / 10? positive, maybe decimal.
+valid = 1.
+Need all positive. Could have decimals. Ensure numeric no quotes.
+
+But exactly 220 rows: need generate manually? We can use reasoning to list all 220? Need final CSV. We can produce via mental deterministic generation. But 220 rows long. Need ensure no missing/extra. We can create table using patterns. Since final answer can be long. Need be accurate.
+
+Maybe use a compact deterministic generation in final? But CSV only no code. Need actual rows.
+
+Need count 220. Could exploit repeating blocks. Language period 3, category period 4, lcm 12. So 12-row repeating language/category pattern. 220 = 18*12 + 4? 18*12=216, plus 4. We can define block for 12 rows repeated 18 times with changing numeric by sample id. But IDs increment. Need generate 220 rows.
+
+Could generate via formula row by row. Need avoid errors. Let's design values with simple functions of i so can compute. But final needs explicit rows.
+
+Maybe use row numbers 1-220. Need language and category. Let's precompute language/category sequence for 12 cycle:
+i mod3: 1 en,2 zh,0 ja
+i mod4: 1 code,2 story,3 translation,0 structured
+For i=1: en code
+2: zh story
+3: ja translation
+4: en structured
+5: zh code
+6: ja story
+7: en translation
+8: zh structured
+9: ja code
+10: en story
+11: zh translation
+12: ja structured
+13 repeats en code etc.
+Categories order for 1..12: code, story, translation, structured, code, story, translation, structured, code, story, translation, structured.
+Languages 1..12: en, zh, ja, en, zh, ja, en, zh, ja, en, zh, ja.
+Combined:
+1 en code
+2 zh story
+3 ja translation
+4 en structured
+5 zh code
+6 ja story
+7 en translation
+8 zh structured
+9 ja code
+10 en story
+11 zh translation
+12 ja structured
+Repeat.
+
+Need 220 IDs. Could generate values using i. Let's choose:
+prompt_tokens = 100 + 7*i
+output_tokens = 20 + 3*i
+drafted_tokens = output_tokens + 10 + (i % 9) maybe 30..38
+accepted_drafts = 10 + (i % 7) maybe less than drafted. But ensure accepted_drafts <= drafted_tokens and maybe positive. If output grows, drafted grows. accepted maybe less. Could accepted_drafts = 10 + (i%11) (10-20), drafted_tokens = 30+ (i%20) (30-49). accepted <= drafted yes. But accepted_drafts maybe number of accepted draft tokens? Could be less than drafted tokens. Good.
+decode_tok_s = output_tokens / 10? If output=23 at i=1 => 2.3. Positive. Could be two decimals? Need consistent. Maybe decode_tok_s = round((20+3i)/10, 2). Or simpler = 1.0 + 0.01*i? positive. But internally consistent? decode_tok_s could be decode tokens per second. No strict relation. Could set decode_tok_s = output_tokens / 10 exactly? That creates decimals like 2.3, 2.6... For i such that output 23 => 2.3, 26=>2.6. If output=100+? Could be .? Since output = 20+3i; /10 gives one decimal if 3i mod10? 20+3i divided by10 = (2+0.3i) -> one decimal .0,.3,.6,.9,.2,... Good. Positive.
+
+But valid? If valid=1 all rows positive numeric. Fine.
+
+Need maybe accepted_drafts positive integer, drafted_tokens integer. prompt/output positive integers. decode decimal one/two places.
+
+Could use formula:
+prompt_tokens = 100 + 2*i
+output_tokens = 50 + i
+drafted_tokens = output_tokens + 5 + (i % 6) (i.e., 55-... positive, > accepted)
+accepted_drafts = 10 + (i % 10) (10-19) ensure <= drafted? For i=1 drafted=50+1+5+1=57? Wait output=51, +5+1=57; accepted 11. ok. For i=220 output=270, drafted=270+5+(220%6=4)=279, accepted=10+(220%10=0)=10. okay. But accepted_drafts not correlated? okay. Could accepted_drafts maybe output? No.
+
+Maybe simpler:
+prompt_tokens = 100 + i
+output_tokens = 10 + i
+drafted_tokens = output_tokens + 5
+accepted_drafts = output_tokens / 2? But integer? i 1 -> output 11, drafted 16, accepted 5 (floor). positive. decode_tok_s = output_tokens/10 =1.1 etc. This is easy. accepted_drafts = floor((10+i)/2). For i=1 accepted 5, drafted 16. Good. For i=2 output12 drafted17 accepted6. accepted <= drafted. Positive. decode_tok_s = (10+i)/10 = 1.1,1.2,... 23.0 for i=220? Wait 230/10=23.0. positive.
+
+But output_tokens=10+i, prompt_tokens=100+i. All positive. drafted_tokens=15+i? output+5 = 15+i. accepted_drafts = floor((10+i)/2). For i=220 output=230, drafted=235, accepted=115. Good. Decode= (10+i)/10 = 1.1 to 23.0 (one decimal). This is easy to generate manually? Need 220 rows values increment.
+
+But need cycle language/category. We can generate by block of 12 with numeric increments. Need exact rows.
+
+Maybe use formula row n:
+sample_id = S + 4-digit n.
+language/category from 12 pattern.
+prompt_tokens = 100+n
+output_tokens = 10+n
+accepted_drafts = floor((10+n)/2) = 5 + floor((n+1? let's compute) For n=1:5; n=2:6; n=3:7; n=4:7? floor(14/2)=7; Wait floor((10+n)/2). n=1=5,2=6,3=7,4=7,5=8,6=8,7=9,8=9,9=10,10=10,11=11,12=11,... Pattern pairs.
+drafted_tokens = 15+n
+decode_tok_s = (10+n)/10 = 1.1 + 0.1*(n-1) from 1.1 to 23.0.
+valid=1.
+
+This is internally consistent: drafted_tokens > accepted_drafts, decode positive, output positive.
+
+Need produce 220 rows. Could generate manually with patterns. Need avoid arithmetic errors. Let's plan method.
+
+We can produce 12-row blocks. For block b starting at n = 12*(b-1)+1 to 12*b. Numeric values simple.
+For each n, prompt=100+n, output=10+n, accepted=floor((10+n)/2), drafted=15+n, decode=(10+n)/10 (one decimal). We can generate block template with offsets 1..12 relative to block start.
+
+For n = base + k, where k=1..12, base=12*(b-1).
+prompt = 100+base+k = (100+base)+k.
+output = 10+base+k = (10+base)+k.
+drafted = 15+base+k = (15+base)+k.
+accepted = floor((10+base+k)/2). This depends on base parity and k. base is multiple of 12, even. 10+base even? 10+multiple 12 = even. So 10+base+k parity = parity of k. floor((even + k)/2) = (10+base)/2 + floor(k/2). Since even base part. Let A0 = (10+base)/2 = 5 + 6*(b-1)? Wait base=12m, m=b-1. (10+12m)/2=5+6m. So accepted = 5+6m + floor(k/2). For k 1..12: floor(k/2): 0,1,1,2,2,3,3,4,4,5,5,6. So accepted sequence offset: +0,+1,+1,+2,+2,+3,+3,+4,+4,+5,+5,+6.
+decode = (10+base+k)/10 = (1+1.2m?) Let's compute: (10+12m+k)/10 = 1 + 1.2m + 0.1k. For m=0: 1.1..2.2. For m=1: 2.3..3.4? Wait base=12, n=13 output=23 decode 2.3, yes. So decode block m: start = 1 + 1.2m, then +0.1 each k. one decimal.
+prompt base P0 = 100+12m, plus k.
+output O0 = 10+12m, plus k.
+drafted D0 = 15+12m, plus k.
+
+There are 220 rows = 18 full blocks (m=0..17) + 4 rows of block 19 (m=18, k=1..4) because 18*12=216. Actually m from 0 to 17 for first 216. Then n=217..220: m=18, k=1..4.
+
+Need list 220 rows. Could generate block by block. Need ensure 18 full blocks + partial. That's lengthy but manageable if systematic. Need final only CSV.
+
+Could maybe reduce risk by writing all rows using a generated pattern in analysis? Need final exact. Let's construct carefully.
+
+Let's define 12 language/category rows:
+k1: en,code
+k2: zh,story
+k3: ja,translation
+k4: en,structured
+k5: zh,code
+k6: ja,story
+k7: en,translation
+k8: zh,structured
+k9: ja,code
+k10: en,story
+k11: zh,translation
+k12: ja,structured
+
+For block m (0-based), rows IDs S(12m+1)..S(12m+12).
+Values:
+k=1: prompt=100+12m+1=101+12m; output=11+12m; accepted=5+6m; drafted=16+12m; decode=1.1+1.2m
+k=2: prompt=102+12m; output=12+12m; accepted=6+6m; drafted=17+12m; decode=1.2+1.2m
+k=3: prompt=103+12m; output=13+12m; accepted=6+6m; drafted=18+12m; decode=1.3+1.2m
+k=4: prompt=104+12m; output=14+12m; accepted=7+6m; drafted=19+12m; decode=1.4+1.2m
+k=5: prompt=105+12m; output=15+12m; accepted=7+6m; drafted=20+12m; decode=1.5+1.2m
+k=6: prompt=106+12m; output=16+12m; accepted=8+6m; drafted=21+12m; decode=1.6+1.2m
+k=7: prompt=107+12m; output=17+12m; accepted=8+6m; drafted=22+12m; decode=1.7+1.2m
+k=8: prompt=108+12m; output=18+12m; accepted=9+6m; drafted=23+12m; decode=1.8+1.2m
+k=9: prompt=109+12m; output=19+12m; accepted=9+6m; drafted=24+12m; decode=1.9+1.2m
+k=10: prompt=110+12m; output=20+12m; accepted=10+6m; drafted=25+12m; decode=2.0+1.2m? Wait for k=10, decode =1.0+1.2m? Formula 1+1.2m+0.1*10 =2+1.2m. For m=0: 2.0. yes.
+k=11: prompt=111+12m; output=21+12m; accepted=10+6m; drafted=26+12m; decode=2.1+1.2m
+k=12: prompt=112+12m; output=22+12m; accepted=11+6m; drafted=27+12m; decode=2.2+1.2m
+
+Check n=10 output=20 decode 2.0, accepted floor20/2=10, drafted 25. Good.
+
+Now need generate blocks m=0 to 17 and partial m=18 k=1..4.
+
+Let's compute values for each m.
+m=0:
+k1 S0001 en code prompt101 out11 acc5 draft16 decode1.1
+k2 S0002 zh story 102 12 6 17 1.2
+k3 S0003 ja translation 103 13 6 18 1.3
+k4 S0004 en structured 104 14 7 19 1.4
+k5 S0005 zh code 105 15 7 20 1.5
+k6 S0006 ja story 106 16 8 21 1.6
+k7 S0007 en translation 107 17 8 22 1.7
+k8 S0008 zh structured 108 18 9 23 1.8
+k9 S0009 ja code 109 19 9 24 1.9
+k10 S0010 en story 110 20 10 25 2.0
+k11 S0011 zh translation 111 21 10 26 2.1
+k12 S0012 ja structured 112 22 1

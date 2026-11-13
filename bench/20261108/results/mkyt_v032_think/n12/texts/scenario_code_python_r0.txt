@@ -1,0 +1,215 @@
+The user is asking for a complete Python 3.11 package for a deterministic asynchronous job runner. Requirements:
+
+1. Read a JSON manifest
+2. Enforce a single active GPU job (only one GPU job active at a time)
+3. Persist atomic state (atomic writes via temp file + rename)
+4. Resume completed work (skip completed jobs on re-run)
+5. Stream structured JSONL events (append-only event log)
+6. Handle SIGINT (graceful cancellation, wait for the active job to finish, mark cancelled, exit code)
+7. Redact configured secrets (redact secret values within events and logs)
+8. pytest tests for success, failure, cancellation, and resume
+9. Present all source files in separate fenced blocks with paths, and also include pyproject.toml
+
+Let's design the package:
+
+Package name: `gpu_runner` or `job_runner`. Should we call it `deterministic_runner`... no, `gpujobrunner` or simply `jobrunner`? Keep it simple: package name `jobrunner`.
+
+Layout:
+
+```
+jobrunner/
+  pyproject.toml
+  src/jobrunner/
+    __init__.py
+    manifest.py
+    state.py
+    events.py
+    redact.py
+    scheduler.py / runner.py
+    cli.py
+  tests/
+    conftest.py
+    test_success.py
+    test_failure.py
+    test_cancel.py
+    test_resume.py
+    test_redact.py
+    test_manifest.py
+```
+
+Simpler: a single `runner.py` module with a `Runner` class. Let's design carefully.
+
+Key design points:
+
+**Manifest format (JSON):**
+```json
+{
+  "version": 1,
+  "jobs": [
+    {
+      "id": "train-v1",
+      "gpu": true,
+      "command": ["python", "train.py", "--epochs", "2"],
+      "secrets": {"API_TOKEN": "tok-123"}
+    }
+  ],
+  "secrets": {"API_TOKEN": "tok-123"}   // top-level secrets too, maybe
+}
+```
+
+Actually, the secrets configuration could also live at the top level: `"secrets": ["API_TOKEN", "PASSWORD"]` meaning redact occurrences of these values anywhere. Let's support both: `secrets` is a top-level mapping of name -> value, and the runner redacts the values wherever they appear in event fields, in stdout/stderr output lines, and in commands. Determinism: manifest hashing.
+
+**Determinism:**
+- Jobs execute in manifest order (stable).
+- Non-GPU jobs may run concurrently, but GPU jobs are mutually exclusive (single active GPU job). Also deterministic: schedule is based on manifest order; use `asyncio` with a semaphore for GPU jobs (semaphore = 1), a semaphore for non-GPU (say N, but for determinism a fixed limit like 4). Event timestamps — should include timestamps, but the tests shouldn't depend on them. To aid determinism, maybe include a monotonically increasing `seq` on events. Include both `seq` and `ts` (epoch float). Tests should not rely on the exact values of timestamps.
+
+**State persistence (atomic):**
+- A JSON file `state.json` written atomically: write to `state.json.tmp.<pid>` and `os.replace`. Also persist state on every state transition (job start, finish, fail).
+- State file contents: `{"version":1, "manifest_sha256": "...", "jobs": {"<id>": {"status": "completed", "exit_code": 0, "seq_start":..., "seq_end":...}}, "run_status": "running"}`.
+
+**Resuming completed work:**
+- On startup, load state; if the manifest hash matches, skip jobs with status == "completed" (emit a "resumed"/"skipped" event). Failed jobs get rerun.
+
+**JSONL event stream:**
+- Append events to `events.jsonl`, each line a JSON object: `{"seq": n, "ts": ..., "type": "job_started", "job_id": ..., "data": {...}}`. Flush after each write, and also `os.fsync`? For tests, flush is enough. Events:
+  - `run_started`, `run_finished` (with status: completed / failed / cancelled)
+  - `job_skipped` (reason: completed)
+  - `job_started`, `job_finished` (exit_code), `job_failed`
+  - `gpu_acquired`, `gpu_released` (maybe folded into the job event)
+  - `log` events (stdout/stderr lines, redacted)
+  - `cancellation_requested`, `cancellation_complete`
+
+**SIGINT handling:**
+- Register a signal handler with `loop.add_signal_handler(signal.SIGINT, ...)` — sets a flag and emits a `cancellation_requested` event. The runner then: stops starting new jobs, waits for active jobs to finish (optionally terminate with a timeout), marks pending jobs as `cancelled`, persists state, and emits `run_finished` with status `cancelled`. Exit code: 130 (128+SIGINT) is convention; or custom code 2. Use 130 on cancel, 1 on failure, 0 on success. In tests, we simulate SIGINT by sending to the process group, or by calling a function. For in-process tests, we can call the runner's `request_cancellation()` or use `loop.add_signal_handler` with a real signal in the same process (sending `os.kill(os.getpid(), signal.SIGINT)` in the same process). That works in pytest (main thread). To keep tests robust, use `os.kill(os.getpid(), signal.SIGINT)` in the subprocess? No — simplest: run the runner as a subprocess via a CLI entry point and send SIGINT to the subprocess. That's the most realistic. The CLI `python -m jobrunner run --manifest m.json --workdir wd` launches the runner.
+
+But a subprocess test using the `python -m` entry point requires the package to be importable — install the package with pip install -e, or run with `python -m jobrunner` with PYTHONPATH. In pytest, we can add to `sys.path`. For the subprocess, we can set the `PYTHONPATH` env var to the src directory. Or use `sys.executable -m jobrunner` with `env={...PYTHONPATH: str(src_root)}`. That will work.
+
+Alternatively, tests call `Runner` in-process, and the SIGINT test uses the `os.kill` approach. In-process is faster and simpler; `add_signal_handler` only works in the main thread on Unix — pytest runs in the main thread so that's fine. But pytest may catch KeyboardInterrupt... if we install our own handler via `loop.add_signal_handler`, SIGINT triggers our callback, no KeyboardInterrupt raised. Good.
+
+However, in-process signal tests in pytest can interfere with Ctrl-C of the pytest process. Acceptable range; but to be safe we can use a subprocess. Let's decide: write the test that starts the runner in a background thread? `add_signal_handler` must be called from the main thread of the event loop's thread... Actually `loop.add_signal_handler` requires being called from the loop's thread. If the runner is created with its own loop in the main thread, that's fine.
+
+Simpler and robust: in-process test:
+
+```python
+async def test_cancel(tmp_path):
+    runner = Runner(...)
+    task = asyncio.create_task(runner.run())
+    # wait for first job started
+    await runner._wait_for_event("job_started")
+    loop = asyncio.get_running_loop()
+    loop.call_later(0.05, lambda: os.kill(os.getpid(), signal.SIGINT))
+    rc = await task
+    assert rc == 130
+```
+
+Hmm, but a direct `os.kill` in-process during pytest — our handler intercepts so it's fine.
+
+Wait: `asyncio`'s `loop.add_signal_handler` uses `signal.set_wakeup_fd`, and works in the main thread. pytest is the main thread. OK.
+
+Or use a helper `runner.request_cancel()` and a `simulate_sigint` method to test the same code path. I'll provide both: the runner exposes `request_cancellation()`, and the signal handler calls it. In the cancellation test, to be realistic, test the actual signal path with `os.kill(os.getpid(), signal.SIGINT)`.
+
+**Secrets redaction:**
+- The manifest can declare `"redact": {"values": [...]}` or `"secrets": {"NAME": "value"}`. The runner builds a set of secret strings (values, and maybe names?). Redact in: command args? If the command contains a secret, replace with `"[REDACTED]"`. Also redact in log lines. Also redact in `data` fields of all emitted events (string values scanned, or `str.replace` per line). Implement `Redactor` class:
+
+```python
+class Redactor:
+    def __init__(self, secrets: Iterable[str]):
+        self._secrets = sorted({s for s in secrets if s}, key=len, reverse=True)
+    def redact(self, text: str) -> str:
+        for s in self._secrets:
+            text = text.replace(s, "[REDACTED]")
+        return text
+```
+
+Apply to all string leaves in events and to captured output lines.
+
+**Job execution:**
+- Run `command` with `asyncio.create_subprocess_exec` with env containing top-level secrets? Maybe the manifest provides `"env"` per job and top-level `"env"`. Inject top-level secrets into env under their names. Redact in the emitted command? Actually, if the secret comes only from env, the command shown in the event is fine, but log lines must be redacted.
+
+- Per-job timeout optional: `"timeout_seconds"`. Deterministic default 600.
+
+- Job status: pending → running → completed (exit 0) / failed (exit != 0 or timeout) ; cancelled.
+
+- Fail-fast option: `"fail_fast": false` default; if true, stop scheduling on first failure.
+
+**Concurrency model for determinism:**
+- Scheduler processes the manifest order: for each job in order, launch a coroutine. Non-GPU jobs up to `max_parallel` (manifest setting, default 4? or 2). GPU job: `gpu_semaphore = asyncio.Semaphore(1)` ensures only one active GPU job. To keep it fully deterministic, jobs in each "wave" execute in order? True determinism in the event stream is hard with concurrency. The requirement is "deterministic asynchronous job runner" — I'll interpret that as deterministic *ordering semantics*: manifest order scheduling, single GPU job, stable event sequence for the same manifest (no wall-clock timestamps in identity). To be safe, we could also make the default max_parallel = 1? That trivializes "single active GPU job" but non-GPU concurrency is still a feature. Keep `max_parallel: int = 2` and `gpu: max 1`. Tests will write a small deterministic manifest to verify: two GPU jobs run sequentially (overlapping intervals don't overlap), non-GPU jobs may overlap. To assert "single active GPU job", use a job command that touches a lockfile, or simply verify events: no `job_started` for GPU B before `job_finished` for GPU A. The event stream is single-threaded and append-ordered, so we can assert the order of events: gpu B start after gpu A end. Because the event log is written sequentially on the loop thread, that ordering is reliable.
+
+**Event log writing:**
+- The `EventLog` class opens a file in append mode, with a lock (asyncio is single-threaded so no lock needed). Each write: `f.write(json.dumps(event, sort_keys=True) + "\n"); f.flush()`. Optionally fsync for durability — maybe `sync: bool` flag; tests default true? Fsync is fine for tests (small). For speed, make fsync default False, but "atomic state" uses os.replace. Let's implement `fsync_events` option default True — safe.
+
+State file also written atomically: serialize to a temp file in the same directory, flush+fsync, then `os.replace`.
+
+**Manifest validation:**
+- `Manifest.from_path` validates: schema version, list of jobs, each job has unique `id`, `command` is a non-empty list of strings. Raises `ManifestError` with a message.
+
+**Exit codes:**
+- 0 success
+- 1 failure (job failed)
+- 2 invalid manifest
+- 130 cancelled by SIGINT
+
+**CLI:**
+```
+python -m jobrunner run --manifest manifest.json --workdir . [--max-parallel N] [--fail-fast]
+python -m jobrunner validate --manifest manifest.json
+```
+
+Use argparse inside `__main__.py`, `main(argv=None) -> int`.
+
+**State and resume details:**
+- state.json:
+```json
+{
+  "version": 1,
+  "manifest_sha256": "...",
+  "updated_at": ts,
+  "run_status": "completed|failed|cancelled|running",
+  "jobs": {
+     "train": {"status": "completed", "exit_code": 0, "started_seq": 3, "ended_seq": 9}
+  }
+}
+```
+- On resume: if state exists and manifest hash equals and state's run_status is one of (completed, failed, cancelled, running — treat running as stale/corrupt), completed jobs are skipped with event `job_skipped`, reason "completed". If manifest hash mismatches, reset state (emit `state_reset` event, reason manifest_changed).
+
+**Tests:**
+- `conftest.py`: helpers to build manifest and workdir fixtures; `run_inprocess` helper.
+- `test_success.py`: manifest with 2 GPU jobs + 2 CPU jobs, run to completion, assert exit 0, all jobs completed in state, events exist in order, GPU jobs don't overlap (verify event ordering).
+- `test_failure.py`: a job fails (cmd `sh -c "exit 3"`); assert exit 1, state run_status failed, job failed with exit_code 3, subsequent jobs don't start without fail-fast? Default: continue; verify events. Also test fail-fast mode.
+- `test_cancel.py`: GPU job sleeps ~2s; runner starts; wait for `job_started` for that job; send SIGINT (via loop? in-process os.kill). Assert exit 130, state run_status cancelled, running job is marked cancelled after it terminates... Hmm, semantics: wait for the active job to finish then mark cancelled? If a job is in-flight on SIGINT, options: (a) kill it, (b) wait for graceful finish. Implement: wait for in-flight job to complete within `cancel_timeout` (default 30s); if it finishes before timeout, record the actual exit but mark as `cancelled`? Semantics: if a job was in-flight at cancellation, mark it `cancelled` regardless of the process exit (but wait for the process to exit to avoid orphan processes). If it exceeds timeout, force-kill (SIGKILL? terminate then kill). For the test: a job sleeps 30s; on SIGINT, we wait... The test will be slow. Better: make cancel_timeout small (say 2s) and job sleeps 10s → job gets force-terminated, marked cancelled. Assert state: job cancelled, run_status cancelled, exit 130, `run_finished` event with status cancelled. Also assert remaining pending jobs are marked cancelled.
+
+Actually better UX: on SIGINT, terminate in-flight subprocesses (SIGTERM to the process group), wait for grace timeout, SIGKILL. Mark cancelled. This is deterministic and fast. Implementation: when `cancel_event` is set, the in-flight job execution loop checks `cancel_event` after process termination? Standard pattern: `await proc.wait()`; but if cancellation happens while waiting, `proc.terminate()` then wait. Implementation: `task = await proc.wait()` via `asyncio.wait({proc.wait(), cancel_event.wait()})`... Simpler: wrap in an `asyncio.wait` with two tasks and cancel the proc-wait task when cancel fires, then `proc.terminate()`.
+
+Simplest robust pattern:
+
+```python
+async def wait_with_cancel(proc, cancel_event, grace):
+    done, _ = await asyncio.wait([proc.wait(), cancel_event.wait()], return_when=asyncio.FIRST_COMPLETED)
+    if cancel_event in done:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), grace)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+        return None  # cancelled
+    return proc.returncode
+```
+
+Note: `cancel_event.wait()` task is pending forever — keep it, or cancel when complete. Cancel the cancel-wait task when process ends to avoid leaks.
+
+- `test_resume.py`: manifest with 3 jobs; first run: make job 2 fail (e.g., script that fails on first run via marker file, succeeds on second) — or simpler: first run has a failing job; second run: job 1 completed (skipped, no new execution event), job 2 rerun now succeeds (command `sh -c "touch ok; [ -f ok ]"` fails on first run, succeeds on second), job 3 runs. Assert: final exit 0; events on run 2 include `job_skipped` for job 1 with reason completed; job 2 completed; state all completed. This tests resume well.
+
+Also a test that resume doesn't rerun completed jobs: count execution events per job id between runs.
+
+- `test_redact.py`: job emits `sh -c "echo secret-value-xyz"`; manifest secrets config includes that value; assert events.jsonl doesn't contain the literal, and does contain `[REDACTED]`. Also command arg redaction.
+
+- Also `test_manifest.py` for validation errors, and `test_state_atomic`? The requirement says tests for success, failure, cancellation, and resume. Redaction and manifest tests are bonuses.
+
+**Event types and fields** (structured JSONL):
+
+```
+{"seq":0,"ts":...,"type":"run_started","data":{"manifest_sha256":"...","run_id":"...","workdir":"..."}}
+{"seq":1,"type":"job_skipped","data":{"job_id":"a","reason":"completed"}}
+{"seq":2,"type":"job_started","data":{"job_id":"a","gpu":true,"command":["sh","-c","..."],"timeout_seconds":600}}
+{"seq":3,"type":"log","data":{"job_id":"a","stream":"stdout","line":"..."}}

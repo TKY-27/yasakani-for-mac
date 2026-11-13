@@ -1,0 +1,157 @@
+What the user is asking for is a complete TypeScript 5 service with the following:
+1. Consumes newline-delimited request metrics (NDJSON format)
+2. Validates without third-party schema libraries (hand-rolled validation)
+3. Groups records by model and fixture
+4. Computes mean/median/sample standard deviation
+5. Exposes `/health`, `/summary`, and `/runs/:id` endpoints
+6. Strict typing
+7. Incremental parsing (stream processing, not buffering all input)
+8. Bounded memory
+9. Malformed-input errors
+10. Unit tests
+11. package.json
+12. tsconfig.json
+13. Short operational guide
+14. No placeholders
+
+Let me design this carefully.
+
+**Architectural decisions:**
+
+- Use Node.js built-in `http` module to avoid third-party dependencies (or use `express`? The user says "no third-party schema libraries," so other libraries are allowed, but to be safe and self-contained, I'll use Node's built-in `http` module for the server — this eliminates dependencies entirely).
+- Tests: use Node's built-in test runner (`node:test`) to avoid a jest dependency. This is nice — Node 18+/20 supports `node --test` natively. TypeScript compiled to CommonJS or ESM... let me think about module format.
+
+TypeScript 5 with `node:test` — I'll write tests in TypeScript and compile with ts-node or tsc. To keep it simple with no third-party runtime dependencies, tests can be compiled with `tsc` and run with `node --test dist/test/*.test.js`. But dev dependencies are fine (typescript is a devDependency). Actually, the constraint is "no third-party schema libraries" for validation — so validation must be hand-rolled. TypeScript is fine as a dev dependency.
+
+Plan:
+- `package.json`: scripts for build, start, test, typecheck. DevDependencies: typescript, @types/node.
+- `tsconfig.json`: strict: true, NodeNext module, ES2022 target, outDir dist, rootDir src.
+- `src/types.ts`: strict types — `MetricsRecord`, `ValidationIssue`, `Stats`, etc.
+- `src/validator.ts`: hand-rolled validation producing typed errors (field, code, message, path).
+- `src/parser.ts`: incremental NDJSON line splitter (handles lines split across chunks, backpressure-friendly), emits complete lines.
+- `src/aggregator.ts`: bounded-memory grouping by (model, fixture). Bounded memory: cap on number of distinct groups; cap on number of records retained per group? But computing mean/median/std requires all data, or streaming statistics.
+
+Hmm — median requires the full data or a two-level histogram (Greenwald-Khanna) for streaming. To keep it exact and bounded:
+- Option A: store all latencies in memory (unbounded).
+- Option B: store up to N samples per group (reservoir sampling) — then median/std are approximate, not exact.
+- Option C: exact streaming stats: mean + sample variance can be done exactly with Welford's algorithm (sum, sum of squares, or Welford). Median requires full data.
+
+The user asks for "mean/median/sample standard deviation" and "bounded memory." Exact median is incompatible with bounded memory for arbitrary data unless data is bounded by design. Practical approach: bound records per group to a cap `MAX_RECORDS_PER_GROUP` (e.g., 100,000). Beyond that, use reservoir sampling to keep a fixed-size sample, stats computed on the reservoir are approximate, and the service reports `sampled: true` plus `totalRecords` (exact count) alongside the stats. This is a legitimate, honest design: exact count, exact mean? If using reservoir sampling, mean/std are also approximate over the sample. Alternatively, maintain exact Welford (mean, sample variance are exact with bounded memory) + reservoir for median (median is approximate). Then: mean and std are exact (bounded memory, constant per group), median is approximate via reservoir. That's a nice design and defensible. But wait: Welford's sample variance is exact in exact arithmetic; floating point has error, but that's inherent. Actually, if we use sum and sum-of-squares, catastrophic cancellation could happen, and Welford is numerically stable. So:
+
+- Exact, bounded (O(1) per group): count, sum → mean, Welford → sample variance/std, min, max.
+- Approximate with bounded reservoir: median via reservoir of size R (e.g., 4096).
+
+But the user said "computes mean/median/sample standard deviation" — they likely expect exact values. If we set the cap high, most runs stay within it. If a group exceeds the reservoir size, stats are computed over the reservoir (documented, with `approximate: true` flag). Hmm, but then mean/std also become approximate. Or, when data fits within cap, compute everything exactly; when it overflows, maintain a reservoir and degrade.
+
+Actually, let me reconsider: simpler and fully honest — maintain a bounded buffer per group of up to `MAX_PER_GROUP` (say 50_000) latency values, with reservoir sampling beyond that. When buffer == reservoir (saturated), stats are marked `sampled: true` and computed over the reservoir. Counts remain exact. This bounds memory: groups capped by `MAX_GROUPS` (e.g., 10_000) → each group holds up to `MAX_PER_GROUP` floats. Worst case 50k * 8 bytes = 400KB per group... times 10k groups = 4GB. Too much. Let me pick more realistic bounds: MAX_GROUPS = 4096, MAX_PER_GROUP = 1024 reservoir, but before saturation buffer grows up to reservoir size. Memory: 4096 * 1024 * 8B ≈ 32MB. Fine. Actually, simpler: use reservoir from the start? No — a reservoir of size 1024 for 100 records is a poor estimate. Better: grow buffer up to capacity, then switch to reservoir sampling (standard "reservoir with growing phase"). Implementation: keep an array; while n <= capacity, push; thereafter, replace with probability capacity/n. This yields exact stats until saturation, then approximate.
+
+Wait, but mean/std exactness via Welford: if we keep the reservoir array after saturation, we can recompute mean/std over the reservoir, or keep Welford over all data (exact). Keeping Welford over all data is cheap (2-3 numbers per group). So design:
+
+Per group:
+- `totalRecords: number` (exact, counts all validated records in the group)
+- `sum`, `m2` (Welford) → exact mean, sample variance/std over all records
+- `min`, `max`
+- `reservoir: number[]` (size <= capacity) → median (exact while unsaturated, approximate after)
+- `saturated: boolean`
+- `dropped?` no — nothing is dropped from count; the reservoir just samples.
+
+Memory bound: groups ≤ MAX_GROUPS; each group O(1) + reservoir of O(capacity). Total bounded.
+
+If number of distinct (model, fixture) pairs exceeds MAX_GROUPS → reject new groups with a `group_limit_exceeded` error? Or hash? Rejection is cleaner and honest; the error counts as a malformed/bounded-input error reported in the run result. I'll go with rejection with a typed error code `TOO_MANY_GROUPS` and include in error aggregation.
+
+**Runs:** What is a "run"? The service consumes NDJSON from some source. Let me define the ingestion contract: the service exposes an ingestion endpoint? The user says "consumes newline-delimited request metrics" and "exposes /health, /summary, /runs/:id endpoints." So metrics come in somewhere — likely via POST /ingest with NDJSON body, or a stdin pipe. `/runs/:id` implies runs are entities with an id. Design: `POST /runs` creates a run (id = ULID-ish or generated UUIDv4? no, crypto.randomUUID built-in is fine). `POST /runs/:id/ingest` accepts an NDJSON body (streaming, chunked), incrementally parsed, validated, aggregated. `GET /runs/:id` returns the run's summary (per-model/fixture stats, error counts, state). `GET /summary` aggregates across all runs (or a global view). `GET /health` returns liveness/readiness + memory usage.
+
+Also support `POST /ingest` with body containing `runId`? Simpler: make run id a required header `X-Run-Id`, or make it part of the path. Let me do this:
+
+- `GET /health` → `{ status: "ok", uptimeMs, memory: {...}, version }`
+- `POST /runs` → creates run, returns `{ runId, createdAt }`
+- `POST /runs/:id/ingest` → streams NDJSON body; incremental parse; validate; aggregate; responds with `{ runId, accepted, rejected, rejectedDetails: [first N] }`. Supports chunked transfer. Bounded request size: cap body at `MAX_INGEST_BYTES` (e.g., 32 MB), with 413 beyond.
+- `GET /runs/:id` → run detail: state (ingesting/closed), accepted/rejected counts, per-group stats, saturated flags, error samples.
+- `POST /runs/:id/close` → marks run complete (optional; ingestion still possible? no — closed runs reject further ingestion with 409).
+- `GET /summary` → cross-run view: total runs, total accepted/rejected, top groups across all runs? For simplicity: global stats aggregated by (model, fixture) across all runs, plus per-run rollup. Hmm, global aggregation across runs would need its own bounded aggregator. Reuse the same `Aggregator` class as a "global" instance and a per-run instance. Memory still bounded (two bounded aggregators). This is elegant.
+
+Actually, to keep memory bounded even with many runs, should runs be capped too? Number of runs * (per-run aggregator) could grow. Each run's aggregator holds at most MAX_GROUPS groups. With many runs that grows. Options: cap total runs (say 256), 429/500 on excess; or auto-archive oldest runs. I'll add `MAX_RUNS` bound and reject new runs with 503 when at cap. Also expose `DELETE /runs/:id` for cleanup? Adding it — good for operations and freeing memory. Keep it.
+
+**Metrics record schema (hand-rolled, strict):**
+
+```json
+{
+  "runId": "...",            // optional? If present, must match the run being ingested into? Actually, records may carry their own metadata; keep optional `clientRunTag`. Let me design the record:
+}
+```
+
+Let me define the record:
+
+```ts
+interface MetricsRecord {
+  ts: string;                 // ISO-8601 timestamp, required
+  model: string;              // non-empty string, ≤64 chars, charset [A-Za-z0-9._-]
+  fixture: string;            // non-empty string, ≤64 chars, same charset
+  latencyMs: number;          // finite, ≥ 0, ≤ 3,600,000 (1 hour)
+  status: "success" | "error";// required
+  requestId?: string;         // optional, ≤128 chars
+  tokens?: number;            // optional integer ≥ 0? Maybe not needed.
+}
+```
+
+Hmm, tokens adds noise; keep minimal but realistic: ts, model, fixture, latencyMs, status, requestId (optional). Group key = (model, fixture). Latency is the metric. Should we group by status too? User says group by model and fixture — so status is just a field; we can also track per-group success/error counts (cheap, and useful for summary). Yes: per-group `success`, `error` counts.
+
+Validation rules (hand-rolled, no JSON schema lib):
+- line must parse as JSON object (not array, not null, no primitives) — use `JSON.parse` then structural check (JSON.parse is fine; constraint is no *schema* library).
+- unknown fields → reject with `unknown_field`? Strictly: I'll reject unknown properties to enforce contract (configurable? Keep strict, document). Hmm, strict rejection of unknowns is a good "strict types" demonstration. Yes: `UNEXPECTED_FIELD`.
+- `ts`: string, must parse with `Date.parse` and `!Number.isNaN`, plus regex gate for ISO-8601 (Z or offset). Also reject non-ISO formats. Require a pattern like `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$` — hand-rolled regex validation. Also ensure date is in valid range (year 1970-2100).
+- `model`, `fixture`: string, length 1..64, regex `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`.
+- `latencyMs`: number (reject string, boolean), `Number.isFinite`, ≥ 0, < 3,600,000. Allow decimals.
+- `status`: exactly "success" | "error".
+- `requestId` optional: string 1..128, regex `^[A-Za-z0-9:_-]+$`? Reasonable.
+- Multiple errors per record: collect all issues and report (better errors), but the record is rejected if there's ≥1 issue.
+
+Error type:
+
+```ts
+interface ValidationIssue {
+  code: IssueCode; // "MISSING_FIELD" | "UNEXPECTED_FIELD" | "WRONG_TYPE" | "INVALID_VALUE" | ...
+  field: string;   // dot path, e.g., "latencyMs" or "" for root
+  message: string;
+}
+```
+
+Malformed-input error: record-level (validation) and stream-level (line not valid JSON → `INVALID_JSON`; body not terminated / trailing incomplete line → report as incomplete; body too large → request aborted with 413).
+
+**Incremental parsing:** NDJSON line splitter class that handles:
+- multi-byte UTF-8? Line splitting on bytes 0x0A; JSON strings may contain escaped `\n`, but actual newline bytes always terminate lines in NDJSON. Split on `\n` bytes is safe. Also handle `\r\n` (strip trailing `\r`).
+- lines split across chunks: retain partial tail.
+- max line length bound (`MAX_LINE_BYTES`, e.g., 64 KB): if a line exceeds → emit `LINE_TOO_LONG` error, discard remainder up to next newline (resync). This bounds memory per line.
+- empty lines: skip (or count as skipped, not error — skip silently, count `skippedBlankLines`).
+
+Implementation: a `LineSplitter` with `feed(chunk: Buffer): LineEvent[]` or callback. For backpressure-friendly ingestion: process body chunks as they arrive; per chunk: split → per line: validate → aggregate. All within chunk loop; if request is large, Node streams handle the backpressure with `pipeline`. Use `pipeline(req, transform?, res)` or manually `req.on('data')`. For simplicity and full control (byte counting, 413 abort), manual: accumulate byte count, on `data` → feed splitter, process lines; on `end` → final flush; on `close`/aborted → mark run as interrupted? I'll track a request-scoped result and on end write JSON response.
+
+**Bounded memory summary:**
+- MAX_LINE_BYTES = 64 * 1024 per line buffer
+- MAX_INGEST_BYTES = 32 * 1024 * 1024 per request
+- MAX_GROUPS = 4096 (per aggregator)
+- RESERVOIR_CAPACITY = 1024 per group
+- MAX_RUNS = 256
+- Error sample retention: first 16 issues per run (bounded)
+- Global aggregator: same bounds.
+
+Wait, 4096 groups × 1024 reservoir × 8 bytes = 32 MB per aggregator; two aggregators = 64 MB worst case. OK, documented. Could lower MAX_GROUPS to 2048. I'll set MAX_GROUPS=2048, capacity 1024 → ~16 MB per aggregator. Fine.
+
+**HTTP server:** Node's `http` server. Routes are a tiny hand-rolled router. JSON response helper. 404 for unknown routes, 405 for wrong method. Parse path param for `/runs/:id`. Run id validation: `^[A-Za-z0-9-]{8,64}$`.
+
+**Endpoints:**
+
+- `GET /health` → 200 `{ status:"ok", version, uptimeSec, nodeVersion, memory: { rssBytes, heapUsedBytes, heapTotalBytes }, limits: {...} }`. Always 200 while the process is alive.
+- `GET /summary` → 200:
+  ```json
+  {
+    "totals": { "runs": n, "accepted": n, "rejected": n, "bytesIngested": n },
+    "groups": [ { "model", "fixture", "records", "success", "error", "latencyMs": { "mean", "median", "stdDev", "min", "max", "sampled" } }, ... ] // sorted by records desc, cap 100
+  }
+  ```
+  The summary groups come from the global aggregator.
+- `POST /runs` → 201 `{ runId, createdAt, state }` or 503 at capacity.
+- `POST /runs/:id/ingest` → streams; on completion 200 `{ runId, accepted, rejected, skippedBlankLines, bytes, incompleteTrailingLine?, groupExhausted?, errorSamples }`; if the run is closed → 409; unknown run → 404; body > MAX_INGEST_BYTES → 413 (abort).
+- `GET /runs/:id` → 200 run detail with per-group stats (cap group listing, say 200, sorted); 404 if unknown.
+- `POST /runs/:id/close` → 200 state closed; 404 if unknown.
+- `DELETE /runs/:id` → 200 `{

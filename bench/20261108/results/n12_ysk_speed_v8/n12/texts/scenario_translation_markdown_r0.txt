@@ -1,0 +1,47 @@
+# 发布流程
+
+发布负责人必须严格保留诸如 `request_id`、`max_context`、`kv_dtype` 和 `mtp_rounds` 等标识符。请将正文翻译为中文，但不要翻译代码、JSON 键、命令行标志、文件名或表格中的值。
+
+| Phase | Required evidence | Failure action |
+|---|---|---|
+| prepare | fixture hash and prompt-token count | stop before generation |
+| warmup | one successful unmeasured request | restart the service |
+| measure | five sequential responses | invalidate the complete block |
+| publish | summary plus per-request rows | withhold the headline |
+
+```json
+{"model":"qwen3.6-35b-a3b","max_completion_tokens":1024,"seed":42,"stream":false}
+```
+
+## 备注
+
+操作员需确认前缀复用已禁用、缓存命中计数为零，且没有无关的 GPU 进程处于活动状态。自然停止的响应仍视为有效观测；因客户端断开连接而丢失的响应则不视为有效。报告需区分服务器内部 TTFT 与网络观测时间，并说明首个生成的 token 归属于 prefill 阶段。
+
+## 双语术语表
+
+| 术语 | 中文 | 说明 |
+|---|---|---|
+| Release owner | 发布负责人 | 负责执行发布流程并确保证据完整的人员。 |
+| Identifier | 标识符 | 在系统中用于唯一标识请求或配置的字符串，如 `request_id`。 |
+| Fixture hash | 测试夹具哈希 | 用于验证测试数据完整性的哈希值。 |
+| Prompt-token count | 提示词令牌数 | 输入提示词中包含的 token 数量。 |
+| Unmeasured request | 未测量请求 | 用于预热但不计入性能统计的请求。 |
+| Sequential responses | 顺序响应 | 按顺序生成的多个响应，用于测量稳定性。 |
+| Invalidate the complete block | 使整个块失效 | 当测量失败时，丢弃该批次的所有数据。 |
+| Per-request rows | 每请求行 | 报告中针对每个单独请求的详细数据行。 |
+| Withhold the headline | 保留标题结论 | 在数据不完整时不发布主要结论。 |
+| Prefix reuse | 前缀复用 | 复用相同前缀以加速生成的机制，此处需禁用。 |
+| Cache-hit count | 缓存命中计数 | 命中缓存的次数，此处要求为零以确保冷启动。 |
+| GPU process | GPU 进程 | 占用 GPU 资源的进程，需确保无无关进程干扰。 |
+| Valid observation | 有效观测 | 符合实验条件、可用于分析的数据点。 |
+| Client disconnected | 客户端断开 | 客户端主动或意外断开连接导致响应丢失。 |
+| Server-internal TTFT | 服务器内部首字延迟 | 服务器内部记录的首个 token 生成时间。 |
+| Network-observed time | 网络观测时间 | 从客户端视角观测到的网络传输时间。 |
+| Prefill | 预填充 | 处理输入提示词并构建 KV 缓存的阶段。 |
+| First generated token | 首个生成 token | 模型生成的第一个输出 token。 |
+| KV cache | KV 缓存 | 存储注意力机制中 Key 和 Value 的缓存。 |
+| MTP rounds | MTP 轮次 | 多 token 预测（Multi-Token Prediction）的迭代轮数。 |
+| KV dtype | KV 数据类型 | KV 缓存中数据的数据类型（如 float16, bfloat16）。 |
+| Max context | 最大上下文 | 模型允许的最大上下文长度。 |
+| Seed | 随机种子 | 用于控制随机数生成器以确保可复现性的整数。 |
+| Stream | 流式输出 | 是否以流式方式逐步返回生成内容。 |

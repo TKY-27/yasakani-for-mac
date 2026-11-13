@@ -1,0 +1,497 @@
+# Deterministic Asynchronous Job Runner
+
+Below is a complete, runnable Python 3.11 package. Every file is in its own fenced block. The package is self-contained (no third‑party runtime dependencies — it uses only the standard library), so `pip install -e .` just needs a Python 3.11 interpreter.
+
+## How it works (one paragraph)
+
+`runner` reads a JSON **manifest** describing a set of *jobs* (each job is a deterministic function identified by name + arguments). A single‑worker, single‑GPU‑slot scheduler runs exactly **one** job at a time (enforced by a lock + an atomic state file). Progress is persisted **atomically** (write‑to‑temp + `os.replace`) into a `state/` directory, so a crash mid‑run leaves a consistent state. On startup the runner **resumes** by skipping jobs already recorded as `SUCCEEDED` (and re‑running `FAILED`/`PENDING` ones). Every lifecycle transition is emitted as a **structured JSONL** event to stdout (and optionally a log file). `SIGINT` is handled gracefully: the current job is cancelled (via a cooperative cancel flag / `asyncio` task cancellation), state is flushed, and the process exits cleanly. Any **secret** values appearing in events or logs are **redacted** using the configured secret names.
+
+---
+
+## `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deterministic-job-runner"
+version = "1.0.0"
+description = "Deterministic asynchronous job runner with atomic state, resume, JSONL events, SIGINT handling, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Example Corp" }]
+keywords = ["jobs", "async", "deterministic", "gpu", "runner"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+]
+# NOTE: no third-party runtime dependencies on purpose (stdlib only).
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+]
+
+[project.scripts]
+djrunner = "runner.cli:main"
+
+[tool.setuptools]
+packages = ["runner"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+```
+
+---
+
+## `runner/__init__.py`
+
+```python
+"""Deterministic asynchronous job runner.
+
+Public API:
+    Runner            -- the main orchestrator
+    Job               -- a single unit of work
+    JobStatus         -- lifecycle enum
+    Event             -- structured event dataclass
+    JobRegistry       -- maps job names to callables
+    load_manifest     -- parse a JSON manifest into a list of Jobs
+"""
+
+from .config import Config, load_config
+from .events import Event, EventWriter
+from .manifest import Job, JobStatus, load_manifest, JobRegistry
+from .redact import Redactor
+from .scheduler import Scheduler, GpuSlot
+from .state import StateStore, AtomicState
+from .runner import Runner
+
+__all__ = [
+    "Config",
+    "load_config",
+    "Event",
+    "EventWriter",
+    "Job",
+    "JobStatus",
+    "load_manifest",
+    "JobRegistry",
+    "Redactor",
+    "Scheduler",
+    "GpuSlot",
+    "StateStore",
+    "AtomicState",
+    "Runner",
+]
+
+__version__ = "1.0.0"
+```
+
+---
+
+## `runner/config.py`
+
+```python
+"""Configuration dataclass and loader.
+
+The config is a plain dataclass so it is trivial to construct in tests and
+to serialise. ``load_config`` reads a JSON file (or an inline dict) and
+validates it.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Mapping
+
+
+@dataclass
+class Config:
+    """Runtime configuration for the runner.
+
+    Attributes:
+        state_dir: Directory where atomic state files are persisted.
+        event_file: Optional path to a JSONL event log file (None = stdout only).
+        secrets: Mapping of secret *names* to their *values*. Any value that
+            appears verbatim in an event/log is replaced with ``[REDACTED:<name>]``.
+        gpu_count: Number of GPU slots. The runner enforces at most one *active*
+            GPU job at a time regardless of this value (see Scheduler).
+        max_retries: How many times a failed job may be retried before it is
+            marked FAILED permanently.
+        timeout: Per-job timeout in seconds (0 = no timeout).
+        seed: Random seed used to make behaviour deterministic.
+        workdir: Working directory for jobs (informational).
+    """
+
+    state_dir: Path
+    event_file: Path | None = None
+    secrets: dict[str, str] = field(default_factory=dict)
+    gpu_count: int = 1
+    max_retries: int = 0
+    timeout: float = 0.0
+    seed: int = 0
+    workdir: Path | None = None
+
+    def validate(self) -> None:
+        if self.gpu_count < 1:
+            raise ValueError("gpu_count must be >= 1")
+        if self.max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+        if self.timeout < 0:
+            raise ValueError("timeout must be >= 0")
+        if self.seed < 0:
+            raise ValueError("seed must be >= 0")
+
+
+def _coerce_path(value: Any, field_name: str) -> Path | None:
+    if value is None:
+        return None
+    if isinstance(value, Path):
+        return value
+    if isinstance(value, str):
+        return Path(value)
+    raise TypeError(f"{field_name} must be a str or Path, got {type(value).__name__}")
+
+
+def load_config(data: Mapping[str, Any] | str | Path | None = None) -> Config:
+    """Build a ``Config`` from a mapping, a JSON string, or a JSON path.
+
+    ``data`` may be:
+      * None          -> defaults
+      * dict          -> direct mapping
+      * str (path)    -> path to a JSON file
+      * Path          -> path to a JSON file
+    """
+    if data is None:
+        cfg = Config(state_dir=Path("state"))
+        cfg.validate()
+        return cfg
+
+    if isinstance(data, (str, Path)):
+        path = Path(data)
+        if not path.exists():
+            raise FileNotFoundError(f"Config file not found: {path}")
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+
+    if not isinstance(data, Mapping):
+        raise TypeError("Config data must be a mapping or a path to a JSON file")
+
+    kwargs: dict[str, Any] = {}
+    if "state_dir" in data:
+        kwargs["state_dir"] = _coerce_path(data["state_dir"], "state_dir")
+    if "event_file" in data:
+        kwargs["event_file"] = _coerce_path(data["event_file"], "event_file")
+    if "secrets" in data:
+        secrets = data["secrets"]
+        if not isinstance(secrets, Mapping):
+            raise TypeError("'secrets' must be a mapping")
+        kwargs["secrets"] = {str(k): str(v) for k, v in secrets.items()}
+    if "gpu_count" in data:
+        kwargs["gpu_count"] = int(data["gpu_count"])
+    if "max_retries" in data:
+        kwargs["max_retries"] = int(data["max_retries"])
+    if "timeout" in data:
+        kwargs["timeout"] = float(data["timeout"])
+    if "seed" in data:
+        kwargs["seed"] = int(data["seed"])
+    if "workdir" in data:
+        kwargs["workdir"] = _coerce_path(data["workdir"], "workdir")
+
+    if "state_dir" not in kwargs:
+        kwargs["state_dir"] = Path("state")
+
+    cfg = Config(**kwargs)
+    cfg.validate()
+    return cfg
+```
+
+---
+
+## `runner/manifest.py`
+
+```python
+"""Manifest parsing and the Job model.
+
+A manifest is a JSON document of the form::
+
+    {
+      "jobs": [
+        {"name": "train", "args": {"epochs": 3}, "gpu": true},
+        {"name": "eval",  "args": {"split": "val"}, "gpu": false}
+      ]
+    }
+
+Each job is deterministic: running the same ``name`` with the same ``args``
+must produce the same result. The ``JobRegistry`` maps names to callables.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+
+class JobStatus(str, Enum):
+    """Lifecycle states for a job."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in (
+            JobStatus.SUCCEEDED,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+        )
+
+
+@dataclass
+class Job:
+    """A single unit of work.
+
+    Attributes:
+        id: Stable unique identifier (deterministic from name+args by default).
+        name: Name of the registered callable to run.
+        args: Arguments passed to the callable.
+        gpu: Whether the job requires the GPU slot.
+        retries: Number of times the job has been retried.
+        status: Current lifecycle status.
+        result: Captured result (if any).
+        error: Captured error message (if any).
+    """
+
+    name: str
+    args: dict[str, Any] = field(default_factory=dict)
+    gpu: bool = True
+    id: str = ""
+    retries: int = 0
+    status: JobStatus = JobStatus.PENDING
+    result: Any = None
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.id:
+            self.id = deterministic_job_id(self.name, self.args)
+
+    def key(self) -> str:
+        """Stable identity used to detect 'already completed' jobs on resume."""
+        return self.id
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "args": self.args,
+            "gpu": self.gpu,
+            "retries": self.retries,
+            "status": self.status.value,
+            "result": self.result,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "Job":
+        status = data.get("status", JobStatus.PENDING.value)
+        if isinstance(status, str):
+            status = JobStatus(status)
+        return cls(
+            name=data["name"],
+            args=dict(data.get("args", {})),
+            gpu=bool(data.get("gpu", True)),
+            id=data.get("id", ""),
+            retries=int(data.get("retries", 0)),
+            status=status,
+            result=data.get("result"),
+            error=data.get("error"),
+        )
+
+
+def deterministic_job_id(name: str, args: Mapping[str, Any]) -> str:
+    """Produce a stable, deterministic id from a job name and its args.
+
+    Uses a sorted, canonical JSON encoding so that argument *order* does not
+    affect the id, and then takes a short SHA-256 hex digest. This makes the
+    id reproducible across runs and platforms, which is what 'deterministic'
+    means here.
+    """
+    canonical = json.dumps(
+        {"name": name, "args": args},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    import hashlib
+
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def load_manifest(path: str | Path) -> list[Job]:
+    """Read a JSON manifest file and return a list of ``Job`` objects."""
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    if not isinstance(data, dict) or "jobs" not in data:
+        raise ValueError("Manifest must be a JSON object with a 'jobs' key")
+
+    jobs: list[Job] = []
+    for raw in data["jobs"]:
+        if not isinstance(raw, dict):
+            raise ValueError(f"Each job must be an object, got {type(raw).__name__}")
+        if "name" not in raw:
+            raise ValueError(f"Job missing 'name': {raw!r}")
+        jobs.append(
+            Job(
+                name=raw["name"],
+                args=dict(raw.get("args", {})),
+                gpu=bool(raw.get("gpu", True)),
+            )
+        )
+    return jobs
+
+
+class JobRegistry:
+    """Maps job names to callables.
+
+    Callables may be sync or async. The scheduler will await them uniformly
+    (sync callables are wrapped).
+    """
+
+    def __init__(self) -> None:
+        self._functions: dict[str, Callable[..., Any]] = {}
+
+    def register(self, name: str, fn: Callable[..., Any]) -> None:
+        if name in self._functions:
+            raise ValueError(f"Job name already registered: {name!r}")
+        self._functions[name] = fn
+
+    def has(self, name: str) -> bool:
+        return name in self._functions
+
+    def resolve(self, name: str) -> Callable[..., Any]:
+        if name not in self._functions:
+            raise KeyError(f"No job registered for name {name!r}")
+        return self._functions[name]
+
+    def names(self) -> list[str]:
+        return list(self._functions.keys())
+```
+
+---
+
+## `runner/state.py`
+
+```python
+"""Atomic, crash-safe persistence of job state.
+
+``StateStore`` persists a single JSON document (the full set of jobs and their
+statuses) to a file inside ``state_dir``. Every write is *atomic*: we write to
+a temporary file in the same directory and then ``os.replace`` it over the
+target. ``os.replace`` is atomic on POSIX (and on Windows for files), so a
+crash mid-write never leaves a half-written state file behind.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class AtomicState:
+    """A snapshot of all jobs plus a monotonically increasing revision.
+
+    The ``revision`` lets us detect out-of-order / stale writes and is used by
+    tests to verify that state is actually being persisted.
+    """
+
+    revision: int
+    jobs: list[dict[str, Any]]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"revision": self.revision, "jobs": self.jobs}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "AtomicState":
+        return cls(revision=int(data.get("revision", 0)), jobs=list(data.get("jobs", [])))
+
+
+class StateStore:
+    """Persists :class:`AtomicState` atomically to ``state_dir/state.json``.
+
+    The store is deliberately simple and synchronous: state writes are tiny
+    and infrequent, and doing them synchronously keeps the event stream and
+    the on-disk state consistent (a job is only marked RUNNING/SUCCEEDED in
+    the event stream *after* its state has been durably written).
+    """
+
+    def __init__(self, state_dir: str | Path) -> None:
+        self.state_dir = Path(state_dir)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._path = self.state_dir / "state.json"
+        self._revision = 0
+        self._jobs: list[dict[str, Any]] = []
+        self._load_existing()
+
+    def _load_existing(self) -> None:
+        """Load any previously persisted state (for resume)."""
+        if not self._path.exists():
+            return
+        try:
+            with self._path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            # A corrupt/empty file should not crash startup; start fresh.
+            return
+        state = AtomicState.from_dict(data)
+        self._revision = state.revision
+        self._jobs = state.jobs
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def revision(self) -> int:
+        return self._revision
+
+    def snapshot(self) -> AtomicState:
+        return AtomicState(revision=self._revision, jobs=[dict(j) for j in self._jobs])
+
+    def set_jobs(self, jobs: list[dict[str, Any]]) -> None:
+        """Replace the in-memory job list (e.g. on resume)."""
+        self._jobs = [dict(j) for j in jobs]
+
+    def update_job(self, job_dict: dict[str, Any]) -> None:
+        """Update (or insert) a single job record and persist atomically."""
+        self._jobs = [
+            job for job in self._jobs if job.get("id") != job_dict.get("id")
+        ]
+        self._jobs.append(dict(job_dict))
+        self._persist()
+
+   

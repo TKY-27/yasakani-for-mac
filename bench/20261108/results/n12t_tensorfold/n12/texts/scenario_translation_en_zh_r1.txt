@@ -1,0 +1,150 @@
+我们需要回答用户：将完整英文文档翻译成准确、自然的简体中文，保留六个章节标题和所有技术边界。译文之后附上至少二十项英中术语表。
+
+需要仔细翻译。用户要求“完整英文文档”应该是给出的六个段落。需要保留六个章节标题和所有技术边界。技术边界可能指“技术边界”或“所有技术边界”指不要改动技术含义，或保留边界条件？ 可能指“所有技术边界”即技术术语的边界/概念边界要保留。译文之后附至少二十项英中术语表。
+
+我们需要输出中文译文，然后术语表至少20项英中术语。要确保自然准确。
+
+先分析原文：
+Section One — Ownership. A reliable inference service gives every mutable frontier a single owner. The program may delegate mathematical operations to kernels, but kernels do not silently advance request state. This separation makes successful rounds, rejected speculative drafts, cancellation, and prefix restoration observable as complete transitions.
+
+关键词：Ownership 所有权；mutable frontier 可变前沿/可变边界；single owner 单一属主/唯一所有者；delegate mathematical operations to kernels 将数学运算委托给内核/算子（GPU kernel? 推理引擎中 kernel 可能“内核/算子”）；silently advance request state 静默推进请求状态；successful rounds 成功轮次；rejected speculative drafts 被拒绝的推测草稿；cancellation 取消；prefix restoration 前缀恢复；observable as complete transitions 可观察为完整状态迁移/完整转换。
+
+Section Two — Measurement. Loading time, prompt preparation, prefill, decode, and network transport answer different questions. A benchmark should name the interval behind every reported rate. The first generated token belongs to prefill in this engine, while the remaining generated tokens belong to decode, so the token counts must follow the same boundary.
+
+Measurement 测量；loading time 加载时间；prompt preparation 提示准备/提示词准备；prefill 预填充；decode 解码；network transport 网络传输；benchmark 基准测试；name the interval behind every reported rate 为每个报告速率指明其对应的时间区间；first generated token 第一个生成 token；belongs to prefill 归属于预填充；remaining generated tokens 其余生成 token；token counts 令牌计数；same boundary 同一边界。
+
+Section Three — Reproducibility. Inputs are frozen before the official run. The request body, resolved sampling parameters, model identity, context capacity, cache format, and raw timing fields are retained. Warm-up requests are labeled and excluded instead of being mixed into the measured repetitions.
+
+Reproducibility 可复现性；inputs frozen 输入被冻结；official run 正式运行/正式测试；request body 请求体；resolved sampling parameters 已解析/已确定的采样参数；model identity 模型标识；context capacity 上下文容量；cache format 缓存格式；raw timing fields 原始计时字段；warm-up requests 预热请求；labeled and excluded 标记并排除；measured repetitions 受测重复/被测量重复次数。
+
+Section Four — Long Context. Allocating the maximum cache capacity is not the same as presenting a maximum-length prompt. The engine can keep a 262,144-token allocation while the test varies the actual prepared prompt. This isolates the cost of visible context without changing the memory plan between cases.
+
+Long Context 长上下文；maximum cache capacity 最大缓存容量；presenting a maximum-length prompt 呈现/提交一个最大长度提示；262,144-token allocation 262,144 个令牌的分配；actual prepared prompt 实际准备好的提示；isolates cost of visible context 隔离可见上下文成本；without changing memory plan between cases 不改变各用例之间的内存计划。
+
+Section Five — Speculation. Draft acceptance is workload dependent. Code, prose, translation, and structured records have different local predictability, so both accepted-draft percentage and output tokens per round are necessary. Throughput remains the user-visible result; acceptance statistics explain rather than replace it.
+
+Speculation 推测；draft acceptance 草稿接受；workload dependent 依赖工作负载；local predictability 局部可预测性；accepted-draft percentage 草稿接受率；output tokens per round 每轮输出令牌数；throughput 吞吐量；user-visible result 用户可见结果；acceptance statistics explain rather than replace it 接受统计用于解释而非替代它。
+
+Section Six — Reporting. Publish the complete configuration, repeated measurements, variation, and material limitations. Do not discard a valid slow run, and do not describe an internal timer as client-observed latency. Clear boundaries make an excellent result easier to trust.
+
+Reporting 报告/结果报告；complete configuration 完整配置；repeated measurements 重复测量；variation 波动/方差；material limitations 重大限制/实质性限制；valid slow run 有效的慢速运行；internal timer 内部计时器；client-observed latency 客户端观测延迟；clear boundaries 清晰边界；excellent result 优异结果。
+
+需要保留六个章节标题：可能用“第一节 — 所有权”等。英文标题是 Section One — Ownership. 可以译为“第一节 —— 所有权。”或者“第一部分 — 所有权”。用户要求保留六个章节标题，不是保留英文标题？ “保留六个章节标题”可能意思是在译文中保留标题结构，不一定英文。中文自然。可以用“第一节 — 所有权”等。注意破折号。
+
+“所有技术边界”可能指必须保留技术边界？ 比如第一 token 属于 prefill 的边界，内存计划不变等。确保翻译体现边界。
+
+术语表至少二十项英中术语。需要列出英文术语和中文译名。需要至少 20 项。可以包含：inference service, mutable frontier, owner, kernel, request state, transition, benchmark, reported rate, interval, prefill, decode, generated token, token count, boundary, reproducibility, official run, request body, sampling parameters, model identity, context capacity, cache format, timing fields, warm-up requests, measured repetitions, long context, maximum cache capacity, prompt, allocation, visible context, memory plan, speculation, draft acceptance, workload, local predictability, accepted-draft percentage, output tokens per round, throughput, user-visible result, acceptance statistics, reporting, configuration, variation, material limitations, internal timer, client-observed latency. 需要至少20，可以超过。
+
+要注意术语统一。可能 kernel 翻译为“内核”还是“算子”？ 在推理服务/深度学习中 kernel 常指 GPU 内核/算子。中文可译“内核（算子）”。用户要求自然，准确。可用“内核”。为避免歧义，术语表可写 kernel：内核（GPU/计算内核，亦作“算子”）。但术语表应简洁。 如果用“内核”可能读者理解。也可“计算内核”。
+
+mutable frontier：可变前沿？ “frontier” 在并发状态系统中指“可变边界”或“前沿”。“mutable frontier”可能指可变边界/前沿。自然：可变前沿。可以解释：可变状态边界。但译文用“可变前沿”。
+
+request state：请求状态。
+
+rounds：轮次。推测解码中的 round? 可译“轮次”。
+
+speculative drafts：推测草稿。
+
+prefix restoration：前缀恢复。
+
+observable as complete transitions：能够作为完整迁移被观察。更自然：“可被观察为完整迁移”。 “transition” 状态迁移。
+
+Measurement: “loading time” 模型加载时间？ 原文 loading time, prompt preparation, prefill, decode, network transport. 可以译“加载时间、提示准备、预填充、解码和网络传输分别回答不同问题。” 基准测试应为每个报告的速率明确其对应的时间区间。 “name the interval behind every reported rate” 译“点名每个报告速率背后对应的时间区间” 或“明确每个报告速率所依据的时间区间”。自然：基准测试应为每一个报告的速率标明其对应的测量区间。
+
+first generated token belongs to prefill in this engine: 在此引擎中，第一个生成令牌归属于预填充；剩余生成令牌归属于解码，因此令牌计数必须遵循同一边界。 保留“token” 可译“令牌”或“词元”。中文 LLM 常用“令牌”或“token”。 自然且准确可用“令牌”。术语表 token: 令牌（亦常称词元）。
+
+Section Three: “Inputs are frozen before the official run.” 译“正式运行前冻结输入。” “resolved sampling parameters” 可译“已解析的采样参数”或“最终确定的采样参数”。“model identity” 模型标识。“context capacity” 上下文容量。“cache format” 缓存格式。“raw timing fields” 原始计时字段。“retained” 保留。“Warm-up requests are labeled and excluded instead of being mixed into the measured repetitions.” 预热请求会被标记并排除，而不是混入被测量的重复中。 “measured repetitions” 可译“受测重复”或“被测量的重复运行”。自然：“被测重复次数”。
+
+Section Four: “Allocating the maximum cache capacity is not the same as presenting a maximum-length prompt.” 译“分配最大缓存容量并不等同于提交一个最大长度提示。” “presenting” 可以“呈现/提交”。 在 prompt 用“提交”更自然。“engine can keep a 262,144-token allocation” 引擎可保持 262,144 令牌的分配，同时测试改变实际准备好的提示。 “This isolates the cost of visible context without changing the memory plan between cases.” 这能在不改变各用例之间内存计划的情况下，隔离可见上下文的成本。 技术边界：保持最大分配不变，但 prompt 变化。 译“保持分配不变”更好：引擎可以保持 262,144 令牌的分配不变，而测试改变实际准备好的提示。 原 can keep a 262,144-token allocation while the test varies actual prepared prompt. 译“引擎可以维持 262,144 令牌的分配，而测试则让实际准备好的提示发生变化。” 自然。
+
+Section Five: “Draft acceptance is workload dependent.” 草稿接受率取决于工作负载。 “Code, prose, translation, and structured records have different local predictability” 代码、散文、翻译和结构化记录具有不同的局部可预测性。 “so both accepted-draft percentage and output tokens per round are necessary.” 因此，草稿接受率和每轮输出令牌数二者都必不可少。 “Throughput remains the user-visible result; acceptance statistics explain rather than replace it.” 吞吐量仍是用户可见的结果；接受统计只作解释，而非替代它。
+
+Section Six: “Publish the complete configuration, repeated measurements, variation, and material limitations.” 发布完整配置、重复测量、波动情况和重大限制。 “Do not discard a valid slow run” 不要丢弃一次有效的慢速运行。 “do not describe an internal timer as client-observed latency” 也不要把内部计时器描述为客户端观测到的延迟。 “Clear boundaries make an excellent result easier to trust.” 清晰的边界让优异结果更可信。
+
+需要确保术语表至少二十项。可列出 24 项。 注意英中术语表：可表格。 用户要求“译文之后附上至少二十项英中术语表。” 可以先译文，然后术语表。 必须至少20项。 可以 24 或 30。
+
+考虑是否保留英文技术术语？ 用户要求简体中文，翻译准确自然。 可以用中文术语，必要时括注英文？ 译文是否保留英文？ 不一定。 但术语表需要英中。 译文中可以用“预填充（prefill）”吗？ 用户说翻译成简体中文，保留技术边界。 自然中文可以用中文术语。 但 LLM 中 prefill/decode 常保留英文。 若完全中文：“预填充”“解码”。 技术边界清楚。 可以不用英文括注，术语表提供。 但“token”译“令牌”自然吗？ 在中文技术文章中常用“token”。 准确自然可以用“令牌”或“token”。 用户要求简体中文，术语表可映射 token 令牌。 若译文大量“令牌”可能生硬，但可接受。 “生成令牌”自然吗？ 可以。 或者“词元”。“令牌”常见于安全，LLM 也常见“token/词元”。“词元”更术语化。 中文自然？ “第一个生成词元”。“词元”较生僻但准确。 可以用“令牌”更通俗。 但“token”在模型上下文也常称“词元/令牌”。 选择“令牌”。
+
+需要保留“262,144-token allocation”：262,144 令牌的分配。 中文数字可保留英文逗号？ 简体中文可用“262144 个令牌”或“262,144 个令牌”。 为了保留技术边界和原数字，保留“262,144 个令牌的分配”。
+
+“visible context”：可见上下文。
+
+“memory plan”：内存计划/内存规划。 “plan” 在 memory planning 中译“内存规划”更自然。 用“内存规划”。 技术边界：不改变各用例之间的内存规划。
+
+“cache format”：缓存格式。
+
+“raw timing fields”：原始计时字段。
+
+“repeated measurements”：重复测量。
+
+“variation”：波动/变异。 基准测试中“variation”可译“波动”或“方差”。 为自然：“波动”。 但“重复测量、波动和重大限制”略怪。 可以“重复测量结果、其波动以及重大限制”。 但需准确：“repeated measurements, variation” 可能指测量重复及其变异度。 可译“重复测量、波动以及重大限制”。
+
+“material limitations”：重大限制 / 实质性限制。 在报告中，“material” 指重大、实质性。 可译“重大限制”。
+
+“client-observed latency”：客户端观测延迟 / 客户端观测到的延迟。 用“客户端观测延迟”。
+
+“internal timer”：内部计时器。
+
+“complete transitions”：完整迁移。 “observable as complete transitions” 译“能够作为完整迁移被观察”。 也许自然：“可观察为完整的状态迁移”。 加上“状态”？ transition in state 是状态迁移。 原文 complete transitions，不必须加状态，但中文自然“完整迁移”。
+
+“successful rounds, rejected speculative drafts, cancellation, and prefix restoration” 成功轮次、被拒绝的推测草稿、取消和前缀恢复。 “cancellation” 取消（请求取消）。 可以“取消操作”。
+
+“This separation makes ... observable as complete transitions.” 译“这种分离使成功轮次、被拒绝的推测草稿、取消以及前缀恢复都能被观察为完整迁移。”
+
+Section One: “A reliable inference service gives every mutable frontier a single owner.” 可靠推理服务为每个可变前沿指定单一属主。 “owner” 用“属主”更技术。 “single owner” 单一属主。 可用“唯一属主”。 “gives ... a single owner” 赋予每个可变前沿一个唯一属主。 自然：“每个可变前沿都应有唯一属主。” 但原句主语 is service. “可靠推理服务让每个可变前沿都有唯一属主。” 更好。
+
+“The program may delegate mathematical operations to kernels, but kernels do not silently advance request state.” 程序可以将数学运算委托给内核，但内核不会静默推进请求状态。 “kernels” 复数。 可以“内核”。 “silently advance request state” 暗中/静默推进请求状态。 用“静默”。
+
+“inference service” 推理服务。
+
+Potential issue: “technical boundaries” maybe they expect preserve “边界” phrases: Section 2 “same boundary”, Section 6 “Clear boundaries”. Ensure translated as “边界”。 Also “maximum cache capacity ... not same as presenting maximum-length prompt” technical boundary? yes.
+
+Need maybe include all six headings exactly: “第一节 — 所有权” etc. 英文 uses em dash. 中文可用破折号“——”。 用户说保留六个章节标题。 可能期望标题如“第一节 — 所有权”。 可以使用“第一节 — 所有权。” 保留 em dash? 中文自然用“——”。 但为了保留原样式可用“第一节 — 所有权”。“—” 单破折号? 原文 em dash. 中文“——”。 可统一。
+
+Need ensure “all technical boundaries” maybe include exact numbers and boundaries. Keep 262,144. Keep first token boundary. Keep maximum capacity vs maximum prompt. Keep internal timer vs client-observed. Good.
+
+Now final: maybe output:
+
+第一节 —— 所有权
+可靠的推理服务让每个可变前沿都有唯一属主。程序可以将数学运算委托给内核，但内核不会静默推进请求状态。这种分离使成功轮次、被拒绝的推测草稿、取消以及前缀恢复都能被观察为完整迁移。
+
+第二节 —— 测量
+加载时间、提示准备、预填充、解码和网络传输分别回答不同的问题。基准测试应为每一个报告的速率标明其背后的测量区间。在本引擎中，第一个生成令牌归属于预填充，其余生成令牌归属于解码；因此，令牌计数必须遵循同一边界。
+
+第三节 —— 可复现性
+正式运行前必须冻结输入。请求体、已解析的采样参数、模型标识、上下文容量、缓存格式以及原始计时字段均须保留。预热请求应被标记并排除，而不是混入受测重复之中。
+
+第四节 —— 长上下文
+分配最大缓存容量并不等同于提交一个最大长度提示。引擎可以保持 262,144 个令牌的分配，而测试让实际准备好的提示发生变化。这能在不改变各用例之间内存规划的情况下，隔离可见上下文的成本。
+
+第五节 —— 推测
+草稿接受情况取决于工作负载。代码、散文、翻译和结构化记录具有不同的局部可预测性，因此草稿接受率和每轮输出令牌数二者都必须报告。吞吐量仍然是用户可见的结果；接受统计用于解释，而非替代它。
+
+第六节 —— 报告
+应发布完整配置、重复测量、波动情况以及重大限制。不要丢弃一次有效的慢速运行，也不要把内部计时器描述为客户端观测延迟。清晰的边界会使优异结果更容易被信任。
+
+术语表：
+English | Chinese
+inference service | 推理服务
+mutable frontier | 可变前沿
+owner | 属主
+kernel | 内核（计算内核/算子）
+request state | 请求状态
+transition | 迁移
+measurement | 测量
+loading time | 加载时间
+prompt preparation | 提示准备
+prefill | 预填充
+decode | 解码
+network transport | 网络传输
+benchmark | 基准测试
+reported rate | 报告速率
+interval | 测量区间
+generated token | 生成令牌
+token count | 令牌计数
+boundary | 边界
+reproducibility | 可复现性
+frozen inputs | 冻结输入
+official run | 正式运行
+request body | 请求体
+resolved sampling parameters | 

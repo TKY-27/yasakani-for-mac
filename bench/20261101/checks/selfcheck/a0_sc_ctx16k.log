@@ -1,0 +1,11 @@
+loading the model (11.5 GiB of weights) ...
+[q35_g6] prefill only, temporary workspace 111543640 bytes
+[KV-PROTOCOL] target_kv=int8-row-f32-scale
+[TB-CAP] capacity mode (k=5): packed K streams 16/16, packed V streams 13/16; KV of the attention layers 346.0 MiB (INT8 containers: 520.0 MiB); staging 4096 rows
+[qwen3_5] 64 layers loaded, LNORD codes 11.81 GB, free 18.2 / 34.2 GB
+[qwen3_5] SHEAD drafter head loaded (<model_dir>\bdraft2_k8.shead): rank 512, 1.41 GB, score grid 510 blocks; GPU free 15.3 / 34.2 GB
+model ready in 5 s (context 16384 tokens)
+  short-answer   PASS  (3 tokens)
+  thinking       PASS  (160 tokens)
+  plain-text     PASS  (32 tokens)
+self-check passed: this installation reproduces the reference output.

@@ -1,0 +1,210 @@
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS models (
+    model_id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    architecture VARCHAR(100) NOT NULL,
+    context_length INT NOT NULL CHECK (context_length > 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS fixtures (
+    fixture_id SERIAL PRIMARY KEY,
+    kind VARCHAR(50) NOT NULL,
+    description TEXT,
+    unique_identifier VARCHAR(255) NOT NULL UNIQUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id SERIAL PRIMARY KEY,
+    model_id INT NOT NULL REFERENCES models(model_id) ON DELETE CASCADE,
+    fixture_id INT NOT NULL REFERENCES fixtures(fixture_id) ON DELETE CASCADE,
+    started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at TIMESTAMP,
+    status VARCHAR(20) NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed')),
+    UNIQUE (model_id, fixture_id, started_at)
+);
+
+CREATE INDEX idx_runs_model ON runs(model_id);
+CREATE INDEX idx_runs_fixture ON runs(fixture_id);
+CREATE INDEX idx_runs_status ON runs(status);
+
+CREATE TABLE IF NOT EXISTS request_metrics (
+    metric_id BIGSERIAL PRIMARY KEY,
+    run_id INT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    timestamp_ms INT NOT NULL CHECK (timestamp_ms >= 0),
+    tokens_generated INT NOT NULL CHECK (tokens_generated >= 0),
+    latency_ms FLOAT NOT NULL CHECK (latency_ms >= 0),
+    mtp_accepted_tokens INT NOT NULL DEFAULT 0 CHECK (mtp_accepted_tokens >= 0),
+    mtp_proposed_tokens INT NOT NULL DEFAULT 0 CHECK (mtp_proposed_tokens >= 0),
+    long_context_retention_score FLOAT CHECK (long_context_retention_score BETWEEN 0.0 AND 1.0)
+);
+
+CREATE INDEX idx_metrics_run ON request_metrics(run_id);
+CREATE INDEX idx_metrics_timestamp ON request_metrics(timestamp_ms);
+CREATE INDEX idx_metrics_mtp ON request_metrics(mtp_proposed_tokens, mtp_accepted_tokens);
+
+-- View for aggregated run statistics
+CREATE OR REPLACE VIEW v_run_summary AS
+SELECT 
+    r.run_id,
+    m.name AS model_name,
+    f.kind AS fixture_kind,
+    r.status,
+    COUNT(rm.metric_id) AS total_requests,
+    SUM(rm.tokens_generated) AS total_tokens,
+    AVG(rm.latency_ms) AS avg_latency_ms,
+    MAX(rm.long_context_retention_score) AS max_retention_score,
+    CASE WHEN SUM(rm.mtp_proposed_tokens) > 0 THEN SUM(rm.mtp_accepted_tokens)::FLOAT / SUM(rm.mtp_proposed_tokens) ELSE 0 END AS mtp_acceptance_rate
+FROM runs r
+JOIN models m ON r.model_id = m.model_id
+JOIN fixtures f ON r.fixture_id = f.fixture_id
+LEFT JOIN request_metrics rm ON r.run_id = rm.run_id
+GROUP BY r.run_id, m.name, f.kind, r.status;
+
+-- View for detailed throughput analysis
+CREATE OR REPLACE VIEW v_throughput_analysis AS
+SELECT 
+    r.run_id,
+    m.name AS model_name,
+    f.kind AS fixture_kind,
+    rm.timestamp_ms,
+    rm.tokens_generated,
+    rm.latency_ms,
+    CASE WHEN rm.latency_ms > 0 THEN rm.tokens_generated::FLOAT / (rm.latency_ms / 1000.0) ELSE 0 END AS tokens_per_second
+FROM request_metrics rm
+JOIN runs r ON rm.run_id = r.run_id
+JOIN models m ON r.model_id = m.model_id
+JOIN fixtures f ON r.fixture_id = f.fixture_id
+WHERE r.status = 'completed';
+
+-- Transaction-safe upsert function for request metrics
+CREATE OR REPLACE FUNCTION upsert_request_metric(
+    p_run_id INT,
+    p_timestamp_ms INT,
+    p_tokens_generated INT,
+    p_latency_ms FLOAT,
+    p_mtp_accepted INT,
+    p_mtp_proposed INT,
+    p_retention_score FLOAT
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO request_metrics (run_id, timestamp_ms, tokens_generated, latency_ms, mtp_accepted_tokens, mtp_proposed_tokens, long_context_retention_score)
+    VALUES (p_run_id, p_timestamp_ms, p_tokens_generated, p_latency_ms, p_mtp_accepted, p_mtp_proposed, p_retention_score)
+    ON CONFLICT (run_id, timestamp_ms) DO UPDATE SET
+        tokens_generated = EXCLUDED.tokens_generated,
+        latency_ms = EXCLUDED.latency_ms,
+        mtp_accepted_tokens = EXCLUDED.mtp_accepted_tokens,
+        mtp_proposed_tokens = EXCLUDED.mtp_proposed_tokens,
+        long_context_retention_score = EXCLUDED.long_context_retention_score;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Insert Models
+INSERT INTO models (name, architecture, context_length) VALUES
+('Llama-3-8B-Instruct', 'llama', 4096),
+('Mistral-7B-v0.1', 'mistral', 32768);
+
+-- Insert Fixtures
+INSERT INTO fixtures (kind, description, unique_identifier) VALUES
+('short_qa', 'Short question answering tasks', 'fixture_short_qa_001'),
+('code_gen', 'Code generation benchmarks', 'fixture_code_gen_001'),
+('long_doc', 'Long document summarization', 'fixture_long_doc_001'),
+('chat_multi_turn', 'Multi-turn conversation scenarios', 'fixture_chat_multi_turn_001');
+
+-- Insert Runs
+INSERT INTO runs (model_id, fixture_id, started_at, finished_at, status) VALUES
+(1, 1, '2023-10-01 10:00:00', '2023-10-01 10:05:00', 'completed'),
+(1, 2, '2023-10-01 10:10:00', '2023-10-01 10:15:00', 'completed'),
+(1, 3, '2023-10-01 10:20:00', '2023-10-01 10:25:00', 'completed'),
+(1, 4, '2023-10-01 10:30:00', '2023-10-01 10:35:00', 'completed'),
+(2, 1, '2023-10-01 11:00:00', '2023-10-01 11:05:00', 'completed'),
+(2, 2, '2023-10-01 11:10:00', '2023-10-01 11:15:00', 'completed'),
+(2, 3, '2023-10-01 11:20:00', '2023-10-01 11:25:00', 'completed'),
+(2, 4, '2023-10-01 11:30:00', '2023-10-01 11:35:00', 'completed');
+
+-- Insert Request Metrics (80 rows)
+-- Run 1: Llama-3-8B-Instruct, short_qa
+INSERT INTO request_metrics (run_id, timestamp_ms, tokens_generated, latency_ms, mtp_accepted_tokens, mtp_proposed_tokens, long_context_retention_score) VALUES
+(1, 100, 12, 45.2, 3, 5, 0.95),
+(1, 200, 15, 52.1, 4, 6, 0.94),
+(1, 300, 10, 38.5, 2, 4, 0.96),
+(1, 400, 18, 60.3, 5, 7, 0.93),
+(1, 500, 14, 55.0, 4, 6, 0.95),
+(1, 600, 11, 42.8, 3, 5, 0.97),
+(1, 700, 16, 58.2, 5, 7, 0.94),
+(1, 800, 13, 50.5, 4, 6, 0.96),
+(1, 900, 17, 62.1, 5, 7, 0.93),
+(1, 1000, 12, 46.0, 3, 5, 0.95);
+
+-- Run 2: Llama-3-8B-Instruct, code_gen
+INSERT INTO request_metrics (run_id, timestamp_ms, tokens_generated, latency_ms, mtp_accepted_tokens, mtp_proposed_tokens, long_context_retention_score) VALUES
+(2, 100, 45, 120.5, 12, 15, 0.88),
+(2, 200, 52, 135.2, 14, 18, 0.87),
+(2, 300, 38, 105.8, 10, 13, 0.89),
+(2, 400, 60, 150.3, 16, 20, 0.86),
+(2, 500, 48, 128.0, 13, 16, 0.88),
+(2, 600, 42, 112.5, 11, 14, 0.90),
+(2, 700, 55, 142.2, 15, 19, 0.87),
+(2, 800, 46, 125.0, 12, 15, 0.89),
+(2, 900, 58, 148.1, 16, 20, 0.86),
+(2, 1000, 44, 118.0, 11, 14, 0.88);
+
+-- Run 3: Llama-3-8B-Instruct, long_doc
+INSERT INTO request_metrics (run_id, timestamp_ms, tokens_generated, latency_ms, mtp_accepted_tokens, mtp_proposed_tokens, long_context_retention_score) VALUES
+(3, 100, 120, 350.5, 30, 40, 0.75),
+(3, 200, 135, 380.2, 34, 45, 0.74),
+(3, 300, 110, 320.8, 28, 36, 0.76),
+(3, 400, 145, 410.3, 36, 48, 0.73),
+(3, 500, 125, 360.0, 31, 41, 0.75),
+(3, 600, 115, 335.5, 29, 38, 0.77),
+(3, 700, 140, 395.2, 35, 46, 0.74),
+(3, 800, 122, 355.0, 30, 40, 0.76),
+(3, 900, 138, 390.1, 34, 45, 0.73),
+(3, 1000, 118, 340.0, 29, 38, 0.75);
+
+-- Run 4: Llama-3-8B-Instruct, chat_multi_turn
+INSERT INTO request_metrics (run_id, timestamp_ms, tokens_generated, latency_ms, mtp_accepted_tokens, mtp_proposed_tokens, long_context_retention_score) VALUES
+(4, 100, 25, 85.2, 6, 8, 0.92),
+(4, 200, 28, 92.1, 7, 9, 0.91),
+(4, 300, 22, 78.5, 5, 7, 0.93),
+(4, 400, 32, 105.3, 8, 10, 0.90),
+(4, 500, 26, 88.0, 6, 8, 0.92),
+(4, 600, 24, 82.8, 6, 8, 0.94),
+(4, 700, 30, 98.2, 7, 9, 0.91),
+(4, 800, 27, 90.5, 6, 8, 0.93),
+(4, 900, 31, 102.1, 8, 10, 0.90),
+(4, 1000, 23, 80.0, 5, 7, 0.92);
+
+-- Run 5: Mistral-7B-v0.1, short_qa
+INSERT INTO request_metrics (run_id, timestamp_ms, tokens_generated, latency_ms, mtp_accepted_tokens, mtp_proposed_tokens, long_context_retention_score) VALUES
+(5, 100, 14, 48.2, 4, 6, 0.96),
+(5, 200, 16, 55.1, 5, 7, 0.95),
+(5, 300, 12, 42.5, 3, 5, 0.97),
+(5, 400, 19, 63.3, 5, 7, 0.94),
+(5, 500, 15, 58.0, 4, 6, 0.96),
+(5, 600, 13, 45.8, 4, 6, 0.98),
+(5, 700, 17, 61.2, 5, 7, 0.95),
+(5, 800, 14, 52.5, 4, 6, 0.97),
+(5, 900, 18, 65.1, 5, 7, 0.94),
+(5, 1000, 13, 47.0, 4, 6, 0.96);
+
+-- Run 6: Mistral-7B-v0.1, code_gen
+INSERT INTO request_metrics (run_id, timestamp_ms, tokens_generated, latency_ms, mtp_accepted_tokens, mtp_proposed_tokens, long_context_retention_score) VALUES
+(6, 100, 48, 115.5, 13, 16, 0.89),
+(6, 200, 55, 130.2, 15, 19, 0.88),
+(6, 300, 42, 100.8, 11, 14, 0.90),
+(6, 400, 62, 145.3, 17, 21, 0.87),
+(6, 500, 50, 123.0, 14, 17, 0.89),
+(6, 600, 45, 108.5, 12, 15, 0.91),
+(6, 700, 58, 138.2, 16, 20, 0.88),
+(6, 800, 49, 120.0, 13, 16, 0.90),
+(6, 900, 60, 142.1, 17, 21, 0.87),
+(6, 1000, 47, 112.0, 12, 15, 0.89);
+
+-- Run 7: Mistral-7B-v0.1, long_doc
+INSERT INTO request_metrics (run_id, timestamp_ms, tokens_generated, latency_ms, mtp_accepted_tokens, mtp_proposed_tokens, long_context_retention_score) VALUES
+(7, 100, 125, 340.5, 32, 42, 0.78),
+(7, 200, 140, 370.2, 36, 47, 0.77),
+(

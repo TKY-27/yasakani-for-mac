@@ -1,0 +1,372 @@
+The user is requesting a complete Python 3.11 package for a deterministic asynchronous job runner with the following requirements:
+
+1. Read a JSON manifest
+2. Enforce only one active GPU job
+3. Persist state atomically
+4. Resume already-completed work
+5. Stream structured JSONL events
+6. Handle SIGINT
+7. Redact (mask) configured secrets
+8. Include pytest tests for success, failure, cancellation, and resume
+9. Present all source files in separate fenced blocks with their paths
+10. Include pyproject.toml
+
+Let me design this carefully.
+
+Package name: `deterministic_gpu_runner` or `djr` (deterministic job runner). I'll go with `djr` (deterministic job runner), and use the module `djr`.
+
+Structure:
+
+```
+djr/
+  pyproject.toml
+  README.md (optional)
+  src/djr/
+    __init__.py
+    __main__.py
+    manifest.py       # load/validate manifest
+    state.py          # atomic state persistence
+    events.py         # JSONL event streaming
+    redaction.py      # secret redaction
+    runner.py         # core async runner, single GPU job enforcement, SIGINT handling
+    cli.py            # CLI entry point
+  tests/
+    __init__.py
+    conftest.py
+    test_success.py
+    test_failure.py
+    test_cancellation.py
+    test_resume.py
+    test_redaction.py
+    test_manifest.py
+    test_state.py
+```
+
+Or more simply: a flat package layout without src? The user asked for a complete Python 3.11 package with pyproject.toml. The src layout is fine, and the path will be `src/djr/...`.
+
+Key design decisions:
+
+**Manifest format (JSON):**
+
+```json
+{
+  "version": 1,
+  "run_id": "run-001",
+  "secrets": ["AWS_SECRET_ACCESS_KEY"],
+  "redact_keys": ["password", "token"],
+  "jobs": [
+    {
+      "job_id": "job-a",
+      "name": "Train model",
+      "command": ["python", "train.py", "--epochs", "3"],
+      "workdir": ".",
+      "env": {"AWS_SECRET_ACCESS_KEY": "secret-value"},
+      "gpu": true
+    },
+    {
+      "job_id": "job-b",
+      "name": "CPU job",
+      "command": ["python", "cpu_job.py"],
+      "gpu": false
+    }
+  ]
+}
+```
+
+Determinism: jobs execute in manifest order (deterministic order), no nondeterminism from concurrency. One active GPU job: even if there are multiple jobs, only one job with `gpu: true` may run at a time. CPU jobs can be executed in parallel? For determinism, simplest is to execute jobs sequentially in manifest order. But "enforce one active GPU job" suggests a scheduler. Let's do this: jobs are submitted in order; CPU jobs run concurrently (async subprocesses) but GPU jobs are gated by a single semaphore. To keep determinism in event ordering, events are timestamped with a monotonic counter (sequence number) in addition to wall clock. Event ordering is by sequence, which is deterministic per scheduler, but... concurrent execution yields nondeterministic order. For truly deterministic output, run jobs sequentially? Hmm.
+
+"Enforce one active GPU job" — I'll implement a semaphore that permits only one GPU job at a time. CPU jobs can overlap. Deterministic behavior is preserved in the sense that: the set of events, the final state, and the completion order of each job are deterministic; event sequence numbers are assigned at emission time.
+
+In practice, to make tests deterministic and robust, I'll design the runner like this:
+- Schedule all pending jobs (those not yet completed per state).
+- GPU jobs await `gpu_lock = asyncio.Semaphore(1)`.
+- CPU jobs run without the semaphore.
+- To make event ordering deterministic in tests, tests either use a single job or assert sets rather than exact ordering. But I can also add sequence numbers.
+
+Let me keep it clean:
+
+**State file (JSON), atomic writes:**
+
+`state/run.json`:
+```json
+{
+  "version": 1,
+  "run_id": "run-001",
+  "jobs": {
+     "job-a": {"status": "completed", "exit_code": 0, "finished_at": "..."},
+     "job-b": {"status": "pending"}
+  },
+  "updated_at": ...
+}
+```
+
+Atomic persistence: write to a temp file in the same directory, `os.fsync`, `os.replace`.
+
+**Resume:** on startup, load state; mark already-completed jobs and skip them; emit `resumed` event. If a job was in progress at kill time (status "running"), mark it as "interrupted" and re-run it (jobs are idempotent in the sense that we re-run incomplete ones). Resume only skips completed jobs — "resume already-completed work" = already-completed work is preserved, not re-run.
+
+**JSONL events** are appended to `events.jsonl` (also printed to stdout?). Requirement: "stream structured JSONL events". Append to file, and also emit each line on stdout (so it can be piped). Events have a schema:
+
+```json
+{"seq": 1, "ts": 1700000000.0, "type": "run_started", "run_id": "..."}
+{"seq": 2, "type": "job_submitted", "job_id": "job-a"}
+{"seq": 3, "type": "job_started", "job_id": "job-a", "gpu": true}
+{"seq": 4, "type": "job_log_line", "job_id": "job-a", "stream": "stdout", "line": "..."}
+{"seq": 5, "type": "job_completed", "job_id": "job-a", "exit_code": 0}
+{"seq": 6, "type": "run_completed", "failed": 0}
+```
+
+Types: `run_started`, `job_resumed_skipped`, `job_submitted`, `job_started`, `gpu_acquired`/`gpu_released` (if needed), `job_log_line`, `job_completed`, `job_failed`, `run_cancelled`, `run_completed`, `fatal`.
+
+Redaction is applied to log lines and env dumps: if a secret value appears, replace with `[REDACTED]`.
+
+**Secrets**: manifest has a `secrets` list of env var names, or a `redact: ["value1", "value2"]` list of literal values? Better: a list of env var names that contain secrets; the runner collects secret values from job env vars with those names and redacts from event output. Also allow explicit literal strings under `redact_values` in the manifest. Keep it simple: `secrets` = list of env var names; also a top-level `redact` list of literal strings.
+
+**SIGINT handling**: on SIGINT (first press) → graceful cancellation: stop spawning new jobs, terminate running subprocesses (SIGTERM, then SIGKILL after grace period), persist state, and emit `run_cancelled` event. On second SIGINT → immediate force exit? Implementation: first SIGINT → graceful cancel; second SIGINT → force exit (default behavior). Use a signal handler that sets an `asyncio.Event` via `loop.add_signal_handler`? Better inside the event loop: `loop.add_signal_handler(signal.SIGINT, ...)`. For testability, also provide a `cancel()` method that can be called directly, and the CLI wires up SIGINT.
+
+**Deterministic async**: jobs are launched in manifest order, awaiting the GPU semaphore in that order, etc. Use `asyncio.subprocess` — `asyncio.create_subprocess_exec`. On Windows, subprocesses are fine. Tests use simple shell commands (e.g., `python -c` or `echo`). Cross-platform: use `sys.executable -c "..."` for test commands so we can rely on python without bash. For a "GPU job" test, the flag `gpu: true` is what matters; the command can just be python.
+
+**CLI**: `python -m djr run manifest.json --state-dir ./state --events ./events.jsonl`. Keep the CLI minimal but functional.
+
+**Failure handling**: if a job exits nonzero → `job_failed` event, state is `failed`, continue with other jobs (default policy), run completes with `failed > 0`, and exit code 1. A `fail_fast` option (manifest `fail_fast: false`) is also possible.
+
+Now let me carefully write the code.
+
+### File: pyproject.toml
+
+```toml
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "djr"
+version = "1.0.0"
+description = "Deterministic asynchronous GPU job runner"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+[project.scripts]
+djr = "djr.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff] ...
+```
+
+I'll omit ruff to keep it minimal. Include pytest config.
+
+No runtime dependencies needed (stdlib only). pytest as dev dependency: `[project.optional-dependencies] dev = ["pytest>=7"]`.
+
+### Source files
+
+Let me write them.
+
+**src/djr/__init__.py**
+
+```python
+"""djr — deterministic asynchronous job runner."""
+from .runner import JobRunner, RunResult
+from .manifest import Manifest, JobSpec, load_manifest
+
+__all__ = ["Manifest", "JobSpec", "load_manifest", "JobRunner", "RunResult"]
+__version__ = "1.0.0"
+```
+
+**src/djr/manifest.py**
+
+Manifest dataclass with validation.
+
+```python
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+class ManifestError(ValueError):
+    """Raised when a manifest file is missing, malformed, or invalid."""
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    job_id: str
+    name: str
+    command: tuple[str, ...]
+    workdir: Path
+    env: dict[str, str]
+    gpu: bool = False
+
+    @property
+    def id(self) -> str:
+        return self.job_id
+
+
+@dataclass(frozen=True)
+class Manifest:
+    run_id: str
+    jobs: tuple[JobSpec, ...]
+    secret_names: frozenset[str]
+    redact_values: tuple[str, ...]
+    fail_fast: bool = False
+    terminate_grace_seconds: float = 5.0
+
+    @property
+    def secret_values(self) -> frozenset[str]: ...
+```
+
+Hmm, secret values are derived from job env. A frozen dataclass with computed properties is OK.
+
+load_manifest(path) -> Manifest. Validate:
+- Top-level is a dict
+- `jobs` is a list of dicts with unique, non-empty `job_id`, `command` is a non-empty list of strings
+- `gpu` is a bool, default False
+- `env` is dict of str->str, default {}
+- `workdir` is a string, default "."
+- `secrets` is list of strings (names), default []
+- `redact_values` (or `redact`) is list of strings, default []
+- `fail_fast` is bool, default False
+- `run_id` is a string, default derived from path's stem.
+
+**src/djr/redaction.py**
+
+```python
+class Redactor:
+    def __init__(self, values: Iterable[str]):
+        # only non-empty values, sort by length descending to redact longer substrings first
+        self._values = sorted({v for v in values if v}, key=len, reverse=True)
+    def redact(self, text: str) -> str:
+        for v in self._values:
+            if v in text:
+                text = text.replace(v, "[REDACTED]")
+        return text
+```
+
+This is deterministic: sort by length descending, and for determinism tiebreak by string (use key=lambda v: (-len(v), v)).
+
+**src/djr/events.py**
+
+JSONL event stream. Write to file and stdout.
+
+```python
+class EventSink:
+    def __init__(self, path: Path, *, to_stdout: bool = True, redactor: Redactor):
+        self._path = path
+        self._lock = asyncio.Lock()  # ensure single-writer
+        self._seq = 0
+        self._fh = None
+
+    async def start(self): ...
+    async def emit(self, type_: str, **fields) -> dict:
+        # build event dict, assign seq, redact all string values, write line
+    async def close(self): ...
+```
+
+Event ordering: sequence number assigned under a lock to guarantee monotonically increasing even under concurrent emit. Wall clock `ts` via time.time() and monotonic? Determinism: include `"seq"` and `"wall_ts"` — tests shouldn't depend on ts. I'll include `"ts"` (epoch float) but tests assert seq ordering.
+
+Actually for "deterministic", we can also add a monotonic counter-based logical clock. I'll include both: `seq` (logical, deterministic) and `ts` (wall clock).
+
+Also support stdout echo: write the same line to stdout via print with flush.
+
+File buffering: open file, write each line, flush each event (streaming). On each write: `self._fh.write(line + "\n"); self._fh.flush()`. os.fsync is optional — for event log flush is enough (fsync per event is slow but for correctness of "persist" it's OK; state file gets fsync).
+
+**src/djr/state.py**
+
+Atomic state persistence.
+
+```python
+@dataclass
+class JobState:
+    status: str  # pending | running | completed | failed
+    exit_code: int | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+
+class StateStore:
+    def __init__(self, path: Path, run_id: str, job_ids: list[str]):
+        self.path = path
+        self._path = path
+        self._lock = asyncio.Lock()
+        self._data: dict
+
+    def load_existing(self) -> dict[str, str]:  # returns previous statuses if file exists
+    async def init(self):
+        # create file if not present
+    async def set_status(self, job_id, status, **fields) -> JobState
+    async def snapshot(self) -> dict  # for tests
+    def _persist(self, data): atomic write: temp + fsync + replace
+```
+
+Atomic write helper:
+
+```python
+def atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+```
+
+Sort keys for deterministic file contents.
+
+The status of the running job is persisted; on startup, if state has jobs with status "running" (crash), they become "pending" again (re-run), and we emit an event? Emit `job_resumed` or `job_restarted`. I'll include handling: on load, statuses: "completed"/"failed" jobs are kept (not re-run; failed jobs — re-run on resume? "Resume already-completed work" — completed jobs are skipped. What about failed? Deterministic retry semantics: also don't re-run failed? Hmm. Simpler and easier to justify: resume skips jobs in terminal state (completed or failed)? Actually, most runners re-run failed jobs on resume. But the spec only says "resume already-completed work". I'll define: terminal states = "completed" and "failed"; jobs in either are not re-run on resume (their results are already recorded), everything else is re-run. Document this. Tests: resume skips completed; also skips failed (documented). I'll also add `retry_failed: bool = False` option to manifest? Let me keep it simple: `skip_failed_on_resume: bool = True`? I'm adding too much configuration. Decision: on resume, jobs with terminal status (completed or failed) are preserved and skipped; emit a `job_skipped` event with reason. That's deterministic and testable.
+
+**src/djr/runner.py**
+
+The core.
+
+```python
+@dataclass
+class RunResult:
+    run_id: str
+    status: str  # "completed" | "cancelled"
+    completed: list[str]
+    failed: list[str]
+    cancelled: list[str]
+```
+
+```python
+class JobRunner:
+    def __init__(self, manifest: Manifest, *, state_path: Path, events_path: Path,
+                 stdout: bool = True):
+        self._manifest = manifest
+        self._state = StateStore(state_path, ...)
+        self._events = EventSink(events_path, ...)
+        self._redactor = Redactor(manifest.secret_values + manifest.redact_values)
+        self._gpu_sem = asyncio.Semaphore(1)
+        self._cancel = asyncio.Event()
+        self._procs: dict[str, asyncio.subprocess.Process] = {}
+        self._procs_lock? Use dict access under a single-threaded loop — no problem.
+        self._gpu_owner: str | None
+
+    async def run(self) -> RunResult:
+        # install? signal wiring done in cli
+        previous = self._state.load_existing()
+        await self._state.init()
+        await self._events.start()
+        emit run_started (include resumed count)
+        for jobs pending... create tasks
+        gather
+        emit run_completed or run_cancelled
+        return result
+```
+
+Job execution:
+
+```python
+async def _run_job(self, job: JobSpec) -> Job

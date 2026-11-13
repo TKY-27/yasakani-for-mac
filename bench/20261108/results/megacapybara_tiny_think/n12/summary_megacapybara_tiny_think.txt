@@ -1,0 +1,15 @@
+label megacapybara_tiny_think  model qwen3.8-27b  temperature 1.00
+cat         fixture                            mean      min      max   ntok
+code        scenario_code_cuda                278.8    277.0    280.6   4096
+code        scenario_code_python              285.3    277.8    292.8   4096
+code        scenario_code_typescript          289.9    282.2    297.7   4096
+story       scenario_story_zh_scifi           149.2    144.4    154.0   4096
+story       scenario_story_en_mystery         254.7    253.3    256.2   4096
+story       scenario_story_zh_dialogue        170.8    134.2    207.4   4096
+translation scenario_translation_zh_en        333.2    321.8    344.6   4096
+translation scenario_translation_en_zh        260.2    249.4    271.0   4096
+translation scenario_translation_markdown     300.7    294.2    307.1   4096
+structured  scenario_structured_jsonl         504.9    486.1    523.6   4096
+structured  scenario_structured_csv           416.5    416.2    416.7   4096
+structured  scenario_structured_sql           332.1    316.8    347.3   4096
+per category (mean of runs): code 284.7, story 191.6, translation 298.0, structured 417.8

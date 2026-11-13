@@ -1,0 +1,96 @@
+We need answer user asks: "Implement a complete CUDA 13.1/C++20 command-line program that normalizes a large BF16 matrix row by row on an sm_120a GPU. Include argument parsing, RAII device buffers, a numerically stable FP32 reference, a vectorized CUDA kernel, warm-up, CUDA-event timing, deterministic input generation, error checking, tolerance-based verification, and a CMakeLists.txt. Explain the memory layout and launch geometry after the code. Do not omit implementations or replace sections with comments."
+
+We need produce complete runnable code and CMakeLists. Need think deeply.
+
+Requirements:
+- CUDA 13.1 / C++20? CUDA 13.1? Current CUDA versions? Maybe CUDA 13? But likely means latest? sm_120a GPU (Blackwell? sm_120a is B200?). Need compile with arch gencode arch=compute_120a,code=sm_120a perhaps. CUDA 12.8 introduced sm_100a? sm_120a? We can set CMake properties: CMAKE_CUDA_ARCHITECTURES=120a? For CUDA 12.8+, CMake supports 120a? We can set CUDA_ARCHITECTURES "120a" or gencode. But if user says CUDA 13.1 maybe use CUDA 13.1. We can write CMakeLists with cmake_minimum_required(3.28?) and project LANGUAGES CXX CUDA). set(CMAKE_CXX_STANDARD 20 REQUIRED). set(CMAKE_CUDA_STANDARD 20 REQUIRED). set(CMAKE_CUDA_ARCHITECTURES "120a"). Or if not supported, gencode.
+
+Need program normalizes large BF16 matrix row by row. What does normalize mean? Row by row likely normalize each row to unit L2 norm (L2 row normalization) or maybe max-abs / RMS? "normalizes a large BF16 matrix row by row" ambiguous. Common row normalization: divide each element by row's RMS or L2 norm. Need implement. Maybe "row by row" means process rows, each row normalized (L2). BF16 input output. FP32 reference numerically stable. Need deterministic input generation. Tolerance-based verification comparing CUDA output vs FP32 reference maybe in FP32? But output BF16. Need check.
+
+We need include argument parsing. RAII device buffers. Vectorized CUDA kernel. Warm-up, CUDA-event timing. Deterministic input generation. Error checking. Tolerance-based verification. CMakeLists. Explain memory layout and launch geometry after code.
+
+Need design.
+
+BF16: use cuda_bf16 / __nv_bfloat16 from cuda_bf16.h. For vectorized: use __nv_bfloat162 maybe. Could use uint2 or float2 to load 8 bytes? BF162 is 32-bit, 4 per 128-bit. Need vectorized load/store: align to 16 bytes, process 8 bf16s per thread? 8*2=16 bytes. Use __nv_bfloat162 array of 4. Need ensure row length multiple of 8 for vectorized? We can require or handle tail. Better for complete: vectorized kernel with 8 per thread, require columns divisible by 8. Argument parse can enforce. But "large" maybe dimensions arbitrary. To keep simple: require cols % 8 == 0, rows > 0. Or implement scalar tail? User wants vectorized kernel; could still handle tail in separate scalar loop. But complete. We can make row-major matrix. Each row normalized independently. To vectorize across rows? We need row data contiguous. For row length multiple of 8, each thread handles 8 consecutive BF16 elements. Block size e.g. 256. Each block processes one row? Then gridDim.x = rows. If row length/8 > block threads, need loop inside block. Or use multiple blocks per row? Simpler: one block per row, each thread loops stride over vec8 chunks. This gives good memory coalescing: threads t, t+256 access consecutive vec8 elements -> 4KB per warp? Actually each thread reads 16 bytes, warp 256 bytes contiguous. Good. If row long, loop. Each block computes L2 norm for row: threads sum partial squares in FP32, warp reduce, block reduce in shared memory, then broadcast norm, second loop divides and stores. But if using one block per row, memory transactions: load row twice for norm and divide. Could fuse by storing values? If row large cannot keep all in registers. We could load to global? It reads twice. For performance maybe one-pass if keep row in shared memory? But large row maybe not fit. Requirement says vectorized kernel; not necessarily single pass. But a more optimized kernel can do two-pass row normalization. Since "large matrix row by row" perhaps one block per row acceptable. But if rows many, one block per row with long loops. Could also assign multiple blocks per row to compute norm, then a second kernel divide. But user says a vectorized CUDA kernel singular? Could have two kernels? It says include a vectorized CUDA kernel. Maybe one kernel for normalize. Could implement single-kernel two-pass. That is vectorized. Or use multi-block row with grid sync? Not needed.
+
+Need FP32 reference: We need deterministic input generation same as kernel. Input matrix generated deterministically on CPU (host) and copied to device. Reference computed in FP32 using stable algorithm: Kahan? For L2 norm, FP32 reference maybe accumulate in double? "numerically stable FP32 reference" means reference in FP32, using stable reduction? Could do FP32 sum with FMA? But stable? Use long double? But says FP32 reference. Maybe use FP32 with Kahan summation and pairwise? We can compute reference on CPU in FP32 using Kahan summation per row, and normalization division in FP32 then convert to BF16? But output kernel also outputs BF16. For verification compare BF16 outputs exactly? Need tolerance. If reference uses FP32 stable and conversion to BF16, results should be very close; compare with tolerance. But if using different accumulation order, FP32 output may differ by BF16 rounding. Tolerance based on relative/absolute.
+
+Alternative reference: Use FP32 host implementation with stable normalization (two pass: compute norm via Kahan FP32, then divide using FP32, convert to BF16) and compare CUDA BF16 to reference BF16 with max absolute/relative. Since BF16 has low precision, tolerance maybe 1e-2? Need robust. If output normalized rows, values around 1/sqrt(cols) if random. Max absolute error due to rounding maybe a few ULP. We can set tolerance e.g. max_abs = 4 * bf16 epsilon? bf16 epsilon ~ 0.0078125? Actually machine epsilon for bf16 2^-8 = 0.00390625? ULP at 1 is 2^-8. But relative error maybe 2^-8. Use tolerance = 1e-2 for normalized values? Need deterministic verification. Could compare FP32 values: convert CUDA output to FP32, reference FP32 normalized, tolerance 1e-3? Let's reason.
+
+Input deterministic random in [-1,1] maybe. Row L2 norm. Normalized row elements = x_i / ||x||_2. If values around random, each normalized element maybe ~1/sqrt(N). For N large, small. Absolute error tolerance maybe need scaled. Use combined tolerance: tol_abs + tol_rel * |ref|. For BF16, quantization error ~ 0.5 ulp ~ 0.002 for magnitude 1; for magnitude 0.01 ulp ~ 2e-5. Need tol_abs maybe 1e-3? But if row norm near zero, division unstable. We can avoid zero rows by generating with nonzero? Deterministic random can be all near zero maybe extremely unlikely but need handle. Reference stable: if norm==0 output zeros. Kernel: if norm==0 avoid divide by zero, output zero. For input generation ensure not all zeros? Use deterministic pseudo random from splitmix64, values in [-1,1], with maybe offset? But random can be zero. Norm zero improbable. We can handle.
+
+Need deterministic input generation: Use seed from argument? Include seed arg. Use deterministic sequence independent of rows/cols. Need generate host matrix of __nv_bfloat16 or uint16. Could use simple splitmix64 / PCG to generate uniform values. Need avoid heavy <random> nondeterministic? Use custom splitmix664 deterministic. Generate BF16 directly? Could generate float from random bits, convert to bf16. But reference needs same input. We can generate float values first? If convert to BF16 input, kernel uses BF16 input. Reference should use input as BF16 converted to FP32 exactly. So generation can produce BF16 values; for reference, read host BF16 to FP32. Deterministic. Need memory large.
+
+Potential issue: input generation of large matrix on host as vector<__nv_bfloat16> maybe memory heavy. But okay. Need output vector. Host reference maybe vector<float> or vector<__nv_bfloat16>. For large matrix, vector<__nv_bfloat16> input + output + reference. Could be large. Need row-by-row to limit host memory? But simpler generate full input host, copy device, compute reference full? User asks large matrix. To be complete, maybe generate in chunks? But complete code can be simple but robust.
+
+Let's decide architecture.
+
+Command-line args:
+Usage: row_norm_bf16 [--rows N] [--cols M] [--block-size B] [--threads-per-row? maybe] [--seed S] [--iterations K] [--warm-up W] [--tol-abs X] [--tol-rel X] [--help]
+Default rows=1024, cols=8192? Need cols multiple of 8. Large. Block size maybe 256. Seed default 0x254de. Iterations 5, warm-up 1? We can use --warmup int.
+
+Argument parsing: implement parse_args struct. Handle --help, unknown. For numbers parse using std::from_chars? C++20. We can implement robust.
+
+RAII device buffers: struct CudaBuffer { size_t size; void* ptr; CudaBuffer(size); ~; copy/move; allocate using cudaMalloc; maybe cudaMallocAsync? But simple. Need RAII for input, output. Maybe also host buffers. Could use unique_ptr with custom deleter? But user asks RAII device buffers; implement class DeviceBuffer with void* data, size bytes; constructor allocates; destructor frees; move semantics; no copy.
+
+Error checking: macros CUDA_CHECK, CUDART_CHECK. For async operations need cudaDeviceSynchronize after events? Use check.
+
+Kernel design:
+Input: const __nv_bfloat16* d_input, __nv_bfloat16* d_output, int rows, int cols, int vec_elems=8, maybe scale? Row norm L2.
+Assume cols % 8 == 0.
+Block size e.g. 256. Grid: rows blocks. But if row has vec_chunks = cols/8. Each thread processes chunks = ceil(vec_chunks / blockDim.x). If blockDim.x > vec_chunks, some threads idle in norm. Need reduce across active threads.
+
+Kernel pseudocode:
+__global__ void row_l2_normalize_bf16(const __nv_bfloat16* in, __nv_bfloat16* out, int rows, int cols, int block_size) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const int vecs_per_row = cols / 8; // guaranteed
+    const int tid = threadIdx.x;
+    // Use 4 bf162 per thread.
+    __nv_bfloat162 v[4];
+    float local_sum = 0.0f;
+    // FMA accumulation maybe enough; for stable use Kahan? In GPU many threads, FP32 sum may be less stable. We can use double? But reference FP32. To be numerically stable, use Kahan summation per thread? Or use float2? Let's implement Kahan summation for local sum to improve. But reduction across threads still. Could use double? If output expected FP32? Maybe use double accumulation? The request says numerically stable FP32 reference, not kernel. But kernel should be accurate. Could use FP32 with Kahan or double? On modern GPUs double slower. Use FP32 with Kahan? But row L2 norm sum of many squares. For large N=100k, FP32 summation error maybe relative ~1e-5? acceptable. Kahan improves. Use local compensation.
+    for (int chunk = tid; chunk < vecs_per_row; chunk += blockDim.x) {
+       load 8 bf16: use reinterpret_cast<const __nv_bfloat162*>(in + row*cols + chunk*8). Actually alignment: input row start might not be 16-byte aligned if row offset not multiple of 8? cols multiple of 8, so each row start is multiple of 8 elements (16 bytes) if base aligned. cudaMalloc 256B aligned. Good.
+       convert to float: __bfloat1622float2? For each bf162, __bfloat1622float2(v[i]) gives float2. Square and FMA into Kahan.
+    }
+    // block reduce with Kahan? We need combine per-thread sums. If just sum float local, order maybe. Use shared memory tree. Could use double shared? But output normalized uses FP32 norm. For stable reference maybe double? Hmm.
+}
+
+Maybe better: compute norm squared in FP32 but use a stable block reduction with pairwise tree and Kahan final. Use shared float partial sums. Block size <= 1024. Reduction:
+    __shared__ float sdata[blockDim.x];
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
+       if (tid < stride) {
+          // Kahan? simple fma? Could use float add.
+          sdata[tid] += sdata[tid+stride];
+       }
+       __syncthreads();
+    }
+    float norm_sq = sdata[0];
+    // Maybe apply sqrt, if norm_sq <= 0 -> zero.
+    float inv_norm = (norm_sq > 0.f) ? rsqrtf(norm_sq) : 0.f;
+    __syncthreads(); // after reduction? need ensure sdata not overwritten? okay.
+    // second pass:
+    for chunks: load, convert, multiply by inv_norm, store.
+
+But if norm_sq small, rsqrtf. Use sqrtf. Need divide stable: inv = 1/sqrtf(norm_sq). If norm_sq overflows? Input BF16 max finite ~3.39e38, square can overflow FP32 if values near max. But random values not huge. But robust: Could scale? "numerically stable" maybe handle overflow/underflow. For arbitrary BF16, row L2 norm can overflow/underflow. We can implement stable normalization using max absolute scaling? Row normalize: find max abs, scale by max, compute sum squares of scaled values, norm = max * sqrt(sum), divide x / norm = (x/max)/sqrt(sum). This is numerically stable (avoid overflow/underflow). But that requires two passes? Need max abs first, then sum squares of x/max, then divide. Or compute max and sum squares in one pass with scaling? For stability, use max-abs scaling. Since output normalized row, can do:
+    m = max(|x_i|)
+    if m == 0 -> output zero
+    s = sum((x_i/m)^2)
+    norm = m * sqrt(s)
+    y_i = x_i / norm = (x_i/m) / sqrt(s)
+This avoids overflow for large values and underflow for small values (though x_i/m could underflow? BF16 min normal ~1e-38, ratio okay; if all subnormal? BF16 subnormals min ~1e-45? ratio to max maybe tiny but fp32 handles subnormal). We can implement vectorized kernel with one or two passes? To compute max and sum squares stably, if we first compute max, then need second pass to compute sum scaled, then third pass to output. Or can compute max and unnormalized sum in first pass, but if overflow. For arbitrary stable, maybe three passes. But requirement "numerically stable FP32 reference" not necessarily kernel stable. But good to implement stable kernel using max scaling with 3 passes? That increases memory traffic. Could still be fine. But if we want performance, maybe two-pass without scaling. The prompt says normalize large BF16 matrix row by row; likely values normal. But "numerically stable FP32 reference" implies reference uses stable algorithm; maybe kernel also stable? It says include a numerically stable FP32 reference, a vectorized CUDA kernel. Could mean reference is stable, kernel maybe straightforward.
+
+Need choose. For robust, implement stable L2 row normalization using FP32 max-abs scaling. But output BF16. Kernel can do:
+Pass 1: compute max_abs for row (vectorized load, convert to float, fabs, max)
+Pass 2: compute sum_sq_scaled = sum((x/m)^2) using Kahan maybe, block reduction. If m==0 -> zero.
+Pass 3: output = x / (m * sqrt(sum)) = (x/m)/sqrt(sum).
+This is 3x reads + 1x writes. Still vectorized. For large matrix, memory bandwidth maybe okay. But if only one block per row, three passes over row.
+
+Could combine max and sum using online stable algorithm? There is algorithm to compute norm stably in one pass using scaling: maintain max and sum? But complex. 3-pass is stable.
+
+But FP32 reference: We can implement host reference same algorithm in FP32: for each row, first max_abs, then sum scaled squares with Kahan, then divide. Since input BF16, convert to float. That matches algorithm. Use FP32 but stable due to scaling. Kahan summation. Good.
+
+However, if we use max scaling, need handle max_abs = 0. For rows with max_abs very small

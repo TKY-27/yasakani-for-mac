@@ -1,0 +1,235 @@
+```cpp
+// bf16_row_norm.cu
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <numeric>
+#include <random>
+#include <chrono>
+
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
+
+// RAII wrapper for device memory
+class DeviceBuffer {
+public:
+    DeviceBuffer() : ptr_(nullptr), size_(0) {}
+    
+    explicit DeviceBuffer(size_t bytes) {
+        allocate(bytes);
+    }
+    
+    ~DeviceBuffer() {
+        free();
+    }
+    
+    void allocate(size_t bytes) {
+        free();
+        size_ = bytes;
+        if (bytes > 0) {
+            CUDA_CHECK(cudaMalloc(&ptr_, bytes));
+        } else {
+            ptr_ = nullptr;
+        }
+    }
+    
+    void free() {
+        if (ptr_) {
+            CUDA_CHECK(cudaFree(ptr_));
+            ptr_ = nullptr;
+            size_ = 0;
+        }
+    }
+    
+    void* get() const { return ptr_; }
+    size_t size() const { return size_; }
+    
+    // Copy host to device
+    template<typename T>
+    void copyFromHost(const T* src, size_t count) {
+        size_t bytes = count * sizeof(T);
+        if (bytes > size_) {
+            allocate(bytes);
+        }
+        CUDA_CHECK(cudaMemcpy(ptr_, src, bytes, cudaMemcpyHostToDevice));
+    }
+    
+    // Copy device to host
+    template<typename T>
+    void copyToHost(T* dst, size_t count) const {
+        size_t bytes = count * sizeof(T);
+        CUDA_CHECK(cudaMemcpy(dst, ptr_, bytes, cudaMemcpyDeviceToHost));
+    }
+    
+    // Zero out
+    void zero() {
+        if (size_ > 0) {
+            CUDA_CHECK(cudaMemset(ptr_, 0, size_));
+        }
+    }
+    
+private:
+    void* ptr_;
+    size_t size_;
+};
+
+// Vectorized BF16 row normalization kernel
+// Each block processes one row.
+// We use float32 accumulation for numerical stability.
+// The input is a matrix of shape [rows, cols] stored in row-major order.
+// Output is the normalized rows (each row divided by its L2 norm).
+
+__global__ void normalize_rows_bf16_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int rows,
+    int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    
+    const __nv_bfloat16* row_ptr = input + static_cast<size_t>(row) * cols;
+    __nv_bfloat16* out_row = output + static_cast<size_t>(row) * cols;
+    
+    // Use shared memory to store the computed norm
+    extern __shared__ float s_norm[];
+    
+    // Each thread handles multiple elements using vectorization
+    // Process 8 elements per iteration (8 * 2 bytes = 16 bytes = one float4 load equivalent)
+    // Actually, let's process 4 elements at a time for simplicity with proper alignment
+    
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    
+    // Compute sum of squares in FP32
+    float local_sum_sq = 0.0f;
+    
+    // Stride through the row
+    for (int col = tid; col < cols; col += nthreads) {
+        float val = __bfloat162float(row_ptr[col]);
+        local_sum_sq += val * val;
+    }
+    
+    // Block-level reduction
+    // Simple tree reduction in shared memory
+    __shared__ float s_partial[32]; // max threads per block assumed <= 32 for this simple version
+    // Actually, let's support up to 256 threads properly
+    
+    // Let's redo with proper shared memory allocation
+    // We'll use dynamic shared memory sized to blockDim.x
+    
+    // First, write partial sums to shared memory
+    // But we need to know the size. Let's use a fixed-size approach or pass it.
+    
+    // For now, assume blockDim.x <= 1024 and use dynamic shared memory
+    // The caller will set shared memory size appropriately
+    
+    // Write local sum to shared memory
+    s_norm[tid] = local_sum_sq;
+    __syncthreads();
+    
+    // Tree reduction
+    for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_norm[tid] += s_norm[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // All threads read the final norm from s_norm[0]
+    float total_sum_sq = s_norm[0];
+    float norm = sqrtf(total_sum_sq);
+    
+    // Avoid division by zero
+    if (norm == 0.0f) {
+        norm = 1.0f;
+    }
+    
+    // Normalize the row
+    for (int col = tid; col < cols; col += nthreads) {
+        float val = __bfloat162float(row_ptr[col]);
+        float normalized = val / norm;
+        out_row[col] = __float2bfloat16(normalized);
+    }
+}
+
+// More optimized version with better vectorization
+__global__ void normalize_rows_bf16_vectorized(
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int rows,
+    int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    
+    const __nv_bfloat16* row_ptr = input + static_cast<size_t>(row) * cols;
+    __nv_bfloat16* out_row = output + static_cast<size_t>(row) * cols;
+    
+    extern __shared__ float s_shared[];
+    
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    
+    // Process 4 elements at a time for better memory coalescing
+    // 4 * 2 bytes = 8 bytes per thread per iteration
+    float local_sum_sq = 0.0f;
+    
+    int vec_cols = cols / 4;
+    int remainder = cols % 4;
+    
+    // Process vectorized chunks
+    for (int i = tid; i < vec_cols; i += nthreads) {
+        int col = i * 4;
+        float v0 = __bfloat162float(row_ptr[col]);
+        float v1 = __bfloat162float(row_ptr[col + 1]);
+        float v2 = __bfloat162float(row_ptr[col + 2]);
+        float v3 = __bfloat162float(row_ptr[col + 3]);
+        
+        local_sum_sq += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
+    }
+    
+    // Handle remainder
+    if (remainder > 0) {
+        int start_col = vec_cols * 4;
+        for (int col = start_col + tid; col < cols; col += nthreads) {
+            float val = __bfloat162float(row_ptr[col]);
+            local_sum_sq += val * val;
+        }
+    }
+    
+    // Block reduction
+    s_shared[tid] = local_sum_sq;
+    __syncthreads();
+    
+    for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_shared[tid] += s_shared[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    float total_sum_sq = s_shared[0];
+    float norm = sqrtf(total_sum_sq);
+    if (norm == 0.0f) {
+        norm = 1.0f;
+    }
+    
+    // Normalize - vectorized
+    for (int i = tid; i < vec_cols; i += nthreads) {
+        int col = i * 4;
+        float v0 = __bfloat162float(row_ptr[col]) / norm;
+        float v1 = __bfloat162float(row_ptr[col + 1]) / norm;
+        float v2 = __bfloat162float(row_ptr

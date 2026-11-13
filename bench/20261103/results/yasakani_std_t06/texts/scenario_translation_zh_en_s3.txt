@@ -1,0 +1,48 @@
+**Part 1: Operational Boundaries**
+The system services only one active request at a time, with all model states exclusively owned by a single execution process. This constraint is not a temporary defect, but a deliberate product decision tailored for single-GPU local inference. It enables the memory planner to pre-determine workspace, cache, and graph execution addresses, and simplifies the verification of state transitions for cancellation, failure, and recovery.
+
+**Part 2: Prefill**
+Input is first subjected to template rendering and tokenization, then fed into the model in fixed-size blocks. Each block reads previously committed states and atomically advances the frontier. Timing must distinguish between host preparation, visual preprocessing, text prefill, and the first output token; file reading or model loading must not be conflated with throughput.
+
+**Part 3: Decoding**
+Standard decoding commits one token per round, whereas speculative decoding can verify multiple candidates and commit a contiguous prefix. Regardless of how many candidates are accepted, the public output, KV cache, loop state, and counters must correspond to the same committed position; no partially updated state may remain.
+
+**Part 4: Long Context**
+As context grows, latency is jointly determined by fixed weight reads and the ever-increasing attention cache reads. Reports should provide both absolute speed and relative retention rate, along with the actual prompt token count. They must also document the cache format, maximum capacity, sampler, and graph execution state.
+
+**Part 5: Reproducibility**
+Stable inputs must be saved as the actual message files sent, with their sources and token counts recorded. Formal runs must not involve temporary web downloads, random question selection, or the exclusion of slower samples. Every reported number must be traceable back to a specific model, command, input, and service log.
+
+**Part 6: Result Interpretation**
+A single isolated fastest run cannot prove stable performance, nor can a single high-acceptance-rate text represent all output scenarios. Code, narrative, translation, and structured content exhibit different token distributions and should be presented separately rather than merged into a meaningless overall average.
+
+***
+
+**Chinese-English Glossary**
+
+1.  **运行边界** (Operational Boundaries)
+2.  **活动请求** (Active Request)
+3.  **模型状态** (Model State)
+4.  **执行程序** (Execution Process)
+5.  **单卡本地推理** (Single-GPU Local Inference)
+6.  **内存规划器** (Memory Planner)
+7.  **工作区** (Workspace)
+8.  **图执行** (Graph Execution)
+9.  **状态转换** (State Transition)
+10. **预填充** (Prefill)
+11. **模板渲染** (Template Rendering)
+12. **分词** (Tokenization)
+13. **原子地推进** (Atomically Advance)
+14. **前沿** (Frontier)
+15. **主机准备** (Host Preparation)
+16. **视觉预处理** (Visual Preprocessing)
+17. **解码** (Decoding)
+18. **推测解码** (Speculative Decoding)
+19. **候选** (Candidate)
+20. **KV 缓存** (KV Cache)
+21. **长上下文** (Long Context)
+22. **注意力缓存** (Attention Cache)
+23. **相对保留率** (Relative Retention Rate)
+24. **采样器** (Sampler)
+25. **可复现性** (Reproducibility)
+26. **结果解释** (Result Interpretation)<|im_end|>

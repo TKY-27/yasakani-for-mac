@@ -1,0 +1,260 @@
+I need to provide a complete TypeScript 5 service. Requirements:
+
+- A complete TypeScript 5 service that consumes newline-delimited request metrics
+- Validates without third-party schema libraries (i.e., hand-written validation)
+- Groups records by model and fixture
+- Computes mean/median/sample standard deviation
+- Exposes /health, /summary, /runs/:id endpoints
+- Strict types
+- Incremental parsing
+- Bounded memory
+- Malformed input errors
+- Unit tests
+- package.json, tsconfig.json
+- A concise operational guide
+- No placeholders
+
+So I need to design a service:
+
+- HTTP server (Node built-in `http` to avoid third-party dependencies. No express). Use only Node built-ins so package.json has only devDependencies (typescript, vitest or node:test?). Use Node's built-in test runner to avoid third-party test libraries? The requirement says "validate without third-party schema libraries" — that's about schema validation. It doesn't necessarily forbid other third-party libs, but to be safe and self-contained I'll use only Node built-ins: `http`, `crypto` (for run ids), etc. For testing, I can use Node's built-in `node:test` runner with `tsx` or compiled TS. Simpler: compile with tsc and run tests with `node --test dist/test/`. TypeScript 5 supports `node` module resolution.
+
+Design:
+
+Data model:
+
+```ts
+interface RequestMetricRecord {
+  runId: string;
+  model: string;
+  fixture: string;
+  latencyMs: number;
+  status: number; // maybe 200/400 etc
+  tokensIn: number;
+  tokensOut: number;
+  timestamp: string; // ISO 8601
+}
+```
+
+Keep it focused: model, fixture, latencyMs, status, timestamp, runId.
+
+Incremental parsing: a `LineStream` / `IncrementalParser` that accepts string chunks (possibly split mid-line) and yields validated records or error objects. Bounded memory: a ring buffer / capped aggregation. "Groups records by model and fixture, computes mean/median/sample standard deviation" — computing an exact median requires retaining all values. To keep memory bounded:
+
+Option A: cap number of stored samples per group (reservoir or cap at N with a sampling flag). To keep memory bounded while retaining exactness, cap the stored values per group at MAX_SAMPLES (e.g., 4096). If exceeded, either stop counting or use a sampling flag. More honest approach: bounded buffer per group. Beyond the cap, drop records but count them as dropped, and compute mean/std from retained values with a flag `truncated: true`? That's statistically wrong.
+
+Better: use a bounded structure: keep mean and M2 (Welford) online for exact mean/std even at unbounded count (O(1) memory per group) — that's exact for mean and sample stddev, and doesn't need bounded storage. Median: exact median requires all values. Use a bounded approximate structure: e.g., keep a sliding-window cap on values (ring buffer of last K samples per group). The median is computed from that bounded window and flagged as an approximation when truncated. Or use a t-digest-like sketch — too complex to implement correctly.
+
+Cleaner approach: bounded per-group sample store (fixed capacity K, e.g., 2048), overflow policy: reservoir sampling replacement (randomly replaces existing item when new one arrives). Then median computed from the reservoir is approximate but memory-bounded. Report `sampleCount` (true count), `storedCount`, `approximate` flag. Mean/std via Welford is exact over all records. This is a defensible design and I'll document it in the operational guide.
+
+Also bound total groups: a cap on number of distinct (model, fixture) groups (e.g., 10_000). If exceeded, reject or aggregate as "unknown"? Throw an error on the ingest path: `LimitExceededError`. The endpoint returns 500 or 400? Ingest is POST /ingest with NDJSON body. The service also needs endpoints /health, /summary, /runs/:id. The question says "expose /health, /summary, /runs/:id endpoints" — ingestion is probably POST /ingest (or /metrics). Since it "consumes newline-delimited request metrics", I'll implement POST /ingest that accepts NDJSON (possibly chunked) with a max body size.
+
+Memory boundedness: max body size (e.g., 8 MiB), max line length, max groups, max samples per group.
+
+Malformed input errors: line-level parse error with line number, field-level validation error. Ingest response: 207-like JSON with per-line errors and count accepted. Or fail the whole batch on first error? Better: collect per-line errors, return a structured JSON with `accepted`, `rejected`, `errors: [{line, code, message}]`. Status: 400 if any rejected? Common pattern: 200 with partial success. Let me do: if at least one accepted and some rejected, 202? Keep it simple: 200 with report. 400 if all rejected? Let me define: if zero bytes, 400. If no valid records, 400. Otherwise 201? Ingest returns 200 with a report. Keep the docs clear.
+
+Endpoints:
+
+- GET /health → { status: "ok", uptime, memory: { rss, heapUsed }, recordsAccepted, recordsRejected, groups, truncatedGroups? }
+- GET /summary → all groups: key is `${model}|${fixture}`? Return array of { model, fixture, count, mean, median, sampleStdDev, min, max, approximateMedian }. Sorted by model, then fixture.
+- GET /runs/:id → summary filtered to records from that run id. That is, grouping must be per (runId, model, fixture)? "Groups records by model and fixture" but /runs/:id needs per-run filtering. So aggregation keyed by (runId, model, fixture). /summary aggregates across runs per (model, fixture) — but median cannot be exactly recomputed from per-run groups. Hmm.
+
+Simplification: maintain per-run group aggregations, and /summary merges per-run Welford state to give exact mean/std (merging two Welford states is mathematically exact), but merging medians requires stored values — we do store bounded samples per (runId, model, fixture). Merging medians across runs is approximate from the combined stored sample pool (which is bounded by K per run-group. Could be unbounded across many runs… to bound, cap total stored samples globally: MAX_TOTAL_STORED_SAMPLES = e.g., 100_000. When global pool full, do reservoir replacement across the pool? Complex.
+
+Alternative simpler design: aggregation key = (model, fixture). Store per-record runId? But /runs/:id filter would then need per-run substats — which requires per-run sub-structure anyway.
+
+Decision: group key = `${runId}::${model}::${fixture}`. Maintain:
+
+- exactCount (total accepted for that key)
+- Welford state (mean, M2) — exact
+- min, max
+- bounded reservoir of values for median (capacity K per key, e.g., 512). Reservoir sampling keeps statistical uniformity of retained samples.
+- Approximate median flag if exactCount > storedCount.
+
+Also maintain a per-run index: runId -> Set of keys (bounded by group count).
+
+/summary: aggregate across all runs per (model, fixture):
+- total count (sum)
+- exact mean and sample stddev via Welford merge (mathematically exact given child states)
+- min/max = min/max of child min/max
+- median: compute from combined stored samples. Approximation flag if total stored < total count, or… The combined reservoir may not represent the union well, but is bounded. If any contributing group is truncated (i.e., total count > total stored), flag `medianApprox: true`.
+- runs: list of run ids contributing.
+
+Memory bounds:
+- MAX_GROUPS (distinct runId::model::fixture): 50,000.
+- Per-key reservoir capacity: 256 samples? Let's say 512.
+- Global memory: also bound the number of distinct runIds: MAX_RUNS = 2000. When exceeded, reject ingest of that run's records? Or drop oldest run (eviction). Eviction is complex. Simpler: reject new run ids with a 400 line error `RUNS_LIMIT` — but that's an input-limit error and it's acceptable as "bounded memory" behavior. Hmm, but this could be seen as a DoS. For a service with bounded memory, a cap is expected. Document it.
+
+Alternative: LRU eviction of least-recently-used runs with `evictedRuns` counter. More code but nice. Let me keep it as rejection with clear error codes. Simpler and deterministic. Actually eviction is nicer for a long-running metrics service but adds complexity. Let's go with hard cap and rejection and document it. Hmm, "bounded memory" just requires an upper bound. Rejection keeps it deterministic and testable. Let's do that.
+
+Welford merge: given state A(nA, meanA, M2A) and B: combined n = nA+nB; delta = meanB - meanA; mean = meanA + delta*nB/n; M2 = M2A + M2B + delta^2 * nA*nB/n. Sample stddev: sqrt(M2/(n-1)) for n>=2 else null (undefined). Per requirements, sample stddev (denominator n-1).
+
+Median of stored samples: sort a copy, if even, average of two middle values.
+
+Incremental parsing: `NdjsonParser` class that accepts `push(chunk: string): ParseEvent[]`, maintains leftover buffer. Detects lines split across chunks. Each line: trim. Ignore empty lines and lines starting with `#`? Blank line skip is standard. Parse line → JSON.parse → validate record.
+
+Validation rules (hand-written):
+- JSON must be a plain object (typeof object, not null, not array) — JSON.parse result check.
+- `runId`: string, 1..64 chars, pattern `^[A-Za-z0-9][A-Za-z0-9._-]*$` (maybe no spaces).
+- `model`: string 1..128, pattern `^[A-Za-z0-9][A-Za-z0-9._-]*$`.
+- `fixture`: string 1..128, similar pattern.
+- `latencyMs`: finite number ≥ 0 and ≤ 3600_000? Let's say ≤ 86_400_000 (1 day). Must be finite number, not bool/string. Number.isFinite.
+- `status`: integer 100..599.
+- `timestamp`: ISO 8601 string, parseable via Date.parse, and validate format with regex `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$`. Validate actual calendar validity with Date.parse not NaN.
+- Unknown extra fields: reject or ignore? Reject unknown fields to be strict ("unknown field"). Let's reject: strict validation.
+
+Error codes: `LINE_PARSE` (invalid JSON), `TYPE`, `RANGE`, `PATTERN`, `UNKNOWN_FIELD`, plus limit errors `GROUPS_LIMIT`, `RUNS_LIMIT`, `BODY_TOO_LARGE`, `LINE_TOO_LONG`.
+
+Per-line errors: { line, code, message }.
+
+Ingest endpoint: POST /ingest. Read body incrementally (http request stream), enforce max bytes (e.g., 8MiB) → abort with 413. Max line length 64KB → parser reports line-length error and truncates to end of line. Content-Type: application/x-ndjson or application/json — I'll accept both but not hard-fail. Ignore content-type but validate content. Or require? Keep lenient.
+
+Also handle non-UTF8? Assume UTF-8. Use default of string decode. Incremental parsing over chunks: `req.on('data', chunk: Buffer) => parser.push(chunk.toString('utf8'))`. But splitting a multi-byte character across chunks will produce replacement chars → line parse error. To be strict, better to use string_decoder to handle multi-byte splits. Let me use `string_decoder` (built-in) — that's proper incremental text decoding.
+
+Also `AbortSignal`? Node 18+ supports AbortSignal in setTimeout — I'll just use plain setTimeout.
+
+Engine:
+
+`MetricsEngine`:
+```ts
+type GroupKey = { runId: string; model: string; fixture: string };
+class GroupAgg {
+  n = 0; mean = 0; m2 = 0; min = Infinity; max = -Infinity;
+  reservoir: number[] = [];
+  stored = 0;
+  add(value): void {
+    // Welford update
+    this.n += 1;
+    const delta = value - this.mean;
+    this.mean += delta / this.n;
+    this.m2 += delta * (value - this.mean);
+    if (value < this.min) this.min = value;
+    if (value > this.max) this.max = value;
+    if (this.reservoir.length < RESERVOIR_CAP) { this.reservoir.push(value); }
+    else {
+      const j = randomInt(0, this.n); // reservoir sampling: keep with prob K/n
+      if (j < RESERVOIR_CAP) this.reservoir[j] = value;
+    }
+  }
+}
+```
+Reservoir sampling: for the (i+1)-th item with reservoir size K, generate j uniform in [0, n). If j < K, replace reservoir[j]. This is standard Algorithm R — yes.
+
+Note: sample stddev uses the Welford m2 computed over all n values: std = sqrt(m2/(n-1)).
+
+Merge function for summary:
+```ts
+function mergeWelford(a: {n,mean,m2}, b) { ... }
+```
+Edge: skip n=0.
+
+`/summary` output shape:
+```json
+{
+  "groups": [
+    {
+      "model": "...",
+      "fixture": "...",
+      "runs": ["run-a"],
+      "count": 12,
+      "mean": 123.4,
+      "median": 121.0,
+      "sampleStdDev": 5.2,
+      "min": 110,
+      "max": 140,
+      "medianApprox": false,
+      "valuesStored": 12
+    }
+  ]
+}
+```
+When n===1, sampleStdDev: null (undefined → null in JSON).
+
+`/runs/:id`:
+```json
+{
+  "runId": "...",
+  "count": 34,
+  "groups": [ { model, fixture, count, mean, median, sampleStdDev, min, max, medianApprox, valuesStored } ],
+  "byFixtureTotal"? maybe not.
+}
+```
+If unknown run → 404.
+
+/health:
+```json
+{ "status": "ok", "version": "...", "uptimeSec": ..., "memory": { "rssBytes": ..., "heapUsedBytes": ..., "heapTotalBytes": ... }, "accepted": n, "rejected": n, "droppedBatches"? , "groups": n, "runs": n }
+```
+
+Routing: minimal router:
+- `GET /health`
+- `GET /summary`
+- `GET /runs/<id>` — path regex `^/runs/([^/]+)$`, URL-decode.
+- `POST /ingest`
+- 404 otherwise, 405 for unknown method on known path.
+
+CORS? Not required.
+
+Server config: env vars PORT (default 8787), HOST 127.0.0.1, MAX_BODY_BYTES, etc. Provide `createServer(config)` and `main.ts` entry that reads env and starts. Graceful shutdown on SIGINT/SIGTERM.
+
+File layout:
+
+```
+metrics-service/
+  package.json
+  tsconfig.json
+  README.md (operational guide)
+  src/
+    types.ts
+    errors.ts
+    parser.ts       (incremental NDJSON parsing + validation)
+    aggregate.ts    (Welford, reservoir, merge, median)
+    engine.ts       (MetricsEngine: groups, runs, limits, summary, run view)
+    http/
+      server.ts     (router + handlers)
+      json.ts       (safe json response)
+    config.ts
+    main.ts
+  test/
+    parser.test.ts
+    aggregate.test.ts
+    engine.test.ts
+    server.test.ts
+```
+
+Tests via `node:test` and `node:assert/strict`. Run with `node --test dist/test/` after `tsc`. devDeps: only typescript + @types/node.
+
+package.json:
+```json
+{
+  "name": "ndjson-metrics-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=18.17" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/main.js",
+    "test": "npm run build && node --test dist/test/",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/node": "^20.14.0"
+  }
+}
+```
+
+ESM with node16 resolution. In Node ESM, relative imports need `.js` extensions. I'll write imports with `.js` suffix. tsconfig:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "rootDir": ".",
+    "outDir": "dist",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch

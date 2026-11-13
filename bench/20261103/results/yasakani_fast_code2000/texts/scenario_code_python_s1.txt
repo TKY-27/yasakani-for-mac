@@ -1,0 +1,239 @@
+Below is a complete, runnable Python 3.11 package. Every file is in its own fenced block with its path.
+
+**Design notes (so the code is self-explanatory):**
+- **Determinism:** the runner is driven by a single `asyncio` event loop; the "GPU" is a simulated device whose output is a pure function of the job's `seed` (no wall-clock, no randomness).
+- **One active GPU job:** a single `asyncio.Semaphore(1)` plus a `gpu_busy` flag persisted in the state file.
+- **Atomic state:** state is written to a temp file in the same directory and `os.replace`d (atomic on POSIX).
+- **Resume:** on start, jobs already `completed`/`failed` are skipped; a `running` job is re-queued (crash recovery).
+- **Structured JSONL events:** every lifecycle transition is emitted as one JSON object per line.
+- **SIGINT:** a signal handler sets a cancellation flag; the active job is cancelled and the state is flushed.
+- **Secret redaction:** configured secret values are scrubbed from every emitted event.
+
+---
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deterministic-job-runner"
+version = "0.1.0"
+description = "Deterministic asynchronous GPU job runner with atomic state, resume, JSONL events, SIGINT handling and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Example" }]
+keywords = ["asyncio", "gpu", "jobs", "deterministic", "runner"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7.4", "pytest-asyncio>=0.21"]
+
+[tool.setuptools]
+packages = ["jobrunner"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+---
+
+### `jobrunner/__init__.py`
+
+```python
+"""Deterministic asynchronous GPU job runner."""
+
+from .config import Config, load_config
+from .events import Event, EventSink, JsonlEventSink, Redactor
+from .gpu import GpuDevice, GpuResult
+from .manifest import Job, Manifest, load_manifest
+from .runner import JobRunner, RunnerResult
+from .state import State, StateStore
+
+__all__ = [
+    "Config",
+    "load_config",
+    "Event",
+    "EventSink",
+    "JsonlEventSink",
+    "Redactor",
+    "GpuDevice",
+    "GpuResult",
+    "Job",
+    "Manifest",
+    "load_manifest",
+    "JobRunner",
+    "RunnerResult",
+    "State",
+    "StateStore",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+### `jobrunner/config.py`
+
+```python
+"""Configuration loading and validation."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class Config:
+    """Runtime configuration for the runner.
+
+    ``secrets`` is a mapping of a label to the literal secret value that must
+    be redacted from every emitted event.
+    """
+
+    state_path: Path
+    events_path: Path
+    manifest_path: Path
+    secrets: dict[str, str] = field(default_factory=dict)
+    gpu_device: str = "gpu0"
+    gpu_concurrency: int = 1
+    max_retries: int = 0
+    retry_backoff: float = 0.0
+    tick: float = 0.01
+    flush_every: int = 1
+
+    def __post_init__(self) -> None:
+        if self.gpu_concurrency < 1:
+            raise ValueError("gpu_concurrency must be >= 1")
+        if self.max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+        if self.tick <= 0:
+            raise ValueError("tick must be > 0")
+        if self.flush_every < 1:
+            raise ValueError("flush_every must be >= 1")
+
+
+def load_config(path: str | Path) -> Config:
+    """Load a JSON configuration file into a :class:`Config`.
+
+    The file may contain a flat object or an object with a ``"config"`` key.
+    """
+    p = Path(path)
+    raw: dict[str, Any] = json.loads(p.read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and "config" in raw and isinstance(raw["config"], dict):
+        raw = raw["config"]
+
+    secrets = raw.get("secrets", {})
+    if not isinstance(secrets, dict):
+        raise ValueError("config 'secrets' must be an object")
+    secrets = {str(k): str(v) for k, v in secrets.items()}
+
+    return Config(
+        state_path=Path(raw["state_path"]),
+        events_path=Path(raw["events_path"]),
+        manifest_path=Path(raw["manifest_path"]),
+        secrets=secrets,
+        gpu_device=str(raw.get("gpu_device", "gpu0")),
+        gpu_concurrency=int(raw.get("gpu_concurrency", 1)),
+        max_retries=int(raw.get("max_retries", 0)),
+        retry_backoff=float(raw.get("retry_backoff", 0.0)),
+        tick=float(raw.get("tick", 0.01)),
+        flush_every=int(raw.get("flush_every", 1)),
+    )
+```
+
+---
+
+### `jobrunner/manifest.py`
+
+```python
+"""Manifest (job list) parsing and validation."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class Job:
+    """A single unit of GPU work.
+
+    ``seed`` drives the deterministic output; ``duration`` is the simulated
+    number of ticks the job occupies the GPU for; ``should_fail`` forces a
+    failure (used by tests); ``metadata`` is free-form and is redacted on
+    emission.
+    """
+
+    id: str
+    seed: int
+    duration: float = 1.0
+    should_fail: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "seed": self.seed,
+            "duration": self.duration,
+            "should_fail": self.should_fail,
+            "metadata": self.metadata,
+        }
+
+
+@dataclass
+class Manifest:
+    """An ordered collection of jobs."""
+
+    jobs: list[Job] = field(default_factory=list)
+
+    def by_id(self, job_id: str) -> Job:
+        for job in self.jobs:
+            if job.id == job_id:
+                return job
+        raise KeyError(f"unknown job id: {job_id!r}")
+
+
+def _parse_job(raw: dict[str, Any], index: int) -> Job:
+    if "id" not in raw:
+        raise ValueError(f"job at index {index} is missing required field 'id'")
+    job_id = str(raw["id"])
+    seed = raw.get("seed", 0)
+    if not isinstance(seed, int):
+        raise ValueError(f"job {job_id!r}: 'seed' must be an integer")
+    duration = raw.get("duration", 1.0)
+    if not isinstance(duration, (int, float)) or duration <= 0:
+        raise ValueError(f"job {job_id!r}: 'duration' must be a positive number")
+    should_fail = bool(raw.get("should_fail", False))
+    metadata = raw.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ValueError(f"job {job_id!r}: 'metadata' must be an object")
+    return Job(id=job_id, seed=seed, duration=float(duration), should_fail=should_fail, metadata=metadata)
+
+
+def load_manifest(path: str | Path) -> Manifest:
+    """Load a JSON manifest file into a :class:`Manifest`.
+
+    Accepts either a bare list of job objects or an object with a ``"jobs"``
+    list. Duplicate job ids are rejected.
+    """
+    p = Path(path)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    if isinstance(raw, dict):
+        raw_jobs = raw.get("jobs")
+        if not isinstance(raw_jobs, list):
+            raise ValueError("manifest object must contain

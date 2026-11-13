@@ -1,0 +1,157 @@
+juzbox/Qwen3.8-27B-NVFP4-GDN@3e68640: 0 files to download -> <mkyt_hf_dir>\hub\models--juzbox--Qwen3.8-27B-NVFP4-GDN\snapshots\3e686408cf61c2b579c67ab21696c9fc94e41e25
+incoai/Qwen3.8-27B-DFlash2@015e795: 0 files to download -> <mkyt_hf_dir>\hub\models--incoai--Qwen3.8-27B-DFlash2\snapshots\015e795645c74b1a0eeef3b570031fb62e769bc5
+all checkpoints are present
+[api] serving qwen3.8-27b on 127.0.0.1:8000 (the engine is loading)
+[q27] free VRAM: 30.26 GiB by cudaMemGetInfo, 29.35 GiB with other programs
+[q27] GDN / attention projections: NVFP4
+[q27] draft linear layers: nvfp4
+[q27] draft vocabulary: 131072 ids (<mkyt_dir>\app\bench\draft-vocab\vocab-128k.txt)
+[q27] memory budget: free at start 29.35 GiB of 31.82 GiB, budget 27.83 GiB
+[q27]   weights      device   15.682 GiB
+[q27]       lm_head.weight                  0.592 GiB
+[q27]       draft vocabulary head           0.312 GiB
+[q27]       draft candidate_selector.successor_codebook    0.118 GiB
+[q27]       draft candidate_selector.predecessor_codebook    0.118 GiB
+[q27]   embedding    host      3.221 GiB
+[q27]       model.language_model.embed_tokens.weight    2.368 GiB
+[q27]   kv           device    9.581 GiB
+[q27]       K | V pages (and parking areas)    9.581 GiB
+[q27]   state        device    0.897 GiB
+[q27]       gdn verify inputs               0.424 GiB
+[q27]       checkpoint staging              0.185 GiB
+[q27]       ssm                             0.141 GiB
+[q27]       ssm (second buffer)             0.141 GiB
+[q27]   activations  device    1.396 GiB
+[q27]       prefill attention E4M3 KV       0.250 GiB
+[q27]       logits                          0.237 GiB
+[q27]       big1                            0.133 GiB
+[q27]       big2                            0.133 GiB
+[q27]   state cache  host      3.889 GiB
+[q27]       state checkpoints               3.889 GiB
+[q27]   image embeddings host      0.156 GiB
+[q27]       image embeddings                0.156 GiB
+[q27]   total: device 27.556 GiB, host pinned 7.266 GiB
+[api] "GET /ui HTTP/1.1" 200 -
+[api] "GET /admin/engine HTTP/1.1" 200 -
+[api] "GET /ui/stream HTTP/1.1" 200 -
+[api] "GET /favicon.ico HTTP/1.1" 404 -
+[q27] pools allocated in 0.39 s
+[q27] kv pool: 8720 pages (558080 tokens), max_tokens 262144
+[q27] prefix cache: 21 state slots of 189.6 MiB (3.89 GiB pinned, allocated as needed), checkpoint interval 8192
+[q27] sequences: 7 parking areas of 189.6 MiB (171 KV pages each, lent to the KV pool while unused)
+[q27] vision: BF16 in pinned host memory, workspace 395 MiB (in the prefill activations), images up to 4194304 px, 16384 image tokens per request
+[q27] batched decode: up to 8 sequences per step
+[api] "POST /admin/engine/plan HTTP/1.1" 200 -
+[q27] loaded 18.65 GB of weights in 2.1 s (8.68 GB/s)
+[q27] loaded the draft (3.85 GB) in 0.6 s
+[api] engine ready: {'max_tokens': 262144, 'max_seqs': 8, 'spec': True, 'vision': True}
+[sched] 8 sequences at once (target 8, KV admission on, min 0 tok/s per request), decode share 0.5, quantum 50 ms, DFlash2, batched decode steps
+[api] "GET /ui/stream HTTP/1.1" 200 -
+[api] "GET /admin/engine HTTP/1.1" 200 -
+[api] "POST /admin/engine/plan HTTP/1.1" 200 -
+[api] "GET /v1/models HTTP/1.1" 200 -
+[api] "GET /v1/models HTTP/1.1" 200 -
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-d977dc1fee534bad: prompt 26 tokens, cached 0 of 0 reusable, waited 0.00 s, checkpoints at [0, 19]
+[sched] req-d977dc1fee534bad: stop, 156 tokens, ttft 0.04 s, 577.5 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-0f8b2682a9af4408: prompt 26 tokens, cached 0 of 25 reusable, waited 0.00 s, checkpoints at [0, 19, 25]
+[sched] req-0f8b2682a9af4408: stop, 156 tokens, ttft 0.02 s, 604.0 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-096b92b81d254ea2: prompt 144 tokens, cached 0 of 1 reusable, waited 0.00 s, checkpoints at [1, 24, 137]
+[sched] req-096b92b81d254ea2: length, 4096 tokens, ttft 0.05 s, 366.5 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-6099a76824e04da2: prompt 144 tokens, cached 128 of 143 reusable, waited 0.00 s, checkpoints at [24, 137, 143]
+[sched] req-6099a76824e04da2: length, 4096 tokens, ttft 0.03 s, 366.4 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-4f999f3d363c4c01: prompt 122 tokens, cached 0 of 27 reusable, waited 0.00 s, checkpoints at [24, 27, 115]
+[sched] req-4f999f3d363c4c01: length, 4096 tokens, ttft 0.05 s, 423.4 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-108874e42456471d: prompt 122 tokens, cached 64 of 121 reusable, waited 0.00 s, checkpoints at [24, 115, 121]
+[sched] req-108874e42456471d: length, 4096 tokens, ttft 0.03 s, 423.3 tok/s
+[sched] req-a8b7371659b94150: prompt 122 tokens, cached 0 of 27 reusable, waited 0.00 s, checkpoints at [24, 27, 115]
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-a8b7371659b94150: stop, 199 tokens, ttft 0.06 s, 506.5 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-dcbf0e0576624c1f: prompt 122 tokens, cached 64 of 121 reusable, waited 0.00 s, checkpoints at [24, 115, 121]
+[sched] req-dcbf0e0576624c1f: stop, 199 tokens, ttft 0.03 s, 506.6 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-8aa45613aa514d8e: prompt 127 tokens, cached 0 of 3 reusable, waited 0.00 s, checkpoints at [3, 23, 120]
+[sched] req-8aa45613aa514d8e: stop, 3294 tokens, ttft 0.06 s, 176.6 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-f4cf0eae35ef4cf6: prompt 127 tokens, cached 64 of 126 reusable, waited 0.00 s, checkpoints at [23, 120, 126]
+[sched] req-f4cf0eae35ef4cf6: stop, 3294 tokens, ttft 0.03 s, 176.6 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-86b1175f10a942cc: prompt 131 tokens, cached 0 of 6 reusable, waited 0.00 s, checkpoints at [6, 23, 124]
+[sched] req-86b1175f10a942cc: stop, 4052 tokens, ttft 0.05 s, 262.2 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-7802032e3e044d92: prompt 131 tokens, cached 64 of 130 reusable, waited 0.00 s, checkpoints at [23, 124, 130]
+[sched] req-7802032e3e044d92: length, 4096 tokens, ttft 0.05 s, 323.5 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-cf9c135b796c418d: prompt 135 tokens, cached 0 of 26 reusable, waited 0.00 s, checkpoints at [23, 26, 128]
+[sched] req-cf9c135b796c418d: stop, 3085 tokens, ttft 0.04 s, 143.3 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-861f3b74b34245b4: prompt 135 tokens, cached 128 of 134 reusable, waited 0.00 s, checkpoints at [23, 128, 134]
+[sched] req-861f3b74b34245b4: stop, 3085 tokens, ttft 0.02 s, 143.4 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-2eb1429097a04c19: prompt 401 tokens, cached 0 of 3 reusable, waited 0.00 s, checkpoints at [0, 3, 394]
+[sched] req-2eb1429097a04c19: stop, 805 tokens, ttft 0.06 s, 463.3 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-365dedb2abf94551: prompt 401 tokens, cached 384 of 400 reusable, waited 0.00 s, checkpoints at [0, 394, 400]
+[sched] req-365dedb2abf94551: stop, 805 tokens, ttft 0.03 s, 463.4 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-5bcaaa1c70ab4719: prompt 395 tokens, cached 0 of 3 reusable, waited 0.00 s, checkpoints at [0, 3, 388]
+[sched] req-5bcaaa1c70ab4719: stop, 927 tokens, ttft 0.06 s, 357.4 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-3307fa5f5a034d7f: prompt 395 tokens, cached 384 of 394 reusable, waited 0.00 s, checkpoints at [0, 388, 394]
+[sched] req-3307fa5f5a034d7f: stop, 927 tokens, ttft 0.03 s, 356.8 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-5e962c5cdf294d82: prompt 360 tokens, cached 0 of 5 reusable, waited 0.00 s, checkpoints at [0, 5, 353]
+[sched] req-5e962c5cdf294d82: stop, 754 tokens, ttft 0.06 s, 293.8 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-28267e89af9a4861: prompt 360 tokens, cached 320 of 359 reusable, waited 0.00 s, checkpoints at [0, 353, 359]
+[sched] req-28267e89af9a4861: stop, 754 tokens, ttft 0.03 s, 293.9 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-f6e7d6fc9a30486e: prompt 130 tokens, cached 0 of 3 reusable, waited 0.00 s, checkpoints at [0, 3, 123]
+[sched] req-f6e7d6fc9a30486e: length, 4096 tokens, ttft 0.05 s, 633.3 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-b371c9b1ea0347be: prompt 130 tokens, cached 64 of 129 reusable, waited 0.00 s, checkpoints at [0, 123, 129]
+[sched] req-b371c9b1ea0347be: length, 4096 tokens, ttft 0.05 s, 634.8 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-9ac979ef24e241a3: prompt 113 tokens, cached 0 of 3 reusable, waited 0.00 s, checkpoints at [0, 3, 106]
+[sched] req-9ac979ef24e241a3: length, 4096 tokens, ttft 0.05 s, 496.8 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-8f192b9c20a14aa0: prompt 113 tokens, cached 64 of 112 reusable, waited 0.00 s, checkpoints at [0, 106, 112]
+[sched] req-8f192b9c20a14aa0: length, 4096 tokens, ttft 0.03 s, 496.8 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-0e220fddffd24ced: prompt 101 tokens, cached 0 of 3 reusable, waited 0.00 s, checkpoints at [0, 3, 94]
+[sched] req-0e220fddffd24ced: length, 4096 tokens, ttft 0.05 s, 531.7 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-ce53d7a8ce3843a3: prompt 101 tokens, cached 64 of 100 reusable, waited 0.00 s, checkpoints at [0, 94, 100]
+[sched] req-ce53d7a8ce3843a3: length, 4096 tokens, ttft 0.03 s, 531.8 tok/s
+[api] "GET /v1/models HTTP/1.1" 200 -
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-072328bb6f404228: prompt 26 tokens, cached 0 of 25 reusable, waited 0.00 s, checkpoints at [0, 19, 25]
+[sched] req-072328bb6f404228: stop, 156 tokens, ttft 0.02 s, 603.6 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-8e161b6b4f1346bd: prompt 26 tokens, cached 0 of 25 reusable, waited 0.00 s, checkpoints at [0, 19, 25]
+[sched] req-8e161b6b4f1346bd: stop, 156 tokens, ttft 0.02 s, 603.7 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-f7e826406f394486: prompt 4773 tokens, cached 0 of 3 reusable, waited 0.00 s, checkpoints at [0, 3, 4766]
+[sched] req-f7e826406f394486: stop, 4710 tokens, ttft 0.33 s, 422.1 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-457b52a8835941cd: prompt 4773 tokens, cached 4736 of 4772 reusable, waited 0.00 s, checkpoints at [0, 4766, 4772]
+[sched] req-457b52a8835941cd: stop, 4710 tokens, ttft 0.03 s, 422.3 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-bda5ad09c50c44a4: prompt 2927 tokens, cached 0 of 4 reusable, waited 0.00 s, checkpoints at [0, 4, 2920]
+[sched] req-bda5ad09c50c44a4: stop, 2853 tokens, ttft 0.21 s, 632.6 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-db0641e7b8ee4522: prompt 2927 tokens, cached 2880 of 2926 reusable, waited 0.00 s, checkpoints at [0, 2920, 2926]
+[sched] req-db0641e7b8ee4522: stop, 2853 tokens, ttft 0.03 s, 632.0 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-19f8b1cb8b604670: prompt 146 tokens, cached 0 of 6 reusable, waited 0.00 s, checkpoints at [0, 6, 139]
+[sched] req-19f8b1cb8b604670: length, 8192 tokens, ttft 0.05 s, 638.2 tok/s
+[api] "POST /v1/chat/completions HTTP/1.1" 200 -
+[sched] req-472d5aaafb834d98: prompt 146 tokens, cached 128 of 145 reusable, waited 0.00 s, checkpoints at [0, 139, 145]
+[sched] req-472d5aaafb834d98: length, 8192 tokens, ttft 0.03 s, 638.1 tok/s
+Traceback (most recent call last):

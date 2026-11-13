@@ -1,0 +1,128 @@
+We need to translate the Markdown document into Simplified Chinese, preserving heading levels, table structure, inline identifiers, JSON keys and values, fenced code block exactly. Then append requested bilingual glossary. Output Markdown only.
+
+Need analyze carefully. User request in English. We need produce final Markdown only. Need likely include translated document plus bilingual glossary. Need preserve exact table cells? "do not translate code, JSON keys, command-line flags, filenames, or values in the table." Values in table include identifiers prepare, warmup, measure, publish? Also evidence descriptions? "values in the table" likely all cell contents? But they ask translate prose into Chinese, but do not translate code, JSON keys, command-line flags, filenames, or values in the table. So table values must remain original? The table contains:
+| Phase | Required evidence | Failure action |
+|---|---|---|
+| prepare | fixture hash and prompt-token count | stop before generation |
+| warmup | one successful unmeasured request | restart the service |
+| measure | five sequential responses | invalidate the complete block |
+| publish | summary plus per-request rows | withhold the headline |
+
+"values in the table" maybe means values in the table (cells) should not be translated. But "Required evidence" and "Failure action" headers? Preserve heading levels and table structure. It says "do not translate ... values in the table." It might mean all table values (including headers?) are values? In Markdown table, header row values too. Need preserve table structure, but translate prose. Since table cells are prose except identifiers like prepare, warmup, measure, publish? The instruction: "The release owner must preserve identifiers such as `request_id`, `max_context`, `kv_dtype`, and `mtp_rounds` exactly. Translate prose into Chinese, but do not translate code, JSON keys, command-line flags, filenames, or values in the table." So specifically table values should not be translated. Thus leave table as original English? But maybe translate table headers? "values" may include all cell content. To be safe, keep entire table exactly as original, because "values in the table" not translate. But table headers are values? yes likely. The table structure preserved. But the document says "The final document should read naturally in Chinese while preserving every heading level, table cell, inline identifier, and fenced block." "table cell" maybe preserve? It says preserving every heading level, table cell, inline identifier, and fenced block. That suggests table cell contents? "table cell" could mean structure? But earlier "do not translate ... values in the table." So keep table cells unchanged. Need output Markdown only, no explanatory text.
+
+Need append bilingual glossary containing at least twenty technical terms from source and one concise note for each term. Bilingual glossary likely terms in English/Chinese with notes. Need from source. Source technical terms: release owner? identifiers request_id, max_context, kv_dtype, mtp_rounds, fixture hash, prompt-token count, unmeasured request, restart, invalidate block, headline, summary, per-request rows, prefix reuse, cache-hit count, GPU, response, client disconnected, server-internal TTFT, network-observed time, prefill, generated token, max_completion_tokens, seed, stream, model? Need at least 20. Could include terms: release owner, request_id, max_context, kv_dtype, mtp_rounds, fixture hash, prompt-token count, unmeasured request, invalidate, headline, prefix reuse, cache-hit count, TTFT, prefill, server-internal, network-observed, client disconnected, valid observation, warmup, measure, publish, prepare, fixture hash? Need at least 20. Bilingual glossary: maybe table with English Term | Chinese | Note (Chinese? concise). "one concise note for each term" Could be bilingual note? Need likely glossary entries with term and note. Could produce a table: | English | 中文 | 说明 |. Note maybe Chinese concise. Bilingual glossary means terms have English and Chinese. Need at least 20 technical terms from source. Include inline identifiers exact? If in glossary, preserve identifiers? They are technical terms. Could list `request_id` etc. Need maybe preserve code formatting.
+
+Need translate prose:
+Title: "# Release procedure" -> "# 发布流程" or "# 发布程序". Release procedure likely "发布流程". 
+Paragraph: "The release owner must preserve identifiers such as `request_id`, `max_context`, `kv_dtype`, and `mtp_rounds` exactly. Translate prose into Chinese, but do not translate code, JSON keys, command-line flags, filenames, or values in the table." This is meta instruction in source? The original document includes this instruction? Yes after title. We need translate prose into Chinese but do not translate code, JSON keys, command-line flags, filenames, or values in the table. So this sentence should be translated: "发布负责人必须准确保留诸如 `request_id`、`max_context`、`kv_dtype` 和 `mtp_rounds` 等标识符。请将散文翻译为中文，但不要翻译代码、JSON 键、命令行标志、文件名或表格中的值。" Need preserve identifiers inline. "release owner" -> 发布负责人. Good.
+
+Then table unchanged.
+
+JSON code block unchanged exactly:
+```json
+{"model":"qwen3.6-35b-a3b","max_completion_tokens":1024,"seed":42,"stream":false}
+```
+
+## Notes -> ## 说明 or ## 备注. "Notes" maybe "说明". Good.
+
+Prose: "The operator checks that prefix reuse is disabled, the cache-hit count is zero, and no unrelated GPU process is active. A response that stops naturally remains a valid observation; a response lost because the client disconnected does not. The report distinguishes server-internal TTFT from network-observed time and explains that the first generated token is assigned to prefill."
+
+Translate naturally: "操作员需检查前缀复用已禁用、缓存命中数为零，且没有无关 GPU 进程处于活动状态。自然停止的响应仍属于有效观察；因客户端断开而丢失的响应则不属于。报告需区分服务端内部的 TTFT 与网络侧观测时间，并说明首个生成 token 归属于 prefill 阶段。" Need preserve "TTFT"? technical acronym, can leave English. "prefill" maybe code? It's identifier? preserve? The instruction says do not translate command-line flags, filenames, etc. "prefill" is technical term, likely preserve? It says translate prose into Chinese, but not code, JSON keys, command-line flags, filenames, or values in table. "prefill" isn't code necessarily but can be inline identifier? We can preserve TTFT and prefill? The source uses lowercase "prefill" not backticks. The final should preserve inline identifiers? They specifically mention identifiers like `request_id` etc. But "prefill" maybe concept. Could translate "预填充"? But to preserve technical terms maybe leave "prefill". User asks append glossary technical terms. I can keep TTFT and prefill as English in prose to be safe. "first generated token" -> "首个生成 token". "network-observed time" -> "网络观测时间". "server-internal" -> "服务端内部". "valid observation" -> "有效观测/观察". "stops naturally" -> "自然结束". "client disconnected" -> "客户端断开". Good.
+
+Need table maybe keep exact. But if table headers English, document less natural but required. Could we translate table headers? The instruction "do not translate ... values in the table" is explicit. So keep entire table exact. Need ensure no accidental translation of table.
+
+Need append glossary after Notes. Heading maybe "## Glossary" or "## 双语术语表". Since output should be Markdown only. Bilingual glossary containing at least twenty technical terms from source and one concise note for each term. Need maybe use table:
+## 双语术语表
+
+| English | 中文 | 说明 |
+|---|---|---|
+| release owner | 发布负责人 | ... |
+...
+Need at least 20 rows. Need one concise note for each term. Notes can be Chinese. Could include 25 terms. Need ensure all terms from source. Let's list from source:
+1 release owner
+2 request_id
+3 max_context
+4 kv_dtype
+5 mtp_rounds
+6 fixture hash
+7 prompt-token count
+8 unmeasured request
+9 invalidate
+10 headline
+11 prefix reuse
+12 cache-hit count
+13 GPU
+14 valid observation
+15 client disconnected
+16 TTFT
+17 server-internal
+18 network-observed time
+19 prefill
+20 generated token
+21 warmup
+22 measure
+23 publish
+24 prepare
+25 summary
+26 per-request rows
+27 restart
+28 stop before generation
+29 stream
+30 max_completion_tokens
+31 seed
+
+Need at least 20. Could include 24. Need "from source" yes all present. Table values? Some are table values; can glossary translate them? It's not table values in original table? It's new glossary, allowed? The instruction "do not translate ... values in the table" refers original table. Glossary can have terms. But need preserve code/identifiers? If listing `request_id` preserve. Could use code formatting for identifiers.
+
+Need "bilingual glossary" maybe each term with English and Chinese and concise note. Could use definition list or table. Markdown table likely. Need maybe ensure
+
+My thinking time is over. I must now write the complete final answer from what I already have, without calling any more tools.# 发布流程
+
+发布负责人必须准确保留诸如 `request_id`、`max_context`、`kv_dtype` 和 `mtp_rounds` 等标识符。请将散文翻译为中文，但不要翻译代码、JSON 键、命令行标志、文件名或表格中的值。
+
+| Phase | Required evidence | Failure action |
+|---|---|---|
+| prepare | fixture hash and prompt-token count | stop before generation |
+| warmup | one successful unmeasured request | restart the service |
+| measure | five sequential responses | invalidate the complete block |
+| publish | summary plus per-request rows | withhold the headline |
+
+```json
+{"model":"qwen3.6-35b-a3b","max_completion_tokens":1024,"seed":42,"stream":false}
+```
+
+## 说明
+
+操作员需检查前缀复用已禁用、缓存命中数为零，且没有无关 GPU 进程处于活动状态。自然停止的响应仍属于有效观察；因客户端断开而丢失的响应则不属于有效观察。报告需区分服务端内部 TTFT 与网络观测时间，并说明首个生成 token 归属于 prefill。
+
+## 双语术语表
+
+| English | 中文 | 说明 |
+|---|---|---|
+| release owner | 发布负责人 | 负责发布流程执行与质量把关的人员 |
+| `request_id` | `request_id` | 用于标识单次请求的字段 |
+| `max_context` | `max_context` | 上下文长度相关的配置或标识字段 |
+| `kv_dtype` | `kv_dtype` | 键值缓存数据类型相关标识 |
+| `mtp_rounds` | `mtp_rounds` | MTP 轮次相关配置标识 |
+| fixture hash | 测试夹具哈希 | 用于核对输入夹具一致性的校验值 |
+| prompt-token count | 提示词 token 数 | 提示词对应的 token 计数 |
+| unmeasured request | 未计量请求 | 不计入正式测量指标的请求 |
+| invalidate | 作废 | 使某个数据块或结果失效 |
+| headline | 头条结论 | 报告中需要暂缓发布的总体结论 |
+| prefix reuse | 前缀复用 | 复用已有前缀内容的行为 |
+| cache-hit count | 缓存命中数 | 缓存命中发生次数的统计值 |
+| GPU | GPU | 图形处理器，亦常用于 AI 推理加速 |
+| valid observation | 有效观察 | 可用于结论分析的响应结果 |
+| client disconnected | 客户端断开 | 客户端主动或异常中断连接的状态 |
+| TTFT | 首 token 时延 | Time To First Token 的缩写 |
+| server-internal | 服务端内部 | 指标来自服务器内部而非网络观测 |
+| network-observed time | 网络观测时间 | 从客户端或网络侧测量得到的时间 |
+| prefill | prefill | 处理提示词前缀的推理阶段 |
+| generated token | 生成 token | 模型在解码阶段产出的 token |
+| warmup | 预热 | 正式测量前的一次性准备阶段 |
+| measure | 测量 | 获取正式指标的阶段 |
+| publish | 发布 | 公布结果或结论的阶段 |
+| summary | 汇总 | 对结果的概括性描述 |
+| per-request rows | 按请求明细行 | 每个请求单独列出的记录行 |
+| `max_completion_tokens` | `max_completion_tokens` | 控制最大生成 token 数的 JSON 键 |
+| `stream` | `stream` | 控制是否流式返回的 JSON 键 |
+| `seed` | `seed` | 控制随机性的种子参数 |

@@ -1,0 +1,43 @@
+# 发布流程
+
+发布负责人必须精确保留诸如 `request_id`、`max_context`、`kv_dtype` 和 `mtp_rounds` 等标识符。请将正文翻译成中文，但不要翻译代码、JSON 键、命令行标志、文件名或表格中的值。
+
+| Phase | Required evidence | Failure action |
+|---|---|---|
+| prepare | fixture hash and prompt-token count | stop before generation |
+| warmup | one successful unmeasured request | restart the service |
+| measure | five sequential responses | invalidate the complete block |
+| publish | summary plus per-request rows | withhold the headline |
+
+```json
+{"model":"qwen3.6-35b-a3b","max_completion_tokens":1024,"seed":42,"stream":false}
+```
+
+## 备注
+
+操作员需检查前缀重用已禁用、缓存命中次数为零，且没有无关的 GPU 进程处于活动状态。自然停止的响应仍视为有效观察；因客户端断开连接而丢失的响应则不是。报告区分服务器内部的 TTFT 和网络观测时间，并解释第一个生成的令牌被分配给 prefill 阶段。
+
+## 双语术语表
+
+1. **Release owner** / 发布负责人：负责管理发布流程并确保数据完整性的人员。
+2. **Identifier** / 标识符：用于唯一识别对象或参数的字符串或符号。
+3. **`request_id`** / 请求 ID：用于追踪特定 API 请求的唯一标识符。
+4. **`max_context`** / 最大上下文：模型在处理时允许的最大上下文长度。
+5. **`kv_dtype`** / KV 数据类型：键值缓存中使用的数据类型（如 float16, bfloat16）。
+6. **`mtp_rounds`** / MTP 轮数：多 token 预测（Multi-Token Prediction）的迭代轮数。
+7. **Prose** / 正文：文档中除代码和元数据外的叙述性文本。
+8. **Command-line flag** / 命令行标志：用于配置程序行为的命令行参数。
+9. **Phase** / 阶段：发布流程中的特定步骤或时期。
+10. **Fixture hash** / 测试夹具哈希：用于验证测试数据完整性的哈希值。
+11. **Prompt-token count** / 提示令牌数：输入提示中包含的令牌数量。
+12. **Generation** / 生成：模型产生输出文本的过程。
+13. **Warmup** / 预热：正式测量前使系统达到稳定状态的阶段。
+14. **Unmeasured request** / 未测量请求：不计入性能统计的请求。
+15. **Sequential responses** / 顺序响应：按顺序生成的一组响应。
+16. **Invalidate** / 使无效：标记数据或结果为不可用。
+17. **Withhold** / 扣留：暂时不发布或隐藏信息。
+18. **Prefix reuse** / 前缀重用：利用相同前缀的缓存以加速处理。
+19. **Cache-hit count** / 缓存命中次数：缓存成功匹配请求的次数。
+20. **GPU process** / GPU 进程：在图形处理单元上运行的计算任务。
+21. **TTFT** / 首令牌时间：从请求发出到收到第一个令牌的时间。
+22. **Prefill** / 预填充：模型处理输入提示并准备生成输出的阶段。<|im_end|>

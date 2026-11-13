@@ -1,0 +1,137 @@
+I'll design a complete TypeScript 5 service that satisfies all the requirements.
+
+【Requirements】
+1. TypeScript 5 service
+2. Consume newline-delimited request metrics (NDJSON stream)
+3. Validation without third-party schema libraries (manual validation)
+4. Group records by model and fixture
+5. Compute mean / median / sample standard deviation
+6. Expose /health, /summary, /runs/:id endpoints
+7. Strict typing
+8. Incremental parsing
+9. Bounded memory
+10. Malformed input errors
+11. Unit tests
+12. package.json, tsconfig.json
+13. Concise operational guide
+14. No placeholders allowed
+
+【Design Decisions】
+
+【HTTP Server】To keep it dependency-free and robust, I'll build with Node's built-in http module. This avoids express. That said, "no third-party schema libraries" only forbids schema libraries, so express itself might be allowed. But if I go zero-runtime-dependency I make deployment simpler and avoid version-drift issues. I'll use node:http. For tests, I could use Jest or Node's built-in test runner (node:test), available from Node 18+. Node's built-in test runner has zero dependencies and works well with TS if I compile to JS and run node --test on the dist folder. To keep things robust and simple: use tsconfig, build with tsc, test with node --test against the compiled output. Alternative is tsx + node:test but that adds a dev dependency. The simplest and most reliable is: devDependencies: only typescript + @types/node. Tests: node:test against compiled JS.
+
+Actually, with TS 5 and Node 20+, node --test can run .js files. Tests will be compiled alongside. Good.
+
+【Incremental Parsing】Accept POST /ingest (or /metrics) with NDJSON body. Process the stream incrementally: read chunks, maintain a partial line buffer, split on \n, validate + aggregate each complete line. Handle incomplete final line (carry over remainder to next chunk). Enforce per-line byte limit and per-request total size. On validation failure: report malformed line error (status + line number), and decide policy: reject the whole batch or partial commit? For a metrics service, best to be strict: all-or-nothing per batch is hard with a streaming model (memory bounded → can't buffer the whole request). So I'll adopt an explicit per-line policy: each line is independently validated; a single bad line produces a per-line error, and that line is discarded while the service returns 207-ish semantics: 200 with a "rejectedLines" list? Or 400?
+
+The requirement is "malformed input errors" — errors for malformed input. Cleanest approach: streaming ingest that reports a per-line error with line number and reason, and the response is:
+- If all lines were valid → 200 with the accepted count
+- If some lines were invalid → 422 (or 400) with per-line errors, but valid lines are committed? Mixed semantics get complex.
+
+Alternative: strict mode — if any line is malformed, reject the entire request (400) and discard valid lines too. But since we aggregate incrementally, discarding valid lines means having to roll back. To keep memory bounded and logic simple, two modes: strict (default) and lenient. Rollback in strict requires buffering aggregates… complicated.
+
+Simplest, most consistent approach: ingest commits line-by-line; the response enumerates accepted and rejected lines; if there are rejections, status 422 but valid lines are committed (documented). Hmm, mixed commits with 422 are defensible for an append-only metrics pipeline. But tests should nail down the behavior.
+
+Alternatively, per-line commit, status: 200 all valid; 207 multi-status? 207 is WebDAV. Custom: 200 with {accepted: n, rejected: [...]} and if rejected>0 status 422. Document clearly. I think that's fine and realistic.
+
+Actually, reconsidering: many real metric pipelines are append-only; a line-by-line commit with 422 + per-line errors is a defensible design. I'll go with this: POST /ingest returns 422 if there are rejections, 200 if all good; the run state is unchanged by rejections; rejections are listed with line number, byte offset, and code (like LINE_TOO_LONG, INVALID_JSON, BAD_TYPE, etc).
+
+【Bounded Memory】Aggregations per (model, fixture) are kept in memory: mean needs the sum; sample standard deviation — can be computed with Welford's online algorithm (mean, M2, count) — O(1) per group. But median requires the full data! Median needs sorted data. Bounded memory + median → options:
+1. Keep all values per group but cap group size → memory bounded by cap. On overflow…? Drop or reject new lines? Rejecting valid lines is bad.
+2. Keep a reservoir sample for median approximation — but the requirement says compute the median; an approximation might violate the "median" spec.
+3. Keep values per group, but with a hard cap: when a group exceeds maxSamplesPerGroup, reject lines for that group (documented as capacity error) — this makes memory truly bounded, and median remains exact for retained data. Hmm, rejecting valid data is harsh.
+
+Alternative: per-run bounded memory: cap the total record count (maxRecordsPerRun). Once a run hits the cap, reject further lines with RUN_FULL. That's simple, deterministic, and memory is bounded. Also cap group count (distinct models × fixtures), each group capped at maxGroupSamples.
+
+What to implement:
+- maxRecordsPerRun (default e.g. 200_000)
+- maxGroups (default 1_000) — new groups beyond this rejected with TOO_MANY_GROUPS
+- Welford for mean/stddev; median via storing sorted-inserted arrays? Insertion into a sorted array is O(n). Better: keep unsorted arrays and sort on read (when computing /summary, /runs/:id). Median cost is O(n log n) per read — fine for a service. Memory: bounded by caps.
+
+But wait — for memory to be *bounded*, I need an absolute cap on stored samples per group. Since maxRecordsPerRun bounds the total, per-group is also bounded by that. Also bound per line (maxLineBytes e.g. 16 KiB) and per request (maxBodyBytes e.g. 16 MiB).
+
+Also cap distinct string values for model/fixture (maxStringLength).
+
+【Runs】Each POST /ingest can carry a runId. Or is a run = one ingest request? "/runs/:id" implies runs with IDs. Design: client provides runId in the request (header X-Run-Id or body? Since lines are NDJSON metrics without a run ID, the run ID is in the header). Let me define: POST /ingest, header x-run-id (required, validated by pattern, e.g. /^[a-z0-9][a-z0-9._-]{0,63}$/i). All lines of the request are appended to that run. GET /runs/:id returns the run's stats grouped by model+fixture. GET /summary aggregates across all runs (global group-by model+fixture across all runs? or per-run summary?). "Group records by model and fixture and compute mean/median/sample stddev" — the grouping is by (model, fixture) — the summary endpoint should present those groups. Let's do:
+- /summary: global stats over all runs (grouped by model, fixture), plus per-run counts, totals.
+- /runs/:id: same structure scoped to that run.
+
+Also multiple runs coexist — memory-bounded: cap total runs (maxRuns), cap total records (global). When global cap is reached, reject new records with GLOBAL_CAPACITY_EXCEEDED. Should I add DELETE /runs/:id for freeing? Not required; I can add POST /reset for tests/ops. I'll add POST /reset (admin) — useful for the operational guide too. But keep the scope narrow; /reset is small and useful. I'll include it.
+
+【Record Schema (no schema library — manual validation)】
+Each NDJSON line is a JSON object:
+{
+  "ts": number (unix epoch ms, positive finite, ≤ now+skew tolerance? Simpler: finite positive number; or allow string? Keep it numeric),
+  "model": string (non-empty, ≤ 64 chars),
+  "fixture": string (non-empty, ≤ 64 chars),
+  "latencyMs": positive finite number (allow 0? latency could be 0 — allow ≥ 0),
+  "tokensIn"?: non-negative integer,
+  "tokensOut"?: non-negative integer,
+  "status"?: "success"|"error" — hmm, keep minimal.
+}
+
+Required: ts, model, fixture, latencyMs. Optional: tokensIn, tokensOut (non-negative integers), status enum ["success","error"]. Validation errors with specific codes:
+
+Error codes: EMPTY_LINE (maybe skip whitespace-only lines? Policy: whitespace-only lines are skipped as a no-op, documented; blank lines are legal in NDJSON? Actually, NDJSON typically allows empty-line termination. Let's skip whitespace-only lines without error — document it),
+- LINE_TOO_LONG
+- INVALID_JSON (syntax)
+- ROOT_NOT_OBJECT
+- UNKNOWN_FIELD (strict: reject unknown keys)
+- MISSING_FIELD
+- BAD_TYPE_* (e.g. TS_NOT_NUMBER)
+- TS_OUT_OF_RANGE (finite, ≥ 0, ≤ now + maxClockSkewMs)
+- MODEL_NOT_STRING / MODEL_EMPTY / MODEL_TOO_LONG
+- FIXTURE_*
+- LATENCY_NOT_NUMBER / LATENCY_NEGATIVE / LATENCY_NOT_FINITE
+- TOKENS_NOT_INT
+- STATUS_NOT_ENUM
+- DUPLICATE_KEY (duplicate JSON key → malformed)
+- NaN/Infinity literals in JSON (JSON.parse accepts `NaN`? no — JSON.parse("NaN") throws. Infinity too throws. So NaN can't appear via JSON.parse; however a number 1e999 → Infinity? JSON.parse("1e999") → Infinity in JS! Right: JSON.parse("1e309") returns Infinity. So check Number.isFinite.)
+- MAX_DEPTH (reject deeply nested objects to prevent DoS — manual depth check? JSON.parse doesn't have a depth hook. I could write a small custom JSON tokenizer… that's a lot of work. Alternative: enforce max line size + use JSON.parse; depth attack: a 16KiB line of 8000-level "[[[...]]]" — each object consumes a few bytes → 8K depth → recursion in JSON.parse… V8's JSON.parse is iterative internally? Actually V8's JSON parser is recursive but 8K depth might throw RangeError, or handle it fine. Risky. I could write a lightweight validator that pre-scans bracket depth… hmm.
+
+Given the "no placeholders" and "complete" demands, a custom incremental JSON parser is overkill. Practical mitigation: track max nesting depth with a cheap scan? A full scan for depth would double parsing cost but lines are small. Actually simpler: after JSON.parse, do a structural check with a custom recursive walker capped at depth 5 that checks types — but the risk is the parsing itself. Let's test in my head: does V8's JSON.parse have stack issues on deep nesting? V8's JSON parser historically had recursion limits and throws RangeError "Maximum call stack size exceeded" — I recall JSON.parse('['.repeat(100000)+']'.repeat(100000)) throwing a RangeError in Node? Hmm, V8's JSON parse is implemented in C++ (i::JSONReader) and I think it's iterative for arrays/objects… actually V8's JSONReader is recursive. Node has had issues. To be safe, I'll implement a small pre-scan: walk the raw line counting only nesting depth of `{` and `[`, ignoring strings (tracking in-string state, escapes). If depth > MAX_DEPTH (say 6) reject with MAX_DEPTH_EXCEEDED before JSON.parse. This is cheap and deterministic, handles the DoS vector. I also need to handle the string state to avoid counting braces inside strings. ~30 lines. Good — this demonstrates craft.
+
+But a raw scan is O(n) with state; fine.
+
+Then JSON.parse, then a manual validator that walks the parsed object and produces typed errors. Also detect duplicate keys: JSON.parse silently keeps last. A pre-scan can't easily detect duplicates. Alternative: pass a reviver? A reviver receives keys in order; duplicate detection: the reviver is called per key with the value; duplicates mean the key appears twice on the same object — the reviver can track: when called for an object, keep a Set of seen keys; if already present → throw. Does the reviver work? The reviver function is called for each key with the value; but to detect duplicates you need to know when the same object's keys are revisited — the reviver is called bottom-up (children before parents? actually revivers are called in bottom-up key order: for an object, each property is processed after nested revivals, and the object itself last). Duplicate keys: JSON.parse("{'a':1,'a':2}") → reviver calls: key "a" value 1, then key "a" value 2, then "" key with object. So I can implement a dup-key detector in a reviver: maintain a stack: for each call: if value is an object (not null), the reviver for this object's key has already seen all of this object's properties… hmm, ordering: the property values are revived before the object itself. So on reviver(key, value): if value is a plain object/array, we can push a new key set after processing? The object's reviver call comes after its properties. So algorithm:
+- Let current = new Set<string>() (stack: array of Sets).
+- On reviver(key, value):
+  - If the key is "" and value is the root, root processing…
+  - If value is a plain object or array: all its properties have already been checked against the current set? No — properties were checked against the current (enclosing) set? No — properties of this object were processed while "current" pointed to this object's set, if the set existed before its properties.
+
+Let me think concretely: reviver calls for `{"a":{"b":1,"b":2}}`:
+Order: reviver("b",1) then reviver("b",2) then reviver("a",{...}) then reviver("",root).
+So when reviver("b",1) is called, we're in the context of object "a" which hasn't been announced yet. So we can't distinguish which object a key belongs to… unless we use a different approach: since reviver receives the parent key, for a nested object we get its key at the same time as the object value (after its properties). So property-level duplicate detection: property "b" appears twice inside "a": calls reviver("b",1), reviver("b",2) — both under parent context. But the parent "a" was only announced later. So tracking: maintain a stack of "scopes". When do scopes start? On the first occurrence of a key that maps to an object? We don't know in advance.
+
+Alternative simpler and robust: write a minimal JSON lexer for duplicate-key detection and depth… that's essentially writing a JSON parser. Overkill.
+
+Compromise: detect duplicate keys with a reviver using the following trick:
+- Stack of sets.
+- When reviver(key, value) is called:
+  - The enclosing object's set is the current stack top (or root set if stack empty).
+  - Mark key as seen in the top set (or root set if stack empty).
+  - If key was already in the top set → duplicate → throw.
+  - Then: if value is a plain object or array → the properties of this object will be processed next? No — already processed (bottom-up). Properties of value were processed in the previous calls, under the parent's set — wrong scope.
+
+Ugh. The bottom-up order makes scope assignment impossible without lookahead.
+
+Top-down: the `JSON.parse` reviver is bottom-up only. So reviver can't do it.
+
+OK, pragmatic choice: implement a small streaming JSON validator/lexer — actually since lines are capped at 16KiB and I need duplicate-key detection + depth + numeric checks anyway, I could write a complete strict JSON parser (a few hundred lines). That's the "senior engineer" move and guarantees no JSON.parse edge cases (1e999→Infinity, duplicates, depth). But it's a lot of code and bug surface. Hmm. "No placeholders", "complete and runnable" — I need to be correct. Hand-rolled JSON parser: I've done it before; ~200 lines with a tokenizer. Risk: subtle bugs. But I can unit-test it thoroughly.
+
+Alternative: accept JSON.parse with pre-scan for depth (string-aware) and document duplicate-key last-wins as acceptable JSON behavior (JSON spec says keys SHOULD be unique; many parsers keep last). Real-world services do that. Duplicate-key detection is a nice-to-have; strictness on duplicates is not in the requirements. Requirement: "validation without third-party schema libraries" — that's about schema validation; JSON.parse is a built-in, not a third-party schema library — allowed.
+
+Decision: use JSON.parse with:
+1. Pre-scan: depth + control chars (reject raw control chars in strings? JSON.parse auto-rejects unescaped control chars — yes, it throws).
+2. Post-parse type validation.
+3. Number.isFinite checks for all numeric fields (catches 1e999→Infinity).
+Also reject `{"a":1}` with a number key etc.
+
+Hmm, but 1e999: JSON.parse("1e999") === Infinity — and my latency validation checks Number.isFinite → reject with LATENCY_NOT_FINITE. Good. ts too. tokens too. Fine.
+
+Duplicate keys: document as last-wins (JSON.parse behavior). Actually can I cheaply detect duplicates with a regex pre-scan? Not reliably (strings can contain colleys). Skip; document the policy. Wait — one more trick: a reviver that throws on a number whose absolute value is non-finite (e.g. Infinity) at parse time: reviver(key,value){ if typeof value==='number' && !isFinite(value) throw }. That catches Infinity early. Fine.
+
+Now, let me define the exact record:
+
+interface MetricRecord {
+  ts: number;          // epoch ms, integer? Allow non-integer? Require integer ms: Number.isInteger. Let's require integer epoch ms, 0 < ts <= now + maxClockSk

@@ -1,0 +1,172 @@
+The user is asking for a complete CUDA 13.1 / C++20 command-line program that does the following:
+- row-wise normalizes a large BF16 matrix
+- sm_120a GPU
+- argument parsing
+- RAII device buffers
+- numerically stable FP32 reference (on host, presumably)
+- vectorized CUDA kernels
+- warm-up
+- measurement via CUDA events
+- deterministic input generation
+- error checking
+- tolerance-based verification
+- CMakeLists.txt
+- explanation of memory layout and launch configuration
+- no eliding implementation or replacing sections with comments
+
+Let me think about what "row-wise normalize" means. Probably normalizing each row to unit L2 norm: row_i / ||row_i||_2. That's the common interpretation. Implementation: scale = 1 / sqrt(sum_j x_ij^2), handle rows with zero norm (leave unchanged or set scale to 1? typically scale = 0 to avoid NaN; choose scale = 1 if norm is 0 to avoid 0/0, or set scale to 0 — better: if norm2 == 0 then scale = 1.0f (leave row as-is). Actually, in many normalization implementations, the output for zero rows becomes zero. Let's define it: out = row / norm, if norm > 0, else row unchanged (scale = 1). I'll document that.
+
+BF16: bfloat16_t. CUDA 12.8+ provides the __nv_bfloat16 type in cuda_bf16.h; is sm_120a Blackwell (B200? actually sm_120 is the GB200 family? Let me recall: sm_120 = Blackwell GeForce? Actually sm_100 is GB100 (B200/B100 data center), sm_101? sm_120 is the "Blackwell" for consumer (RTX 50 series is sm_120), sm_121 is DGX Spark? Hmm. CUDA 12.8 introduced sm_100, sm_100a, sm_101a, sm_120, sm_120a for Blackwell. The user says CUDA 13.1 with sm_120a. CUDA 13.x does exist (CUDA 13.0 released mid-2025). So I should target sm_120a with the CUDA 13.1 toolkit.
+
+CUDA 13.1 — I believe it's still fine to use the __nv_bfloat16 from <cuda_bf16.h>. In CUDA 13, there might be new bf16 support; there's __nv_bfloat16 in cuda_bf16.h, __hadd, __hmul, etc. For numerically stable reduction in FP32, I want to do the reduction with __bfloat162hf2float conversion to float, or __bfloat162float? Actually there's __bfloat162float() conversion (intrinsic __bfloat162float). And __float2bfloat16 for conversion.
+
+Vectorization: read with 8-byte loads (uint2 / uint4?). BF16 is 2 bytes; 16-byte load (uint4) covers 8 BF16s; 8-byte (uint2) covers 4. I'll use 16-byte vector loads via reinterpret_cast to alignas(16) uint4 or float4, or use __nv_bfloat162 pairs. I'll define struct alignas(16) BF16x8 { __nv_bfloat162 v[4]; }. Then convert each to float via __bfloat1622float2 for the reduction.
+
+Numerically stable FP32 reference: two passes? "Numerically stable" might mean doing the accumulation in double? It says FP32 reference — so an FP32 host reference implementation that's numerically stable, i.e., computing the sum of squares with Kahan compensated summation and then scaling. The GPU kernel also does an FP32 reduction; both are FP32 but the GPU uses different ordering (tree reduction) so there's a tolerance. Verification compares GPU output to host FP32 reference with a tolerance (e.g., relative L∞ error threshold, or relative error < 1e-3 given BF16 rounding, etc.).
+
+Actually, reference: "numerically stable FP32 reference" — I'll implement a host function that converts each BF16 element to FP32 and uses Kahan compensated summation to compute the row L2 norm and scaling factor, then writes BF16 output (rounded). The GPU kernel computes the norm from BF16 converted to FP32 in a warp/block reduction (tree), then multiplies. Differences: FP32 addition associativity order → within tolerance. Also double rounding: in the kernel, convert the product of float scale and float value to BF16 — fine.
+
+Design:
+
+- CLI args: --rows N, --cols M, --iterations ITERS, --seed SEED, --tol TOL, --check/--no-check?, --warmup, --help. Default large sizes: rows=16384? columns=4096? Must be large; e.g., default 65536 x 16384 → 1 GiB of BF16 matrix (2 bytes * 65536*16384 = 2 GiB? 65536*16384 = 1,073,741,824 elements × 2 bytes = 2 GiB of input plus 2 GiB of output = 4 GiB — might be too big for sm_120a? sm_120a GPU (RTX 5090, 32GB) is fine. But default should be "large" but reasonably sized: rows=65536, cols=16384 → input+output 4 GiB. Hmm, might exceed 24GB? 4 GiB total is fine for 32GB. But safer default: rows=32768, cols=8192 → 512MB ×2 = 256MB*2 = wait, 32768*8192=268,435,456 elements, ×2 bytes = 512 MB per buffer, 1 GiB for both. Still "large". I'll make it configurable via args and set default to rows=32768 cols=8192 (512 MiB of input). Fine.
+
+- Alignment: require cols % 8 == 0 for 16B vectors; enforce with validation (if cols%8 != 0, error, or handle remainder? Simpler: require alignment and verify on startup; but "don't omit implementations" — I could also implement a scalar tail loop. To be robust and complete, I'll implement vectorized main + scalar tail handling for unaligned cols. This shows care. Actually, to keep the kernel correct for arbitrary cols, I'll include tail handling.
+
+Memory layout: row-major, each row is 16-byte aligned at start (ensure buffer allocation aligns rows to 16B; if cols%8==0 and base pointer is 256B aligned, all rows are aligned — cudaMalloc returns 256-byte aligned, so rows are aligned when cols%8==0).
+
+Launch configuration: 1 block per row? That's the simplest and correct: grid = rows, block = 256 or 1024 threads; each block normalizes one row: convert, block reduce sum-of-squares, compute scale in thread 0 (or all threads compute same scale from reduced value), multiply, store. With cols up to 8192, elements per thread ~ 8192/256 = 32 → 4 iterations of 8-element vector. 1 block per row works well and matches "row-by-row normalization".
+
+But block per row with 65536 rows → 65536 blocks, fine.
+
+Alternative: 2-pass per row with shared memory. Let me write the kernel:
+
+```
+__global__ void normalize_rows_kernel(const __nv_bfloat16* __restrict__ in,
+                                      __nv_bfloat16* __restrict__ out,
+                                      int rows, int cols)
+```
+
+Per thread: iterate over vector loads: idx = threadIdx.x + i*blockDim.x, up to vec_per_row. Accumulate sum-of-squares with 8-element vectors: convert to float, accumulate each of 8 products. Then block reduction (shared memory, warp shuffles, then cross-warp). scale = norm2 > 0 ? 1/sqrtf(norm2) : 1.0f. Then re-iterate: out[i] = __float2bfloat16(__low2float? no — we need to convert in to float, multiply, and convert back). To avoid a second read of input... it's already in registers from the first pass if cols is small enough — not possible for arbitrary size. Just read twice (L1-cached). Fine.
+
+Actually simpler: keep in registers up to a max? Don't overcomplicate. Two passes over input per row; second pass is likely L1-cached. Fine.
+
+Alternatively, store per-thread partial sums in shared memory and reuse the values... Let me just do two-pass.
+
+Block reduction:
+
+```
+__shared__ float sdata[32];
+// warp reduction
+for (offset = 16; ... ) __shfl_xor_sync
+if (lane == 0) sdata[wid] = val;
+__syncthreads();
+if (wid == 0) { val = sdata[lane]; ... warp reduce; }
+__syncthreads();
+scale in shared memory or compute everywhere.
+```
+
+Standard. Then scale = computed by all threads from the shared final value, or broadcast via shared.
+
+Numerically stable: I'll add Kahan compensation in the per-thread accumulation of the kernel too? That's "numerically stable". The user asks for "numerically stable FP32 reference" — meaning the reference is numerically stable FP32 (Kahan). The kernel can just do plain FP32 accumulation; tolerance covers it. But it's cheap and "stable" so I can also add Kahan in the kernel. To be safe: kernel does plain FP32 accumulation with pairwise-ish ordering; reference uses Kahan double? No — "FP32 reference" so it must be FP32; Kahan is still FP32 (with FP32 compensation term). Use Kahan in the reference (FP32) and simple accumulation in the kernel; compare outputs in BF16 space with tolerance.
+
+Verification: convert both outputs to float; max abs diff and max relative; pass if max abs diff <= tol (e.g., default tol = 1e-2? BF16 has about 3 decimal digits of precision, ~7-bit mantissa; a single-ULP rounding difference can be ~0.4% of value. For normalized rows, values are within [min,1]. A robust tolerance: relative error threshold 2e-2 or abs 1e-2? Let me think: BF16 ULP near 1.0 is 1/128 ≈ 0.0078; near small values, relative error ~ 1/128 too since it's floating point. So max relative error ~ 2-3 ULP ≈ 0.02-0.03 is safe. Verification: for each element compute err = |g - r|; rel_err = err / max(|r|, eps); pass if all rel_err <= tol_rel (default 0.05). Also report max abs and max rel and pass/fail; non-zero exit code on failure. Also compare norms of the normalized rows? I could verify row norms are close to 1 (for non-zero rows) — extra but nice. Keep focus: element-wise comparison.
+
+Deterministic input generation: seed-based LCG or xorshift64* — deterministic across runs. Generate BF16 values from a pseudo-random distribution, e.g., uniform in [-1,1] via Box-Muller? Simple: use philox-style or splitmix64 with seed; uniform(-1,1). Also to exercise zero-norm paths, some rows are fully zero? Randomly zero out a few rows to test zero-norm handling — nice: set every 1000th row to zero. Then normalization leaves it as zero (scale=1 → zero stays zero; reference same). Wait, if scale=1 and row is zero, output = 0, matches reference. Good.
+
+Host reference implementation:
+
+```
+bool reference_normalize(const std::vector<__nv_bfloat16>& in, int rows, int cols,
+                         std::vector<__nv_bfloat16>& out, float tol... )
+```
+
+For each row: convert to float, Kahan sum of squares, norm = sqrt, scale, out[j] = __float2bfloat16(scale * x) (or 0 if norm==0? if scale=1 then 0*scale=0 fine; keep the scale=1 convention).
+
+Actually for zero-norm rows: reference: if norm2==0 scale=1. Output = x (zero) → zero. Kernel same. Consistent.
+
+RAII device buffer:
+
+```
+class DeviceBuffer {
+  void* ptr_;
+  size_t bytes_;
+public:
+  DeviceBuffer(size_t bytes);
+  ~DeviceBuffer();
+  DeviceBuffer(DeviceBuffer&&)... 
+  void* data();
+  template<typename T> T* get();
+};
+```
+
+Throw std::runtime_error on failure.
+
+Argument parsing: hand-rolled (C++20, no external deps). Options:
+- --rows <int>
+- --cols <int>
+- --seed <int>
+- --iters <int>
+- --warmup <int>
+- --tol <float>
+- --verify (bool) / --no-verify
+- --help
+- Also --check-arch? Not needed.
+
+Error checking: CUDA_CHECK macro that prints file/line, cudaGetLastError, cudaGetDeviceProperties to check driver. Check device supports sm_120? Can query compute capability: major==12 && minor==0. Warn or error if not sm_120? Since we compile with -arch=sm_120a, the binary won't run on other GPUs anyway (unless we add PTX fallback; I'll set CMake to generate only sm_120a code without PTX, so it won't load on other GPUs). I'll add a runtime check that prints compute capability and warns if not 12.0. Actually better: require it? If user runs on 5090 (sm_120) it's fine. "sm_120a" is the arch flag; runtime reports CC 12.0. Warn if not 12.0.
+
+Warm-up: run the kernel several times before timing (default 3 or 5). Measurement via CUDA events over N iterations: start event, N launches, stop event, cudaEventSynchronize, elapsed; report time per iteration in ms, bandwidth in GiB/s (bytes = 2*N*rows*cols (read+write)).
+
+C++20: use concepts? std::span? Use <concepts>? Keep it reasonable: use std::source_location in error macro, span? Use std::string_view for arg parsing. That's plenty C++20.
+
+CMakeLists: cmake_minimum_required(3.24+), project LANGUAGES CXX, find_package(CUDAToolkit REQUIRED), add_executable, target_compile_features cxx_std_20, set CUDA_ARCHITECTURES "120a" (CMake supports "120a" suffix since 3.23? Yes, CMake supports 'a' suffix like 90a, 100a, 120a). CUDA 13.1 requires CMake ~3.27+. Use cmake_minimum_required(VERSION 3.27). Set CMAKE_CUDA_STANDARD 20. Link CUDA::cudart. Optionally check for toolchain version.
+
+Note: CUDA 13.1 — actually, hmm, is the latest CUDA 13.0/13.1? The prompt says CUDA 13.1; I'll trust it. In CUDA 13.0 the driver API changes? For our purposes it's still fine with cuda_runtime.h. Also CUDA 13 might have new bfloat16 types; __nv_bfloat16 remains. cuda_bf16.h is still present in CUDA 13. Yes.
+
+Important: in CUDA 13, `-arch=sm_120a` is valid (introduced in 12.8, still in 13.x). Good.
+
+Let me write the code carefully.
+
+Structure:
+
+```cpp
+// bf16_row_norm.cpp
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+...
+```
+
+Components:
+
+1. CUDA_CHECK macro with std::source_location.
+2. DeviceBuffer RAII class.
+3. Deterministic RNG: splitmix64 → float uniform [-1,1].
+4. Host reference (Kahan).
+5. Kernel: vectorized.
+6. Verification.
+7. Argument parsing struct + parse function.
+8. main.
+
+Kernel details:
+
+```cpp
+namespace {
+
+constexpr int kVecBytes = 16;
+constexpr int kElemsPerVec = kVecBytes / sizeof(__nv_bfloat16); // 8
+
+struct alignas(kVecBytes) BF16x8 {
+  __nv_bfloat162 data[kElemsPerVec / 2];
+};
+
+__device__ __forceinline__ float bf16x8_sumsq(const BF16x8& v) {
+  float acc = 0.f;
+  #pragma unroll
+  for (int i = 0; i < kElemsPerVec/2; ++i) {
+    float2 f = __bfloat1622float2(v.data[i]);
+    acc = fmaf(f.x, f.x, acc);
+    acc = fmaf(f.y, f.y, acc);
+  }
+  return acc;
+}
+
+__device__ __forceinline__ void bf16x8_scale_store(BF16x8& out, const BF16x8& in, float scale) {

@@ -1,0 +1,224 @@
+BEGIN;
+
+-- 1. Create Tables
+CREATE TABLE IF NOT EXISTS models (
+    model_id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    architecture VARCHAR(100),
+    context_length INT CHECK (context_length > 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS fixtures (
+    fixture_id SERIAL PRIMARY KEY,
+    kind VARCHAR(50) NOT NULL CHECK (kind IN ('short', 'medium', 'long', 'code')),
+    description TEXT,
+    token_count INT CHECK (token_count >= 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id SERIAL PRIMARY KEY,
+    model_id INT NOT NULL REFERENCES models(model_id) ON DELETE CASCADE,
+    fixture_id INT NOT NULL REFERENCES fixtures(fixture_id) ON DELETE CASCADE,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    finished_at TIMESTAMP,
+    status VARCHAR(20) DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed')),
+    UNIQUE (model_id, fixture_id, started_at)
+);
+
+CREATE TABLE IF NOT EXISTS request_metrics (
+    metric_id SERIAL PRIMARY KEY,
+    run_id INT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    tokens_generated INT CHECK (tokens_generated >= 0),
+    latency_ms FLOAT CHECK (latency_ms >= 0),
+    mtp_acceptance_rate FLOAT CHECK (mtp_acceptance_rate BETWEEN 0 AND 1),
+    memory_usage_mb FLOAT CHECK (memory_usage_mb >= 0)
+);
+
+-- 2. Create Indexes
+CREATE INDEX IF NOT EXISTS idx_runs_model ON runs(model_id);
+CREATE INDEX IF NOT EXISTS idx_runs_fixture ON runs(fixture_id);
+CREATE INDEX IF NOT EXISTS idx_metrics_run ON request_metrics(run_id);
+CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON request_metrics(timestamp);
+CREATE INDEX IF NOT EXISTS idx_metrics_mtp ON request_metrics(mtp_acceptance_rate);
+
+-- 3. Insert Data: Models
+INSERT INTO models (name, architecture, context_length) VALUES
+('Llama-3-8B-Instruct', 'llama', 4096),
+('Mistral-7B-v0.3', 'mistral', 32768);
+
+-- 4. Insert Data: Fixtures
+INSERT INTO fixtures (kind, description, token_count) VALUES
+('short', 'Simple greeting and basic Q&A', 50),
+('short', 'Short factual query', 80),
+('medium', 'Summarization of a news article', 500),
+('medium', 'Code explanation snippet', 400),
+('long', 'Long-form essay generation prompt', 2000),
+('long', 'Multi-turn conversation history', 3000),
+('code', 'Python function refactoring task', 800),
+('code', 'SQL query optimization request', 600);
+
+-- 5. Insert Data: Runs and Metrics (80+ rows total across tables)
+-- We will generate runs for both models against all 8 fixtures.
+-- Each run will have multiple metric entries to simulate time-series data.
+
+-- Model 1: Llama-3-8B-Instruct (ID 1)
+-- Fixture 1 (short)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (1, 1, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(1, 10, 120.5, 0.85, 1200.0),
+(1, 15, 130.2, 0.82, 1205.0),
+(1, 12, 125.8, 0.88, 1202.0);
+
+-- Fixture 2 (short)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (1, 2, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(2, 20, 150.3, 0.75, 1210.0),
+(2, 25, 160.1, 0.72, 1215.0),
+(2, 18, 145.9, 0.78, 1212.0);
+
+-- Fixture 3 (medium)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (1, 3, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(3, 100, 450.2, 0.65, 1300.0),
+(3, 120, 480.5, 0.62, 1310.0),
+(3, 95, 440.1, 0.68, 1295.0);
+
+-- Fixture 4 (medium)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (1, 4, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(4, 80, 380.4, 0.70, 1280.0),
+(4, 90, 400.2, 0.68, 1290.0),
+(4, 85, 390.1, 0.72, 1285.0);
+
+-- Fixture 5 (long)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (1, 5, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(5, 500, 2500.5, 0.55, 1500.0),
+(5, 520, 2600.2, 0.52, 1510.0),
+(5, 480, 2400.8, 0.58, 1490.0);
+
+-- Fixture 6 (long)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (1, 6, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(6, 600, 3000.1, 0.50, 1600.0),
+(6, 650, 3200.5, 0.48, 1620.0),
+(6, 580, 2900.3, 0.52, 1580.0);
+
+-- Fixture 7 (code)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (1, 7, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(7, 150, 600.2, 0.60, 1350.0),
+(7, 160, 620.5, 0.58, 1360.0),
+(7, 140, 580.1, 0.62, 1340.0);
+
+-- Fixture 8 (code)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (1, 8, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(8, 120, 500.3, 0.65, 1320.0),
+(8, 130, 520.1, 0.63, 1330.0),
+(8, 110, 480.5, 0.67, 1310.0);
+
+-- Model 2: Mistral-7B-v0.3 (ID 2)
+-- Fixture 1 (short)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (2, 1, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(9, 12, 110.2, 0.90, 1100.0),
+(9, 14, 115.5, 0.88, 1105.0),
+(9, 11, 105.8, 0.92, 1095.0);
+
+-- Fixture 2 (short)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (2, 2, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(10, 22, 140.1, 0.85, 1110.0),
+(10, 24, 145.3, 0.83, 1115.0),
+(10, 21, 135.9, 0.87, 1105.0);
+
+-- Fixture 3 (medium)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (2, 3, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(11, 110, 420.5, 0.75, 1250.0),
+(11, 115, 430.2, 0.73, 1260.0),
+(11, 105, 410.8, 0.77, 1240.0);
+
+-- Fixture 4 (medium)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (2, 4, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(12, 85, 350.2, 0.80, 1220.0),
+(12, 92, 360.5, 0.78, 1230.0),
+(12, 82, 340.1, 0.82, 1210.0);
+
+-- Fixture 5 (long)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (2, 5, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(13, 550, 2200.5, 0.65, 1450.0),
+(13, 560, 2300.2, 0.63, 1460.0),
+(13, 540, 2100.8, 0.67, 1440.0);
+
+-- Fixture 6 (long)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (2, 6, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(14, 700, 2800.1, 0.60, 1550.0),
+(14, 720, 2900.5, 0.58, 1560.0),
+(14, 680, 2700.3, 0.62, 1540.0);
+
+-- Fixture 7 (code)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (2, 7, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(15, 160, 550.2, 0.70, 1300.0),
+(15, 170, 560.5, 0.68, 1310.0),
+(15, 150, 540.1, 0.72, 1290.0);
+
+-- Fixture 8 (code)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (2, 8, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(16, 130, 450.3, 0.75, 1270.0),
+(16, 140, 460.1, 0.73, 1280.0),
+(16, 120, 440.5, 0.77, 1260.0);
+
+-- Additional runs to ensure >80 INSERT rows total (we have 16 runs * 3 metrics = 48 metrics + 16 runs + 2 models + 8 fixtures = 74 rows so far. Need more.)
+-- Let's add 10 more runs with 3 metrics each to exceed 80 insert statements/rows significantly.
+
+-- Model 1, Fixture 1 again (different time)
+INSERT INTO runs (model_id, fixture_id, status) VALUES (1, 1, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(17, 11, 122.5, 0.84, 1201.0),
+(17, 13, 128.2, 0.81, 1204.0),
+(17, 10, 118.8, 0.86, 1199.0);
+
+-- Model 1, Fixture 2 again
+INSERT INTO runs (model_id, fixture_id, status) VALUES (1, 2, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(18, 21, 152.3, 0.74, 1211.0),
+(18, 23, 158.1, 0.71, 1214.0),
+(18, 19, 147.9, 0.77, 1213.0);
+
+-- Model 2, Fixture 3 again
+INSERT INTO runs (model_id, fixture_id, status) VALUES (2, 3, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(19, 112, 425.5, 0.74, 1255.0),
+(19, 118, 435.2, 0.72, 1265.0),
+(19, 108, 415.8, 0.76, 1245.0);
+
+-- Model 2, Fixture 4 again
+INSERT INTO runs (model_id, fixture_id, status) VALUES (2, 4, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(20, 88, 355.2, 0.79, 1225.0),
+(20, 95, 365.5, 0.77, 1235.0),
+(20, 84, 345.1, 0.81, 1215.0);
+
+-- Model 1, Fixture 5 again
+INSERT INTO runs (model_id, fixture_id, status) VALUES (1, 5, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(21, 510, 2550.5, 0.54, 1505.0),
+(21, 530, 2650.2, 0.51, 1515.0),
+(21, 490, 2450.8, 0.57, 1495.0);
+
+-- Model 2, Fixture 6 again
+INSERT INTO runs (model_id, fixture_id, status) VALUES (2, 6, 'completed');
+INSERT INTO request_metrics (run_id, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES
+(22, 710, 2850.1, 0.59, 1555.0),
+(22, 730, 2950.5, 0.57, 1565.0),
+(22, 690, 2750.3, 0.61, 1545.0

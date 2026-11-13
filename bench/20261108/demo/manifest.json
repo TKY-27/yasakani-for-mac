@@ -1,0 +1,128 @@
+{
+  "recording": "Direct continuous desktop capture containing the live generation app and a separate native Windows command-prompt clock. No replay or post-capture overlays.",
+  "recorded_at": "2026-11-08T19:22:49.237+09:00",
+  "model_label": "YASAKANI 最速モデル",
+  "model_bytes": 10311344128,
+  "model_sha256": "3ba17a76871a2b5e86fb1d01ab677e6b35ff5ccc27d4f03ad941501e3319d1ca",
+  "runtime_sha256": "0f5d973b791c8d66034d87bdfc7f2c018718dc0e851b9a6ee6dc1eb275150bbb",
+  "build_status": "Same model and validation build as the November 8 speed table; not described as the earlier distribution DLL.",
+  "hardware": "RTX 5090 1 card, 600W stock",
+  "context_tokens": 262144,
+  "output_cap": 8192,
+  "temperature": 0,
+  "thinking": false,
+  "trials": 1,
+  "warmups": 2,
+  "warmup_description": "Two unrelated short prompts; the measured task is first seen by this process.",
+  "cached_prompt_tokens": 0,
+  "metrics": {
+    "ttft_s": 1.281498,
+    "t_last_s": 5.555668,
+    "t_end_s": 5.556058400019538,
+    "completion_tokens": 4712,
+    "decode_tok_s": 1102.2022989258733,
+    "finish": "stop"
+  },
+  "formula": "(completion_tokens - 1)/(t_last_s - ttft_s)",
+  "video": {
+    "streams": [
+      {
+        "codec_name": "h264",
+        "width": 1800,
+        "height": 1000,
+        "r_frame_rate": "30/1",
+        "avg_frame_rate": "30/1",
+        "duration": "17.000000",
+        "nb_frames": "510"
+      }
+    ],
+    "frames": 510,
+    "first_pts": 0.0,
+    "last_pts": 16.966667,
+    "strictly_increasing": true,
+    "max_gap_seconds": 0.03333400000000353,
+    "gaps_over_1_5_frames": 0,
+    "temporal_editing": false
+  },
+  "code_verified": true,
+  "differential_cases": 17701,
+  "differential_mismatches": 0,
+  "notes": [
+    "One newly recorded target request in a fresh process, after two unrelated short warmups; previous recording preserved.",
+    "Screen capture, clock display and CPU encoding run during measurement; overhead is not separately measured.",
+    "510 frames over 17.000 seconds, continuous timestamps; no temporal editing or post-capture overlays.",
+    "Clocks and hashes support cross-checks and do not independently rule out all fabrication."
+  ],
+  "files": {
+    "arrival_events.jsonl": {
+      "bytes": 98363,
+      "sha256": "21b8579053601d4b4b004b15fc8f37e26a26756e06103314b455f1f243dc4eb6"
+    },
+    "capture.json": {
+      "bytes": 37399,
+      "sha256": "6b70accde8548fc758702e71766b8282df828c0d953485df8efcd6d9dba31783"
+    },
+    "clock-check.json": {
+      "bytes": 621,
+      "sha256": "ebedf220f6e2b7b0e1eedc9cd4439fb89bf858191352e6340913b05186e53a5d"
+    },
+    "clock-signal.json": {
+      "bytes": 150,
+      "sha256": "3bdcf6503acdd5aa56308751f133ad125a37ef8b51775a6ba7b2b0bf7db65d6b"
+    },
+    "clock-ticks.jsonl": {
+      "bytes": 98889,
+      "sha256": "555544c516d6e5967850958119749685cedccb8751628e0d4ecb779ef57c25ac"
+    },
+    "clock_console.py": {
+      "bytes": 5161,
+      "sha256": "d667a5b9d2032cb769a3ddaa835faf3ff6a64c18d560af5dc6475dddc720915f"
+    },
+    "fast_live_uncut.mp4": {
+      "bytes": 11391224,
+      "sha256": "035b60e0c33f22f1f71312e1a1aab3ab383fc0a229dca4af7ac23a91eb4b6339"
+    },
+    "original.py": {
+      "bytes": 20209,
+      "sha256": "cad00069b2a25a585604d2fa774c288cf5ed70d4464afac16edf821f3a4afd5f"
+    },
+    "output.py": {
+      "bytes": 20312,
+      "sha256": "00630daff7f84578339d74dd837a18d9d487b315df26ab2d9924925c52d4123c"
+    },
+    "poster.png": {
+      "bytes": 565512,
+      "sha256": "67aecbc742986cb2620d743f9994cabe91c2ead8c1f8e34a8c145ede4e546567"
+    },
+    "README_JA.md": {
+      "bytes": 3655,
+      "sha256": "2c474040ac6d4177811ed49b254f998707a523657c6ffe37b6a88027a3449f3f"
+    },
+    "reproduce.py": {
+      "bytes": 1874,
+      "sha256": "0ca7b679e976aa8cd5e39772fe0ade012f6b227ffc7d8678338959ed2c485135"
+    },
+    "request.json": {
+      "bytes": 21021,
+      "sha256": "3e2a4265b03e975f2ecd9cbfb75577602214b95e64b99628c1526444a25c838d"
+    },
+    "verify.json": {
+      "bytes": 1167,
+      "sha256": "dd494fbeb875d336c78cebf2ef3644db6608bbef6c6a6cd12625d01dbe6194f4"
+    },
+    "verify_output.py": {
+      "bytes": 5106,
+      "sha256": "3b74d6a3d47108e0d47573f6251e80b46074324634ca129b70fad62d4f2200e2"
+    },
+    "video-check.json": {
+      "bytes": 435,
+      "sha256": "bef3b0fbafbbeb84fb91c6ae14ea4a869c077319a5adc6d684d80d2492934c1b"
+    }
+  },
+  "clock": {
+    "source": "Separate Python process inside Windows Command Prompt; wall clock and monotonic clock from this PC",
+    "request_markers": "Read from the live receiver; continuous timer is independent of request markers",
+    "samples_in_recording": 169,
+    "max_wall_vs_monotonic_error_s": 0.0005697000003426211
+  }
+}

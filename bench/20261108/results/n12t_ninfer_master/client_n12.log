@@ -1,0 +1,41 @@
+[14:36:13] server http://127.0.0.1:18080/v1 model qwen3.8-27b
+[14:36:13] warm-up done
+[14:36:38] code        scenario_code_cuda             r0:   165.2 tok/s,  4096 tokens in   24.79 s (length), ttft 0.06, 1424 chunks
+[14:37:02] code        scenario_code_cuda             r1:   174.7 tok/s,  4096 tokens in   23.44 s (length), ttft 0.04, 1344 chunks
+[14:37:28] code        scenario_code_python           r0:   154.9 tok/s,  4096 tokens in   26.44 s (length), ttft 0.07, 1520 chunks
+[14:37:53] code        scenario_code_python           r1:   163.2 tok/s,  4096 tokens in   25.10 s (length), ttft 0.05, 1442 chunks
+[14:38:18] code        scenario_code_typescript       r0:   167.3 tok/s,  4096 tokens in   24.48 s (length), ttft 0.06, 1407 chunks
+[14:38:41] code        scenario_code_typescript       r1:   177.2 tok/s,  4096 tokens in   23.11 s (length), ttft 0.05, 1326 chunks
+[14:39:13] story       scenario_story_zh_scifi        r0:   129.2 tok/s,  4096 tokens in   31.70 s (length), ttft 0.06, 1821 chunks
+[14:39:42] story       scenario_story_zh_scifi        r1:   140.2 tok/s,  4096 tokens in   29.20 s (length), ttft 0.05, 1678 chunks
+[14:40:10] story       scenario_story_en_mystery      r0:   147.0 tok/s,  4096 tokens in   27.86 s (length), ttft 0.07, 1599 chunks
+[14:40:38] story       scenario_story_en_mystery      r1:   148.4 tok/s,  4096 tokens in   27.60 s (length), ttft 0.06, 1584 chunks
+[14:41:12] story       scenario_story_zh_dialogue     r0:   120.6 tok/s,  4096 tokens in   33.94 s (length), ttft 0.06, 1948 chunks
+[14:41:43] story       scenario_story_zh_dialogue     r1:   131.8 tok/s,  4096 tokens in   31.07 s (length), ttft 0.06, 1783 chunks
+[14:41:58] translation scenario_translation_zh_en     r0:   266.3 tok/s,  4096 tokens in   15.38 s (length), ttft 0.08, 881 chunks
+[14:42:15] translation scenario_translation_zh_en     r1:   247.6 tok/s,  4096 tokens in   16.54 s (length), ttft 0.08, 950 chunks
+[14:42:31] translation scenario_translation_en_zh     r0:   260.0 tok/s,  4096 tokens in   15.75 s (length), ttft 0.07, 904 chunks
+[14:42:49] translation scenario_translation_en_zh     r1:   227.4 tok/s,  4096 tokens in   18.01 s (length), ttft 0.08, 1034 chunks
+[14:43:08] translation scenario_translation_markdown  r0:   220.7 tok/s,  4096 tokens in   18.55 s (length), ttft 0.07, 1066 chunks
+[14:43:24] translation scenario_translation_markdown  r1:   247.8 tok/s,  4096 tokens in   16.53 s (length), ttft 0.07, 950 chunks
+[14:43:40] structured  scenario_structured_jsonl      r0:   263.0 tok/s,  4096 tokens in   15.57 s (length), ttft 0.04, 896 chunks
+[14:43:53] structured  scenario_structured_jsonl      r1:   301.8 tok/s,  4096 tokens in   13.57 s (length), ttft 0.06, 781 chunks
+[14:44:08] structured  scenario_structured_csv        r0:   290.0 tok/s,  4096 tokens in   14.12 s (length), ttft 0.06, 812 chunks
+[14:44:23] structured  scenario_structured_csv        r1:   269.0 tok/s,  4096 tokens in   15.23 s (length), ttft 0.04, 875 chunks
+[14:44:44] structured  scenario_structured_sql        r0:   189.6 tok/s,  4096 tokens in   21.60 s (length), ttft 0.05, 1240 chunks
+[14:45:05] structured  scenario_structured_sql        r1:   196.3 tok/s,  4096 tokens in   20.86 s (length), ttft 0.06, 1198 chunks
+label ninfer_master  model qwen3.8-27b  temperature 1.00
+cat         fixture                            mean      min      max   ntok
+code        scenario_code_cuda                170.0    165.2    174.7   4096
+code        scenario_code_python              159.0    154.9    163.2   4096
+code        scenario_code_typescript          172.2    167.3    177.2   4096
+story       scenario_story_zh_scifi           134.7    129.2    140.2   4096
+story       scenario_story_en_mystery         147.7    147.0    148.4   4096
+story       scenario_story_zh_dialogue        126.2    120.6    131.8   4096
+translation scenario_translation_zh_en        256.9    247.6    266.3   4096
+translation scenario_translation_en_zh        243.7    227.4    260.0   4096
+translation scenario_translation_markdown     234.3    220.7    247.8   4096
+structured  scenario_structured_jsonl         282.4    263.0    301.8   4096
+structured  scenario_structured_csv           279.5    269.0    290.0   4096
+structured  scenario_structured_sql           192.9    189.6    196.3   4096
+per category (mean of runs): code 167.1, story 136.2, translation 245.0, structured 251.6

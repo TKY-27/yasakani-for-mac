@@ -1,0 +1,145 @@
+We need answer user's request. Need output exactly 160 JSONL records, no Markdown. Each line object fields id RUN-0001 through RUN-0160, model alternating qwen3.6-27b and qwen3.6-35b-a3b. prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance, status, tags. Deterministic arithmetic progressions, status values ok/warn in 4:1 pattern, two tags per record. Every line strict JSON.
+
+Need construct 160 lines. Need ensure JSON valid. We can design arithmetic progressions:
+- prompt_tokens maybe start 1000, step 10: 1000 + 10*(i-1). For 160: 1000 to 2590.
+- completion_tokens maybe start 200, step 5: 200 + 5*(i-1). 200 to 995.
+- decode_tok_s maybe 20 + i? Could be 20.0 + 0.1*(i-1). JSON number okay.
+- mtp_acceptance maybe 0.5 + 0.001*(i-1) maybe up to 0.659. Or deterministic arithmetic progression.
+- status: 4:1 pattern ok/warn. 160 divisible by 5. Pattern ok ok ok ok warn repeated. For i mod 5: if (i-1)%5 ==4 warn else ok.
+- model alternating qwen3.6-27b and qwen3.6-35b-a3b. If i odd qwen3.6-27b, even qwen3.6-35b-a3b? Alternating. Need 160, first qwen3.6-27b, second qwen3.6-35b-a3b.
+- tags two per record. Deterministic. Could ["batch-0","metric-1"]? Need two tags. Could use ["t1","t2"] but vary? deterministic. Maybe tags: ["a","b"]? Better maybe ["run-0001","qwen3.6-27b"]? But field model already. Need exactly two tags. Could use ["ok","v1"] but status? Let's pick tags: ["batch-0","seq-0001"]? Two. For 160, seq number. Or ["qwen3.6-27b","metric"]? Need not unique. Ensure valid JSON strings.
+
+Need output exactly 160 lines. Need be careful no trailing extra. Could manually generate? Need produce 160 lines. We can reason and list. Since final answer must only JSONL no Markdown. We can produce 160 lines. Need avoid mistakes. We can create pattern and maybe use mental generation. 160 lines is long. Need ensure counts. Could use systematic blocks of 5 to manage status pattern. Each block of 5 has ids consecutive, models alternating. We can generate by i from 1 to 160.
+
+Need compute values for each record. Let's define formula:
+i = 1..160
+id = RUN-0001 ... RUN-0160 zero padded 4.
+model = qwen3.6-27b if i odd else qwen3.6-35b-a3b.
+prompt_tokens = 1000 + 10*(i-1)
+completion_tokens = 200 + 5*(i-1)
+decode_tok_s = 20 + (i-1)/10? To keep finite, maybe 20.0, 20.1 etc. JSON numbers with one decimal. 20.0 + 0.1*(i-1) => for i=1 20.0, i=2 20.1, i=10 20.9, i=11 21.0. This is arithmetic. We can write with one decimal. For i 160: 35.9. Good.
+mtp_acceptance = 0.500 + 0.001*(i-1) => for i=1 0.500, i=160 0.659. Could write 0.500 etc. JSON numbers. Or 0.5 + 0.001... Use 3 decimals.
+status = ok except i mod 5 == 0? Pattern 4:1. If (i-1)%5==4 => i%5==0. So ids ending 5,10,... warn.
+tags: maybe ["mtp", "decode"]? two per record. Could vary? Requirement just two tags. Deterministic. Maybe ["t-a", "t-b"] but same. To be safe, two tags per record; can be identical? Better distinct. Use tags = ["run", "mtp"]? Could use ["v1","v2"]. But maybe tags should vary? It says two tags per record, not unique. Deterministic arithmetic progressions maybe all fields arithmetic? Tags not numeric. Could use ["tag-a", "tag-b"] constant, okay? But maybe they expect tags as strings. Could use tags: ["q0001","t0001"]? That is deterministic but not arithmetic? Let's choose tags: ["batch-" + floor((i-1)/5)+1, "seq-" + i]? Need JSON strings. But generating 160 with varying tags maybe more work. Simpler constant ["ok","warn"]? No status separate. Maybe tags: ["decode","acceptance"] constant. That's two tags per record. Acceptable? It says two tags per record. Constant tags are valid. But deterministic arithmetic progressions likely for numeric fields. Tags can be constant.
+
+Need output 160 lines. We must ensure no markdown. Let's plan to produce block by block. Could use a script mentally? Need exact. Maybe we can generate using pattern and manually write. 160 lines is large but doable with careful blocks of 10 or 20. Need ensure numbers. Let's create table for i values:
+prompt = 1000 + 10(i-1): sequence 1000,1010,...2590.
+completion = 200+5(i-1): 200,205,...995.
+decode = 20.0 + 0.1(i-1): 20.0,20.1,...35.9.
+accept = 0.500 + 0.001(i-1): 0.500,0.501,...0.659.
+status: every 5th warn.
+model alternates odd 27b, even a3b.
+
+Need output exactly 160. Let's generate in blocks of 10. For each i, line:
+{"id":"RUN-0001","model":"qwen3.6-27b","prompt_tokens":1000,"completion_tokens":200,"decode_tok_s":20.0,"mtp_acceptance":0.500,"status":"ok","tags":["decode","acceptance"]}
+
+Need maybe JSON strict: numbers okay. Tags array two strings. No trailing comma.
+
+Let's create list 1-160. We can use block 5? Because status pattern. Let's define block 1 i=1-5:
+1 odd 27b prompt1000 comp200 decode20.0 accept0.500 ok
+2 even a3b 1010 205 20.1 0.501 ok
+3 odd 27b 1020 210 20.2 0.502 ok
+4 even 1030 215 20.3 0.503 ok
+5 odd 1040 220 20.4 0.504 warn
+Block2 i=6-10:
+6 even 1050 225 20.5 0.505 ok
+7 odd 1060 230 20.6 0.506 ok
+8 even 1070 235 20.7 0.507 ok
+9 odd 1080 240 20.8 0.508 ok
+10 even 1090 245 20.9 0.509 warn
+Block3 i=11-15:
+11 odd 1100 250 21.0 0.510 ok
+12 even 1110 255 21.1 0.511 ok
+13 odd 1120 260 21.2 0.512 ok
+14 even 1130 265 21.3 0.513 ok
+15 odd 1140 270 21.4 0.514 warn
+Block4 i=16-20:
+16 even 1150 275 21.5 0.515 ok
+17 odd 1160 280 21.6 0.516 ok
+18 even 1170 285 21.7 0.517 ok
+19 odd 1180 290 21.8 0.518 ok
+20 even 1190 295 21.9 0.519 warn
+Block5 i=21-25:
+21 odd 1200 300 22.0 0.520 ok
+22 even 1210 305 22.1 0.521 ok
+23 odd 1220 310 22.2 0.522 ok
+24 even 1230 315 22.3 0.523 ok
+25 odd 1240 320 22.4 0.524 warn
+Block6 26-30:
+26 even 1250 325 22.5 0.525 ok
+27 odd 1260 330 22.6 0.526 ok
+28 even 1270 335 22.7 0.527 ok
+29 odd 1280 340 22.8 0.528 ok
+30 even 1290 345 22.9 0.529 warn
+Block7 31-35:
+31 odd 1300 350 23.0 0.530 ok
+32 even 1310 355 23.1 0.531 ok
+33 odd 1320 360 23.2 0.532 ok
+34 even 1330 365 23.3 0.533 ok
+35 odd 1340 370 23.4 0.534 warn
+Block8 36-40:
+36 even 1350 375 23.5 0.535 ok
+37 odd 1360 380 23.6 0.536 ok
+38 even 1370 385 23.7 0.537 ok
+39 odd 1380 390 23.8 0.538 ok
+40 even 1390 395 23.9 0.539 warn
+Block9 41-45:
+41 odd 1400 400 24.0 0.540 ok
+42 even 1410 405 24.1 0.541 ok
+43 odd 1420 410 24.2 0.542 ok
+44 even 1430 415 24.3 0.543 ok
+45 odd 1440 420 24.4 0.544 warn
+Block10 46-50:
+46 even 1450 425 24.5 0.545 ok
+47 odd 1460 430 24.6 0.546 ok
+48 even 1470 435 24.7 0.547 ok
+49 odd 1480 440 24.8 0.548 ok
+50 even 1490 445 24.9 0.549 warn
+Block11 51-55:
+51 odd 1500 450 25.0 0.550 ok
+52 even 1510 455 25.1 0.551 ok
+53 odd 1520 460 25.2 0.552 ok
+54 even 1530 465 25.3 0.553 ok
+55 odd 1540 470 25.4 0.554 warn
+Block12 56-60:
+56 even 1550 475 25.5 0.555 ok
+57 odd 1560 480 25.6 0.556 ok
+58 even 1570 485 25.7 0.557 ok
+59 odd 1580 490 25.8 0.558 ok
+60 even 1590 495 25.9 0.559 warn
+Block13 61-65:
+61 odd 1600 500 26.0 0.560 ok
+62 even 1610 505 26.1 0.561 ok
+63 odd 1620 510 26.2 0.562 ok
+64 even 1630 515 26.3 0.563 ok
+65 odd 1640 520 26.4 0.564 warn
+Block14 66-70:
+66 even 1650 525 26.5 0.565 ok
+67 odd 1660 530 26.6 0.566 ok
+68 even 1670 535 26.7 0.567 ok
+69 odd 1680 540 26.8 0.568 ok
+70 even 1690 545 26.9 0.569 warn
+Block15 71-75:
+71 odd 1700 550 27.0 0.570 ok
+72 even 1710 555 27.1 0.571 ok
+73 odd 1720 560 27.2 0.572 ok
+74 even 1730 565 27.3 0.573 ok
+75 odd 1740 570 27.4 0.574 warn
+Block16 76-80:
+76 even 1750 575 27.5 0.575 ok
+77 odd 1760 580 27.6 0.576 ok
+78 even 1770 585 27.7 0.577 ok
+79 odd 1780 590 27.8 0.578 ok
+80 even 1790 595 27.9 0.579 warn
+Block17 81-85:
+81 odd 1800 600 28.0 0.580 ok
+82 even 1810 605 28.1 0.581 ok
+83 odd 1820 610 28.2 0.582 ok
+84 even 1830 615 28.3 0.583 ok
+85 odd 1840 620 28.4 0.584 warn
+Block18 86-90:
+86 even 1850 625 28.5 0.585 ok
+87 odd 1860 630 28.6 0.586 ok
+88 even 1870 635 28.7 0.587 ok
+89 odd 1880 640 28.8 0.588 ok
+90 even 1890 64

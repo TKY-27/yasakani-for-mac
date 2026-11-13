@@ -1,0 +1,247 @@
+# `metrics-service` — a complete, runnable TypeScript 5 service
+
+Below is a full, self-contained implementation. It uses **only Node built-ins** (no third-party runtime dependencies) for the service, and **only `typescript` + `@types/node`** as dev dependencies. Tests use Node's built-in `node:test` runner.
+
+---
+
+## 1. `package.json`
+
+```json
+{
+  "name": "metrics-service",
+  "version": "1.0.0",
+  "description": "Newline-delimited request-metrics ingestion, validation, and aggregation service.",
+  "type": "module",
+  "engines": { "node": ">=18.17.0" },
+  "main": "dist/index.js",
+  "bin": { "metrics-service": "dist/index.js" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsc -p tsconfig.json --watch & node --watch dist/index.js",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "keywords": ["metrics", "ingestion", "aggregation", "typescript"],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
+```
+
+---
+
+## 2. `tsconfig.json` (service)
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "dist-test", "test"]
+}
+```
+
+## 3. `tsconfig.test.json` (tests)
+
+```json
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist-test",
+    "rootDir": ".",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "dist", "dist-test"]
+}
+```
+
+---
+
+## 4. `src/types.ts` — strict domain types
+
+```ts
+/**
+ * Core domain types for the metrics service.
+ *
+ * Design notes:
+ *  - `RunRecord` is the *validated* shape. Raw input is `unknown` until it
+ *    passes `validateRunRecord`, which narrows it to `RunRecord`.
+ *  - `GroupKey` is a stable, canonical string used as a Map key so that
+ *    grouping is O(1) and independent of object identity.
+ *  - `Aggregation` holds the running statistics for one (model, fixture) group.
+ */
+
+/** A single validated request-metrics record. */
+export interface RunRecord {
+  /** Unique run identifier (e.g. a UUID or a short slug). */
+  id: string;
+  /** Model name (e.g. "gpt-4", "llama-3-70b"). */
+  model: string;
+  /** Fixture / dataset name (e.g. "mmlu", "gsm8k"). */
+  fixture: string;
+  /** Wall-clock timestamp of the run, in milliseconds since epoch. */
+  timestamp: number;
+  /** Latency in milliseconds (non-negative). */
+  latencyMs: number;
+  /** Tokens processed (non-negative integer). */
+  tokens: number;
+  /** Outcome of the run. */
+  outcome: RunOutcome;
+  /** Optional free-form error message when outcome === "error". */
+  error?: string;
+}
+
+export type RunOutcome = "success" | "error" | "timeout";
+
+/** Canonical grouping key: `${model}::${fixture}`. */
+export type GroupKey = string;
+
+/**
+ * Running aggregation for one (model, fixture) group.
+ *
+ * `sum` and `sumSq` are kept so the sample standard deviation can be
+ * computed in O(1) at query time. `values` is a bounded ring buffer used
+ * only for the median (see `MedianBuffer`).
+ */
+export interface Aggregation {
+  key: GroupKey;
+  model: string;
+  fixture: string;
+  count: number;
+  min: number;
+  max: number;
+  sum: number;
+  sumSq: number;
+  /** Bounded buffer of the most recent latency values, for the median. */
+  median: MedianBuffer;
+  /** Distinct run ids observed (bounded). */
+  runIds: BoundedSet<string>;
+  /** First/last observed timestamps. */
+  firstTs: number;
+  lastTs: number;
+  /** Outcome tallies. */
+  outcomes: Record<RunOutcome, number>;
+}
+
+/**
+ * A bounded, FIFO buffer of numbers used to approximate the median.
+ *
+ * We keep at most `capacity` of the most recent values. The median is
+ * computed over that window. This bounds memory while still giving a
+ * useful, stable median for streaming workloads.
+ */
+export interface MedianBuffer {
+  capacity: number;
+  /** Ring buffer storage. */
+  ring: number[];
+  /** Number of valid elements currently stored (<= capacity). */
+  size: number;
+  /** Index of the next slot to overwrite. */
+  head: number;
+}
+
+/** A bounded set of strings (FIFO eviction). */
+export interface BoundedSet<T> {
+  capacity: number;
+  map: Map<T, true>;
+  /** FIFO queue of insertion order for eviction. */
+  order: T[];
+  head: number;
+  size: number;
+}
+
+/** Validation error with a machine-readable code and human message. */
+export interface ValidationError {
+  code: ValidationErrorCode;
+  message: string;
+  /** The offending field, if applicable. */
+  field?: string;
+  /** The offending raw value, if applicable. */
+  value?: unknown;
+}
+
+export type ValidationErrorCode =
+  | "NOT_OBJECT"
+  | "MISSING_FIELD"
+  | "WRONG_TYPE"
+  | "OUT_OF_RANGE"
+  | "INVALID_ENUM"
+  | "DUPLICATE_ID"
+  | "UNKNOWN_FIELD";
+
+/** Result of a single record validation. */
+export type ValidationResult =
+  | { ok: true; record: RunRecord }
+  | { ok: false; error: ValidationError };
+
+/** A parsed-but-not-yet-validated line. */
+export interface ParsedLine {
+  lineNo: number;
+  raw: string;
+  value: unknown;
+}
+
+/** Summary of a single (model, fixture) group. */
+export interface GroupSummary {
+  model: string;
+  fixture: string;
+  count: number;
+  mean: number;
+  median: number;
+  /** Sample standard deviation (n-1 denominator). 0 when count < 2. */
+  sampleStdDev: number;
+  min: number;
+  max: number;
+  firstTs: number;
+  lastTs: number;
+  outcomes: Record<RunOutcome, number>;
+  /** Number of distinct run ids observed (bounded). */
+  distinctRuns: number;
+}
+
+/** Top-level /summary response. */
+export interface SummaryResponse {
+  generatedAt: number;
+  totalRecords: number;
+  totalGroups: number;
+  groups: GroupSummary[];
+}
+
+/** /runs/:id response. */
+export interface RunResponse {
+  id: string;
+  found: boolean;
+  /** Records belonging to this run id, if found. */
+  records: RunRecord[];
+  /** Groups this run id appears in, if found. */
+  groups: Array<{ model: string; fixture: string }>;
+}
+
+/** /health response. */
+export interface HealthResponse {
+  status: "ok" |

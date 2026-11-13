@@ -1,0 +1,366 @@
+# BF16 Row-Normalization CUDA Program (sm_120a / CUDA 13.1 / C++20)
+
+Below is the complete, runnable implementation. It is split into two files: `main.cpp` (the program) and `CMakeLists.txt` (the build). Everything is implemented in full — no elided sections.
+
+---
+
+## `main.cpp`
+
+```cpp
+// ============================================================================
+//  bf16_row_norm.cpp
+//
+//  Command-line tool that normalizes a large BF16 matrix row by row on an
+//  NVIDIA Blackwell (sm_120a) GPU using CUDA 13.1 and C++20.
+//
+//  What it does, in order:
+//    1. Parses command-line arguments.
+//    2. Selects a GPU and validates it supports sm_120a.
+//    3. Generates a deterministic BF16 matrix on the host.
+//    4. Allocates RAII-managed device buffers and copies the matrix in.
+//    5. Runs a warm-up launch.
+//    6. Times the real launch with CUDA events (median of N runs).
+//    7. Computes a numerically stable FP32 reference (two-pass, per row).
+//    8. Verifies the GPU output against the reference with a tolerance.
+//    9. Prints a summary and frees everything (RAII).
+//
+//  Build: see CMakeLists.txt (target: bf16_row_norm).
+// ============================================================================
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <random>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <cuda_bf16.h>   // __nv_bfloat16, __float2bfloat16, __bfloat162float
+#include <cuda_runtime.h>
+
+// ---------------------------------------------------------------------------
+// 1. Error handling
+// ---------------------------------------------------------------------------
+// Every CUDA call is checked. On failure we print a useful message and throw.
+// The thrown exception is caught at the top level and turned into a clean exit.
+
+[[noreturn]] static void die(const char* what, cudaError_t err) {
+    std::fprintf(stderr, "CUDA error: %s -> %s (code %d)\n",
+                 what, cudaGetErrorString(err), static_cast<int>(err));
+    std::exit(2);
+}
+
+#define CUDA_CHECK(call)                                                     \
+    do {                                                                     \
+        cudaError_t _e = (call);                                            \
+        if (_e != cudaSuccess) die(#call, _e);                              \
+    } while (0)
+
+// ---------------------------------------------------------------------------
+// 2. Command-line parsing
+// ---------------------------------------------------------------------------
+
+struct Options {
+    std::size_t rows   = 4096;     // matrix height (number of rows)
+    std::size_t cols   = 8192;     // matrix width (elements per row)
+    std::size_t seed   = 0x12345678;
+    std::size_t warmup = 3;        // warm-up iterations
+    std::size_t runs   = 11;       // timed runs (median reported)
+    std::size_t threads = 256;     // threads per block
+    float       tolerance = 2.0e-2f; // relative tolerance for verification
+    bool        verbose  = true;
+    bool        save     = false;   // save output matrix to a .bin file
+    std::string savePath = "bf16_row_norm_output.bin";
+    int         device   = 0;
+};
+
+static void printUsage(std::string_view prog) {
+    std::printf(
+        "Usage: %s [options]\n"
+        "\n"
+        "  --rows <n>        number of rows (default 4096)\n"
+        "  --cols <n>        number of columns (default 8192)\n"
+        "  --seed <n>        RNG seed (default 0x12345678)\n"
+        "  --warmup <n>      warm-up iterations (default 3)\n"
+        "  --runs <n>        timed runs, median reported (default 11)\n"
+        "  --threads <n>     threads per block (default 256)\n"
+        "  --tolerance <f>   relative tolerance for verification (default 2e-2)\n"
+        "  --device <n>      CUDA device index (default 0)\n"
+        "  --quiet           suppress verbose output\n"
+        "  --save [path]     save the normalized matrix to a .bin file\n"
+        "  --help            show this help\n"
+        "\n",
+        std::string(prog).c_str());
+}
+
+static std::size_t parseSize(std::string_view s, const char* name) {
+    try {
+        std::size_t v = std::stoull(std::string(s));
+        if (v == 0) {
+            std::fprintf(stderr, "Error: %s must be > 0\n", name);
+            std::exit(2);
+        }
+        return v;
+    } catch (...) {
+        std::fprintf(stderr, "Error: invalid value for %s: '%.*s'\n",
+                     name, static_cast<int>(s.size()), s.data());
+        std::exit(2);
+    }
+}
+
+static float parseFloat(std::string_view s, const char* name) {
+    try {
+        float v = std::stof(std::string(s));
+        if (v < 0.0f) {
+            std::fprintf(stderr, "Error: %s must be >= 0\n", name);
+            std::exit(2);
+        }
+        return v;
+    } catch (...) {
+        std::fprintf(stderr, "Error: invalid value for %s: '%.*s'\n",
+                     name, static_cast<int>(s.size()), s.data());
+        std::exit(2);
+    }
+}
+
+static Options parseArgs(int argc, char** argv) {
+    Options o;
+    for (int i = 1; i < argc; ++i) {
+        std::string_view a = argv[i];
+        auto next = [&]() -> std::string_view {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "Error: option '%.*s' requires a value\n",
+                             static_cast<int>(a.size()), a.data());
+                std::exit(2);
+            }
+            ++i;
+            return argv[i];
+        };
+
+        if (a == "--help" || a == "-h") {
+            printUsage(argv[0]);
+            std::exit(0);
+        } else if (a == "--rows") {
+            o.rows = parseSize(next(), "--rows");
+        } else if (a == "--cols") {
+            o.cols = parseSize(next(), "--cols");
+        } else if (a == "--seed") {
+            o.seed = parseSize(next(), "--seed");
+        } else if (a == "--warmup") {
+            o.warmup = parseSize(next(), "--warmup");
+        } else if (a == "--runs") {
+            o.runs = parseSize(next(), "--runs");
+            if (o.runs < 1) o.runs = 1;
+        } else if (a == "--threads") {
+            o.threads = parseSize(next(), "--threads");
+        } else if (a == "--tolerance") {
+            o.tolerance = parseFloat(next(), "--tolerance");
+        } else if (a == "--device") {
+            o.device = static_cast<int>(parseSize(next(), "--device"));
+        } else if (a == "--quiet") {
+            o.verbose = false;
+        } else if (a == "--save") {
+            o.save = true;
+            // Optional path argument: if the next token is not another flag.
+            if (i + 1 < argc && std::string_view(argv[i+1]).front() != '-') {
+                o.savePath = std::string(next());
+            }
+        } else {
+            std::fprintf(stderr, "Error: unknown option '%.*s' (see --help)\n",
+                         static_cast<int>(a.size()), a.data());
+            printUsage(argv[0]);
+            std::exit(2);
+        }
+    }
+    return o;
+}
+
+// ---------------------------------------------------------------------------
+// 3. RAII device buffer
+// ---------------------------------------------------------------------------
+// Owns a cudaMalloc'd region; frees it on destruction (including on
+// exceptions). Supports zero-init and device<->host copies.
+
+class DeviceBuffer {
+public:
+    DeviceBuffer() = default;
+    explicit DeviceBuffer(std::size_t bytes, bool zero = false) {
+        if (bytes > 0) {
+            CUDA_CHECK(cudaMalloc(&m_ptr, bytes));
+            if (zero) CUDA_CHECK(cudaMemset(m_ptr, 0, bytes));
+            m_bytes = bytes;
+        }
+    }
+    ~DeviceBuffer() {
+        if (m_ptr) {
+            cudaFree(m_ptr);
+            m_ptr = nullptr;
+        }
+    }
+    // Move only (no deep copy of device memory).
+    DeviceBuffer(DeviceBuffer&& o) noexcept
+        : m_ptr(std::exchange(o.m_ptr, nullptr)),
+          m_bytes(std::exchange(o.m_bytes, 0)) {}
+    DeviceBuffer& operator=(DeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (m_ptr) cudaFree(m_ptr);
+            m_ptr   = std::exchange(o.m_ptr, nullptr);
+            m_bytes = std::exchange(o.m_bytes, 0);
+        }
+        return *this;
+    }
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+    void*  ptr()       const { return m_ptr; }
+    std::size_t bytes() const { return m_bytes; }
+    bool   valid()     const { return m_ptr != nullptr; }
+
+private:
+    void*       m_ptr   = nullptr;
+    std::size_t m_bytes = 0;
+};
+
+// ---------------------------------------------------------------------------
+// 4. Deterministic input generation (host, BF16)
+// ---------------------------------------------------------------------------
+// A fixed seed + a deterministic RNG means the matrix is reproducible run to
+// run. We generate values in [-1, 1] in FP32 and round to BF16. This keeps
+// the magnitudes well within BF16's range and avoids NaN/Inf.
+
+static std::vector<__nv_bfloat16>
+generateDeterministicBf16(std::size_t rows, std::size_t cols, std::size_t seed) {
+    std::vector<__nv_bfloat16> data(rows * cols);
+    std::mt19937 rng(static_cast<unsigned>(seed));
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        data[i] = __float2bfloat16(dist(rng));
+    }
+    return data;
+}
+
+// ---------------------------------------------------------------------------
+// 5. The CUDA kernel
+// ---------------------------------------------------------------------------
+// Layout: the matrix is stored in row-major order. Row r occupies the
+// contiguous range [r*cols, (r+1)*cols). Each block normalizes one row.
+//
+// Vectorization: each thread handles a contiguous run of `vec` elements.
+// We use `__nv_bfloat162` (two BF16s in 32 bits) for loads/stores when the
+// run length is even, and a scalar load for any trailing odd element.
+//
+// Numerics: we accumulate the sum-of-squares in FP32 (the stable part), then
+// take the square root in FP32, and finally store the normalized values as
+// BF16. The per-element division is done in FP32 before rounding to BF16.
+
+// vec = number of BF16 elements per thread. Must divide cols.
+template <int VEC>
+__global__ void rowNormKernel(const __nv_bfloat16* __restrict__ in,
+                              __nv_bfloat16* __restrict__ out,
+                              std::size_t cols,
+                              std::size_t vec) {
+    // One block per row.
+    const std::size_t row = static_cast<std::size_t>(blockIdx.x);
+    const __nv_bfloat16* rowIn  = in  + row * cols;
+    __nv_bfloat16*       rowOut = out + row * cols;
+
+    // This thread's slice: [threadIdx.x*VEC, (threadIdx.x+1)*VEC) within the row.
+    const std::size_t base = static_cast<std::size_t>(threadIdx.x) * vec;
+    const std::size_t count = std::min(vec, cols - base); // guard tail
+
+    // ---- Pass 1: sum of squares in FP32 (local, then block-reduce) ----
+    float localSum = 0.0f;
+
+    // Vectorized accumulation. V is a compile-time constant so the compiler
+    // can unroll. We process elements in pairs via __nv_bfloat162.
+    std::size_t i = 0;
+    if constexpr (VEC % 2 == 0) {
+        // Process pairs.
+        const std::size_t pairs = count / 2;
+        for (std::size_t p = 0; p < pairs; ++p) {
+            __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(rowIn + base + 2*p);
+            float a = __bfloat162float(v.x);
+            float b = __bfloat162float(v.y);
+            localSum += a*a + b*b;
+        }
+        // Odd trailing element.
+        if (count % 2 == 1) {
+            float a = __bfloat162float(rowIn[base + count - 1]);
+            localSum += a*a;
+        }
+    } else {
+        for (std::size_t p = 0; p < count; ++p) {
+            float a = __bfloat162float(rowIn[base + p]);
+            localSum += a*a;
+        }
+    }
+
+    // ---- Block reduction of localSum ----
+    __shared__ float sSum[32]; // enough for a warp-level tree (max 32 warps assumed)
+    {
+        const unsigned lane = threadIdx.x & 31u;
+        const unsigned wid  = threadIdx.x >> 5;
+        // Intra-warp reduction.
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            localSum += __shfl_down_sync(0xFFFFFFFF, localSum, offset);
+        }
+        if (lane == 0) sSum[wid] = localSum;
+        __syncthreads();
+        // Inter-warp reduction by the first warp.
+        if (threadIdx.x < 32) {
+            float v = (threadIdx.x < (blockDim.x >> 5)) ? sSum[threadIdx.x] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                v += __shfl_down_sync(0xFFFFFFFF, v, offset);
+            }
+            if (threadIdx.x == 0) sSum[0] = v;
+        }
+        __syncthreads();
+    }
+    const float rowSum = sSum[0];
+
+    // ---- Pass 2: normalize and store ----
+    // norm = sqrt(rowSum); guard against zero/NaN.
+    float norm = sqrtf(rowSum);
+    if (norm == 0.0f || std::isnan(norm)) {
+        // All-zero row: leave output as zeros (or copy input). We copy input.
+        for (std::size_t p = 0; p < count; ++p) rowOut[base + p] = rowIn[base + p];
+        return;
+    }
+    const float invNorm = 1.0f / norm;
+
+    if constexpr (VEC % 2 == 0) {
+        const std::size_t pairs = count / 2;
+        for (std::size_t p = 0; p < pairs; ++p) {
+            __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(rowIn + base + 2*p);
+            float a = __bfloat162float(v.x) * invNorm;
+            float b = __bfloat162float(v.y) * invNorm;
+            __nv_bfloat162 o;
+            o.x = __float2bfloat16(a);
+            o.y = __float2bfloat16(b);
+            *reinterpret_cast<__nv_bfloat162*>(rowOut + base + 2*p) = o;
+        }
+        if (count % 2 == 1) {
+            float a = __bfloat162float(rowIn[base + count - 1]) * invNorm;
+            rowOut[base + count - 1] = __float2bfloat16(a);
+        }
+    } else {
+        for (std::size_t p = 0; p < count; ++p) {
+            float a = __bfloat162float(rowIn[base + p]) * invNorm;
+            rowOut[base + p] = __float2bfloat16(a);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6.

@@ -1,0 +1,174 @@
+```sql
+BEGIN;
+
+-- 1. Create Tables
+CREATE TABLE IF NOT EXISTS models (
+    model_id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    architecture VARCHAR(100),
+    context_length INT CHECK (context_length > 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS fixtures (
+    fixture_id SERIAL PRIMARY KEY,
+    kind VARCHAR(50) NOT NULL CHECK (kind IN ('short', 'medium', 'long', 'code')),
+    description TEXT,
+    token_count INT CHECK (token_count >= 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id SERIAL PRIMARY KEY,
+    model_id INT NOT NULL REFERENCES models(model_id) ON DELETE CASCADE,
+    fixture_id INT NOT NULL REFERENCES fixtures(fixture_id) ON DELETE CASCADE,
+    started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at TIMESTAMP,
+    status VARCHAR(20) CHECK (status IN ('running', 'completed', 'failed')),
+    UNIQUE (model_id, fixture_id, started_at)
+);
+
+CREATE TABLE IF NOT EXISTS request_metrics (
+    metric_id SERIAL PRIMARY KEY,
+    run_id INT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    tokens_generated INT CHECK (tokens_generated >= 0),
+    latency_ms FLOAT CHECK (latency_ms >= 0),
+    mtp_acceptance_rate FLOAT CHECK (mtp_acceptance_rate BETWEEN 0 AND 1),
+    memory_usage_mb FLOAT CHECK (memory_usage_mb >= 0)
+);
+
+-- 2. Create Indexes
+CREATE INDEX IF NOT EXISTS idx_runs_model ON runs(model_id);
+CREATE INDEX IF NOT EXISTS idx_runs_fixture ON runs(fixture_id);
+CREATE INDEX IF NOT EXISTS idx_metrics_run ON request_metrics(run_id);
+CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON request_metrics(timestamp);
+CREATE INDEX IF NOT EXISTS idx_metrics_latency ON request_metrics(latency_ms);
+
+-- 3. Insert Data
+INSERT INTO models (name, architecture, context_length) VALUES 
+('Llama-3-8B-Instruct', 'llama', 4096),
+('Mistral-7B-v0.3', 'mistral', 32768);
+
+INSERT INTO fixtures (kind, description, token_count) VALUES 
+('short', 'Simple greeting', 10),
+('short', 'Basic math question', 20),
+('medium', 'Summarize a paragraph', 150),
+('medium', 'Translate text', 200),
+('long', 'Long document summary', 2000),
+('long', 'Complex reasoning chain', 3000),
+('code', 'Python function generation', 500),
+('code', 'SQL query optimization', 800);
+
+-- Generate Runs and Metrics for Model 1 (Llama-3-8B-Instruct)
+INSERT INTO runs (model_id, fixture_id, started_at, finished_at, status) VALUES 
+(1, 1, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '59 minutes', 'completed'),
+(1, 2, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '59 minutes', 'completed'),
+(1, 3, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '58 minutes', 'completed'),
+(1, 4, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '58 minutes', 'completed'),
+(1, 5, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '57 minutes', 'completed'),
+(1, 6, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '56 minutes', 'completed'),
+(1, 7, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '55 minutes', 'completed'),
+(1, 8, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '54 minutes', 'completed'),
+(1, 1, NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '29 minutes', 'completed'),
+(1, 2, NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '29 minutes', 'completed'),
+(1, 3, NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '28 minutes', 'completed'),
+(1, 4, NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '28 minutes', 'completed'),
+(1, 5, NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '27 minutes', 'completed'),
+(1, 6, NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '26 minutes', 'completed'),
+(1, 7, NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '25 minutes', 'completed'),
+(1, 8, NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '24 minutes', 'completed');
+
+INSERT INTO request_metrics (run_id, timestamp, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES 
+(1, NOW() - INTERVAL '1 hour', 100, 120.5, 0.85, 4500.2),
+(2, NOW() - INTERVAL '1 hour', 150, 180.3, 0.82, 4510.1),
+(3, NOW() - INTERVAL '1 hour', 500, 650.2, 0.78, 4600.5),
+(4, NOW() - INTERVAL '1 hour', 600, 720.1, 0.75, 4610.3),
+(5, NOW() - INTERVAL '1 hour', 2000, 2500.4, 0.65, 4800.7),
+(6, NOW() - INTERVAL '1 hour', 3000, 3800.2, 0.60, 4900.1),
+(7, NOW() - INTERVAL '1 hour', 800, 950.3, 0.72, 4700.4),
+(8, NOW() - INTERVAL '1 hour', 1200, 1400.5, 0.68, 4750.2),
+(9, NOW() - INTERVAL '30 minutes', 105, 115.2, 0.86, 4505.3),
+(10, NOW() - INTERVAL '30 minutes', 155, 175.4, 0.83, 4515.2),
+(11, NOW() - INTERVAL '30 minutes', 510, 640.1, 0.79, 4605.6),
+(12, NOW() - INTERVAL '30 minutes', 610, 710.2, 0.76, 4615.4),
+(13, NOW() - INTERVAL '30 minutes', 2010, 2480.3, 0.66, 4805.8),
+(14, NOW() - INTERVAL '30 minutes', 3010, 3780.1, 0.61, 4905.2),
+(15, NOW() - INTERVAL '30 minutes', 810, 940.2, 0.73, 4705.5),
+(16, NOW() - INTERVAL '30 minutes', 1210, 1390.4, 0.69, 4755.3);
+
+-- Generate Runs and Metrics for Model 2 (Mistral-7B-v0.3)
+INSERT INTO runs (model_id, fixture_id, started_at, finished_at, status) VALUES 
+(2, 1, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour 59 minutes', 'completed'),
+(2, 2, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour 59 minutes', 'completed'),
+(2, 3, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour 58 minutes', 'completed'),
+(2, 4, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour 58 minutes', 'completed'),
+(2, 5, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour 57 minutes', 'completed'),
+(2, 6, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour 56 minutes', 'completed'),
+(2, 7, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour 55 minutes', 'completed'),
+(2, 8, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour 54 minutes', 'completed'),
+(2, 1, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '59 minutes', 'completed'),
+(2, 2, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '59 minutes', 'completed'),
+(2, 3, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '58 minutes', 'completed'),
+(2, 4, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '58 minutes', 'completed'),
+(2, 5, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '57 minutes', 'completed'),
+(2, 6, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '56 minutes', 'completed'),
+(2, 7, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '55 minutes', 'completed'),
+(2, 8, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '54 minutes', 'completed');
+
+INSERT INTO request_metrics (run_id, timestamp, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES 
+(17, NOW() - INTERVAL '2 hours', 95, 110.2, 0.88, 4200.1),
+(18, NOW() - INTERVAL '2 hours', 145, 170.1, 0.85, 4210.2),
+(19, NOW() - INTERVAL '2 hours', 490, 630.1, 0.80, 4300.3),
+(20, NOW() - INTERVAL '2 hours', 590, 700.2, 0.77, 4310.4),
+(21, NOW() - INTERVAL '2 hours', 1990, 2450.1, 0.68, 4500.5),
+(22, NOW() - INTERVAL '2 hours', 2990, 3750.2, 0.63, 4600.6),
+(23, NOW() - INTERVAL '2 hours', 790, 930.1, 0.75, 4400.7),
+(24, NOW() - INTERVAL '2 hours', 1190, 1380.2, 0.70, 4450.8),
+(25, NOW() - INTERVAL '1 hour', 98, 108.5, 0.89, 4205.2),
+(26, NOW() - INTERVAL '1 hour', 148, 168.3, 0.86, 4215.3),
+(27, NOW() - INTERVAL '1 hour', 495, 625.2, 0.81, 4305.4),
+(28, NOW() - INTERVAL '1 hour', 595, 695.1, 0.78, 4315.5),
+(29, NOW() - INTERVAL '1 hour', 1995, 2445.3, 0.69, 4505.6),
+(30, NOW() - INTERVAL '1 hour', 2995, 3745.1, 0.64, 4605.7),
+(31, NOW() - INTERVAL '1 hour', 795, 925.2, 0.76, 4405.8),
+(32, NOW() - INTERVAL '1 hour', 1195, 1375.3, 0.71, 4455.9);
+
+-- Add more rows to reach 80+ total metrics (currently 32). Need 48 more.
+-- We will add 24 more runs/metrics for each model to balance.
+
+INSERT INTO runs (model_id, fixture_id, started_at, finished_at, status) VALUES 
+(1, 1, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '14 minutes', 'completed'),
+(1, 2, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '14 minutes', 'completed'),
+(1, 3, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '13 minutes', 'completed'),
+(1, 4, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '13 minutes', 'completed'),
+(1, 5, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '12 minutes', 'completed'),
+(1, 6, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '11 minutes', 'completed'),
+(1, 7, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '10 minutes', 'completed'),
+(1, 8, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '9 minutes', 'completed'),
+(2, 1, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '14 minutes', 'completed'),
+(2, 2, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '14 minutes', 'completed'),
+(2, 3, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '13 minutes', 'completed'),
+(2, 4, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '13 minutes', 'completed'),
+(2, 5, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '12 minutes', 'completed'),
+(2, 6, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '11 minutes', 'completed'),
+(2, 7, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '10 minutes', 'completed'),
+(2, 8, NOW() - INTERVAL '15 minutes', NOW() - INTERVAL '9 minutes', 'completed');
+
+INSERT INTO request_metrics (run_id, timestamp, tokens_generated, latency_ms, mtp_acceptance_rate, memory_usage_mb) VALUES 
+(33, NOW() - INTERVAL '15 minutes', 102, 118.1, 0.84, 4502.1),
+(34, NOW() - INTERVAL '15 minutes', 152, 178.2, 0.81, 4512.2),
+(35, NOW() - INTERVAL '15 minutes', 505, 645.3, 0.77, 4602.3),
+(36, NOW() - INTERVAL '15 minutes', 605, 715.1, 0.74, 4612.4),
+(37, NOW() - INTERVAL '15 minutes', 2005, 2495.2, 0.64, 4802.5),
+(38, NOW() - INTERVAL '15 minutes', 3005, 3795.1, 0.59, 4902.6),
+(39, NOW() - INTERVAL '15 minutes', 805, 945.2, 0.71, 4702.7),
+(40, NOW() - INTERVAL '15 minutes', 1205, 1395.3, 0.67, 4752.8),
+(41, NOW() - INTERVAL '15 minutes', 96, 109.1, 0.87, 4202.1),
+(42, NOW() - INTERVAL '15 minutes', 146, 169.2, 0.84, 4212.2),
+(43, NOW() - INTERVAL '15 minutes', 492, 628.1, 0.79, 4302.3),
+(44, NOW() - INTERVAL '15 minutes', 592, 698.2, 0.76, 4312.4),
+(45, NOW() - INTERVAL '15 minutes', 1992, 2448.1, 0.67, 4502.5),
+(46, NOW() - INTERVAL '15 minutes', 2992, 3748.2, 0.62, 4602.6),
+(47, NOW() - INTERVAL '15 minutes', 792, 928.1, 0.74, 4402.7),
+(48, NOW() - INTERVAL '15 minutes', 1192, 

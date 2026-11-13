@@ -1,0 +1,25 @@
+{
+ "configuration": "MegaCapybara, Tiny (the earlier run through the API, top-1 only)",
+ "engine": "MegaCapybara 1.39 (its server API)",
+ "model": "qwen3.8-27b-tiny.mcapy",
+ "kv_cache": "6/4",
+ "size_bytes": 16594763776,
+ "size_note": "the model file (from the folder listing)",
+ "kl": null,
+ "kl_kind": null,
+ "top1_agreement_pct": 92.69026025236593,
+ "ppl": null,
+ "in_table": false,
+ "in_documents_table": false,
+ "how": "Through the ordinary API only: for every position the prompt is the window up to that position (token ids), one greedy token is generated, and its text is compared with the text of the reference's most likely token. Top-1 agreement only; KL cannot be measured this way.",
+ "record": {
+  "same_top_pct": 92.69026025236593,
+  "positions": 20460,
+  "compared": 20288,
+  "same": 18805,
+  "not_comparable_by_text": 172,
+  "errors": 0,
+  "passes": 8,
+  "seconds": 545.2
+ }
+}

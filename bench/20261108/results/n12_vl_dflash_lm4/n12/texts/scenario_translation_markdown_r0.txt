@@ -1,0 +1,45 @@
+# 发布流程
+
+发布负责人必须原样保留诸如 `request_id`、`max_context`、`kv_dtype` 和 `mtp_rounds` 等标识符。将正文翻译为中文，但不得翻译代码、JSON 键、命令行参数、文件名或表格中的值。
+
+| Phase | Required evidence | Failure action |
+|---|---|---|
+| prepare | fixture hash and prompt-token count | stop before generation |
+| warmup | one successful unmeasured request | restart the service |
+| measure | five sequential responses | invalidate the complete block |
+| publish | summary plus per-request rows | withhold the headline |
+
+```json
+{"model":"qwen3.6-35b-a3b","max_completion_tokens":1024,"seed":42,"stream":false}
+```
+
+## 备注
+
+操作员需确认前缀复用已禁用，缓存命中计数为零，且没有无关的 GPU 进程处于活动状态。自然停止的响应仍视为有效观测；因客户端断开连接而丢失的响应则不视为有效。报告需区分服务器内部 TTFT 与网络观测时间，并说明首个生成 token 被分配给 prefill 阶段。
+
+## 双语术语表
+
+| 术语 (Term) | 中文释义 (Chinese Definition) |
+| :--- | :--- |
+| `request_id` | 请求唯一标识符，用于追踪特定 API 调用。 |
+| `max_context` | 模型可处理的最大上下文长度限制。 |
+| `kv_dtype` | 键值缓存（KV Cache）使用的数据类型。 |
+| `mtp_rounds` | 多 token 预测（Multi-Token Prediction）的轮数。 |
+| fixture hash | 测试数据（fixture）的哈希值，用于验证数据完整性。 |
+| prompt-token count | 提示词中 token 的数量。 |
+| warmup | 预热阶段，用于初始化系统但不计入性能测量。 |
+| unmeasured request | 未进行性能测量的请求。 |
+| sequential responses | 按顺序生成的多个响应。 |
+| invalidate | 使数据或结果失效。 |
+| summary | 汇总统计信息。 |
+| per-request rows | 每个请求对应的详细数据行。 |
+| headline | 主要结论或标题性数据。 |
+| `max_completion_tokens` | 模型生成内容的最大 token 数量限制。 |
+| `seed` | 随机数种子，用于确保结果可复现。 |
+| `stream` | 是否启用流式输出模式。 |
+| prefix reuse | 前缀复用机制，指重用相同前缀的计算结果。 |
+| cache-hit count | 缓存命中次数。 |
+| GPU process | 在 GPU 上运行的进程。 |
+| TTFT | 首 token 时间（Time To First Token）。 |
+| prefill | 预填充阶段，指处理输入提示词的过程。 |
+| observation | 观测数据或实验结果。 |

@@ -1,0 +1,190 @@
+We need answer user's request: produce CSV only, one header and exactly 220 data rows. Columns sample_id,language,category,prompt_tokens,output_tokens,accepted_drafts,drafted_tokens,decode_tok_s,valid. sample IDs S0001-S0220. cycle languages en/zh/ja, cycle categories code/story/translation/structured. generate internally consistent positive numeric values. Quote fields only when CSV requires. No commentary.
+
+Need produce 220 rows. Need ensure CSV no quotes unless required. All fields numeric except IDs and language/category. Positive numeric values. Internally consistent: probably accepted_drafts <= drafted_tokens? drafted_tokens maybe multiple of? decode_tok_s positive. prompt_tokens, output_tokens positive. Could create deterministic pattern. Need exactly 220 rows. Need count. Let's design formulas.
+
+IDs S0001 to S0220. Languages cycle en,zh,ja starting at S0001 en, S0002 zh, S0003 ja, repeat every 3.
+Categories cycle code,story,translation,structured starting at S0001 code, S0002 story, S0003 translation, S0004 structured, S0005 code, repeat every 4.
+Need 220 rows, not multiple? 220 mod 3 = 1, mod4=0. So last S0220 language? For n 1-based: lang index (n-1)%3: 0 en,1 zh,2 ja. n=220: 219%3=0 => en. Category (n-1)%4: 219%4=3 => structured.
+
+Generate numeric values. Need positive. Let's make simple deterministic:
+prompt_tokens = 100 + n
+output_tokens = 20 + (n % 50) maybe positive.
+drafted_tokens = output_tokens + 10
+accepted_drafts = drafted_tokens - 5 (positive). Or accepted_drafts integer <= drafted_tokens.
+decode_tok_s = maybe 10 + (n%100)/10? Need positive numeric. Could be decimal. CSV okay.
+Need ensure accepted_drafts and drafted_tokens positive. If output_tokens min 20? Use output_tokens=50+n? Simpler.
+Let n from 1 to 220. prompt_tokens = 100 + n (101..320). output_tokens = 20 + n (21..240). drafted_tokens = output_tokens + 20 (41..260). accepted_drafts = drafted_tokens - 5 (36..255) <= drafted_tokens. decode_tok_s = 10.0 + (n % 10) * 0.1 maybe 10.0 to 10.9. Positive.
+This is internally consistent: accepted drafts less than drafted tokens. Prompt/output positive. But decode_tok_s maybe not related. Good.
+Need exactly 220 rows. Need generate manually? We can create in answer. Need be careful count. Could use pattern but must list all. 220 lines is long. We can produce with systematic rows. Need ensure no mistakes. Could write in final manually. But we can generate mentally? Need produce 220 rows. This is large but doable with pattern. Need maybe use chunks. Let's create table. Could use formula and list. Need count exactly. Need avoid commentary. CSV header: sample_id,language,category,prompt_tokens,output_tokens,accepted_drafts,drafted_tokens,decode_tok_s,valid
+
+valid column? Need positive numeric values? valid maybe positive numeric? User says generate internally consistent positive numeric values. Columns include valid; likely numeric? Maybe valid as 1? It says positive numeric values. valid could be boolean? But column name valid maybe should be numeric positive. Use 1 for all? Positive integer. Or maybe validity score. Use 1. If positive numeric values, 1 okay. Could vary? Internally consistent maybe valid=1 if accepted_drafts>0 and decode>0. Use 1. Need no quotes. All fields simple no commas.
+
+Need ensure language/category cycles. Let's define mapping for n:
+n mod 3: 1 en, 2 zh, 0 ja.
+n mod 4: 1 code, 2 story, 0 translation, 3 structured? Since n=1 code, 2 story, 3 translation, 4 structured. So mod4: 1 code, 2 story, 3 translation, 0 structured.
+Language and category combination cycles lcm 12. Could generate 1..220.
+Need maybe use n formula:
+prompt = 100+n
+output = 20+n
+drafted = 40+n
+accepted = 35+n
+decode = 10.0 + ((n-1)%10)*0.1? If n=1 decode=10.0, n=10 10.9, n=11 10.0. Good. Or 10+n%10*0.1. If n%10=0 gives 10.0. Positive.
+valid=1.
+
+Need list 220 rows. Let's verify cycles. Let's produce in chunks of maybe 20 rows. Need ensure IDs formatted four digits: S0001...S0220.
+
+Let's create mapping for n 1-220. Could produce by arithmetic. Need be meticulous.
+
+Alternative: generate using Python mentally impossible? But can write systematic rows with patterns. We can generate all 220 by repeating 12-row block because lang/category repeat every 12. Numeric increments. Could create 18 full blocks of 12 = 216 plus 4 rows. This is manageable. Need list row values for n offset in block.
+
+Let's define for n = base + k, k=1..12 maybe. For block b=0..18? Actually n from 1. Could list each 12 rows: n=1..12, 13..24, etc. Use formula. But need ensure cycles. The 12-row language/category pattern:
+n=1 en code
+2 zh story
+3 ja translation
+4 en structured
+5 zh code
+6 ja story
+7 en translation
+8 zh structured
+9 ja code
+10 en story
+11 zh translation
+12 ja structured
+Then repeats for 13: en code etc. Yes because lcm 12.
+
+Numeric per n:
+prompt=100+n
+output=20+n
+accepted=35+n
+drafted=40+n
+decode = 10.0 + (n % 10)*0.1? For n=1 10.1 if n%10=1. Maybe okay. Or 10.0 for n=1? Let's use 10 + (n % 10) * 0.1. For n=1 10.1. All positive. But maybe decode_tok_s should be output_tokens / time? Not necessary. Could use 20.0? Simpler all 20.0. But maybe positive numeric, internally consistent? decode_tok_s positive. Could set decode_tok_s = 20.0 for all? That is consistent? It's a rate. But maybe generate varied. Use 10.0 + (n%10)*0.1; for n=10 10.0, for n=20 10.0. Fine.
+valid=1.
+
+Need ensure accepted_drafts <= drafted_tokens: 35+n <= 40+n yes. accepted_drafts positive. drafted_tokens positive. output_tokens positive. prompt positive.
+
+Could use accepted_drafts = output_tokens? no. Good.
+
+Now need produce 220 rows. Let's create list. We can use formula. Let's make chunks.
+
+Maybe easier: For n from 1 to 220, values:
+id S####
+lang category per n.
+prompt 101+? Actually 100+n.
+output 20+n.
+accepted 35+n.
+drafted 40+n.
+decode = 10.0,10.1... pattern n mod10. Let's list decode sequence for n 1-220: for n=1 10.1, 2 10.2, ... 9 10.9, 10 10.0, 11 10.1 ... etc.
+
+Need exact 220 rows. Let's generate with chunk 12 rows. For each block start s = 1 + 12*b, b=0..18 (19 blocks?) 12*18=216, plus n=217..220. b=0 n1-12, b1 13-24, ... b17 205-216, b18 217-228 but only 4. We'll list 18 full blocks (0-17) = 216 rows, then 4 rows.
+
+Let's create a template for 12 rows given start s:
+For k=1..12:
+n=s+k-1
+id S{n:04d}
+langcat:
+k1 en,code
+k2 zh,story
+k3 ja,translation
+k4 en,structured
+k5 zh,code
+k6 ja,story
+k7 en,translation
+k8 zh,structured
+k9 ja,code
+k10 en,story
+k11 zh,translation
+k12 ja,structured
+prompt = 100+n
+output=20+n
+accepted=35+n
+drafted=40+n
+decode = 10 + (n%10)*0.1. For n ending 0 -> 10.0.
+valid=1.
+
+Need compute each block. Could use start values.
+
+Let's make table for k relative values:
+For n = s+k-1.
+prompt = 99+s+k? Since 100+s+k-1 = 99+s+k.
+output = 19+s+k.
+accepted = 34+s+k.
+drafted = 39+s+k.
+decode based on (s+k-1)%10.
+
+For block start s=1:
+n=1 prompt101 output21 accepted36 drafted41 decode10.1
+2 102 22 37 42 10.2
+3 103 23 38 43 10.3
+4 104 24 39 44 10.4
+5 105 25 40 45 10.5
+6 106 26 41 46 10.6
+7 107 27 42 47 10.7
+8 108 28 43 48 10.8
+9 109 29 44 49 10.9
+10 110 30 45 50 10.0
+11 111 31 46 51 10.1
+12 112 32 47 52 10.2
+
+Block s=13 (n13-24): prompt 113-124, output33-44, accepted48-59, drafted49-60, decode n%10: 13 10.3,14 10.4,15 10.5,16 10.6,17 10.7,18 10.8,19 10.9,20 10.0,21 10.1,22 10.2,23 10.3,24 10.4.
+Wait for k mapping: n=13 k1 decode 10.3, k2 10.4, k3 10.5, k4 10.6, k5 10.7, k6 10.8, k7 10.9, k8 10.0, k9 10.1, k10 10.2, k11 10.3, k12 10.4.
+
+Could produce all blocks with these increments.
+
+Let's enumerate all 220 rows. Need no mistakes. I'll construct final CSV. Let's use maybe a systematic line by line.
+
+Header:
+sample_id,language,category,prompt_tokens,output_tokens,accepted_drafts,drafted_tokens,decode_tok_s,valid
+
+Rows:
+S0001,en,code,101,21,36,41,10.1,1
+S0002,zh,story,102,22,37,42,10.2,1
+S0003,ja,translation,103,23,38,43,10.3,1
+S0004,en,structured,104,24,39,44,10.4,1
+S0005,zh,code,105,25,40,45,10.5,1
+S0006,ja,story,106,26,41,46,10.6,1
+S0007,en,translation,107,27,42,47,10.7,1
+S0008,zh,structured,108,28,43,48,10.8,1
+S0009,ja,code,109,29,44,49,10.9,1
+S0010,en,story,110,30,45,50,10.0,1
+S0011,zh,translation,111,31,46,51,10.1,1
+S0012,ja,structured,112,32,47,52,10.2,1
+
+Block 13-24:
+S0013,en,code,113,33,48,49,10.3,1
+S0014,zh,story,114,34,49,50,10.4,1
+S0015,ja,translation,115,35,50,51,10.5,1
+S0016,en,structured,116,36,51,52,10.6,1
+S0017,zh,code,117,37,52,53,10.7,1
+S0018,ja,story,118,38,53,54,10.8,1
+S0019,en,translation,119,39,54,55,10.9,1
+S0020,zh,structured,120,40,55,56,10.0,1
+S0021,ja,code,121,41,56,57,10.1,1
+S0022,en,story,122,42,57,58,10.2,1
+S0023,zh,translation,123,43,58,59,10.3,1
+S0024,ja,structured,124,44,59,60,10.4,1
+
+Check cycle: n=20 mod3=2 zh, mod4=0 structured yes. n=21 ja code. Good.
+
+Block 25-36 (start 25): n25 prompt125 output45 accepted60 drafted61 decode 10.5; 26 10.6;27 10.7;28 10.8;29 10.9;30 10.0;31 10.1;32 10.2;33 10.3;34 10.4;35 10.5;36 10.6.
+S0025 en code? n25 mod3 1 en, mod4 1 code yes.
+S0026 zh story
+S0027 ja translation
+S0028 en structured
+S0029 zh code
+S0030 ja story
+S0031 en translation
+S0032 zh structured
+S0033 ja code
+S0034 en story
+S0035 zh translation
+S0036 ja structured
+
+Rows:
+S0025,en,code,125,45,60,61,10.5,1
+S0026,zh,story,126,46,61,62,10.6,1
+S0027,ja,translation,127,47,62,63,10.7,1
+S0028,en,structured,128,48,63,64,10.8,1
+S0029,zh,code,129,49,64,65,10.9,1
+S0030,ja,story,130,50,65,66,10.0,1
+S0031,en,translation,131,51,66,67,10.1,1
+S003

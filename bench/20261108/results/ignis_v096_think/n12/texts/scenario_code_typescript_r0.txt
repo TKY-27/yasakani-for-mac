@@ -1,0 +1,337 @@
+The user is asking for a complete TypeScript 5 service that does the following:
+1. Consumes newline-delimited request metrics
+2. Validates them without using third-party schema libraries
+3. Groups records by model and fixture
+4. Computes mean / median / sample standard deviation
+5. Exposes /health, /summary, and /runs/:id endpoints
+6. Includes strict types
+7. Incremental parsing
+8. Bounded memory
+9. Error handling for malformed inputs
+10. Unit tests
+11. package.json
+12. tsconfig.json
+13. A short operational guide
+14. No placeholders
+
+Let me design this properly.
+
+**Architecture:**
+
+- Node.js with Node's built-in `http` module (avoid third-party dependencies for the service body. For tests we can use node:test, which is built into Node 18+). In fact, to keep "no third-party schema libraries" and "no placeholders," I'll use only Node built-ins: `node:http`, `node:test`, `node:assert/strict`, `ts-node` or `tsx` for running TS, `typescript` as a dev dependency, and `@types/node` as a dev dependency. This keeps production runtime dependency-free.
+
+- Service: an HTTP server that receives POST /metrics (newline-delimited metrics, either JSON per line or a custom format). The prompt says "consumes newline-delimited request metrics" — I'll define the record format: each line is a JSON object (NDJSON) with fields:
+
+```json
+{ "runId": "run-1", "model": "llama-2-7b", "fixture": "prompt-42", "latencyMs": 132.4, "tokens": 512, "status": "ok", "ts": "2024-05-01T00:00:00Z" }
+```
+
+Actually, "groups records by model and fixture" — so each record should have `model` and `fixture` fields, plus `runId` and a measurement like `latencyMs`. Let me define the metrics record schema:
+
+```ts
+interface MetricRecord {
+  runId: string;      // required, non-empty
+  model: string;      // required, non-empty
+  fixture: string;    // required, non-empty
+  latencyMs: number;  // required, finite, >= 0
+  tokens: number;     // required? or optional integer >= 0
+  ts: string;         // optional ISO timestamp
+}
+```
+
+Let's make it strict:
+- `runId`: string matching /^[a-z0-9][a-z0-9_-]{0,63}$/
+- `model`: string, non-empty, max 128
+- `fixture`: string, non-empty, max 128
+- `latencyMs`: finite number >= 0, e.g. <= 1e9
+- `tokens`: optional non-negative integer <= 1e9
+- `ts`: optional ISO-8601 string, parseable as Date
+
+Validation without third-party schema library: hand-rolled `validateMetricRecord` returning a discriminated result type `{ ok: true; value: MetricRecord } | { ok: false; error: ValidationError }`.
+
+**Incremental parsing:**
+
+The ingestion endpoint accepts chunks. "Incremental parsing" suggests we can process a stream incrementally rather than buffering the whole body. So POST /metrics should stream-parse the body with a `ReadableStream`-style parser that processes each newline-delimited record as it arrives, without holding the whole payload in memory. Bounded memory: keep per-(model, fixture) group statistics in an incremental form (Welford / running sum, count, sum, sumSq, plus min/max), and bound the number of distinct groups via an LRU or a cap that emits "overflow" when the cap is hit (reject or count overflow). For the median, a streaming median without storing all values isn't easy. Options:
+- Store raw values per group up to a cap (say 4096 values per group, then switch to approximation? no — better: cap total stored values, and if a group's sample cap is exceeded, use a quantile sketch? that's complex.)
+
+Simpler approach for "bounded memory": maintain a bounded reservoir per group: e.g. keep up to N=2048 values per group (reservoir sampling or just a sliding window). Median from bounded sample: if the group's total count <= N, we have the full list, so we can compute the median exactly (sorted). If count > N, we compute the median from the retained bounded sample (documented as approximate). Bounded-memory guarantee: O(number of groups × N). And bound the number of groups, e.g. 10_000 (each key ~ up to 256 bytes) — when exceeded, we can reject new groups (or ignore + count).
+
+Alternative: use a GK / t-digest sketch. But I want to avoid over-engineering. Sliding window with a cap is enough and honest. Actually, let me use reservoir sampling per group to keep a statistically representative sample for the median. Simpler: keep the most recent K values (sliding window via a per-group ring buffer), and document that the median is computed over the most recent K observations when the count exceeds K. That's deterministic and simple. Hmm, but for "complete and correct" the sliding window is fine.
+
+Actually even better: per-group store:
+- count
+- sum (double)
+- m2 (sum of squared deviations) — Welford for a numerically stable sample standard deviation
+- min, max
+- values: a ring buffer of the most recent `WINDOW = 2048` numbers
+
+Mean = sum/count (use Welford mean + count for stability).
+Sample standard deviation = sqrt(m2/(count-1)), defined when count >= 2, otherwise null.
+Median: if count <= window capacity → sorted all values (we keep them all). Otherwise → median of the retained window (flag as approximate: `medianApproximation: "windowed" | "exact"`).
+
+**Grouping:** key = `${model}\u0000${fixture}`? or `${model}::${fixture}` — risk of collision with a delimiter that's contained in the name. Use a composite key string built with an unlikely-to-occur delimiter like `\u0000` (NUL), or store in a Map keyed by the model string → nested Map keyed by fixture. Nested maps are cleaner and avoid key-collision issues: `Map<string, Map<string, Group>>`. That handles "grouped by model and fixture" naturally.
+
+**Bounded memory:**
+- Max distinct (model, fixture) groups: e.g. 10_000. When exceeded → the record is rejected with an error `group_capacity_exceeded`, counted in `rejected.group_capacity`.
+- Per-group value window: 2048.
+- Also bound total accepted records? Not needed if groups are bounded.
+- Also bound request body size: limit the POST /metrics payload (e.g. 1 MB) to bound per-request memory; if exceeded → 413 with an error. Actually, streaming-parser boundedness: we process per-line and don't buffer; but the HTTP client might keep streaming; we can cap total bytes accepted and abort. Let's implement: max 1_048_576 bytes per request; if exceeded, respond 413 and destroy the stream (stop consuming). Bounded parse state: if a single line exceeds max line length (e.g. 64 KB), abort the line with a "line too long" error.
+
+**Malformed input errors:**
+- Per-line errors: invalid JSON, schema violation, unknown fields? (unknown fields: allow or reject? strict — I'll reject with `unexpected_fields` error listing them. Actually a strict validator often ignores unknown fields, but for strictness we'll reject them — document it.) Hmm, rejecting unknown fields might be annoying; but "strict types" suggests strictness. I'll reject unknown fields and return the list.
+- Blank lines: skipped (counted as `ignoredBlankLines`) — blank lines at end of NDJSON are typical.
+- NUL bytes? skip.
+- Errors report line number (1-indexed within the request) and error code.
+- Endpoint returns 200 with JSON: `{ accepted: n, rejected: m, errors: [ { line, code, message } (up to 100) ], groups: ... }`? If all rejected → 400? Better: 200 with partial results when at least one is accepted, 400 if zero accepted, 413 if size exceeded, 415 if content-type is not JSON/text (accept `application/json`, `application/x-ndjson`, `text/plain`).
+
+**Endpoints:**
+
+- `GET /health` → `{ status: "ok", uptimeSec, version, memory: { heapUsed, ... }, metrics: { accepted, rejected, groups } }`.
+- `GET /summary` → aggregate over all groups: totalRecords, per-model rollups? The spec says "groups records by model and fixture, computes mean/median/sample standard deviation" and "exposes /summary." So /summary returns groups: an array of `{ model, fixture, count, mean, median, sampleStdDev, min, max, medianSource: "exact" |
+
+My thinking time is over. I must now write the complete final answer from what I already have, without calling any more tools.Below is the complete, self-contained project. Runtime dependencies are **zero** (only Node built-ins); TypeScript is a dev dependency only. Files, tree, and the operational guide follow.
+
+## Project layout
+
+```
+metric-aggregator/
+├── package.json
+├── tsconfig.json
+├── README.md
+├── examples/
+│   └── demo.ndjson
+├── src/
+│   ├── types.ts
+│   ├── validator.ts
+│   ├── ndjson.ts
+│   ├── aggregate.ts
+│   ├── server.ts
+│   └── index.ts
+└── test/
+    ├── validator.test.ts
+    ├── ndjson.test.ts
+    ├── aggregate.test.ts
+    └── server.test.ts
+```
+
+## `package.json`
+
+```json
+{
+  "name": "metric-aggregator",
+  "version": "1.0.0",
+  "description": "Bounded-memory, newline-delimited request-metrics aggregator with streaming stats (Node.js built-ins only, zero runtime dependencies).",
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "tsc -p tsconfig.json && node --test dist-test/test/",
+    "test:quick": "node --test dist-test/test/"
+  },
+  "keywords": [
+    "ndjson",
+    "metrics",
+    "aggregation",
+    "streaming",
+    "type-safe"
+  ],
+  "license": "MIT"
+}
+```
+
+## `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "rootDir": ".",
+    "outDir": "dist",
+    "sourceMap": false,
+    "declaration": false,
+    "strict": true,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}
+```
+
+## `src/types.ts`
+
+```typescript
+/**
+ * Shared types: wire schemas, aggregate shapes, and the immutable
+ * in-memory limits that bound every collection in the process.
+ */
+
+/**
+ * Wire shape of one NDJSON line. All fields are required and typed;
+ * validation is structural (no schema libraries), defined in validator.ts.
+ *
+ * NOTE: JSON cannot distinguish 3.0 from 3, so `latencyMs` and `tokens`
+ * accept integral values (e.g. 3, 3.0, 3e1) but never true fractions
+ * (e.g. 3.5). The validator enforces integrality explicitly.
+ */
+export interface MetricRecord {
+  /** Opaque run identifier: /^[a-z0-9][a-z0-9_-]{0,63}$/ */
+  runId: string;
+  /** Model name, 1..64 chars, [A-Za-z0-9._-] only */
+  model: string;
+  /** Fixture/prompt name, 1..64 chars, [A-Za-z0-9._-] only */
+  fixture: string;
+  /** End-to-end latency in milliseconds, 0 <= x <= 3_600_000 (1h) */
+  latencyMs: number;
+  /** Output token count, integer 0..1_000_000 */
+  tokens: number;
+  /** Unix epoch milliseconds (integral) */
+  ts: number;
+  /** Optional ISO-8601 event time, e.g. "2024-05-01T12:00:00Z" */
+  eventTime?: string;
+}
+
+export type ErrorSeverity = "record" | "line";
+
+export interface MetricValidationError {
+  readonly code:
+    | "not_an_object"
+    | "unexpected_field"
+    | "missing_field"
+    | "type_mismatch"
+    | "out_of_range"
+    | "not_integer"
+    | "invalid_format"
+    | "invalid_iso8601";
+  readonly field: string;
+  readonly message: string;
+}
+
+export type ValidationResult =
+  | { readonly ok: true; readonly value: MetricRecord }
+  | { readonly ok: false; readonly errors: readonly MetricValidationError[] };
+
+/** Per-line parse result (JSON syntax level). */
+export interface LineOutcome {
+  readonly lineNo: number;
+  readonly status: "accepted" | "skipped_blank" | "invalid_json" | "aborted";
+  readonly text: string;
+}
+
+/** Per-line validation outcome, paired with its LineOutcome. */
+export interface ValidatedLine {
+  readonly outcome: LineOutcome;
+  readonly result: ValidationResult;
+}
+
+/** Bounded, ordered (FIFO) sample of the most recent values in a group. */
+export class ValueWindow {
+  private readonly buf: number[];
+  private head = 0;
+  private size = 0;
+  constructor(readonly capacity: number) {
+    this.buf = new Array<number>(capacity);
+  }
+  push(value: number): void {
+    const i = (this.head + this.size) % this.capacity;
+    this.buf[i] = value;
+    if (this.size < this.capacity) {
+      this.size += 1;
+    } else {
+      this.head = (this.head + 1) % this.capacity;
+    }
+  }
+  /** Copies in chronological order (oldest retained first). */
+  toChronological(): number[] {
+    if (this.size === 0) return [];
+    const out: number[] = new Array<number>(this.size);
+    for (let i = 0; i < this.size; i += 1) {
+      const idx = this.head + i;
+      out[i] = this.buf[idx < this.capacity ? idx : idx - this.capacity] as number;
+    }
+    return out;
+  }
+}
+
+/** Pure-function statistics over a non-empty sample. */
+export interface SampleStats {
+  readonly count: number;
+  readonly mean: number;
+  /** Inclusive median (even n => average of the two middle values). */
+  readonly median: number;
+  /**
+   * Sample standard deviation (Bessel-corrected, n - 1).
+   * null when n < 2 (undefined by definition; we never emit NaN/Infinity).
+   */
+  readonly sampleStdDev: number | null;
+  readonly min: number;
+  readonly max: number;
+}
+
+/** One (model, fixture) group as served by the API. */
+export interface GroupSummary {
+  readonly model: string;
+  readonly fixture: string;
+  readonly records: number;
+  /** Exact when records <= WINDOW_SIZE; otherwise estimated from the most recent WINDOW_SIZE values. */
+  readonly mean: number;
+  readonly median: number;
+  readonly medianExact: boolean;
+  /** null when records < 2 */
+  readonly sampleStdDev: number | null;
+  readonly min: number;
+  readonly max: number;
+  readonly firstRunId: string;
+  readonly lastRunId: string;
+}
+
+export interface AggregateSummary {
+  readonly groups: readonly GroupSummary[];
+  readonly totals: {
+    readonly records: number;
+    readonly groups: number;
+  };
+  readonly capacity: {
+    readonly groupsTotal: number;
+    readonly groupsUsed: number;
+    readonly windowSize: number;
+  };
+}
+
+/** The complete /summary response body. */
+export interface SummaryResponse extends AggregateSummary {
+  readonly server: {
+    readonly version: string;
+    readonly uptimeSec: number;
+    readonly process: {
+      readonly rssBytes: number;
+      readonly heapUsedBytes: number;
+      readonly heapTotalBytes: number;
+    };
+  };
+}
+
+export interface HealthResponse {
+  readonly status: "ok";
+  readonly service: string;
+  readonly version: string;
+  readonly uptimeSec: number;
+  readonly ingested: { readonly records: number

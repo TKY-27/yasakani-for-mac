@@ -1,0 +1,533 @@
+Below is a complete, self-contained TypeScript 5 service. It has **zero runtime dependencies** (Node's built-in `http`/`crypto`/`fs`), so it runs with only `typescript` + `@types/node` as dev dependencies.
+
+## Project layout
+
+```
+metrics-service/
+├── package.json
+├── tsconfig.json
+├── README.md
+├── src/
+│   ├── types.ts
+│   ├── errors.ts
+│   ├── parser.ts
+│   ├── stats.ts
+│   ├── store.ts
+│   ├── server.ts
+│   └── index.ts
+└── test/
+    ├── parser.test.ts
+    ├── stats.test.ts
+    ├── store.test.ts
+    └── server.test.ts
+```
+
+---
+
+## `package.json`
+
+```json
+{
+  "name": "metrics-service",
+  "version": "1.0.0",
+  "description": "Bounded, streaming NDJSON request-metrics service with per-model/fixture statistics.",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsc -p tsconfig.json --watch",
+    "test": "tsc -p tsconfig.json && node --test dist/test/",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
+```
+
+---
+
+## `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": ".",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}
+```
+
+> `noUncheckedIndexedAccess` is enabled, so every array index access is `T | undefined` and must be narrowed — this is what makes the "strict types" claim real.
+
+---
+
+## `src/types.ts`
+
+```ts
+/**
+ * Core domain types. Everything is a strict, closed shape.
+ */
+
+/** A single validated request-metrics record. */
+export interface RequestMetric {
+  /** Stable identifier for the run this record belongs to. */
+  runId: string;
+  /** Model identifier (e.g. "gpt-4o", "claude-3-opus"). */
+  model: string;
+  /** Fixture / dataset identifier (e.g. "mmlu", "gsm8k"). */
+  fixture: string;
+  /** Wall-clock latency in milliseconds. */
+  latencyMs: number;
+  /** Token count for the request. */
+  tokens: number;
+  /** HTTP status code of the request. */
+  status: number;
+  /** Epoch milliseconds when the record was produced. */
+  timestamp: number;
+}
+
+/** A single parsed line, tagged with its 1-based line number. */
+export interface ParsedLine {
+  line: number;
+  record: RequestMetric;
+}
+
+/** Aggregate statistics for one (model, fixture) group. */
+export interface GroupStats {
+  model: string;
+  fixture: string;
+  count: number;
+  mean: number;
+  median: number;
+  /** Sample standard deviation (n-1 denominator). */
+  sampleStdDev: number;
+  min: number;
+  max: number;
+  sum: number;
+}
+
+/** A single run's summary. */
+export interface RunSummary {
+  runId: string;
+  recordCount: number;
+  firstTimestamp: number | null;
+  lastTimestamp: number | null;
+  groups: GroupStats[];
+}
+
+/** The full /summary response. */
+export interface SummaryResponse {
+  runCount: number;
+  totalRecords: number;
+  runs: RunSummary[];
+}
+
+/** The /health response. */
+export interface HealthResponse {
+  status: "ok" | "degraded";
+  uptimeSec: number;
+  memory: {
+    rssBytes: number;
+    heapUsedBytes: number;
+    heapLimitBytes: number;
+  };
+  store: {
+    runCount: number;
+    recordCount: number;
+    droppedRecords: number;
+    atCapacity: boolean;
+  };
+}
+
+/** Configuration for the in-memory store. */
+export interface StoreConfig {
+  /** Maximum number of runs retained (LRU eviction beyond this). */
+  maxRuns: number;
+  /** Maximum records retained per run (oldest dropped beyond this). */
+  maxRecordsPerRun: number;
+}
+
+/** Configuration for the HTTP server. */
+export interface ServerConfig {
+  port: number;
+  host: string;
+  store: StoreConfig;
+  /** Maximum request body size in bytes. */
+  maxBodyBytes: number;
+  /** Maximum number of lines accepted per request. */
+  maxLinesPerRequest: number;
+}
+```
+
+---
+
+## `src/errors.ts`
+
+```ts
+/**
+ * Typed error hierarchy. Each error carries a stable `code` so clients
+ * can branch on it without string-matching messages.
+ */
+
+export type ErrorCode =
+  | "MALFORMED_LINE"
+  | "INVALID_FIELD"
+  | "EMPTY_BODY"
+  | "BODY_TOO_LARGE"
+  | "TOO_MANY_LINES"
+  | "NOT_FOUND"
+  | "METHOD_NOT_ALLOWED"
+  | "INTERNAL";
+
+export class ServiceError extends Error {
+  public readonly code: ErrorCode;
+  public readonly httpStatus: number;
+  public readonly details: Record<string, unknown>;
+
+  constructor(code: ErrorCode, message: string, httpStatus: number, details: Record<string, unknown> = {}) {
+    super(message);
+    this.name = "ServiceError";
+    this.code = code;
+    this.httpStatus = httpStatus;
+    this.details = details;
+  }
+}
+
+/** A single NDJSON line failed to parse or validate. */
+export class MalformedLineError extends ServiceError {
+  constructor(line: number, reason: string, details: Record<string, unknown> = {}) {
+    super("MALFORMED_LINE", `Line ${line}: ${reason}`, 400, { line, reason, ...details });
+  }
+}
+
+/** A field failed validation (wrong type / out of range). */
+export class InvalidFieldError extends ServiceError {
+  constructor(field: string, reason: string, line: number) {
+    super("INVALID_FIELD", `Line ${line}: field "${field}" ${reason}`, 400, { line, field, reason });
+  }
+}
+
+/** The request body was empty. */
+export class EmptyBodyError extends ServiceError {
+  constructor() {
+    super("EMPTY_BODY", "Request body is empty", 400);
+  }
+}
+
+/** The request body exceeded the size limit. */
+export class BodyTooLargeError extends ServiceError {
+  constructor(limit: number) {
+    super("BODY_TOO_LARGE", `Request body exceeds ${limit} bytes`, 413, { limit });
+  }
+}
+
+/** The request contained more lines than allowed. */
+export class TooManyLinesError extends ServiceError {
+  constructor(limit: number) {
+    super("TOO_MANY_LINES", `Request contains more than ${limit} lines`, 413, { limit });
+  }
+}
+
+/** A run was not found. */
+export class NotFoundError extends ServiceError {
+  constructor(runId: string) {
+    super("NOT_FOUND", `Run "${runId}" not found`, 404, { runId });
+  }
+}
+
+/** The HTTP method is not allowed for the route. */
+export class MethodNotAllowedError extends ServiceError {
+  constructor(allowed: string) {
+    super("METHOD_NOT_ALLOWED", `Method not allowed. Allowed: ${allowed}`, 405, { allowed });
+  }
+}
+
+/** Unexpected internal failure. */
+export class InternalError extends ServiceError {
+  constructor(message: string) {
+    super("INTERNAL", message, 500);
+  }
+}
+```
+
+---
+
+## `src/parser.ts`
+
+```ts
+/**
+ * Incremental NDJSON parser + validator.
+ *
+ * - Splits a raw body into lines.
+ * - Parses each line as JSON.
+ * - Validates each field with hand-rolled checks (no schema library).
+ * - Emits `ParsedLine` objects or throws typed errors.
+ *
+ * The parser is stateless per call; "incremental" here means it processes
+ * line-by-line and can be fed a stream of chunks (see `LineSplitter`).
+ */
+
+import type { ParsedLine, RequestMetric } from "./types.js";
+import {
+  BodyTooLargeError,
+  EmptyBodyError,
+  InvalidFieldError,
+  MalformedLineError,
+  TooManyLinesError,
+} from "./errors.js";
+
+/**
+ * A small incremental line splitter. Feed it arbitrary chunks; it yields
+ * complete lines and retains the partial tail across calls. This is what
+ * makes the parser safe for streaming / chunked bodies.
+ */
+export class LineSplitter {
+  private tail = "";
+
+  /** Feed a chunk; returns the complete lines it contains. */
+  push(chunk: string): string[] {
+    this.tail += chunk;
+    const lines: string[] = [];
+    let idx: number;
+    while ((idx = this.tail.indexOf("\n")) !== -1) {
+      lines.push(this.tail.slice(0, idx));
+      this.tail = this.tail.slice(idx + 1);
+    }
+    return lines;
+  }
+
+  /** Flush any remaining partial line (call at end of stream). */
+  flush(): string | null {
+    const remaining = this.tail;
+    this.tail = "";
+    return remaining.length > 0 ? remaining : null;
+  }
+}
+
+/** Field-level validators. Each returns a boolean and a reason string. */
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0;
+}
+
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+function isInteger(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v);
+}
+
+/**
+ * Validate a single parsed JSON object into a `RequestMetric`.
+ * Throws `InvalidFieldError` / `MalformedLineError` on failure.
+ */
+export function validateRecord(obj: unknown, line: number): RequestMetric {
+  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) {
+    throw new MalformedLineError(line, "record must be a JSON object");
+  }
+  const o = obj as Record<string, unknown>;
+
+  // runId
+  if (!isNonEmptyString(o.runId)) {
+    throw new InvalidFieldError("runId", "must be a non-empty string", line);
+  }
+  if (o.runId.length > 128) {
+    throw new InvalidFieldError("runId", "exceeds 128 characters", line);
+  }
+
+  // model
+  if (!isNonEmptyString(o.model)) {
+    throw new InvalidFieldError("model", "must be a non-empty string", line);
+  }
+  if (o.model.length > 128) {
+    throw new InvalidFieldError("model", "exceeds 128 characters", line);
+  }
+
+  // fixture
+  if (!isNonEmptyString(o.fixture)) {
+    throw new InvalidFieldError("fixture", "must be a non-empty string", line);
+  }
+  if (o.fixture.length > 128) {
+    throw new InvalidFieldError("fixture", "exceeds 128 characters", line);
+  }
+
+  // latencyMs
+  if (!isFiniteNumber(o.latencyMs)) {
+    throw new InvalidFieldError("latencyMs", "must be a finite number", line);
+  }
+  if (o.latencyMs < 0) {
+    throw new InvalidFieldError("latencyMs", "must be >= 0", line);
+  }
+
+  // tokens
+  if (!isInteger(o.tokens)) {
+    throw new InvalidFieldError("tokens", "must be an integer", line);
+  }
+  if (o.tokens < 0) {
+    throw new InvalidFieldError("tokens", "must be >= 0", line);
+  }
+
+  // status
+  if (!isInteger(o.status)) {
+    throw new InvalidFieldError("status", "must be an integer", line);
+  }
+  if (o.status < 100 || o.status > 599) {
+    throw new InvalidFieldError("status", "must be in [100, 599]", line);
+  }
+
+  // timestamp
+  if (!isFiniteNumber(o.timestamp)) {
+    throw new InvalidFieldError("timestamp", "must be a finite number", line);
+  }
+  if (o.timestamp < 0) {
+    throw new InvalidFieldError("timestamp", "must be >= 0", line);
+  }
+
+  return {
+    runId: o.runId,
+    model: o.model,
+    fixture: o.fixture,
+    latencyMs: o.latencyMs,
+    tokens: o.tokens,
+    status: o.status,
+    timestamp: o.timestamp,
+  };
+}
+
+export interface ParseOptions {
+  maxBodyBytes: number;
+  maxLinesPerRequest: number;
+}
+
+export interface ParseResult {
+  lines: ParsedLine[];
+}
+
+/**
+ * Parse a full NDJSON body into validated records.
+ *
+ * - Rejects empty bodies.
+ * - Rejects bodies over `maxBodyBytes`.
+ * - Rejects bodies with more than `maxLinesPerRequest` lines.
+ * - Validates every line; the first failure throws a typed error that
+ *   identifies the offending line number.
+ */
+export function parseNdjson(body: string, opts: ParseOptions): ParseResult {
+  if (body.length === 0) {
+    throw new EmptyBodyError();
+  }
+  if (body.length > opts.maxBodyBytes) {
+    throw new BodyTooLargeError(opts.maxBodyBytes);
+  }
+
+  const splitter = new LineSplitter();
+  const rawLines = splitter.push(body);
+  const tail = splitter.flush();
+  if (tail !== null) {
+    rawLines.push(tail);
+  }
+
+  // Drop trailing empty lines (a trailing newline produces one).
+  const trimmed = rawLines.filter((l) => l.trim().length > 0);
+
+  if (trimmed.length === 0) {
+    throw new EmptyBodyError();
+  }
+  if (trimmed.length > opts.maxLinesPerRequest) {
+    throw new TooManyLinesError(opts.maxLinesPerRequest);
+  }
+
+  const lines: ParsedLine[] = [];
+  for (let i = 0; i < trimmed.length; i++) {
+    const lineNo = i + 1;
+    const raw = trimmed[i];
+    let obj: unknown;
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      throw new MalformedLineError(lineNo, "invalid JSON");
+    }
+    lines.push({ line: lineNo, record: validateRecord(obj, lineNo) });
+  }
+
+  return { lines };
+}
+```
+
+---
+
+## `src/stats.ts`
+
+```ts
+/**
+ * Pure statistics helpers. No dependencies.
+ *
+ * - mean
+ * - median (average of the two middle values for even counts)
+ * - sample standard deviation (n-1 denominator; 0 for n < 2)
+ */
+
+export function mean(values: readonly number[]): number {
+  if (values.length === 0) return 0;
+  let sum = 0;
+  for (const v of values) sum += v;
+  return sum / values.length;
+}
+
+/**
+ * Median. Operates on a copy so the input is never mutated.
+ * For even length, returns the average of the two central values.
+ */
+export function median(values: readonly number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const n = sorted.length;
+  const mid = Math.floor(n / 2);
+  if (n % 2 === 1) {
+    return sorted[mid] as number;
+  }
+  const a = sorted[mid - 1] as number;
+  const b = sorted[mid] as number;
+  return (a + b) / 2;
+}
+
+/**
+ * Sample standard deviation (unbiased, n-1 denominator).
+ * Returns 0 when n < 2 (undefined for a single sample).
+ * Uses the two-pass algorithm for numerical stability.
+ */
+export function sampleStdDev(values: readonly number[]): number {
+  const n = values.length;
+  if (n < 2) return 0;
+  const m = mean(values);
+  let ss = 0;
+  for (const v of values) {
+    const d = v - m;
+    ss += d * d;
+  }
+  return Math.sqrt(ss / (n - 1));
+}
+
+export function min(values: readonly number

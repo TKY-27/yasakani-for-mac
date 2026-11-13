@@ -1,0 +1,181 @@
+The user is asking for a complete TypeScript 5 service that meets the following:
+1. Consumes newline-delimited request metrics (NDJSON)
+2. Validates them without using any third-party schema library (hand-rolled validation)
+3. Groups records by model and fixture
+4. Computes mean / median / sample standard deviation
+5. Exposes /health, /summary, /runs/:id endpoints
+6. Strict types
+7. Incremental parsing
+8. Bounded memory
+9. Malformed-input errors
+10. Unit tests
+11. package.json
+12. tsconfig.json
+13. A short operations guide
+14. No placeholders
+
+Architecture:
+
+- A Node.js HTTP server (use node:http to avoid framework dependencies, keep third-party deps to just the test runner — use node:test, and Node 18+ has node:test. This keeps third-party deps zero aside from TypeScript as a devDependency). Actually, the requirement says "no third-party schema libraries" — I'll interpret that as "no zod/joi/ajv". Using the standard library for HTTP is safest. Using node:test for tests avoids mocha/jest deps. TypeScript as devDependency is fine (it's a build tool, not a runtime dep).
+- NDJSON consumption: POST /ingest or a stream endpoint? The user says "consumes newline-delimited request metrics" — probably an ingest endpoint (POST /ingest) that accepts an NDJSON body stream and processes it incrementally (line by line, bounded buffer). Incremental parsing: read the stream, split on \n, keep a bounded leftover buffer; enforce a max line length to bound memory.
+- Validation: hand-rolled validator with strict TypeScript types. Record shape proposal:
+  ```json
+  {"runId":"run-1","model":"resnet-50","fixture":"imagenet","latencyMs":12.3,"status":"ok"}
+  ```
+  Required fields: runId (string, non-empty, max length), model (string, non-empty, max length), fixture (string, non-empty, max length), latencyMs (number, finite, >= 0, max value). status probably optional.
+- Aggregation: group by model+fixture. But memory bounds: cap on number of distinct (model,fixture) keys; per key keep running sum, sum of squares, count, and for median need all values — median requires storing values or using a data structure. Bounded memory: either a fixed-size ring buffer per group (e.g., last N values) for median, or store all values up to a cap. Simpler: keep an array of values per group but cap the total records in memory (e.g., 100k); once the cap is reached, stop storing new values in the median pool but keep count/sum for mean/stddev? That changes semantics. Alternative: store a bounded reservoir: keep up to MAX_SAMPLE_PER_GROUP values per group, sample with uniform random discard (reservoir sampling) for median estimation. This is a legitimate approach: use all values for exact mean and sample stddev (via running sum and sum of squares — but sum of squares can overflow / lose precision; use Kahan compensated summation for mean; sample stddev via running algorithm — Welford's is more stable. Welford gives running mean and M2; stddev = sqrt(M2/(n-1)). Median: use a reservoir sample of size K per group. Document that median is exact until reservoir is full, then approximate via sampling. This gives exact mean/stddev with bounded memory and documented median approximation. Good design to discuss in the operations guide.
+
+Actually, even simpler and more defensible: bounded ring buffer of the most recent N values per group for median; mean/stddev exact via Welford. Either works. Reservoir sampling is more statistically sound for medians. I'll go with reservoir sampling with deterministic-ish random, document it.
+
+Also cap number of groups (maxGroups), cap on total records in flight, etc. Per-run endpoint /runs/:id — aggregate per run? Group by model and fixture within a run? Records have runId. /summary returns global aggregates across all models/fixtures. /runs/:id returns aggregates for that run (group by model+fixture within the run). Bounded: cap on number of runs, cap on number of groups per run.
+
+Malformed input errors:
+- Invalid JSON line → 400 with error detail (line number, reason), or continue? Design decision: ingest endpoint processes the whole body; if a line is invalid, report the error. Options: fail-fast with 400 and reject the whole batch, or accept valid lines and report rejected ones. Do this: validate each line; collect errors up to a cap; if there are errors, respond 400 with the first N errors and line numbers, and reject the whole request (atomic batch) — simpler and safer. Or partial accept. Let's do fail-fast: return 400 as soon as the first invalid line is found, and don't commit anything from this request. This is clean semantics: an atomic batch. Actually, even for a large stream, fail-fast with a 400 after a mid-stream error is fine; we just stop reading. Implement atomic batches with fail-fast and report line number (1-indexed within the body) and field-level reason.
+
+Also, enforce max body size → 413. Max line length → 400/413.
+
+Incremental parsing: implement a LineDecoder class that consumes string chunks and yields lines; enforces maxLineBytes, and errors on leftover over cap.
+
+Strict types: use exactOptionalPropertyTypes, noUncheckedIndexedAccess, strict null checks, etc. Define MetricRecord type, ValidationResult type, Aggregator, etc.
+
+Endpoints:
+- GET /health → 200 {status:"ok", uptime, counts, memory limits, version}
+- POST /ingest → NDJSON body; atomic; 200 {accepted: n} or 400 errors / 413.
+- GET /summary → overall aggregates grouped by model+fixture (with run count etc.)
+- GET /runs/:id → aggregates for a single run: group by model+fixture; 404 if unknown run.
+
+Metrics computed: count, mean, median, sampleStddev (n-1 denominator, n=1 → null or 0? Sample stddev undefined for n=1; return null). mean: sum/n via Welford mean.
+
+Welford per group. Reservoir sample size per group for median (e.g., 512, configurable).
+
+Bounded memory:
+- MAX_GROUPS (distinct model|fixture keys) — reject the record with error if the key is unknown (malformed? more like capacity error) → 400 error type 'capacity'.
+- MAX_RUNS
+- MAX_LINE_BYTES, MAX_BODY_BYTES
+- Reservoir sample size per group is fixed K.
+- Cap on number of error details collected (but fail-fast so 1-5 items).
+
+Unit tests via node:test:
+- Line decoder: chunking, max length, no false positives on \r\n? Define: lines are separated by \n; trailing \r is stripped (CRLF support).
+- Validator: valid, missing fields, wrong types, non-finite numbers, negative, over-max, NaN, null, non-object, empty string, string field over max, boolean as number, extra fields → reject? Decision: allow unknown fields or reject. Strict validation: reject unknown fields (catch typos). Reject unknown fields — "strict". Hmm, might be annoying, but this is our own pipeline; strict is the requirement. Document that unknown fields are rejected.
+- Aggregator: Welford mean/stddev correctness against a known dataset (compare to hand-computed), median with a known set, median approximation with reservoir when it overflows (just check it's in range, or that count exceeds reservoir), bounded group count behavior, run isolation.
+- HTTP: use a real server on an ephemeral port; test /health 200, ingest valid, ingest invalid (400 with line info), over max body (413), summary shape, runs/:id 200/404.
+- Test that summary numbers match expected hand-computed values.
+
+package.json: type: module? TypeScript 5, NodeNext module. Compile with tsc to dist. scripts: build, start, test, maybe typecheck. DevDependencies: typescript@^5.4, @types/node@^20. Engines node >= 20 (node:test available since 18, no experimental warning since 20? node:test is stable in 20+? Test runner became stable around 20/22. Use engines >= 20 and use node:test.)
+
+tsconfig: strict true, exactOptionalPropertyTypes true, noUncheckedIndexedAccess true, module NodeNext, target ES2022, outDir dist, declaration maybe, lib ES2022, skipLibCheck, forceConsistentCasing, noImplicitOverride, etc. Test files under src/**/*.test.ts? For node:test running on compiled JS: test script is `node --test dist/` which runs compiled .test.js files. Build then test: `npm test` = `npm run build && node --test dist/`. Good.
+
+Directory layout:
+```
+package.json
+tsconfig.json
+README.md (operations guide)
+src/
+  config.ts (limits, env parse with validation)
+  lineDecoder.ts
+  validator.ts
+  stats.ts (Welford + reservoir)
+  aggregator.ts (groups, runs, capacity)
+  http.ts or server.ts (http server, routing)
+  app.ts (wires things: createApp(config) -> http.Server)
+  index.ts (bootstrap, listens on PORT)
+  errors.ts
+  types.ts
+Tests:
+  src/lineDecoder.test.ts
+  src/validator.test.ts
+  src/stats.test.ts
+  src/aggregator.test.ts
+  src/server.test.ts
+```
+
+I'll write all the code carefully with strict typing. Watch out for noUncheckedIndexedAccess issues (array index returns T|undefined). Use `.at()` or non-null assertions carefully... `!` is fine even in strict mode. But better: write code that avoids unguarded indexed access, or use explicit guards. Use `.at(i)` and guard. 
+
+Now let me design the record:
+
+```ts
+export interface MetricRecord {
+  runId: string;
+  model: string;
+  fixture: string;
+  latencyMs: number;
+  status?: 'ok' | 'error'; // optional; default 'ok'
+}
+```
+
+Validation function returns `ValidatedRecord` or a `ValidationError` with path info.
+
+Line decoder:
+
+```ts
+export interface LineDecoderOptions { maxLineBytes: number; }
+export class LineDecoder {
+  private buffer: string; // partial line
+  // feed(chunk: string): string[] — returns complete lines
+  // end(): string | undefined — flush the final partial line (if not empty after trim)
+}
+```
+Caveat: bytes vs chars — enforce maxLineBytes on the buffer length; JS strings are UTF-16. Compute byte length via Buffer.byteLength? To keep the decoder stream-pure, we could count code units, but bytes are more accurate for memory. Enforce via Buffer.byteLength on the accumulated partial line; this requires a Buffer per feed — that's fine.
+
+In practice: partial buffer + new line; if Buffer.byteLength(line) > max → throw LineTooLong. Track length of partial: after adding a chunk, if Buffer.byteLength(partial) > maxLineBytes → error. Do this check in feed on the partial segment before splitting: simplest is to compute byte length of partial+chunk and if it exceeds max and there's no newline... hmm, a chunk could contain newlines; the real bound is per-line. Implementation: accumulate into partial; scan chunk; keep building lines; whenever we append to a currently incomplete line, check its byte length (incremental: track current line's byteLength with Buffer.byteLength on the appended slice). Keep a `partialBytes` counter that updates per appended slice with Buffer.byteLength(slice). If it exceeds maxLineBytes → throw. This is O(chunk) and bounds memory.
+
+Edge: a chunk of binary garbage that is non-UTF8 → invalid as JSON line; the JSON parse will fail with a nice error. But we can also early detect invalid UTF-8 via TextDecoder with fatal: true in the ingest pipeline: decode chunk with TextDecoder(stream: true, fatal: true) → throw on invalid bytes → 400 "invalid UTF-8". Good.
+
+Validator specifics:
+- Parse JSON; must be an object (not null, not array).
+- Check unknown keys against an allow-list {runId, model, fixture, latencyMs, status} → error listing offending key.
+- runId: string, length 1..128, maybe pattern? Keep: non-empty after trim? Just length check (no trim; strict). Max 128.
+- model: string 1..128
+- fixture: string 1..128
+- latencyMs: number, finite, 0 <= x <= 1e9 (maxLatencyMs). Must not be NaN/Infinity. JSON can't literally encode NaN/Infinity, but JS numbers can arrive via parse? JSON.parse doesn't produce NaN/Infinity from valid JSON; but a validator with typed input handles it anyway.
+- status: optional; if present must be 'ok' | 'error'.
+Return a discriminated union: `type ValidationResult = { ok: true; record: MetricRecord } | { ok: false; error: FieldError[] }` — collect all field errors per line (not just the first) for a better DX; the ingest is atomic-fail so report all errors in that line, or first N lines? Fail-fast on first invalid line but report all field errors for that line. Good.
+
+Stats:
+```ts
+export class WelfordAccumulator {
+  n = 0; mean = 0; m2 = 0;
+  add(x: number): void
+  get count
+  get mean
+  get sampleStddev(): number | null // n < 2 ? null : sqrt(m2/(n-1))
+  get min/max maybe (nice for summary) — add min/max, cheap and useful.
+}
+export class ReservoirSample {
+  private items: number[]; private n = 0; private readonly capacity; private readonly rng: () => number;
+  add(x)
+  snapshot(): number[] // copy
+  get isApproximate(): boolean
+}
+export interface GroupStats { count, mean, median, medianApproximate, sampleStddev, min, max }
+```
+Median: sort the snapshot; even/odd. Deterministic testability: allow injecting an rng.
+
+Group stats composition:
+```ts
+export class GroupAggregator {
+  private w: WelfordAccumulator; private reservoir: ReservoirSample; key...
+  add(record)
+  stats(): GroupStats
+}
+```
+
+Aggregator (service state):
+```ts
+export interface AggregatorLimits { maxGroups; maxRuns; maxGroupRecords; maxLineBytes; maxBodyBytes; reservoirSize; maxModelLen; ... }
+export class MetricsAggregator {
+  addRecord(rec: MetricRecord): void // throws CapacityError
+  summary(): SummaryResult // groups across all runs, sorted by key, plus totals
+  run(runId): RunResult | undefined
+  metrics(): for /health { totalRecords, groupCount, runCount, capacity }
+}
+```
+Global groups keyed by `${model}\u0000${fixture}`; runs map runId → { groups: Map, records: number }. Capacity: maxGroups global; per-run max groups can just be same maxGroups (bounded anyway). Reject a record if the run exists and it exceeds per-run maxGroups? A new run is OK until maxRuns. If the run exists and a new model|fixture in that run would exceed maxGroups (per-run cap) → capacity error. Similarly global cap.
+
+Errors: define classes: HttpError with status, code, message; ValidationErrors; CapacityError(409? or 400). Capacity → 409 Conflict or 507 Insufficient Storage. Use 409 with code 'capacity-exceeded' and a detail like 'maxGroups'. Malformed → 400. Body too large → 413.
+
+Server:
+- http.createServer; route with URL parse. Methods: GET /health, GET /summary, GET /runs/:id, POST /ingest. Else 404 {error:{code:'not-found'}}. Also 405 for wrong method on a known path.
+- Ingest: read req stream; TextDecoder fatal; LineDecoder; enforce total body bytes ≤ maxBodyBytes (count bytes read; exceed → 413, abort). For each line: skip if empty after trim? Empty lines: strictly — treat empty/whitespace-only lines as... hmm. NDJSON documents sometimes have trailing newline; a trailing empty line after the final \n is not a record. My LineDecoder only emits a line if it's non-empty after... Standard: splitting "a\nb\n" gives ["a","b",""] — the trailing empty isn't a record. Whitespace-only lines in the middle → treat as invalid (strict) or skip? Strict: skip whitespace-only lines? Strictness is requested for the data; trailing newlines are a must not error. Definition: empty/whitespace-only lines are skipped (documented), but count the line numbers. Hmm, "malformed-input errors" — I think whitespace skip is friendly and documented. Actually, let's do this: skip empty lines, but that's lenient... Let's do: lines where trim() === '' are skipped. Document in README. Or strict reject. The requirements emphasize validation and malformed errors; either is defensible. To be strict and avoid a whole file being rejected by a stray blank, skip and count them? No — atomic; if we skip, we're doing partial acceptance within a file, which contradicts "atomic batch"? No: skipping blank lines is normalization; a file with only blank lines has 0 records — that's fine. I'll skip blank lines and report skipped count in the response. Fine.
+- Atomic: first validate all lines (decoding & validation), and if any error → 400 {errors:[{line, fields}]...} no commit. Then addRecord each record (capacity check could fail mid-way → also need to commit-or-not: run addRecord in a "dry-run" pass? Simpler: validate → capacity pre-check: for each record check if the group/run is known or fits in the cap without mutating; then commit. Implement a `tryPlan(records): {ok, error?}` and `commit(records)`. Or even simpler: mutate on addRecord but on capacity error just respond 409

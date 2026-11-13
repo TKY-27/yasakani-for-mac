@@ -1,0 +1,242 @@
+User wants a complete TypeScript 5 service like this:
+
+1. Consumes newline-delimited request metrics (NDJSON format)
+2. Validates without third-party schema libraries (i.e., no Joi, no Zod) — manual validation
+3. Groups records by model and fixture
+4. Computes mean, median, and sample standard deviation
+5. Exposes /health, /summary, /runs/:id endpoints
+6. Strict types
+7. Incremental parsing (stream processing)
+8. Memory limit (bounded memory — e.g., fixed-capacity ring buffer, or only aggregates rather than raw records)
+9. Malformed-input errors
+10. Unit tests
+11. package.json
+12. tsconfig.json
+13. A short operational guide
+14. No placeholders
+
+Think about the architecture:
+
+**Data model:**
+- Each NDJSON line is a "request metrics record":
+  - `runId` (string, non-empty, maybe with a pattern)
+  - `model` (string)
+  - `fixture` (string)
+  - `latencyMs` (number, positive)
+  - `timestamp` (ISO 8601, optional or required)
+  - Maybe `status` (number, HTTP status)
+  - `tokensIn`, `tokensOut` too?
+
+Keep it focused: runId, model, fixture, latencyMs, and optional `error` boolean or `status`. Define the schema:
+
+```json
+{
+  "runId": "run-001",
+  "model": "gpt-x",
+  "fixture": "chat-basic",
+  "latencyMs": 342.5,
+  "timestamp": "2024-01-01T12:00:00Z",
+  "status": 200
+}
+```
+
+Validation rules:
+- Must be a JSON object, not an array, not null
+- runId: string, length 1..128, match pattern (alphanumeric, dashes, dots, underscores, colons)
+- model: string 1..128
+- fixture: string 1..128
+- latencyMs: finite number, 0 < latencyMs <= 3_600_000 (1 hour)
+- timestamp: optional ISO 8601 string, verified with Date parsing
+- status: optional integer 100..599
+- Prohibit unknown keys? Maybe record them. Better: reject unknown keys to catch typos — strict validation is good. Or just ignore. Reject unknown keys and surface which keys are unknown — that's good for malformed-input errors.
+
+**Bounded memory:**
+- Don't store all records. Keep only aggregate stats per (model, fixture) group: count, sum, sum of squares (or Welford's online algorithm for numerically stable mean/std), min, max, and a bounded reservoir or sorted structure for the median.
+- Median in a streaming fashion: two heaps (max-heap for lower half, min-heap for upper half) — a classic approach, bounded by the count in each group… wait, heaps grow unboundedly. To keep memory bounded, use a reservoir-sample-based approximate median, or a fixed-size quantile sketch.
+
+Options:
+1. Exact median with two heaps: memory is O(N) per group → unbounded. Violates "bounded memory."
+2. Bounded median estimation: e.g., keep a bounded random sample (reservoir sampling, fixed capacity like 512 per group), compute median from the sample. Memory strictly bounded. Document that median is an estimate on a bounded sample.
+
+The user said "bounded memory" and "compute mean/median/sample standard deviation." Implement:
+- Welford's online algorithm for mean & sample variance — O(1) per group.
+- Bounded reservoir sample per group (capacity, say, default 1024), compute median from the sample, documented as an estimate once the sample saturates. Actually, to make the median exact up to the cap and an estimate beyond that, the reservoir sample contains the first `capacity` records until full, then random replacement — median computed over the reservoir. That's a principled, bounded approach.
+
+Also track count, min, max, errorCount (status >= 400).
+
+Additionally, to bound the number of groups: cap the number of distinct (model, fixture) groups; when exceeded, evict the group with the oldest lastSeen or smallest count (simple: evict the group that was least recently updated — need an order. Simpler: keep a Map and on overflow, evict the group with the lowest count, tiebreak by least-recently-seen — but that requires a scan; group counts are in the thousands, no problem. Or LRU-like: evict the group with the lowest count among… simpler: keep `firstSeenAt` and evict the oldest first-seen — but need a scan. For a bounded service, a cap of like 10_000 groups and a linear scan on overflow is fine. Evict least-count then oldest-firstSeen. Actually, to keep it deterministic and simple, evict the group with the smallest (count, lastSeen) via a scan. Fine.
+
+Also bound the total number of groups per run? The spec says group by model and fixture. Runs: runId → groups within the run? "Groups records by model and fixture" — grouping is by (model, fixture). But /runs/:id suggests runs. So the structure is: run → groups (model×fixture). Per-run group cap: e.g., 2048 groups per run, cap on the total number of runs: e.g., 512 runs, evict LRU. This gives strict bounds:
+
+- maxRuns: 512 → evict the run with the oldest lastSeen (LRU).
+- maxGroupsPerRun: 2048 → evict the group with the smallest count (tie: least recent lastSeen).
+- Reservoir capacity per group: 1024 (bounded doubles array).
+
+Memory is bounded regardless of input volume.
+
+**Incremental parsing:**
+Read the input stream line by line. Input sources:
+- Files (watched / ingested via CLI, or)
+- HTTP POST /ingest that accepts a chunked NDJSON body.
+
+To make it complete and runnable, support both:
+- `POST /ingest` — HTTP body is NDJSON (chunked, streamed, parsed incrementally per line).
+- CLI mode: `tsx src/cli.ts ingest --file metrics.ndjson` or pipe from stdin.
+
+Incremental line parsing: a LineSplitter that buffers bytes, emits complete lines, and enforces a max line length (e.g., 64 KiB); excess → error.
+
+**Endpoints:**
+- GET /health → { status: "ok", uptime, stats: { runs, groups, recordsIn, errors, memoryBytes } }
+- GET /summary → aggregate across all runs: totals + per (model, fixture) group list (across runs) sorted by count desc, with mean/median/stddev. Include bounds info and warnings (groups evicted, runs evicted).
+- GET /runs/:id → details of a single run: record count, per-group stats, timestamp. 404 if unknown.
+
+Maybe also GET /runs → list of run IDs (handy, but optional; include for ops convenience). The user specifically asked for three endpoints; adding a run-listing is fine, but should stay focused — I'll include it since it's useful for operations and small. Actually, "expose /health, /summary, and /runs/:id endpoints" — implement those three and /ingest (needed for consumption over HTTP). And maybe /runs for discoverability. Keep it minimal but /runs helps. Include it.
+
+**Framework:**
+To keep dependencies minimal, use Node's built-in `node:http` — zero runtime dependencies. Dev dependencies: typescript, @types/node, vitest or node:test. Node 18+ has a built-in `node:test` runner — using that avoids dev deps beyond typescript/@types/node. But vitest is popular. To keep package.json light and complete: devDependencies: typescript, @types/node. Use `node --test` with `tsx`? tsx is another dev dep. Alternative: compile with tsc then run `node --test dist/test/**/*.test.js`. That works: tsc compiles tests too. `node:test` + `assert` — zero runtime deps, zero test deps.
+
+But "TypeScript 5 service" — Node version: target ES2022, module Node16/NodeNext. Set "type": "module" and module NodeNext. node:test works fine with ESM.
+
+Actually, for simpler test execution: `npm test` → `tsc -p tsconfig.json && node --test dist/test/`. Does `node --test dist/test` recursively scan a directory? `node --test` scans files matching test patterns; passing a directory argument, it scans recursively (Node 18: `node --test <dir>` runs test files in the dir; I think recursive since Node 18.13? To be safe, pass a glob or the directory. Node 20+ definitely recursively scans directories for test files. Document engine as node >= 20.)
+
+Engine: `"engines": { "node": ">=20" }`.
+
+**Validation module (no third-party schema library):**
+Write a small typed validator: `validateMetricsRecord(value: unknown): Result<MetricsRecord>` with a `ValidationIssue` list. Rules as above. Also `parseRecord(line: string)`.
+
+Error handling: malformed lines produce structured errors. In /ingest, HTTP response: return summary: `202`? Or `200` with `{ accepted: n, rejected: m, errors: [first k errors] }`? Since lines are streamed and processed incrementally, the response completes when the body is done. Return 200 with an acceptance summary, 400 if all lines failed? Better: 200 with counts + up to 10 sample errors; if nonempty, `error` field. Malformed input errors are exposed as JSON, not by crashing. Also enforce a max body size (bounded) — reject with 413 on exceed, stop reading.
+
+**Streaming ingest core:**
+`MetricsIngestor` class:
+- `feed(chunk: Buffer): IngestResult` — incremental; buffers partial lines internally; bounded line buffer (throws / returns error on > MAX_LINE_BYTES).
+- `finish(): IngestResult` — flush remaining partial line (if not empty, treat as a final line without newline? NDJSON convention: a trailing incomplete line is still processed — process it, count it; or error. A file ending without a newline is common → process the final incomplete line).
+- Each complete line: trim; skip empty lines (count skippedBlanks); parse JSON (with size limit); validate; if ok → update aggregates + reservoir; if bad → increment rejected, store sample errors (bounded, e.g., keep first 10 + latest?). Keep the last 10 errors (ring).
+
+**Statistics:**
+`GroupStats` with Welford:
+- n, mean, M2, min, max
+- sampleStd = sqrt(M2/(n-1)) if n>=2, else 0? null? Use null when n<2. Use `number | null`.
+- medianFromSample: compute on a sorted copy of the reservoir sample (copy to avoid mutation).
+- errorCount when status>=400 or `error: true`? Keep `status` optional; errorCount = count(status != null && status >= 400).
+
+Reservoir sampling: classic Algorithm R with a shared RNG? Use `Math.random`? A seedable deterministic RNG (mulberry32) is better for tests. Inject an rng function (default mulberry32(seed)).
+
+**Group/run structure:**
+
+```ts
+interface RunEntry {
+  id: string;
+  firstSeenAt: number; // epoch ms
+  lastSeenAt: number;
+  records: number;
+  rejected: number;
+  groups: Map<GroupKey, GroupStats>; // key = `${model}\u0000${fixture}`
+  groupsEvicted: number;
+}
+
+interface Registry {
+  runs: Map<string, RunEntry>; // insertion order; evict LRU by lastSeenAt
+  runsEvicted: number;
+}
+```
+
+Key separator: since model/fixture strings are restricted to the pattern `^[A-Za-z0-9._:-]{1,128}$`, they can't contain `\u0000`, so the key is safe.
+
+**HTTP server:**
+`createServer({ port, host, limits })` with a router:
+- GET /health
+- GET /summary
+- GET /runs
+- GET /runs/:id
+- POST /ingest (maybe also PUT? just POST)
+- 404 otherwise; 405 for unknown method on a known path (e.g., GET /ingest → 405).
+
+Body reading: collect chunks, pass to ingestor.feed; enforce maxBytes (limit, say, 8 MiB). Respond with a JSON summary. Content-Type check? Lenient — accept anything, parse lines. Fine.
+
+**CLI:**
+`src/cli.ts` command `serve` (default) and `ingest --file <path> | stdin`, output a summary via `printSummary` to stdout. Use fs read stream to keep memory bounded (chunk size 64KiB).
+
+CLI parsing: a small hand-rolled parser (no third-party). Commands:
+- `npm start` → serve
+- `node dist/src/cli.js ingest --file metrics.ndjson [--pretty]`
+- `node dist/src/cli.js ingest` (stdin)
+- `node dist/src/cli.js validate --file x` → validation only, report issues? Nice to have; ingest does the validation anyway; skip to reduce scope. Actually, a `validate` subcommand is useful for ops: report counts and issues without touching the registry. Cheap to add: use the ingestor with `dryRun`? Just reuse the ingestor — but that mutates the registry; in CLI ingest, print the summary at the end; same path. So skip a separate validate; ingest prints a summary including errors. OK.
+
+**Unit tests** (`src/test/`):
+- validation.test.ts: valid record, missing fields, wrong types, unknown keys, huge latency, NaN, empty string, bad pattern, bad timestamp, bad status, non-object JSON (array, string, number, null), unknown-key reporting.
+- ingestor.test.ts:
+  - incremental split across chunks (line split mid-byte)
+  - line-size-limit error
+  - blank-line skipping
+  - malformed line → rejected, subsequent good lines still processed
+  - final incomplete line without trailing newline
+  - reservoir bounded: feed capacity*3 records, sample length == capacity
+  - eviction: create runs > limit → evict; group cap eviction
+  - stats correctness: for a known dataset compare mean/median/std against manual computation (use a fixed seed rng; for small n where the reservoir is not saturated, median is exact… simpler: set the limit larger so the reservoir doesn't fill, use deterministic data to test exact median/std; another test with a saturated reservoir to verify the sample bound and that the median lies within the min/max range).
+- server.test.ts: use http.request against an ephemeral port (server.listen(0)):
+  - /health returns 200 ok
+  - /summary shape and empty state
+  - POST /ingest then GET /runs/:id and /summary reflect groups
+  - unknown run → 404
+  - POST /ingest with bad lines → 200 with errors array and rejected count
+  - over-size body → 413
+  - /health memory is a number
+
+Test helpers: create the server with the default factory, listen on port 0, make requests with `fetch` (Node 20 has global fetch). Cleanup with afterEach.
+
+**package.json:**
+```json
+{
+  "name": "metrics-ndjson-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/server.js --port 8080",
+    "serve": "npm run build && npm start",
+    "ingest": "node dist/src/cli.js ingest",
+    "test": "tsc -p tsconfig.json && node --test dist/src/test/",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^20.14.0"
+  }
+}
+```
+
+Wait — if I compile everything into dist/src/… set outDir to dist, rootDir to "." or "src"? If rootDir is "src", outDir is dist, then output is dist/server.js and tests at dist/test. Cleaner: rootDir "src", outDir "dist". Scripts reference dist/server.js etc.
+
+Test file naming: `*.test.ts`. Node --test against the dist/test directory: Node 20 recursively finds files matching test patterns (`*.test.js`). Good.
+
+**tsconfig.json:**
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "verbatimModuleSyntax": true,
+    "declaration": true,
+    "sourceMap": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts"]
+}
+```
+
+With `module: NodeNext` + ESM ("type": "module"), relative imports need to end in `.js`. Need to be consistent: `import { foo } from "./foo.js"`. With `verbatimModuleSyntax`, type imports must use `import type`. Be careful to write imports accordingly.
+
+`exactOptionalPropertyTypes`

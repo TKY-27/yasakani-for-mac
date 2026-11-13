@@ -1,0 +1,161 @@
+We need answer in Chinese. User asks: translate complete English document into accurate natural Simplified Chinese, preserve six section titles and all technical boundaries. After translation attach at least 20 English-Chinese glossary. Need produce final only. Need think. Need ensure section titles preserved? "保留六个章节标题" likely keep six section titles in original English? It says 将下面完整英文文档翻译成准确、自然的简体中文，保留六个章节标题和所有技术边界。 Could mean retain the six chapter titles (probably as Section One — Ownership etc? Or translate titles? "保留" likely keep the titles unchanged? It says translate complete English document into Chinese, preserve six chapter titles and all technical boundaries. Maybe the six chapter titles are "Section One — Ownership" etc and should be retained (not translated?) But also translate document? It says 翻译成简体中文, 保留六个章节标题 and all technical boundaries. In translation tasks, "保留章节标题" could mean keep the section headings as original English, or maintain the six section headings in the translation (i.e., don't omit). Need infer. They likely want translated document but keep six section titles (maybe original English titles) and technical boundaries. The phrase "保留六个章节标题和所有技术边界" could mean preserve six section headings and all technical boundary terms. Since it says translate complete English document into accurate natural Simplified Chinese, maybe the section titles should be translated too but the six section structure preserved. However "保留...标题" could mean keep titles as they are, because they are technical labels? Let's examine. English doc: Section One — Ownership, Measurement, Reproducibility, Long Context, Speculation, Reporting. User asks in Chinese: 保留六个章节标题和所有技术边界. They may be testing if model keeps section titles and technical boundaries. I should output translation with headings maybe bilingual: "Section One — Ownership" and Chinese? To be safe, preserve original English section titles exactly, then provide Chinese content. But they ask translate complete English document into Chinese; if I leave headings English, maybe acceptable due to preserve. Could include Chinese title after? Maybe: Section One — Ownership（所有权）? But that may alter. Better: keep six section titles exactly as original: Section One — Ownership, etc. Then Chinese translation under each. Or translate title but preserve six sections? Hmm.
+
+"保留六个章节标题和所有技术边界" likely means in translation, don't merge or omit the six chapter headings; keep the headings (maybe translated? Since translating document includes headings). "保留" could mean keep as is? The phrase "所有技术边界" probably refers to boundaries like prefill/decode, first generated token belongs to prefill, remaining to decode; token counts same boundary; maximum cache capacity vs maximum-length prompt; internal timer vs client-observed latency. Need translate accurately and naturally.
+
+Need attach at least twenty item English-Chinese glossary. Need list at least 20 terms. Could be bullet list. Need include terms from text: inference service, mutable frontier, owner, mathematical operations, kernels, silently advance request state, separation, successful rounds, rejected speculative drafts, cancellation, prefix restoration, complete transitions, loading time, prompt preparation, prefill, decode, network transport, benchmark, interval, reported rate, first generated token, remaining generated tokens, token counts, reproducibility, inputs frozen, official run, request body, resolved sampling parameters, model identity, context capacity, cache format, raw timing fields, warm-up requests, labeled and excluded, measured repetitions, long context, maximum cache capacity, maximum-length prompt, 262,144-token allocation, actual prepared prompt, visible context, memory plan, speculation, draft acceptance, workload dependent, local predictability, accepted-draft percentage, output tokens per round, throughput, user-visible result, acceptance statistics, reporting, complete configuration, repeated measurements, variation, material limitations, valid slow run, internal timer, client-observed latency, clear boundaries. Need at least 20. Could include 30. Need English-Chinese glossary. Ensure accurate.
+
+Potential final structure:
+Section One — Ownership
+一个可靠的推理服务会为每个可变前沿指定唯一所有者。程序可以将数学运算委托给内核，但内核不会悄悄地推进请求状态。这种分离使成功轮次、被拒绝的推测草稿、取消以及前缀恢复都可作为完整状态转换来观察。
+
+Need check terminology. "mutable frontier" in inference service? It might refer to mutable frontier? Could translate "可变边界/前沿". Technical boundary maybe "mutable frontier" as state frontier? In speculative decoding? "frontier" could be "前沿" or "边界". User says technical boundaries, maybe keep "frontier"? Let's think. A reliable inference service gives every mutable frontier a single owner. In programming/systems, "frontier" might be active request frontier? Could be "可变前沿". To preserve technical boundary, maybe use "可变前沿". "owner" = 所有者. "kernels" = 内核 (compute kernels? Could be kernel functions). "request state" = 请求状态. "rejected speculative drafts" = 被拒绝的推测草稿. "prefix restoration" = 前缀恢复. "complete transitions" = 完整状态转换 / 完整转换. Need natural.
+
+Section Two — Measurement. "Loading time, prompt preparation, prefill, decode, and network transport answer different questions." 加载时间、提示准备、预填充、解码和网络传输分别回答不同问题。 A benchmark should name the interval behind every reported rate. 基准测试应明确每个报告速率对应的测量区间。 The first generated token belongs to prefill in this engine, while the remaining generated tokens belong to decode, so the token counts must follow the same boundary. 在本引擎中，首个生成 token 属于 prefill，其余生成 token 属于 decode，因此 token 计数必须遵循同一边界。 Should we keep prefill/decode in English? Technical boundary likely keep terms. Maybe use "prefill（预填充）/decode（解码）"? But need preserve boundaries. In Chinese LLM context, prefill/decode often used. Could translate but keep English in parentheses? User asks accurate natural Chinese. I can use "预填充（prefill）" and "解码（decode）" but technical boundary maybe retain English? The instruction "保留...所有技术边界" not necessarily preserve terms. I can keep technical terms in English where unambiguous: prefill, decode, kernel? But translation into Chinese should not leave many English. However technical terms can remain. Maybe use Chinese equivalents plus English in first occurrence? Since glossary after, maybe translation can use English technical terms? The instruction "保留六个章节标题和所有技术边界" likely from benchmark where they want maintain exact technical boundaries, not necessarily English terms. I'd use Chinese but keep prefill/decode as English? Hmm.
+
+Need final translation maybe with headings bilingual? Let's decide.
+
+Option A: Keep English headings exactly, Chinese text uses English for key technical terms where boundary matters: "prefill" and "decode". This preserves technical boundaries. But user asked translate complete English document into Chinese; headings English may violate? But "保留六个章节标题" strongly supports English headings. Could be: 
+Section One — Ownership
+一个可靠的推理服务为每个可变前沿指定单一所有者...
+
+Section Two — Measurement
+... 在本引擎中，首个生成 token 属于 prefill，其余生成 token 属于 decode，因此 token 计数必须遵循同一边界。
+
+This seems okay.
+
+But if they expect translated headings, could mark: Section One — Ownership（所有权）? That preserves title plus translation. However "保留六个章节标题" maybe not "translate". To be safe, keep original English headings exactly and optionally add Chinese in parentheses? If I add Chinese, not preserving exactly? Could be okay but "保留" maybe exact. The final should be translation; maybe headings in Chinese but with Section numbers? Let's parse: "将下面完整英文文档翻译成准确、自然的简体中文，保留六个章节标题和所有技术边界。译文之后附上至少二十项英中术语表。" It doesn't say "保留英文章节标题" but "保留六个章节标题" could mean in translated document, keep the six section headings (as headings). In Chinese translation, you would translate headings: "第一节——所有权" etc. But then are they "保留"? They remain six chapter titles. But if they wanted original, they'd say "保留英文章节标题". Hmm.
+
+Maybe better: use bilingual headings: "Section One — Ownership（第一节——所有权）"? That preserves original and translates. But might be clutter. The request: translate complete English document into Simplified Chinese, preserve six chapter titles and all technical boundaries. It might be a constraint for a translation evaluation: The section titles are technical labels that should be retained (maybe not translated). The phrase "所有技术边界" suggests they care about not altering boundary statements. I'd output:
+
+Section One — Ownership
+... Chinese ...
+
+This is a translation with English section titles retained. That likely satisfies.
+
+Need at least twenty glossary items. Could include 30. Ensure items are English-Chinese. Format:
+1. inference service — 推理服务
+...
+Need count at least 20. Use numbered list. Need include all? At least 20. Let's list 35 to be safe. Need not too much. Ensure term exact from text. Use em dash? Fine.
+
+Potential glossary:
+1. inference service — 推理服务
+2. mutable frontier — 可变前沿
+3. single owner — 单一所有者
+4. mathematical operations — 数学运算
+5. kernels — 内核
+6. request state — 请求状态
+7. separation — 分离 / 解耦
+8. successful rounds — 成功轮次
+9. rejected speculative drafts — 被拒绝的推测草稿
+10. cancellation — 取消
+11. prefix restoration — 前缀恢复
+12. complete transitions — 完整状态转换
+13. loading time — 加载时间
+14. prompt preparation — 提示准备 / 提示词准备
+15. prefill — 预填充
+16. decode — 解码
+17. network transport — 网络传输
+18. benchmark — 基准测试
+19. interval — 时间区间 / 测量区间
+20. reported rate — 报告的速率
+21. first generated token — 首个生成 token
+22. remaining generated tokens — 其余生成 token
+23. token counts — token 计数
+24. reproducibility — 可复现性
+25. inputs are frozen — 输入被冻结
+26. official run — 正式运行
+27. request body — 请求体
+28. resolved sampling parameters — 解析后的采样参数
+29. model identity — 模型标识 / 模型身份
+30. context capacity — 上下文容量
+31. cache format — 缓存格式
+32. raw timing fields — 原始计时字段
+33. warm-up requests — 预热请求
+34. measured repetitions — 被测量的重复样本 / 实测重复
+35. long context — 长上下文
+36. maximum cache capacity — 最大缓存容量
+37. maximum-length prompt — 最大长度提示
+38. 262,144-token allocation — 262,144 token 的分配量
+39. actual prepared prompt — 实际准备好的提示
+40. visible context — 可见上下文
+41. memory plan — 内存计划 / 内存规划
+42. speculation — 推测
+43. draft acceptance — 草稿接受
+44. workload dependent — 取决于工作负载
+45. local predictability — 局部可预测性
+46. accepted-draft percentage — 草稿接受百分比
+47. output tokens per round — 每轮输出 token 数
+48. throughput — 吞吐量
+49. user-visible result — 用户可见结果
+50. acceptance statistics — 接受统计
+51. complete configuration — 完整配置
+52. repeated measurements — 重复测量
+53. variation — 波动 / 方差 (variance?)
+54. material limitations — 实质性局限
+55. valid slow run — 有效慢速运行
+56. internal timer — 内部计时器
+57. client-observed latency — 客户端观测时延
+58. clear boundaries — 清晰边界
+
+Need at least 20; can include 30. Should we include "Section"? maybe not.
+
+Need ensure translation natural. Let's craft final.
+
+Potential translation:
+Section One — Ownership
+一个可靠的推理服务会为每个可变前沿指定单一所有者。程序可以将数学运算委托给内核，但内核不会悄悄推进请求状态。这种分离让成功轮次、被拒绝的推测草稿、取消以及前缀恢复都能被观察为完整状态转换。
+
+Check "give every mutable frontier a single owner" => "为每个可变前沿指定单一所有者". Good.
+"silent advance request state" => "悄悄推进请求状态". Maybe "静默地推进请求状态" more technical. Use "静默推进".
+"observable as complete transitions" => "能够被观察为完整的状态转换". Good.
+
+Section Two — Measurement
+加载时间、提示准备、预填充、解码和网络传输分别回答不同问题。基准测试应说明每个报告速率背后的测量区间。在本引擎中，首个生成 token 属于预填充，其余生成 token 属于解码，因此 token 计数必须遵循同一边界。
+
+Should I keep prefill/decode English? Maybe "prefill（预填充）" and "decode（解码）". To preserve technical boundary, maybe keep original English: "prefill" and "decode". But natural Chinese can use 预填充/解码. However user says all technical boundaries; boundary is first token belongs to prefill, remaining to decode. Using Chinese is okay if clear. But maybe for technical boundary, keep exact terms "prefill" and "decode" in English? In LLM Chinese docs, often mixed. Maybe translation:
+在本引擎中，首个生成 token 属于 prefill，其余生成 token 属于 decode，因此 token 计数必须遵循同一边界。
+This preserves boundary terms exactly. But if all text should be Chinese, mixing is acceptable for technical terms. The glossary can list prefill—预填充. I'd lean keep prefill/decode as English in the critical sentence? It says "准确、自然的简体中文". Using English technical terms can be natural in tech docs. But if they expect Chinese, maybe not. Could do "prefill（预填充）" and "decode（解码）". That's both. Sentence: 在本引擎中，首个生成 token 属于 prefill（预填充），其余生成 token 属于 decode（解码），因此 token 计数必须遵循同一边界。 Slightly verbose but clear. For repeated terms, maybe only first occurrence. But there is no other.
+
+"Loading time, prompt preparation, prefill, decode, and network transport answer different questions." Could translate "加载时间、提示准备、prefill、decode 和网络传输回答的是不同问题。" Use English terms. Hmm.
+
+Need maybe "reported rate" = "上报速率"? In benchmark, "reported rate" means rate being reported. "报告的速率" okay. "name the interval behind every reported rate" = "标明每个被报告速率所对应的时间区间". "the interval behind" = "背后的测量区间". Good.
+
+Section Three — Reproducibility
+官方运行之前，输入被冻结。保留请求体、解析后的采样参数、模型标识、上下文容量、缓存格式以及原始计时字段。预热请求会被标记并排除，而不是混入实测重复样本。
+
+"official run" = 正式运行. "inputs are frozen before the official run" = "正式运行前，输入已冻结". "retained" = "均被保留". Good.
+
+Section Four — Long Context
+分配最大缓存容量并不等于提交最大长度提示。引擎可以保持 262,144 token 的分配，同时测试改变实际准备好的提示。这在不改变各案例之间内存计划的情况下，隔离可见上下文的成本。
+
+"presenting a maximum-length prompt" = "展示/提交最大长度提示". In LLM, "present" maybe "提供". Use "提供最大长度提示". "The engine can keep a 262,144-token allocation while the test varies the actual prepared prompt." = "引擎可以维持 262,144 token 的分配，同时测试变化实际已准备好的提示。" "actual prepared prompt" = "实际准备好的提示". "This isolates the cost of visible context without changing the memory plan between cases." = "这使可见上下文的成本得以单独衡量，同时不改变不同测试用例之间的内存规划。" Good.
+
+Section Five — Speculation
+草稿接受率取决于工作负载。代码、散文、翻译和结构化记录具有不同的局部可预测性，因此草稿接受百分比和每轮输出 token 数都是必要的。吞吐量仍然是用户可见的结果；接受统计用于解释它，而不是替代它。
+
+"Draft acceptance is workload dependent." = "草稿接受率取决于工作负载" or "草稿的接受情况取决于工作负载". "both accepted-draft percentage and output tokens per round are necessary" = "草稿接受百分比和每轮输出 token 数两者都是必要的". Good. "Throughput remains the user-visible result; acceptance statistics explain rather than replace it." = "吞吐量仍是用户可见的结果；接受统计只解释它，而不替代它。" Good.
+
+Section Six — Reporting
+公布完整配置、重复测量、波动以及实质性局限。不要丢弃一次有效但慢速的运行，也不要将内部计时器描述为客户端观测时延。清晰的边界会让优异结果更容易被信任。
+
+"variation" could be "变化量/方差/波动". In benchmark, "variation" = "变异性/波动". Use "波动". "material limitations" = "实质性限制/局限". Good. "valid slow run" = "有效但慢速的运行". "internal timer as client-observed latency" = "内部计时器描述为客户端观测到的延迟". Good.
+
+Need maybe maintain "six section titles" if original English. If I output original English headings, okay. If I add Chinese translation? Could include both: 
+Section One — Ownership
+... 
+No need Chinese heading.
+
+Need maybe "technical boundaries" means preserve boundaries in text: "first generated token belongs to prefill... remaining ... decode", "262,144-token allocation while test varies actual prepared prompt", "maximum cache capacity vs maximum-length prompt", "internal timer vs client-observed latency". I will ensure those exact distinctions.
+
+Need final after translation: at least twenty term glossary. Should I include heading "英中术语表". Good.
+
+Need count at least 20. I'll include 30. Let's choose 30 meaningful. Need ensure all are English-Chinese. Could be:
+1. inference service — 推理服务
+2. mutable frontier — 可变前沿
+3. single owner — 单一所有者
+4. kernels — 内核
+5. request state — 请求状态
+6. speculative drafts — 推测草稿
+7. prefix restoration — 前缀恢复
+8. complete transitions — 完整状态转换
+9. loading time

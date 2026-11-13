@@ -1,0 +1,13 @@
+max_batch_size: 1
+max_num_tokens: 9472
+max_seq_len: 16384
+attn_backend: FLASHINFER
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [1]
+kv_cache_config:
+  free_gpu_memory_fraction: 0.85
+  dtype: fp8
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 3

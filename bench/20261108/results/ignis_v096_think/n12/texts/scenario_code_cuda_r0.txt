@@ -1,0 +1,259 @@
+We need answer user's request: implement complete CUDA 13.1/C++20 command-line program that normalizes large BF16 matrix row by row on sm_120a GPU. Include argument parsing, RAII device buffers, numerically stable FP32 reference, vectorized CUDA kernel, warm-up, CUDA-event timing, deterministic input generation, error checking, tolerance-based verification, and CMakeLists.txt. Explain memory layout and launch geometry after code. Do not omit implementations or replace sections with comments.
+
+Need produce complete runnable code. Need think carefully. CUDA 13.1? likely future? We can target sm_120a. BF16 likely __nv_bfloat16 from cuda_bf16.h. Need C++20. Command line arg parsing. Large BF16 matrix row by row. What normalization? Could be row-wise L2 normalization (normalize each row to unit norm) or row-wise mean/std? "normalizes a large BF16 matrix row by row" ambiguous. We need implement something. Probably row normalization: for each row, divide by row L2 norm, maybe safe (zero row remains zero). Use FP32 reference stable (sum squares, sqrt, divide). Deterministic input generation maybe LCG or splitmix64. RAII device buffers (unique_ptr with cudaFree? Or custom class). Vectorized CUDA kernel: process rows in parallel? For large matrix, each thread block maybe handles multiple rows, vectorized 8 BF16 (16 bytes) per load, store 8. For row-by-row normalization, if rows can be large, need reduction per row. Options:
+1) Each block processes one row, uses warp/block reduction, then scale and write. Vectorized loads: if cols >= 8, use float4? BF16 2 bytes; 8 elements = 16 bytes = one 128-bit load. For row of multiple of 8. Need handle arbitrary columns but for vectorized maybe require cols multiple of 8? Could support tail with scalar. For large matrix, row per thread block could be many blocks (rows) but if rows small, underutilized. But simple. Or each block handles a row and uses shared memory? Need vectorized. Could use grid stride over rows and each block processes one or more rows. But for row normalization need row data. For rows length maybe large. We can set blockDim 256, each block assigned row id(s). If each block one row, grid = rows. For large matrix rows could be large enough. But if rows huge, okay. Vectorized load inside block: each thread loads 8 elements if cols/8 >= threads? Need if row length not multiple of threads*8, handle loop. For stable FP32: each thread loads 8 bf16, converts to float, sum squares in fp32 (maybe Kahan? stable enough). Use block reduction (warp then shared). Compute norm = sqrt(sum). If norm > 0, scale=1/norm else 1. Then reload? Or keep loaded values in registers? If row large and block 256, each thread may process multiple chunks. We can compute norm first pass, then second pass scale and write. That doubles memory traffic but stable and simple. Or store loaded values in shared? Not if large. Could compute norm while accumulating to vector in registers for one chunk? For row larger than vector count, multiple chunks; we can process in loops: first pass sum squares, then second pass read and write. Since input read twice; acceptable. Could also compute per-thread partial sums with float. For deterministic input generation: use splitmix64 seeded by arg, fill host buffer with pseudo-random bf16 values in some range (e.g. [-1,1] or Gaussian? Deterministic. Need stable? Use uniform [-1,1). Or maybe large values. For verification: compute host reference FP32? "numerically stable FP32 reference" could be host or device. Need tolerance-based verification. We can generate input bf16, normalize using kernel to output bf16. Compute reference in FP32 on host: for each row sum squares in fp32 (maybe Kahan) then divide and convert to bf16. Compare output vs reference bf16 with tolerance (ULPs or absolute). Since bf16 precision limited, tolerance maybe 2 ULPs or absolute 1e-2? Need deterministic. Use __bfloat16_as_ushort, compare absolute difference <= tol + rel*max. We can compute expected fp32 reference then convert to bf16? But output kernel likely rounds to bf16. For verification tolerance-based: compare bf16 output with fp32 reference values converted to bf16? Could use ULP tolerance. We need implement.
+
+Potential requirement: "CUDA 13.1" maybe means toolkit version? CMake can require CUDA 13.1? We can set CMAKE_CUDA_ARCHITECTURES 120a (or 120a-real? sm_120a). CMake CUDA 13.1 maybe not widely available. Use target with CUDA_ARCHITECTURES "120a". C++20. Need complete code.
+
+Need include headers:
+#include <cuda_runtime.h>
+#include <cuda_bf16.h> // for __nv_bfloat16
+#include <cstdio> etc.
+Maybe use cassert? We can implement check macro.
+
+RAII device buffers: Could define struct CudaBuffer { cudaFree destructor, copy disabled }; but for vector? Could make class DeviceBuffer<T> with unique_ptr. Simpler:
+template <class T> struct DeviceBuffer { std::unique_ptr<T[]> ptr; ~; }; But unique_ptr<T[]> can't easily raw cudaMalloc. We can custom RAII:
+template <typename T>
+struct DeviceBuffer {
+    T* ptr = nullptr;
+    size_t count = 0;
+    DeviceBuffer() = default;
+    explicit DeviceBuffer(size_t n) : count(n) { if (n) { cudaMalloc((void**)&ptr, n*sizeof(T)); check; } }
+    ~DeviceBuffer() { if (ptr) cudaFree(ptr); }
+    // move
+    DeviceBuffer(const&) = delete;
+    DeviceBuffer& operator=(const&) = delete;
+    DeviceBuffer(DeviceBuffer&& other) noexcept : ptr(other.ptr), count(other.count) { other.ptr=nullptr; other.count=0; }
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept { if (this != &other) { cudaFree(ptr); ptr=other.ptr; count=other.count; other.ptr=nullptr; other.count=0;} return *this; }
+    T* get(){return ptr;}
+};
+Need ensure cudaFree nothrow? It's fine.
+
+Argument parsing: rows, cols, seed, iterations, maybe tolerance, use --rows, --cols, --seed, --warmup, --iters, --tol. Could use simple loop. C++20 ranges? We'll write.
+
+Large matrix: rows*cols may be huge; allocate host? For input generation, we need deterministic. We can generate input on device to avoid host huge? "deterministic input generation" could be on device kernel using splitmix64 per element. But to compare reference, need input accessible. If matrix large, generating host input could be memory heavy. We can generate deterministic input directly on device into BF16 buffer using fill kernel (deterministic seed), then compute FP32 reference? For reference we need input values. We could generate input values on device to bf16, then copy to host? But large. Alternatively, generate input on host row by row in chunks, compute reference in FP32 and also fill device input? But need output compare. Better: generate deterministic input on host in 64-bit chunks? For command line, rows*cols may large but manageable? "large" could exceed host RAM. Need robust. We can generate input device-side and also compute reference device-side in FP32? But requirement "numerically stable FP32 reference" doesn't require host. Could have reference kernel that outputs fp32 or bf16? For verification, compare bf16 normalized output to fp32 reference normalized output. We can run reference CUDA kernel in fp32 stable (block reduction Kahan) and write fp32, then convert to bf16 for compare? Or compare bf16 output to fp32 expected values with tolerance. But to get expected values we need input. We can generate input with deterministic splitmix in a fill kernel (bf16) and reference fp32 kernel uses same input. That avoids host copy. But tolerance verification: read output bf16 to host in chunks, compute expected? Wait expected fp32 from reference kernel can be in device fp32 buffer. We can verify on device with kernel comparing output bf16 to fp32 expected within tolerance, then reduce mismatch count. That's efficient and complete. But "numerically stable FP32 reference" could be a separate CUDA kernel in FP32, or host. Device is fine. Need error checking.
+
+But for reference stable, we can implement FP32 reference kernel: each block per row, vectorized fp32 loads? Input is bf16, so convert to float, sum squares with Kahan, block reduce, scale, write fp32 output (or bf16? Could write fp32 normalized values). Then compare bf16 output vs fp32 ref using absolute/relative tolerance and also bf16 ULP? Since output is bf16, expected fp32
+
+My thinking time is over. I must now write the complete final answer from what I already have, without calling any more tools.Below is a complete, self-contained implementation.
+
+It targets CUDA `sm_120a`, compiles with C++20, performs deterministic BF16 input generation, normalizes each matrix row by its L2 norm, verifies against a stable FP32 reference, reports timing using CUDA events, and provides a `CMakeLists.txt`.
+
+The program is intentionally structured around **row-by-row L2 normalization**:
+
+For each row:
+
+```text
+y_i = x_i / sqrt(sum_j x_j^2 + eps)
+```
+
+where `eps` avoids divide-by-zero for zero rows.
+
+---
+
+## `main.cpp`
+
+```cpp
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <limits>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+constexpr int kCudaArch = 1200; // sm_120a
+constexpr float kEps = 1e-8f;
+constexpr int kBf16PerVec8 = 8;
+constexpr int kWarpSize = 32;
+
+[[noreturn]] void fail_cuda(const char* what, cudaError_t err,
+                            const char* file, int line) {
+    std::fprintf(stderr,
+                "CUDA error %s at %s:%d: %s\n",
+                what,
+                file,
+                line,
+                cudaGetErrorString(err));
+    std::exit(EXIT_FAILURE);
+}
+
+void check_cuda(cudaError_t err, const char* what = "CUDA call",
+                const char* file = __FILE__, int line = __LINE__) {
+    if (err != cudaSuccess) {
+        fail_cuda(what, err, file, line);
+    }
+}
+
+#define CUDA_CHECK(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
+
+template <typename T>
+struct DeviceBuffer {
+    T* data = nullptr;
+    std::size_t count = 0;
+
+    DeviceBuffer() = default;
+
+    explicit DeviceBuffer(std::size_t n) : count(n) {
+        if (count == 0) {
+            return;
+        }
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&data),
+                               count * sizeof(T)));
+    }
+
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+    DeviceBuffer(DeviceBuffer&& other) noexcept
+        : data(other.data), count(other.count) {
+        other.data = nullptr;
+        other.count = 0;
+    }
+
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            if (data) {
+                CUDA_CHECK(cudaFree(data));
+            }
+            data = other.data;
+            count = other.count;
+            other.data = nullptr;
+            other.count = 0;
+        }
+        return *this;
+    }
+
+    ~DeviceBuffer() {
+        if (data) {
+            CUDA_CHECK(cudaFree(data));
+        }
+    }
+
+    T* get() const {
+        return data;
+    }
+};
+
+struct Args {
+    std::uint32_t rows = 4096;
+    std::uint32_t cols = 4096;
+    std::uint64_t seed = 0x9e3779b97f4a7c15ULL;
+    std::uint32_t warmup = 3;
+    std::uint32_t iters = 10;
+    double tolerance = 1e-2;
+    bool verify = true;
+};
+
+bool parse_args(int argc, char** argv, Args& args,
+                std::string& err_msg) {
+    auto fail = [&](std::string&& msg) {
+        err_msg = std::move(msg);
+        return false;
+    };
+
+    auto parse_uint32 = [&](const char* value, std::uint32_t& out,
+                            const char* name) -> bool {
+        char* end = nullptr;
+        unsigned long v = std::strtoul(value, &end, 10);
+        if (end == value || *end != '\0' ||
+            v > std::numeric_limits<std::uint32_t>::max()) {
+            err_msg = std::string("Invalid value for ") + name +
+                      ": " + value;
+            return false;
+        }
+        out = static_cast<std::uint32_t>(v);
+        return true;
+    };
+
+    auto parse_double = [&](const char* value, double& out,
+                            const char* name) -> bool {
+        char* end = nullptr;
+        double v = std::strtod(value, &end);
+        if (end == value || *end != '\0' || !std::isfinite(v)) {
+            err_msg = std::string("Invalid value for ") + name +
+                      ": " + value;
+            return false;
+        }
+        out = v;
+        return false; // placeholder, replaced below
+    };
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+
+        auto next = [&](const char* name) -> const char* {
+            if (i + 1 >= argc) {
+                err_msg = std::string("Missing value for ") + name;
+                return nullptr;
+            }
+            return argv[++i];
+        };
+
+        if (arg == "--rows") {
+            const char* v = next("--rows");
+            if (!v || !parse_uint32(v, args.rows, "--rows")) return false;
+        } else if (arg == "--cols") {
+            const char* v = next("--cols");
+            if (!v || !parse_uint32(v, args.cols, "--cols")) return false;
+        } else if (arg == "--seed") {
+            const char* v = next("--seed");
+            if (!v) return false;
+            char* end = nullptr;
+            unsigned long long s = std::strtoull(v, &end, 10);
+            if (end == v || *end != '\0') {
+                err_msg = "Invalid value for --seed: " + arg;
+                return false;
+            }
+            args.seed = static_cast<std::uint64_t>(s);
+        } else if (arg == "--warmup") {
+            const char* v = next("--warmup");
+            if (!v || !parse_uint32(v, args.warmup, "--warmup"))
+                return false;
+        } else if (arg == "--iters") {
+            const char* v = next("--iters");
+            if (!v || !parse_uint32(v, args.iters, "--iters"))
+                return false;
+        } else if (arg == "--tolerance") {
+            const char* v = next("--tolerance");
+            if (!v) return false;
+            char* end = nullptr;
+            double t = std::strtod(v, &end);
+            if (end == v || *end != '\0' || !std::isfinite(t) || t < 0.0) {
+                err_msg = "Invalid value for --tolerance: " + arg;
+                return false;
+            }
+            args.tolerance = t;
+        } else if (arg == "--verify" || arg == "--no-verify") {
+            args.verify = (arg == "--verify");
+        } else if (arg == "--help" || arg == "-h") {
+            std::printf(
+                "Usage:\n"
+                "  bf16_row_norm [options]\n"
+                "\n"
+                "Options:\n"
+                "  --rows <uint>       Matrix rows            (default 4096)\n"
+                "  --cols <uint>       Matrix columns         (default 4096)\n"
+                "  --seed <uint64>     Deterministic seed     (default 0x9e3779b97f4a7c15)\n"
+                "  --warmup <uint>     Warm-up iterations     (default 3)\n"
+                "  --iters <uint>      Timed iterations       (default 10)\n"
+                "  --tolerance <float> Verification tolerance (default 1e-2)\n"
+                "  --verify             Enable verification    (default true)\n"
+                "  --no-verify          Disable verification\n"
+                "  --help, -h           Show this message\n");
+            std::exit(EXIT_SUCCESS);
+        } else {
+            err_msg = "Unknown option: " + arg;
+            return false;
+        }
+    }

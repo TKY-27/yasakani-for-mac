@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yasakani"
+dynamic = ["version"]
+description = "Run Qwen3.8-27B locally on one RTX 5090 (Windows) with the YASAKANI engine: OpenAI-compatible server, terminal chat, benchmark and self-check."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = ["numpy>=1.23", "tokenizers>=0.15", "jinja2>=3.1"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Microsoft :: Windows",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+
+[project.scripts]
+yasakani = "yasakani.cli:main"
+
+[tool.setuptools]
+packages = ["yasakani"]
+
+[tool.setuptools.dynamic]
+version = { attr = "yasakani.__version__" }

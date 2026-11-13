@@ -1,0 +1,15 @@
+label vl_dspark_lm4  model qwen3.8-27b  temperature 0.00
+cat         fixture                            mean      min      max   ntok
+code        scenario_code_cuda                249.4    239.9    259.0   4096
+code        scenario_code_python              285.7    282.4    288.9   4096
+code        scenario_code_typescript          268.1    265.6    270.6    200
+story       scenario_story_zh_scifi            83.1     83.1     83.2   2621
+story       scenario_story_en_mystery         149.5    149.1    149.9   4096
+story       scenario_story_zh_dialogue         79.5     75.4     83.6   3180
+translation scenario_translation_zh_en        259.1    240.4    277.7    765
+translation scenario_translation_en_zh        187.1    187.1    187.1    772
+translation scenario_translation_markdown     147.2    137.7    156.7    858
+structured  scenario_structured_jsonl         397.5    369.7    425.2   4096
+structured  scenario_structured_csv           333.2    315.5    350.9   4096
+structured  scenario_structured_sql           332.7    313.4    352.1   4096
+per category (mean of runs): code 267.7, story 104.0, translation 197.8, structured 354.5

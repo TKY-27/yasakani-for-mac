@@ -1,0 +1,191 @@
+The user is asking for a complete Python 3.11 package for a deterministic asynchronous job runner with the following features:
+
+1. Load a JSON manifest
+2. Enforce that only one active GPU job exists at a time
+3. Persist state atomically
+4. Resume completed work
+5. Stream structured JSONL events
+6. Handle SIGINT
+7. Redact configured secrets
+8. Include pytest tests covering success, failure, cancellation, and resume
+9. Present all source files in separate fenced blocks annotated with paths
+10. Include pyproject.toml
+
+Let me design this carefully.
+
+**Package name**: let's call it `jobrunner` or `gpubatch`. Let's go with `jobrunner` — a deterministic asynchronous job runner. No, "deterministic" suggests deterministic ordering (jobs are processed in the manifest order, tie-broken by stable ordering) and deterministically reproducible output. Let's call it `deterministic_job_runner` — hmm, better: `gpubatch`. Let's stick with `jobrunner`.
+
+**Core concepts:**
+
+- **Manifest**: a JSON file like:
+```json
+{
+  "version": 1,
+  "secrets": ["AWS_SECRET_KEY", "DATABASE_PASSWORD"],
+  "jobs": [
+    {"id": "train-a", "command": "python train.py --data a", "timeout_seconds": 600},
+    {"id": "train-b", "command": "python train.py --data b"}
+  ]
+}
+```
+Or maybe simpler: jobs with a `command` list. But the test would need a real GPU job. To keep it testable and deterministic, the "job" should be a command executed as an async subprocess. In tests we can use `python -c "print(...)"` etc. For cross-platform tests, `sys.executable -c ...` is better.
+
+- **Single active GPU job**: use an asyncio semaphore of capacity 1 for GPU jobs. Jobs have a `gpu: true/false` field. GPU jobs are serialized by a semaphore `asyncio.Semaphore(1)`, while non-GPU jobs may run concurrently (up to some max concurrency, default probably a few). Deterministic: jobs are scheduled in manifest order; among ready jobs, the lowest index runs first. asyncio is single-threaded so it's mostly deterministic with a fixed schedule.
+
+- **Atomic state persistence**: write state to a temp file, `os.replace` atomically. Store the state file as `state.json`, with fields: status per job (pending/running/succeeded/failed/cancelled), attempt count, timestamps. Also a "checkpoint" — on startup, load state; jobs marked succeeded are skipped (resume). Failed jobs may be retried up to `retries` in the manifest.
+
+- **JSONL event stream**: append events to `events.jsonl` — job_started, job_finished, job_failed, job_cancelled, runner_started, runner_finished, signal_received, etc. Each event: a single JSON line `{"ts": ..., "seq": n, "event": "...", "job_id": ..., ...}`. seq increments for determinism. To redact secrets: scan the event payload for secret values (obtained from env vars listed in the manifest's `secrets`), and replace occurrences with `"***"` (or a masked value). Redaction should apply to any string field (e.g., error messages that may include secrets). Implementation: at startup, read the env vars listed under `secrets` in the manifest, and if present, collect the values; then redact all string values in events before writing.
+
+- **SIGINT handling**: install a signal handler via `loop.add_signal_handler(signal.SIGINT, ...)` that sets a cancellation flag and gracefully cancels the in-progress job (cancels the subprocess), marks it as "cancelled", skips remaining jobs, and flushes the state atomically. A second SIGINT may force-terminate. Tests simulate this by sending SIGINT to the process… in pytest, we can run the runner in-process with `asyncio.run` and send a signal with `os.kill(os.getpid(), SIGINT)` — but that might interfere with pytest's signal handling. Alternative: expose an internal method `request_cancel()` on the engine that the signal handler calls; the test calls that directly, plus a separate test that actually sends a signal in a subprocess. Simpler and more robust approach: in-process test that sends SIGINT to its own process via `os.kill` — as long as the event loop is running in the main thread, it's safe under pytest (pytest doesn't install a SIGINT handler by default; Python's default SIGINT raises KeyboardInterrupt). Hmm, `loop.add_signal_handler` overrides that. If we run the engine inside a pytest test with `asyncio.run`, adding a signal handler in the main thread works. But pytest may be running under a terminal… should be fine.
+
+  Safer approach: have the engine provide `handle_signal()` and `request_shutdown()`. The test can call `request_shutdown()` to simulate SIGINT, and one test actually sends SIGINT via `os.kill` inside a coroutine on the main thread to verify. Include both, with a guard that skips the actual-signal test when the signal handler cannot be installed (e.g., not on the main thread, or on a platform without signal support).
+
+- **Determinism**:
+  - Fixed order: process jobs in manifest order.
+  - Event sequence numbers.
+  - `ts` timestamps in events may make the output non-deterministic, but events are structured and seq is deterministic. For full determinism, we can omit wall-clock time, or keep it. Determinism refers to ordering and scheduling. Let's keep `ts` but make scheduling deterministic: FIFO queue, GPU jobs acquire the GPU lock in submission order (asyncio.Semaphore is FIFO when awaited in order — but we need to make sure we request the semaphore in job order). To truly guarantee FIFO GPU scheduling, we can use a custom `FairLock` that implements an ordering queue of waiters. Let's implement a simple FIFO fair lock: an asyncio-based queue that hands tokens out one at a time. Actually, `asyncio.Semaphore(1)` is FIFO with respect to *acquisition order* — coroutines that reach acquire in order. Since the scheduler dispatches jobs in order and GPU jobs immediately request the lock in order, acquisition order equals job order. That's sufficient, but to be explicit and robust, let's implement `FifoLock` using `asyncio.Lock` + an internal `asyncio.Queue` of events. Hmm, let's implement a clean FIFO lock:
+
+```python
+class FifoLock:
+    def __init__(self):
+        self._owner: asyncio.Task | None = None
+        self._waiters: collections.deque[asyncio.Future] = deque()
+
+    def acquire(self): ...
+```
+
+But an async context manager is simpler: `async with lock:` — acquire/release. Implement `acquire()` as a coroutine and `release()` as synchronous. To guarantee FIFO order, register the waiting future at the moment we *call* acquire. Jobs start in order, so that's fine.
+
+An even simpler deterministic approach: a single background "GPU lane" — jobs are placed on a queue, and a dedicated worker coroutine processes GPU jobs strictly in order, while CPU jobs run on the pool. But the per-job `async with gpu` is cleaner. Let's implement a FIFO semaphore with a deque of futures.
+
+- **Deterministic async execution model**:
+  - `Runner.run()` iterates jobs in manifest order; creates tasks; enforces a CPU pool of `max_cpu_concurrency`; GPU jobs go through a FIFO queue of a single GPU lane; but ordering: if we dispatch all jobs in order and each job acquires resources in order, determinism holds.
+
+Let's design the scheduler:
+
+```python
+for job in manifest.jobs (in index order):
+    task = asyncio.create_task(self._execute(job_index, job))
+    tasks.append(task)
+```
+
+`_execute` for GPU jobs: `async with self.gpu_lock:` then run subprocess. For CPU jobs: `async with cpu_semaphore:`.
+
+GPU jobs run sequentially in manifest order (FIFO). CPU jobs may overlap but start in order. The overall completion order may interleave, but scheduling is deterministic.
+
+**Determinism**:
+- `run(manifest, workdir)` — loads manifest, loads prior state, filters jobs (skips succeeded; requeues failed ones if attempts remain), schedules, writes events, atomically persists state on each transition.
+
+**Atomic state**: `state.json` inside the work directory. Write to `state.json.tmp` then `os.replace`. Also fsync for durability: open with os.open + fchmod… keep it reasonable: `with open(tmp,'w')`, write, flush, fsync, close, replace.
+
+**Retry on failure**: manifest may allow `retries: 1` per job or global. On failure, if attempts < retries, mark as pending again and rerun. Deterministic.
+
+**JSONL events**: `events.jsonl` in workdir, append + flush per event. Fields: `seq`, `ts`, `event`, `job_id` (optional), and a redacted `data` object. Redaction: `Redactor` class: values come from manifest `secrets` (env var names) read at startup. If a value is non-empty, substitute every occurrence with `[REDACTED]` (or `"***"`). Should redaction also apply to subprocess stdout captured on failure? Events include `stdout_tail`/`stderr_tail` on failure; apply redaction to all string fields recursively. That's a good demo: in tests, a job's command echoes a secret value, and we assert the event file contains no secret and does contain the redaction marker.
+
+**SIGINT**: in the runner: `loop.add_signal_handler(SIGINT, self._on_signal)`. `_on_signal`: first signal → set `self._cancel_requested`, cancel in-progress tasks (send SIGTERM to their child process), wait for them with a timeout, mark running as cancelled and remaining as skipped; second signal → force-terminate (default). Write final state atomically and emit a `runner_finished` event.
+
+For the subprocess: create it with `asyncio.create_subprocess_exec(*cmd, ...)` and on cancel send SIGTERM to the process, wait for termination, then SIGKILL if necessary. Also put the child in its own process group (via preexec_fn `os.setsid`) to kill the group? `start_new_session=True` parameter is available in Python 3.11. Then kill the whole group with `os.killpg`. This is a good touch for GPU jobs that spawn children. Use `start_new_session=True` and `os.killpg(os.getpgid(pid), sig)` guarded with try/except.
+
+**Package layout**:
+
+```
+jobrunner/
+  pyproject.toml
+  README.md (optional; maybe skip or include briefly)
+  jobrunner/
+    __init__.py
+    manifest.py
+    state.py
+    events.py
+    redact.py
+    lock.py  (FifoLock)
+    runner.py
+    cli.py
+    errors.py
+    __main__.py
+  tests/
+    __init__.py (not needed)
+    conftest.py
+    test_success.py
+    test_failure.py
+    test_cancel.py
+    test_resume.py
+```
+
+The user asked to "present all source files in separate fenced blocks annotated with paths, and include pyproject.toml". So we need to output each file in a fenced code block with its path. We can use the path as a heading above the block, or as a comment at the top. Use heading + fenced block.
+
+**Manifest schema** (version 1):
+
+```json
+{
+  "version": 1,
+  "max_cpu_concurrency": 4,
+  "secrets": ["MY_SECRET"],
+  "jobs": [
+    {
+      "id": "train",
+      "command": ["python", "train.py"],
+      "gpu": true,
+      "timeout_seconds": 120,
+      "retries": 1,
+      "env": {"FOO": "bar"}
+    }
+  ]
+}
+```
+
+`command` is a list of strings (safer than shell). `env` optionally merged into os.environ. Job id must be unique; validate the manifest (schema check), raise `ManifestError` with a clear message.
+
+**State file** (state.json):
+
+```json
+{
+  "version": 1,
+  "run_id": "fixed",  // deterministic? maybe derived from manifest hash
+  "manifest_sha256": "...",
+  "started_at": ...,
+  "updated_at": ...,
+  "jobs": {
+     "train": {"status": "succeeded", "attempts": 1, "exit_code": 0, "finished_at": ...}
+  },
+  "status": "succeeded" | "failed" | "cancelled" | "running"
+}
+```
+
+Resume: if state exists and `manifest_sha256` matches, reuse it; jobs in succeeded/cancelled? For resume, succeeded jobs are skipped (their artifacts are considered complete). Should we require `--force` for cancel/failed, or just resume as pending? Policy: `resume=True` (default) skips jobs whose status is in `{"succeeded"}`. Failed jobs: only rerun if attempts <= retries, otherwise leave as failed (if all remaining jobs are permanently failed, run terminates with a failed status). Cancelled: treat as pending on resume (user's intent: resume completed work — cancelled wasn't completed). Skipped: treat as pending? Hmm "skipped" might be used when a job is skipped due to a predecessor failure? We don't have dependencies, so no skipping. Keep statuses: pending, running, succeeded, failed, cancelled, skipped (unused?). Simplify: pending, running, succeeded, failed, cancelled. On resume: succeeded → skip; others → pending (reset).
+
+Deterministic run_id: derived from the sha256 of the manifest content — "deterministic" flavor. Or accept an optional `run_id` in the manifest. Use manifest hash.
+
+**Events** (JSONL): each line:
+```json
+{"seq": 0, "ts": 1700000000.0, "event": "runner_started", "data": {...}}
+{"seq": 1, "event": "job_started", "job_id": "train", "data": {"index": 0, "attempt": 1, "gpu": true}}
+{"seq": 2, "event": "job_finished", "job_id": "train", "data": {"exit_code": 0, "duration_ms": 123}}
+{"seq": 3, "event": "runner_finished", "data": {"status": "succeeded"}}
+```
+On failure: `job_failed` event with `data: {"exit_code": 1, "stderr_tail": "...", "stdout_tail": "..."}`. On cancel: `job_cancelled` with a reason. All strings redacted before writing.
+
+Also `job_resumed`/`job_skipped_completed` events for skipped jobs: `job_skipped` with a reason `already_succeeded`.
+
+**EventWriter**: append to file, flush + fsync? fsync per event might be slow but for a test runner it's fine and robust. Write + flush (optionally fsync). Keep a `seq` counter, and if the file exists on resume, load the existing seq (count lines). That keeps events.jsonl append-only across resumes.
+
+**Redactor**:
+```python
+class Redactor:
+    def __init__(self, secret_values: Iterable[str]):
+        self._values = [v for v in secret_values if v]
+    def redact(self, obj): # deep-copied, replace in strings
+```
+Substitute each secret value with `"[REDACTED]"`. Sort longest-first for overlapping values.
+
+**CLI**: `jobrunner run manifest.json --workdir ./run` → main returns the exit code: 0 success, 1 any failure, 130 cancelled. `python -m jobrunner`.
+
+**SIGINT in the CLI**: wrap `asyncio.run`; Runner installs handlers on the loop with `loop.add_signal_handler`. For non-main threads or unsupported platforms (Windows has no SIGINT add_signal_handler? Actually Windows supports SIGINT via add_signal_handler? `loop.add_signal_handler` throws NotImplementedError on Windows for signals other than SIGINT? Actually Windows supports SIGINT in add_signal_handler in Python 3.8+? Docs: "…not supported on Windows"… Let me recall: `asyncio.loop.add_signal_handler` — "This method is not implemented on Windows event loops (NotImplementedError raised)." So on Windows, use `signal.signal(signal.SIGINT, handler)` as a fallback; the fallback must be synchronous and just set a flag via `call_soon_threadsafe`… for a CLI it's fine to be a sync handler that calls `runner.request_cancel()` (thread-safe enough because it just sets a flag). Try add_signal_handler, fall back to signal.signal on except (NotImplementedError, RuntimeError).
+
+**Tests** (pytest + pytest-asyncio? To avoid a dep, we can just use `asyncio.run` inside sync tests — fewer dependencies. The user asked for pytest tests; use plain pytest with `asyncio.run(...)` inside sync tests to sidestep the pytest-asyncio plugin dep. That's deterministic and simpler. Or include pytest-asyncio. Plain sync tests with asyncio.run are robust enough.)
+
+Tests:
+
+1. `test_success`: manifest with 3 jobs (mix of cpu + gpu). Commands use `sys.executable -c "import sys; print('ok')"`; one GPU job prints its name; assert all succeed, exit code 0, state file says all succeeded, events contain the correct sequence of events in deterministic order (job_started order follows manifest order; gpu jobs serialized: assert the gpu jobs' started/finished don't overlap — check event stream: gpu2's started is after gpu1's finished). Deterministic check: assert exact sequence of event names.
+
+2. `test_failure`: a job that exits 1 with stderr containing a secret → assert state marks it as failed, runner exit code 1, `job_failed` event exists, and secret redacted in events.jsonl. Also with retries: first attempt fails then succeeds? That mixes with the resume test. Keep failure test simple: fail, retries: 0 → failure. Also check that subsequent jobs continue to run? Design decision: on job failure, do we continue with the remaining jobs or abort? For a batch runner, continue-with-fail-fast is a policy: `stop_on_failure: true/false` in manifest. Default true? Hmm. Simpler: default `stop_on_failure: false` → run all, exit code reflects failure. Implement `stop_on_failure` flag, default

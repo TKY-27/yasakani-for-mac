@@ -1,0 +1,15 @@
+label tensorfold  model qwen3.8-27b  temperature 1.00
+cat         fixture                            mean      min      max   ntok
+code        scenario_code_cuda                140.2    130.2    150.3   4096
+code        scenario_code_python              110.3    102.0    118.7   4096
+code        scenario_code_typescript          131.8    131.6    132.0   4096
+story       scenario_story_zh_scifi            61.0     58.9     63.0   4096
+story       scenario_story_en_mystery          98.7     95.9    101.4   4096
+story       scenario_story_zh_dialogue         71.3     71.2     71.3   4096
+translation scenario_translation_zh_en        163.8    136.6    190.9   4096
+translation scenario_translation_en_zh        127.6    124.8    130.3   4096
+translation scenario_translation_markdown     164.3    149.1    179.5   4096
+structured  scenario_structured_jsonl         200.2    198.8    201.6   4096
+structured  scenario_structured_csv           161.4    146.0    176.8   4096
+structured  scenario_structured_sql           162.3    153.2    171.3   4096
+per category (mean of runs): code 127.5, story 77.0, translation 151.9, structured 174.6

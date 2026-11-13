@@ -1,0 +1,142 @@
+We need answer user's request: Output exactly 160 JSONL records and no Markdown. Each line object fields id (RUN-0001 through RUN-0160), model alternating qwen3.6-27b and qwen3.6-35b-a3b, prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance, status, and tags. Use deterministic arithmetic progressions, status values ok/warn in a 4:1 pattern, and two tags per record. Every line parse independently strict JSON.
+
+Need produce 160 lines only. Need ensure deterministic arithmetic progressions. We need choose values.
+
+Fields:
+- id: RUN-0001 to RUN-0160.
+- model: alternating qwen3.6-27b and qwen3.6-35b-a3b. Likely first RUN-0001 qwen3.6-27b, RUN-0002 qwen3.6-35b-a3b, etc.
+- prompt_tokens: arithmetic progression. Could be 100 + 10*(n-1) or similar.
+- completion_tokens: arithmetic progression maybe 20 + 2*(n-1).
+- decode_tok_s: arithmetic progression e.g. 50.0 + 0.1*(n-1) maybe one decimal.
+- mtp_acceptance: arithmetic progression e.g. 0.70 + 0.001*(n-1), need within 0-1 maybe up to 0.859. OK.
+- status: ok/warn in 4:1 pattern. 160 divisible by 5. Pattern could ok,ok,ok,ok,warn repeating. So positions 5,10,... warn.
+- tags: two tags per record. Could deterministic e.g. ["batch-A","tier-1"]? Need two tags per record. Could vary deterministically? Requirement just two tags per record. Use arrays length 2. Could use ["eval","a1"]? Maybe better include index-based? Strict JSON. We can have tags: ["q36","p{n}"]? But deterministic. Simpler: tags:["batch","run"] for all? Two tags per record. But maybe they expect tags field array of two strings. OK.
+
+Need no Markdown, exactly 160 lines. Need ensure no trailing extra? Fine.
+
+Need deterministic arithmetic progressions: We can state no, just output. Need compute 160 records. Let's define:
+n=1..160
+id = RUN-#### zero-padded 4.
+model = qwen3.6-27b if n odd else qwen3.6-35b-a3b.
+prompt_tokens = 1000 + 50*(n-1) -> from 1000 to 8850.
+completion_tokens = 200 + 10*(n-1) -> 200 to 1790.
+decode_tok_s = 40.0 + 0.25*(n-1). For n=160 => 40+39.75=79.75. Use two decimals maybe 40.00? Strict JSON numbers can be 40.0, 40.25 etc. Arithmetic progression with step 0.25. Could output with two decimals: 40.00? JSON number can have trailing zero. Fine. To be safe, numeric no quotes. Use maybe 40.0, 40.25, 40.5? 0.5 not two decimals. Could use step 0.2 and two decimals: 40.00 + 0.20*(n-1), n=160 => 71.80. Use fixed two decimals? JSON numbers can be 40.00. Good. But if output 40.00 parse fine. Need deterministic. Use decode_tok_s = 40.00 + 0.20*(n-1). Values: n1 40.00, n2 40.20, ..., n160 71.80. OK.
+mtp_acceptance = 0.60 + 0.001*(n-1) -> n160 0.759. Use maybe 3 decimals: 0.600, 0.601 ... 0.759. Strict JSON. Arithmetic.
+status: if n % 5 == 0 => warn else ok. 4:1 pattern over 160, 128 ok, 32 warn.
+tags: Need two tags. Could use deterministic based on model and status? ["mtp","tok"]? But perhaps "tags" two tags per record. Could use ["qwen36","run0160"]? That's two. But tags maybe should be strings. If include id, OK. We need exactly two tags. Use tags:["batch-a","model-a"]? But model alternates. Could tags: ["a1","b1"]? Let's design deterministic and meaningful:
+tags: ["eval","q36"]? All same. Requirement doesn't demand unique. But maybe "two tags per record" just array length 2. All same acceptable. But to be safe, use two tags varying deterministically: tag1 based on parity? e.g. "mtp-acceptance", "tok-velocity"? All same? Could be too generic.
+Maybe tags: ["run-" + id, "status-" + status]? But then id in tag; two tags. For RUN-0001: ["run-RUN-0001","ok"]? That's two. But tags usually labels. Could be okay.
+Need strict JSON each line. We can manually generate? Need produce 160 lines accurately. We can use reasoning to generate pattern. Since no actual code execution, need be careful. Could construct lines in final manually. Need avoid mistakes. We can maybe use a mental template and enumerate. 160 lines is long. Need ensure ids correct and values progressions. Need no markdown. We can produce with systematic pattern.
+
+Let's define exact format:
+{"id":"RUN-0001","model":"qwen3.6-27b","prompt_tokens":1000,"completion_tokens":200,"decode_tok_s":40.00,"mtp_acceptance":0.600,"status":"ok","tags":["q36","mtp"]}
+But tags all same? Two tags. If all same, OK. However "deterministic arithmetic progressions" may apply numeric fields. Tags can be static.
+
+Need check model names: qwen3.6-27b and qwen3.6-35b-a3b. Are these actual? Yes.
+
+Potential issue: JSON number 40.00 is valid? Yes, JSON number can have fraction digits. 40.00 okay. 0.600 okay. Could some parsers accept leading zero? Yes. No Markdown. Exactly 160 lines. Need no extra spaces? Fine.
+
+But user says Output exactly 160 JSONL records and no Markdown. We must output only lines. Final should have 160 lines. Need be meticulous.
+
+Could generate using pattern every 5 lines:
+For group k (1..32), positions:
+5k-4: odd? Let's see group 1: n1 odd 27b ok; n2 even 35b ok; n3 odd ok; n4 even ok; n5 odd warn? n5 odd (5%10? 5 odd) so 27b warn. group 2: n6 even ok, n7 odd ok, n8 even ok, n9 odd ok, n10 even warn. Pattern warn alternates model: odd warn for 5,15,... even warn for 10,20,... OK.
+
+Values:
+n, prompt = 1000+50*(n-1) = 50n+950? Check n1 1000; n2 1050; n160 50*160+950=8000+950=8850.
+completion = 200+10*(n-1)=10n+190; n1 200; n160 1790.
+decode = 40 + 0.2*(n-1) = 0.2n+39.8? n1 40; n160 71.8. With two decimals.
+mtp = 0.6 + 0.001*(n-1) = 0.001n+0.599? n1 0.600; n160 0.759. Three decimals.
+
+Need produce 160 lines. Could perhaps use line template and enumerate. Need avoid arithmetic errors. We can create table by groups of 10 or 5. Let's compute values.
+
+Let's compute n 1-160 values maybe in blocks.
+Formula:
+P_n = 1000,1050,1100,... step 50.
+C_n = 200,210,220,... step 10.
+D_n = 40.00,40.20,... step 0.20.
+A_n = 0.600,0.601,... step 0.001.
+
+Status: n%5==0 warn.
+
+Model: odd 27b, even 35b-a3b.
+
+Tags: Let's choose tags ["q36","mtp"] constant. That's simple, reduces errors. But maybe tags should be two tags per record. OK.
+
+Need ensure each line parse independent. Constant tags valid.
+
+Let's draft 160 lines. Need count. I can produce in blocks of 10. Let's create block n=1-10:
+1: 1000 200 40.00 0.600 ok 27b
+2: 1050 210 40.20 0.601 ok 35b
+3: 1100 220 40.40 0.602 ok 27b
+4: 1150 230 40.60 0.603 ok 35b
+5: 1200 240 40.80 0.604 warn 27b
+6: 1250 250 41.00 0.605 ok 35b
+7: 1300 260 41.20 0.606 ok 27b
+8: 1350 270 41.40 0.607 ok 35b
+9: 1400 280 41.60 0.608 ok 27b
+10:1450 290 41.80 0.609 warn 35b
+
+Block 11-20:
+11: 1500 300 42.00 0.610 ok 27b
+12:1550 310 42.20 0.611 ok 35b
+13:1600 320 42.40 0.612 ok 27b
+14:1650 330 42.60 0.613 ok 35b
+15:1700 340 42.80 0.614 warn 27b
+16:1750 350 43.00 0.615 ok 35b
+17:1800 360 43.20 0.616 ok 27b
+18:1850 370 43.40 0.617 ok 35b
+19:1900 380 43.60 0.618 ok 27b
+20:1950 390 43.80 0.619 warn 35b
+
+Block 21-30:
+21:2000 400 44.00 0.620 ok 27b
+22:2050 410 44.20 0.621 ok 35b
+23:2100 420 44.40 0.622 ok 27b
+24:2150 430 44.60 0.623 ok 35b
+25:2200 440 44.80 0.624 warn 27b
+26:2250 450 45.00 0.625 ok 35b
+27:2300 460 45.20 0.626 ok 27b
+28:2350 470 45.40 0.627 ok 35b
+29:2400 480 45.60 0.628 ok 27b
+30:2450 490 45.80 0.629 warn 35b
+
+Block 31-40:
+31:2500 500 46.00 0.630 ok 27b
+32:2550 510 46.20 0.631 ok 35b
+33:2600 520 46.40 0.632 ok 27b
+34:2650 530 46.60 0.633 ok 35b
+35:2700 540 46.80 0.634 warn 27b
+36:2750 550 47.00 0.635 ok 35b
+37:2800 560 47.20 0.636 ok 27b
+38:2850 570 47.40 0.637 ok 35b
+39:2900 580 47.60 0.638 ok 27b
+40:2950 590 47.80 0.639 warn 35b
+
+Block 41-50:
+41:3000 600 48.00 0.640 ok 27b
+42:3050 610 48.20 0.641 ok 35b
+43:3100 620 48.40 0.642 ok 27b
+44:3150 630 48.60 0.643 ok 35b
+45:3200 640 48.80 0.644 warn 27b
+46:3250 650 49.00 0.645 ok 35b
+47:3300 660 49.20 0.646 ok 27b
+48:3350 670 49.40 0.647 ok 35b
+49:3400 680 49.60 0.648 ok 27b
+50:3450 690 49.80 0.649 warn 35b
+
+Block 51-60:
+51:3500 700 50.00 0.650 ok 27b
+52:3550 710 50.20 0.651 ok 35b
+53:3600 720 50.40 0.652 ok 27b
+54:3650 730 50.60 0.653 ok 35b
+55:3700 740 50.80 0.654 warn 27b
+56:3750 750 51.00 0.655 ok 35b
+57:3800 760 51.20 0.656 ok 27b
+58:3850 770 51.40 0.657 ok 35b
+59:3900 780 51.60 0.658 ok 27b
+60:3950 790 51.80 0.659 warn 35b
+
+Block 61-70:
+61:4000 800 52.00 0.660 ok 27b
+62:4050 810

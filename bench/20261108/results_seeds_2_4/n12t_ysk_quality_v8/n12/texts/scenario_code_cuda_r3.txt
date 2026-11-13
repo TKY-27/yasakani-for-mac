@@ -1,0 +1,89 @@
+We need answer user's request: Implement complete CUDA 13.1/C++20 command-line program that normalizes a large BF16 matrix row by row on sm_120a GPU. Include argument parsing, RAII device buffers, numerically stable FP32 reference, vectorized CUDA kernel, warm-up, CUDA-event timing, deterministic input generation, error checking, tolerance-based verification, and CMakeLists.txt. Explain memory layout and launch geometry after code. Do not omit implementations or replace sections with comments.
+
+Need produce final with complete code. Need think deeply. CUDA 13.1? Is there CUDA 13.1? Maybe hypothetical. sm_120a GPU (Blackwell? sm_120 maybe GB20x? Actually sm_120 for Blackwell data center? sm_120a maybe consumer? CUDA 13.1 likely supports sm_120a). Need code that compiles with C++20. Need use BF16. Need row-by-row normalize large BF16 matrix. Need deterministic input generation. Need RAII device buffers. Need FP32 stable reference. Need vectorized CUDA kernel. Need warm-up, CUDA-event timing. Error checking. Tolerance verification. CMakeLists.
+
+We must provide runnable. Need consider CUDA 13.1 may not exist yet? But can target. Need avoid CUDA APIs unavailable? For BF16, use __nv_bfloat16, __nv_bfloat162? CUDA has bf16 math. Need vectorized load/store. For sm_120a, 128-bit loads? Use alignas(16) __nv_bfloat16? We can define struct of 8 bf16 = 16 bytes. But native vector types? There is __nv_bfloat162 for 2. For 8 maybe use uint4 or __nv_bfloat164? CUDA has __nv_bfloat164? I think yes in cuda_bf16.h? There are __nv_bfloat162, __nv_bfloat164, __nv_bfloat168? I need ensure portable. CUDA 12.8? For B200? Maybe __nv_bfloat168? Not sure. Safer define struct aligned 16 with 8 __nv_bfloat16. Use static_assert. Vectorized using alignas(16). Load uint4? We can reinterpret_cast<const uint4*)? But BF16 struct align 16, 8 elements. Use struct BFloat16x8 { __nv_bfloat16 v[8]; } alignas(16); Then kernel loads BFloat16x8. Need ensure base pointer aligned 16. Use cudaMalloc alignment default maybe 256? yes. Rows length multiple of 8 for vectorization. Could require M,N multiple of 8? Or support tail. User says large matrix; can require N % 8 == 0 and rows maybe arbitrary. Could also handle tail scalar for completeness but more code. To keep complete, we can implement vectorized main for N multiple of 8 and scalar fallback? But requirement vectorized kernel, not necessarily handle non-multiple. Could enforce N % 8 == 0. Also row normalization: divide each element by L2 norm of row? Need define. Row by row normalize large BF16 matrix. Usually normalize each row to unit L2 norm. Need stable: FP32 reference computes sum squares in FP32? Numerically stable maybe use two-pass: first compute max absolute to scale, sum scaled squares, norm = scale * sqrt(sum_scaled_sq), then normalize. For rows of BF16. Could also use Welford? For L2 stable. Need compute in FP32 reference and kernel. Need kernel can be vectorized and row by row. One thread block per row? For large matrix, if N large, use block of threads per row, warp/block reduction for norm. Or one block per row, each thread processes chunks, partial sums. Need stable. We can use two passes: first pass compute per-row scale and sumsq in block, then second pass normalize. Since row length large, a block can process row; block reduction. Vectorized: each thread loads 8 values, converts to float, compute local max abs and sumsq of scaled? For stable, need scale row max. But computing sumsq of raw values may overflow/underflow. Use max first: each thread computes local max, block reduce max, then each thread divides by max, accumulate sumsq. But if max==0 then norm 0, output zero (or unchanged). Then norm = max*sqrt(sum_sqr_scaled). Then divide values by norm. Need maybe rescale. For kernel, each thread needs original values; can reread from global or keep in registers. If each thread handles chunk with stride, store vector to registers, but if multiple chunks, could reload or keep? Simpler two-pass over global: pass1 compute scale and sumsq, pass2 normalize. That doubles memory read. Or single pass if each thread stores loaded data in local memory? For large N, can't store all. Could use one pass: each thread loads vector, keeps in registers for one chunk? If block size * vector count covers N, each thread loads vector once, participates reduction, then uses registers to normalize. This requires N <= blockDim.x*8 maybe. For large rows N may be bigger than block*8. Could choose block size 256, each thread processes multiple 8 chunks; to avoid reloading, we can store all chunks in registers? Too many if N large. Alternative use shared memory to store row? Row length maybe large > shared memory. Two-pass simpler and memory bandwidth maybe okay. But normalization needs output write; reading twice. We can also one-pass with per-thread cache if N is moderate. But request large matrix. Two-pass stable is okay.
+
+Need RAII device buffers. Could template class DeviceBuffer<T> with constructor size, destructor free, methods get, size, maybe reset. Need ensure alignment? cudaMalloc returns 256-byte aligned? For __nv_bfloat16x8 maybe okay. But to be safe use cudaMalloc? It guarantees 256-byte alignment? CUDA docs: device memory returned by cudaMalloc is aligned to 256 bytes? I think yes for recent. But can use cudaMallocPitch? For vectorized, need 16-byte alignment; 256 enough. For row stride maybe if N multiple 8, row base offset is multiple 16 since N*2 multiple 16. Good.
+
+Argument parsing: C++20, no external libs. Use simple parse --rows, --cols, --seed, --warmup, --iters, --threads, --vector-width? Need maybe --check. Could keep simple. Need complete.
+
+Deterministic input generation: host CPU or device? Need deterministic. Could generate on host using splitmix64/xoshiro? Fill vector of bf16. Need convert to bf16. Use __nv_bfloat16? Host can convert float to __nv_bfloat16 via __float2bfloat16? Is available host? Yes functions in cuda_bf16.h maybe host/device. Or use bit manipulation. We can generate float values from [-1,1] or [0,1] and cast to bf16. Need deterministic independent of GPU. Use SplitMix64 to generate uniform bits, convert to float. Or generate pseudo-random floats. Need ensure row norms not zero. Maybe generate in [-1,1]. Could also include known values? Deterministic input generation: use seed, generate M*N bf16 values. Use std::vector<__nv_bfloat16>. But __nv_bfloat16 may be 16-bit; vector okay. Need copy to device. For large matrix, host memory maybe huge; command line can specify. Need maybe avoid huge host? But complete. Could generate on device deterministic to reduce host memory? But reference FP32 needs host? Need input BF16 for reference. We can generate device and copy? For verification, need reference on host or device? Could compute FP32 reference on CPU from host input, compare device output on host. That requires host copy. Or compute reference on GPU in FP32 and compare on GPU, then verify errors on GPU and copy flag. But requirement "FP32 reference" could be CPU reference. Need deterministic input generation. Could generate input on host, copy to device. Then CPU reference from host BF16 values converted to float stable. Then copy output back and compare with tolerance. That uses host memory. For large matrix could be too large; but command-line program can handle moderate. Alternative generate input on device deterministic kernel, keep device input; compute reference on device FP32 (or CPU if copy). But "FP32 reference" could be device kernel using FP32 operations. Need tolerance-based verification. To be robust and not require huge host, we can generate on device, but need deterministic input generation maybe device kernel with seed. Then reference can be computed on GPU in FP32 to a buffer, and comparison on GPU. But CPU verification? It says FP32 reference, not necessarily CPU. But often reference implementation on CPU. Let's design: deterministic input generation on host? For completeness, host generation easier and CPU reference stable. But large matrix: can specify moderate. Need maybe stream? Could use device generation and device reference to avoid host huge. But error checking and verification can be done on GPU. However "numerically stable FP32 reference" likely means a reference implementation in FP32 (could be CPU) used for verification. We can implement both? Too much. We need complete but not overcomplicated.
+
+Let's consider requirements:
+- CUDA 13.1/C++20 command-line program.
+- normalizes a large BF16 matrix row by row on an sm_120a GPU.
+- Include argument parsing, RAII device buffers, numerically stable FP32 reference, vectorized CUDA kernel, warm-up, CUDA-event timing, deterministic input generation, error checking, tolerance-based verification, and CMakeLists.txt.
+- Explain memory layout and launch geometry after code.
+- Do not omit implementations or replace sections with comments.
+
+Thus code should be complete, no placeholder. We need produce CMakeLists and .cu file maybe main. Need ensure compiles.
+
+Important: CUDA 13.1/C++20. CMake needs set CMAKE_CUDA_ARCHITECTURES "120a"? For sm_120a. Use project CXX CUDA. Set CMAKE_CXX_STANDARD 20, CMAKE_CUDA_STANDARD 20. Use CUDA_SEPARABLE_COMPILATION maybe. Add executable. Include cuda. For sm_120a, maybe -gencode arch=compute_120a,code=sm_120a. CMAKE_CUDA_ARCHITECTURES=120a should translate. Need also maybe CUDA_RESOLVE_DEVICE_SYMBOLS ON? Not needed. Use set_target_properties CUDA_SEPARABLE_COMPILATION ON? Maybe for CUDA. Need CMake 3.24+.
+
+Potential compile issues: __nv_bfloat16 in host code. Include <cuda_bf16.h>. Need use std::vector<__nv_bfloat16>. __nv_bfloat16 has constructor from float? There is __float2bfloat16(float). Also __bfloat162float. We can use.
+
+Need vectorized kernel. Let's design.
+
+Data layout: row-major matrix M rows, N columns. BF16, 2 bytes. N multiple of 8 => each row is N*2 bytes, multiple 16. Row pointer: input + row*N. Vector count per row: N/8.
+
+Kernel options:
+1. One block per row. Block size configurable e.g. 256 or 512. Each block processes one row in two passes:
+   Pass 1: Each thread t handles vector indices t, t+blockDim.x, ... . For each vector of 8 bf16: convert to float8; compute local max abs and sumsq scaled? But stable needs row max before sumsq. Could do two subpasses: first compute max abs over row; reduce max. Then second compute sumsq of x/scale. Then reduce sumsq. That would be three passes (max, sumsq, normalize) or combine max + store? Need avoid too many reads. Could use single-pass with per-thread local max and local sumsq unscaled? If values can be large, raw sumsq overflow. But for random [-1,1] okay. But "numerically stable" suggests scale by max. Could do one pass per thread: compute local max and local sumsq of x^2? Not stable for large. But if we know input range from generator [-1,1], it's stable enough? Not robust. Need implement stable scale. Could do two-pass per row: pass A max, pass B sumsq scaled and normalize? To normalize, need norm. Could pass B read values again compute y = x/(scale*sqrt(sumsq_scaled)) and write. That's max pass + normalize pass (sumsq computed in pass B? But sumsq needed before dividing; can compute local scaled sumsq while reading in pass B, reduce, then each thread re-reads or holds? If pass B reads once to compute scaled sumsq, but need output after reduction; can reload. That's 3 passes: max, sumsq, normalize. Or pass A max, pass B sumsq, pass C normalize. Too much.
+
+Alternative: One-pass with safe scaling using online max and sum of squares with rescaling. For each value, maintain scale (max so far) and sumsq of scaled values. Algorithm:
+Initialize local scale=0, sum=0.
+For each x:
+  ax=abs(x)
+  if ax > scale:
+    sum = sum * (scale/ax)^2 + 1; scale = ax
+  else:
+    sum += (ax/scale)^2 (if scale>0)
+This accumulates squares in scaled domain, stable, one pass. After block reduce max scale and sum? Need combine local (scale,sum) pairs across threads. How to combine two scaled representations? If a has scale S_a and sum A (sum of (x/S_a)^2). b has S_b, B. To combine: new_scale = max(S_a,S_b). If new_scale = S_a: sum = A + B*(S_b/S_a)^2. If S_b: sum = A*(S_a/S_b)^2 + B. If both zero => 0. Need block reduce using this combine. This is numerically stable one-pass for sum of squares. Great. Then each thread can normalize? But if each thread processed multiple chunks, to output need reread or store in registers. If we store one vector per thread? If row length > blockDim.x*8, thread processes multiple chunks; cannot store all. Could use two passes: first compute local scale/sum using one-pass algorithm over all its chunks (read once); block reduce; then second pass normalize (read again and write). That's two global reads, one write. Stable and no extra max pass. The local combine algorithm avoids needing row max first. Good.
+
+Could also use shared memory to cache row if row length <= shared memory, but not necessary.
+
+Vectorized kernel: Each block per row. Thread block size maybe 256. For vector_count V = N/8. For i = threadIdx.x; i < V; i += blockDim.x:
+ load BFloat16x8 v from row + i*8.
+ convert 8 to float.
+ update local scale/sum over 8 values using stable algorithm. Could unroll.
+After loop, reduce local scale/sum across block using shared memory with custom combine.
+Need compute row_norm = scale * sqrt(sum) (if scale>0 and sum>0). But careful: if all zeros, scale=0 sum=0. If values very small, scale may underflow? BF16 min normal ~1e-38, subnormal ~9e-41? FP32 scale can handle. If scale==0, norm=0.
+Need avoid division by zero.
+
+For reduction: We have pairs (scale, sum). Need combine in shared. Use parallel reduction:
+for (int offset = blockDim.x/2; offset>0; offset>>=1) {
+  if (threadIdx.x < offset) {
+    if (scale < shared_scale[offset+threadIdx.x]) {
+       // combine current (scale,sum) with other? Need symmetric combine.
+       scale, sum = combine(scale,sum, shared_scale[idx], shared_sum[idx])
+    }
+  }
+  __syncthreads();
+}
+But in-place reduction with threads: initialize shared arrays. Then for offset... Need sync. For threads < offset, combine shared[tid] with shared[tid+offset]. Store combined. Need __syncthreads each step. At end thread 0 has combined. But need broadcast norm. Could store row_scale and row_sum in shared[0], syncthreads, compute norm, store norm in shared maybe.
+
+Combine function:
+__device__ void combine_scaled_sums(float s1, float sum1, float s2, float sum2, float &s, float &sum) {
+ if (s1 == 0.f) { s=s2; sum=sum2; }
+ else if (s2 == 0.f) { s=s1; sum=sum1; }
+ else if (s1 >= s2) {
+    float r = s2 / s1; sum = sum1 + sum2 * r * r; s = s1;
+ } else { float r = s1 / s2; sum = sum2 + sum1 * r * r; s = s2; }
+}
+Potential if sum NaN? Input no NaN.
+
+Local update for each x:
+__device__ void update_local(float x, float &scale, float &sum) {
+ float ax = fabsf(x);
+ if (scale == 0.f) { scale = ax; sum = 1.f; } // if ax=0 then sum? If scale=0 and ax=0, remains 0, sum 0? Need handle.
+ else if (ax > scale) { float r = scale/ax; sum = sum*r*r + 1.f; scale=ax; }
+ else { float r = ax/scale; sum += r*r; }
+}
+If scale=0 and ax=0, should remain sum=0. So:
+if (scale == 0.f) { if (ax > 0.f) {scale=ax; sum=1.f;} }
+else if ...
+If ax=0 and scale=0, no change. If scale>0, ax=0 => sum +=0.
+Need use fabsf, __exp? sqrtf.
+
+But is this equivalent to sum of squares? If scale is max absolute so far, sum = sum ((x/scale)^2) for processed values? When new max

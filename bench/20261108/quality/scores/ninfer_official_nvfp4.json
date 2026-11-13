@@ -1,0 +1,38 @@
+{
+ "configuration": "NInfer, official NVFP4",
+ "engine": "NInfer master a754fcf3 (a copy of the source with a dump of the logits added)",
+ "model": "qwen3_8_27b_nvfp4.ninfer (official NVFP4)",
+ "kv_cache": "FP8",
+ "size_bytes": 23719715844,
+ "size_note": "the official .ninfer file",
+ "kl": 0.01778683912294864,
+ "kl_kind": "whole vocabulary",
+ "top1_agreement_pct": 94.67253176930596,
+ "ppl": 2.0843968798153236,
+ "in_table": true,
+ "in_documents_table": true,
+ "how": "A copy of NInfer's source (master a754fcf3) was built with an added dump of the logits of the whole vocabulary in its perplexity tool. The installed build used for the speed tables was not changed.",
+ "record": {
+  "count": 20460,
+  "ppl": 2.0843968798153236,
+  "ppl_base": 2.065188190523882,
+  "ln_ppl_ratio": 0.009258191443375252,
+  "kld_mean": 0.01778683912294864,
+  "kld_median": 0.005312663809824949,
+  "kld_p99": 0.14351948536042375,
+  "kld_p999": 0.41635184488420296,
+  "kld_max": 2.2371083062826296,
+  "rms_dp_pct": 4.529158703224325,
+  "same_top_pct": 94.67253176930596,
+  "ppl_from_engine_targets": 2.0843957486803384,
+  "checks": {
+   "max_abs_nll_difference_dump_vs_engine": 7.510185241699219e-06,
+   "output_rows_the_engine_computes": 248077,
+   "vocabulary": 248320,
+   "largest_reference_probability_on_the_rows_not_computed": 2.7346050046617165e-05,
+   "dump_blocks": 20,
+   "trailing_bytes": 0
+  },
+  "seconds": 155.6
+ }
+}

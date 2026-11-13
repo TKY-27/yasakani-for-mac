@@ -1,0 +1,256 @@
+# `metrics-service` — a complete, runnable TypeScript 5 service
+
+Below is a full, self-contained implementation. It uses **only Node built-ins** (no third-party runtime dependencies) for the service, and **only `typescript` + `@types/node`** as dev dependencies. Tests use Node's built-in `node:test` runner.
+
+---
+
+## 1. `package.json`
+
+```json
+{
+  "name": "metrics-service",
+  "version": "1.0.0",
+  "description": "Newline-delimited request-metrics ingestion, validation, and aggregation service.",
+  "type": "module",
+  "engines": { "node": ">=18.17.0" },
+  "main": "dist/index.js",
+  "bin": { "metrics-service": "dist/index.js" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsc -p tsconfig.json --watch & node --watch dist/index.js",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "keywords": ["metrics", "ingestion", "aggregation", "typescript"],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
+```
+
+---
+
+## 2. `tsconfig.json` (service)
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "dist-test", "test"]
+}
+```
+
+## 3. `tsconfig.test.json` (tests)
+
+```json
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist-test",
+    "rootDir": ".",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "dist", "dist-test"]
+}
+```
+
+---
+
+## 4. `src/types.ts` — strict domain types
+
+```ts
+/**
+ * Core domain types for the metrics service.
+ *
+ * Design notes:
+ *  - `RunRecord` is the *validated* shape. Raw input is `unknown` until it
+ *    passes `validateRunRecord`, which narrows it to `RunRecord`.
+ *  - `GroupKey` is a canonical string so grouping is O(1) and stable.
+ *  - `Aggregation` holds the running statistics for one (model, fixture) group.
+ */
+
+/** A single validated request-metrics record. */
+export interface RunRecord {
+  /** Unique run identifier (e.g. a UUID or a short slug). */
+  id: string;
+  /** Model name (e.g. "gpt-4", "llama-3-70b"). */
+  model: string;
+  /** Fixture / dataset name (e.g. "mmlu", "gsm8k"). */
+  fixture: string;
+  /** Wall-clock timestamp of the run, in milliseconds since epoch. */
+  timestamp: number;
+  /** Latency in milliseconds (non-negative). */
+  latencyMs: number;
+  /** Tokens processed (non-negative integer). */
+  tokens: number;
+  /** Outcome of the run. */
+  outcome: RunOutcome;
+  /** Optional free-form error message when outcome === "error". */
+  error?: string;
+}
+
+export type RunOutcome = "success" | "error" | "timeout";
+
+/** Canonical grouping key: `${model}::${fixture}`. */
+export type GroupKey = string;
+
+/**
+ * Running aggregation for one (model, fixture) group.
+ *
+ * `sum` and `sumSq` are kept so the sample variance can be computed in
+ * O(1) at query time. `values` is a bounded ring buffer used to compute the
+ * median without storing every value ever seen (bounded memory).
+ */
+export interface Aggregation {
+  key: GroupKey;
+  model: string;
+  fixture: string;
+  count: number;
+  sum: number;
+  sumSq: number;
+  min: number;
+  max: number;
+  /** Bounded sample of latency values (most recent `capacity` values). */
+  values: number[];
+  /** Number of values evicted from the ring buffer (for observability). */
+  evicted: number;
+  successCount: number;
+  errorCount: number;
+  timeoutCount: number;
+  firstSeen: number;
+  lastSeen: number;
+}
+
+/** Per-run metadata tracked for the /runs/:id endpoint. */
+export interface RunMeta {
+  id: string;
+  model: string;
+  fixture: string;
+  timestamp: number;
+  outcome: RunOutcome;
+  latencyMs: number;
+  tokens: number;
+  /** Number of records observed for this run id (usually 1). */
+  recordCount: number;
+}
+
+/** A fully computed summary row for one group. */
+export interface GroupSummary {
+  model: string;
+  fixture: string;
+  count: number;
+  mean: number;
+  median: number;
+  /** Sample standard deviation (n-1 denominator). NaN when count < 2. */
+  sampleStdDev: number;
+  min: number;
+  max: number;
+  successCount: number;
+  errorCount: number;
+  timeoutCount: number;
+  firstSeen: number;
+  lastSeen: number;
+}
+
+/** The full /summary response body. */
+export interface SummaryResponse {
+  generatedAt: number;
+  totalRecords: number;
+  totalRuns: number;
+  groups: GroupSummary[];
+}
+
+/** The /health response body. */
+export interface HealthResponse {
+  status: "ok" | "degraded";
+  uptimeSec: number;
+  totalRecords: number;
+  totalRuns: number;
+  groupCount: number;
+  memory: {
+    rssBytes: number;
+    heapUsedBytes: number;
+    heapTotalBytes: number;
+  };
+  version: string;
+}
+
+/** The /runs/:id response body. */
+export interface RunResponse {
+  id: string;
+  model: string;
+  fixture: string;
+  timestamp: number;
+  outcome: RunOutcome;
+  latencyMs: number;
+  tokens: number;
+  recordCount: number;
+}
+
+/** Error thrown for malformed input. Carries a stable `code`. */
+export class MalformedInputError extends Error {
+  readonly code: string;
+  readonly line?: number;
+  constructor(message: string, code: string, line?: number) {
+    super(message);
+    this.name = "MalformedInputError";
+    this.code = code;
+    this.line = line;
+  }
+}
+
+/** Error thrown when the in-memory store is full and a new run id arrives. */
+export class StoreFullError extends Error {
+  readonly code = "STORE_FULL";
+  constructor(message: string) {
+    super(message);
+    this.name = "StoreFullError";
+  }
+}
+```
+
+---
+
+## 5. `src/config.ts` — configuration & limits
+
+```ts
+/**
+ * Central configuration. All limits are bounded to keep memory predictable.
+ * Values can be overridden via environment variables.
+ */
+
+export interface ServiceConfig {
+  /** Port to listen on. */
+  port: number;
+  /** Host to bind. */
+  host: string;
+  /** Max bytes accepted in a single HTTP request body. */
+  maxBodyBytes: number;
+  /** Max number of NDJSON lines accepted in a single request. */
+  maxLinesPerRequest

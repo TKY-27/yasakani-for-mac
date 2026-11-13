@@ -1,0 +1,582 @@
+Here is a complete, runnable Python 3.11 package.
+
+```
+jobrunner/
+├── pyproject.toml
+├── README.md
+├── src/
+│   └── jobrunner/
+│       ├── __init__.py
+│       ├── __main__.py
+│       ├── manifest.py
+│       ├── state.py
+│       ├── events.py
+│       ├── redaction.py
+│       ├── gpu.py
+│       ├── runner.py
+│       └── cli.py
+└── tests/
+    ├── conftest.py
+    ├── test_success.py
+    ├── test_failure.py
+    ├── test_cancellation.py
+    └── test_resume.py
+```
+
+---
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jobrunner"
+version = "0.1.0"
+description = "Deterministic asynchronous job runner with GPU gating, atomic state, and structured events."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "JobRunner Team" }]
+dependencies = [
+    "aiofiles>=23.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "aiofiles>=23.0",
+]
+
+[project.scripts]
+jobrunner = "jobrunner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+---
+
+### `src/jobrunner/__init__.py`
+
+```python
+"""Deterministic asynchronous job runner package."""
+
+__version__ = "0.1.0"
+```
+
+---
+
+### `src/jobrunner/manifest.py`
+
+```python
+"""Manifest loading and validation."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+class ManifestError(Exception):
+    """Raised when the manifest is invalid."""
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    """A single job specification from the manifest."""
+
+    job_id: str
+    command: str
+    gpu: bool = False
+    timeout_seconds: float = 300.0
+    env: dict[str, str] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Manifest:
+    """Parsed and validated manifest."""
+
+    version: int
+    jobs: list[JobSpec]
+    secrets: list[str]
+    output_dir: str
+    max_concurrent: int = 1
+
+    @property
+    def job_ids(self) -> list[str]:
+        return [j.job_id for j in self.jobs]
+
+
+def load_manifest(path: str | Path) -> Manifest:
+    """Load and validate a JSON manifest file.
+
+    Args:
+        path: Path to the JSON manifest.
+
+    Returns:
+        A validated Manifest dataclass.
+
+    Raises:
+        ManifestError: If the manifest is malformed or invalid.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise ManifestError(f"Manifest not found: {p}")
+
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ManifestError(f"Invalid JSON in manifest: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise ManifestError("Manifest root must be a JSON object")
+
+    # Required fields
+    for key in ("version", "jobs", "output_dir"):
+        if key not in raw:
+            raise ManifestError(f"Missing required field: '{key}'")
+
+    version = raw["version"]
+    if not isinstance(version, int) or version < 1:
+        raise ManifestError("'version' must be a positive integer")
+
+    jobs_raw = raw["jobs"]
+    if not isinstance(jobs_raw, list) or len(jobs_raw) == 0:
+        raise ManifestError("'jobs' must be a non-empty list")
+
+    jobs: list[JobSpec] = []
+    seen_ids: set[str] = set()
+    for i, job_raw in enumerate(jobs_raw):
+        if not isinstance(job_raw, dict):
+            raise ManifestError(f"Job at index {i} must be an object")
+
+        job_id = job_raw.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            raise ManifestError(f"Job at index {i} missing valid 'job_id'")
+        if job_id in seen_ids:
+            raise ManifestError(f"Duplicate job_id: '{job_id}'")
+        seen_ids.add(job_id)
+
+        command = job_raw.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise ManifestError(f"Job '{job_id}' missing valid 'command'")
+
+        gpu = job_raw.get("gpu", False)
+        if not isinstance(gpu, bool):
+            raise ManifestError(f"Job '{job_id}': 'gpu' must be a boolean")
+
+        timeout = job_raw.get("timeout_seconds", 300.0)
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ManifestError(f"Job '{job_id}': 'timeout_seconds' must be positive")
+
+        env = job_raw.get("env", {})
+        if not isinstance(env, dict):
+            raise ManifestError(f"Job '{job_id}': 'env' must be an object")
+
+        metadata = job_raw.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ManifestError(f"Job '{job_id}': 'metadata' must be an object")
+
+        jobs.append(
+            JobSpec(
+                job_id=job_id,
+                command=command,
+                gpu=gpu,
+                timeout_seconds=float(timeout),
+                env=env,
+                metadata=metadata,
+            )
+        )
+
+    secrets = raw.get("secrets", [])
+    if not isinstance(secrets, list):
+        raise ManifestError("'secrets' must be a list of strings")
+    for s in secrets:
+        if not isinstance(s, str):
+            raise ManifestError("Each entry in 'secrets' must be a string")
+
+    output_dir = raw["output_dir"]
+    if not isinstance(output_dir, str) or not output_dir:
+        raise ManifestError("'output_dir' must be a non-empty string")
+
+    max_concurrent = raw.get("max_concurrent", 1)
+    if not isinstance(max_concurrent, int) or max_concurrent < 1:
+        raise ManifestError("'max_concurrent' must be a positive integer")
+
+    return Manifest(
+        version=version,
+        jobs=jobs,
+        secrets=secrets,
+        output_dir=output_dir,
+        max_concurrent=max_concurrent,
+    )
+```
+
+---
+
+### `src/jobrunner/state.py`
+
+```python
+"""Atomic state persistence and resumption."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class JobState:
+    job_id: str
+    status: JobStatus = JobStatus.PENDING
+    exit_code: int | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "status": self.status.value,
+            "exit_code": self.exit_code,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "JobState":
+        return cls(
+            job_id=d["job_id"],
+            status=JobStatus(d.get("status", "pending")),
+            exit_code=d.get("exit_code"),
+            started_at=d.get("started_at"),
+            finished_at=d.get("finished_at"),
+            error=d.get("error"),
+        )
+
+
+@dataclass
+class RunState:
+    """Top-level state for a single runner invocation."""
+
+    run_id: str
+    manifest_version: int
+    jobs: dict[str, JobState] = field(default_factory=dict)
+    completed: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+    cancelled: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "manifest_version": self.manifest_version,
+            "jobs": {jid: js.to_dict() for jid, js in self.jobs.items()},
+            "completed": self.completed,
+            "failed": self.failed,
+            "cancelled": self.cancelled,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "RunState":
+        jobs = {
+            jid: JobState.from_dict(js) for jid, js in d.get("jobs", {}).items()
+        }
+        return cls(
+            run_id=d["run_id"],
+            manifest_version=d.get("manifest_version", 1),
+            jobs=jobs,
+            completed=d.get("completed", []),
+            failed=d.get("failed", []),
+            cancelled=d.get("cancelled", []),
+        )
+
+    def is_finished(self, job_id: str) -> bool:
+        js = self.jobs.get(job_id)
+        if js is None:
+            return False
+        return js.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+
+    def pending_jobs(self) -> list[str]:
+        return [
+            jid for jid, js in self.jobs.items()
+            if js.status == JobStatus.PENDING
+        ]
+
+
+class StateStore:
+    """Persists RunState atomically to a JSON file.
+
+    Uses write-to-temp + rename for atomicity on POSIX systems.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def save(self, state: RunState) -> None:
+        """Atomically write state to disk."""
+        data = json.dumps(state.to_dict(), indent=2, sort_keys=True)
+        # Write to a temp file in the same directory, then rename.
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(self._path.parent),
+            prefix=".state_",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self._path)
+        except BaseException:
+            # Clean up temp file on failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def load(self) -> RunState | None:
+        """Load state from disk, or None if no state file exists."""
+        if not self._path.exists():
+            return None
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+            return RunState.from_dict(raw)
+        except (json.JSONDecodeError, KeyError) as exc:
+            raise RuntimeError(
+                f"Corrupt state file at {self._path}: {exc}"
+            ) from exc
+
+    def clear(self) -> None:
+        """Remove the state file."""
+        if self._path.exists():
+            self._path.unlink()
+```
+
+---
+
+### `src/jobrunner/events.py`
+
+```python
+"""Structured JSONL event streaming."""
+
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, TextIO
+
+
+@dataclass
+class Event:
+    """A single structured event."""
+
+    timestamp: str
+    event_type: str
+    job_id: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+
+    def to_jsonl(self) -> str:
+        payload: dict[str, Any] = {
+            "ts": self.timestamp,
+            "type": self.event_type,
+        }
+        if self.job_id is not None:
+            payload["job_id"] = self.job_id
+        payload.update(self.data)
+        return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+class EventStream:
+    """Streams JSONL events to a file and/or stdout.
+
+    Events are written in deterministic order (FIFO) because the runner
+    processes jobs sequentially.
+    """
+
+    def __init__(
+        self,
+        output_file: str | Path | None = None,
+        to_stdout: bool = False,
+        redactor: "Redactor | None" = None,
+    ) -> None:
+        self._output_file: TextIO | None = None
+        self._to_stdout = to_stdout
+        self._redactor = redactor
+        self._events: list[Event] = []
+
+        if output_file is not None:
+            p = Path(output_file)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            self._output_file = open(p, "w", encoding="utf-8")
+
+    @property
+    def events(self) -> list[Event]:
+        """All events emitted so far (for testing/inspection)."""
+        return list(self._events)
+
+    def emit(
+        self,
+        event_type: str,
+        job_id: str | None = None,
+        **data: Any,
+    ) -> None:
+        """Emit a structured event."""
+        ts = datetime.now(timezone.utc).isoformat()
+        event = Event(
+            timestamp=ts,
+            event_type=event_type,
+            job_id=job_id,
+            data=data,
+        )
+        self._events.append(event)
+
+        line = event.to_jsonl()
+
+        # Redact secrets from the serialized line
+        if self._redactor is not None:
+            line = self._redactor.redact(line)
+
+        if self._output_file is not None:
+            self._output_file.write(line + "\n")
+            self._output_file.flush()
+
+        if self._to_stdout:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+
+    def close(self) -> None:
+        if self._output_file is not None:
+            self._output_file.close()
+            self._output_file = None
+
+    def __enter__(self) -> "EventStream":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+```
+
+---
+
+### `src/jobrunner/redaction.py`
+
+```python
+"""Secret redaction for log/event output."""
+
+from __future__ import annotations
+
+import re
+from typing import Sequence
+
+
+class Redactor:
+    """Redacts configured secret values from text.
+
+    Each secret string is replaced with ``[REDACTED]`` in any text
+    that passes through :meth:`redact`.
+    """
+
+    def __init__(self, secrets: Sequence[str]) -> None:
+        self._secrets: list[str] = [s for s in secrets if s]
+        # Build a single regex that matches any of the secrets.
+        # Escape each secret for literal matching.
+        if self._secrets:
+            pattern = "|".join(re.escape(s) for s in self._secrets)
+            self._regex = re.compile(pattern)
+        else:
+            self._regex = None
+
+    def redact(self, text: str) -> str:
+        """Replace all occurrences of known secrets with [REDACTED]."""
+        if self._regex is None:
+            return text
+        return self._regex.sub("[REDACTED]", text)
+```
+
+---
+
+### `src/jobrunner/gpu.py`
+
+```python
+"""GPU job gating: enforce at most one active GPU job at a time."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+
+
+class GpuLock:
+    """Async lock that enforces a single active GPU job.
+
+    Non-GPU jobs do not acquire this lock.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._active_job: str | None = None
+        self._waiters: list[asyncio.Future[None]] = []
+
+    @property
+    def active_job(self) -> str | None:
+        return self._active_job
+
+    @property
+    def is_held(self) -> bool:
+        return self._active_job is not None
+
+    async def acquire(self, job_id: str) -> None:
+        """Acquire the GPU lock for the given job.
+
+        Blocks until no other GPU job is active.
+        """
+        await self._lock.acquire()
+        self._active_job = job_id
+
+    def release(self) -> None:
+        """Release the GPU lock."""
+        if self._active_job is None:
+            raise RuntimeError("GpuLock.release() called without acquire()")
+        self._active_job = None
+        self._lock.release()
+
+    async def __aenter__(self) -> "GpuLock":
+        # Caller must pass job_id via acquire; this context manager
+        # is a convenience for the runner.
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None

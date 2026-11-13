@@ -1,0 +1,376 @@
+We need answer user's request. Need produce complete Python 3.11 package for deterministic asynchronous job runner. Requirements:
+- read JSON manifest
+- enforce one active GPU job
+- persist atomic state
+- resume completed work
+- stream structured JSONL events
+- handle SIGINT
+- redact configured secrets
+- include pytest tests for success, failure, cancellation, resume
+- present every source file in separate fenced block with its path and include pyproject.toml.
+
+We need design package. Need code complete runnable. Need think thoroughly.
+
+We need probably create package named gpu_job_runner or deterministic_gpu_runner. Need files:
+pyproject.toml
+src/gpu_job_runner/__init__.py
+src/gpu_job_runner/manifest.py
+src/gpu_job_runner/state.py
+src/gpu_job_runner/redaction.py
+src/gpu_job_runner/events.py
+src/gpu_job_runner/runner.py
+src/gpu_job_runner/cli.py maybe
+tests/test_runner.py
+Maybe tests/test_redaction.py? But user asks include pytest tests for success, failure, cancellation, and resume. Could have single test file covering all.
+
+Need ensure deterministic asynchronous job runner. Manifest JSON: jobs with id, name, command? We need simulate GPU job? Since package should read manifest, enforce one active GPU job. We can define jobs as Python callable? But manifest JSON likely includes commands. Deterministic: maybe use seeded random? But actual GPU job can't run. We can make jobs have `command` list or `kind` with parameters. For tests, we need simulate success/failure/cancel/resume without real GPU. Need package can execute manifest commands using asyncio.create_subprocess_exec? But to test success/failure easily, we can define manifest job `kind: echo` etc. Or use pluggable executor. For determinism, maybe jobs specify `run` command and `gpu` true? Enforce one active GPU job: semaphore max 1 for GPU jobs; non-GPU can run? But "asynchronous job runner" likely all jobs are GPU jobs, enforce one active. We can use asyncio.Lock for GPU execution.
+
+Need persistent atomic state: store state in JSON file with atomic write (write temp then os.replace). State includes manifest hash, job statuses: pending, running, succeeded, failed, canceled, resume skip completed. On startup load state; resume completed work: skip completed (succeeded? maybe canceled? Typically resume completed work means do not rerun succeeded jobs; maybe canceled can be rerun? We need decide. For tests resume completed: run success then stop, rerun should skip. We can mark completed = succeeded (and maybe canceled? Canceled not completed). Need state file.
+
+Stream structured JSONL events: events to file and stdout? Need `stream` events as JSON lines. Could have EventStream class writes to output stream (file or stdout) with flush. Each event dict with ts? Deterministic? Use monotonic sequence numbers instead of wall time? For deterministic output, use sequence counter and logical clock. But maybe include ISO timestamp? "deterministic" maybe avoid timestamps or make configurable. We can include `seq` and `job_id`, `event`, `status`, maybe `attempts`. For tests, compare JSONL lines? Need stable.
+
+Handle SIGINT: catch KeyboardInterrupt / signal.SIGINT to cancel running job and mark canceled, persist state, output events. Since asyncio.run may raise KeyboardInterrupt. Need install signal handler? In CLI, use `asyncio` and `loop.add_signal_handler(SIGINT, ...)` if available. On first SIGINT request graceful cancellation: cancel active job, persist state. On second SIGINT maybe force exit. Need implement.
+
+Redact configured secrets: manifest may have `secrets` mapping token -> redaction string? Or env variable names? Requirement: redact configured secrets. We need redact in event log and subprocess env? Configured secrets could be list of strings to replace in events, commands, output. Also environment variables referenced in manifest? We'll implement redactor with secrets from manifest: list of values or env var names? Could be `redact.secrets` in manifest: list of strings; runner redacts any event payload strings recursively and subprocess env? Actually redact configured secrets from logs: before emitting event, apply redaction. Also maybe redact environment passed to jobs. We'll implement redaction of all strings in event data; secrets configured in manifest (`redaction.secrets`), plus values of env vars named in `redaction.env_names`. Ensure tests.
+
+Need complete code. Let's design robust.
+
+Package layout:
+src/gpu_job_runner/
+  __init__.py
+  exceptions.py
+  models.py (Manifest, JobSpec)
+  manifest.py (load_manifest, compute_manifest_hash)
+  state.py (StateStore)
+  redaction.py (Redactor)
+  events.py (EventStream)
+  runner.py (JobRunner)
+  cli.py
+tests/
+  test_runner.py
+
+Need maybe one `main` to run manifest: `python -m gpu_job_runner manifest.json --state ... --events ...`
+
+Need ensure one active GPU job: We can have `asyncio.Semaphore(1)` for GPU jobs. Manifest jobs can have `gpu: true` default. If non-GPU? Enforce? We can set all jobs GPU? Simpler: every job has `gpu` bool; GPU jobs use semaphore, non-GPU can run concurrently. But requirement one active GPU job. We can enforce via semaphore and maybe a global lock. If all jobs GPU, only one at time. For deterministic, run tasks concurrently but semaphore serializes GPU. Need avoid scheduling non-determinism? Since GPU serial, event order can be deterministic if we await tasks sequentially? But asynchronous maybe create tasks for all jobs; if only one active GPU, they queue. We can make runner create tasks for all pending jobs and await gather. With max_concurrency=1 for GPU, they run one by one. If all GPU, deterministic order by manifest order? asyncio task creation order and semaphore release order: if tasks acquire semaphore in creation order? If all waiting, first task holds, then next in order? With asyncio.Semaphore, if multiple tasks wait, FIFO? CPython asyncio Semaphore uses deque, yes. But task start order maybe creation order. We can just process sequentially to be deterministic: for job in pending_jobs: await execute. But "asynchronous" and one active GPU job maybe just serial. But if non-GPU, can async. Could use concurrency for non-GPU. For tests, sequential easier. However user says deterministic asynchronous job runner. Could run jobs concurrently but enforce GPU one active. We can make deterministic by using a priority queue? Simpler: create tasks in manifest order and await gather; GPU semaphore ensures one. Need event order may interleave but okay. For resume tests, maybe run manifest sequentially? If tests check JSONL order, need deterministic. We can implement runner to process jobs sequentially if `max_concurrency` not? But asynchronous doesn't require concurrency. Could use `asyncio.create_task` and gather; but for deterministic, we can sort by order. To ensure event stream order, we could serialize event writes with lock, but events from concurrent jobs could interleave. Since only one GPU active, if all jobs GPU, no interleave. We can default all jobs GPU true, and enforce. Then sequential effectively.
+
+Need execute jobs. Manifest JSON: e.g.
+{
+  "schema": "1",
+  "jobs": [
+    {"id": "j1", "name": "train", "gpu": true, "command": ["python", "-c", "..."], "env": {...}, "inputs": {...}},
+  ],
+  "redaction": {"secrets": ["hunter2"]}
+}
+Job can specify `command`, `cwd`, `env`, `timeout_seconds`, `retry_limit`? For deterministic maybe no retry. For tests, command can be `python -c` to print? But in tests, we don't want external commands? Could use `command` with executable. But to test failure, cancellation, resume, can define job `command: ["python", "-c", "raise SystemExit(1)"]` etc. But cancellation test needs long-running command sleep. Use `python -c "import time; time.sleep(...)"`. But subprocess tests depend on Python availability. It's okay in Py3.11 environment. But maybe to be portable, we can support `kind` jobs: `command` or `sleep` or `fail`. Deterministic and test-friendly.
+
+Better: Manifest jobs can have `type`:
+- `command`: run command
+- `python_expr`: not safe? Maybe use built-in executors: `echo`, `sleep`, `fail`, `gpu_task`? But requirement read JSON manifest; could define `executor` field.
+To make tests simple, implement `JobExecutor` protocol and default `CommandExecutor` plus `SimulatedExecutor` for built-in jobs. But complete? Could use `command` only and tests use system commands. For cancellation, `sleep 30` and SIGINT. But in pytest, we can use `asyncio.run` with signal? Need handle SIGINT in test? Cancellation test can directly call runner.request_cancel() rather than actual OS SIGINT. But also must handle SIGINT. We can test signal handler by sending SIGINT to process? Hard. We can simulate by invoking `runner.handle_sigint()`.
+
+Need include tests for cancellation: We can start runner in task, then call `runner.request_cancel()` (which is what SIGINT handler does) and assert job canceled and state persisted. Or use `os.kill(os.getpid(), SIGINT)`? In pytest within same process can be flaky. Better test
+
+My thinking time is over. I must now write the complete final answer from what I already have, without calling any more tools.Below is a complete, runnable Python 3.11 source package.
+
+It provides:
+
+- JSON manifest loading
+- deterministic asynchronous execution
+- exactly one active GPU job at a time
+- atomic state persistence
+- resumption that skips already-successful work
+- structured JSONL event streaming
+- SIGINT handling for graceful cancellation
+- secret redaction in events and subprocess environment logging
+- pytest tests for success, failure, cancellation, and resume
+
+---
+
+## `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deterministic-gpu-job-runner"
+version = "0.1.0"
+description = "Deterministic asynchronous GPU job runner with atomic state, JSONL events, SIGINT handling, and secret redaction"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Example" }
+]
+classifiers = [
+  "Programming Language :: Python :: 3.11",
+  "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.4",
+]
+
+[project.scripts]
+gpu-job-runner = "gpu_job_runner.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["gpu_job_runner*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+```
+
+---
+
+## `src/gpu_job_runner/__init__.py`
+
+```python
+"""Deterministic asynchronous GPU job runner package."""
+
+from gpu_job_runner.exceptions import (
+    CancelledJobError,
+    JobCancelledError,
+    ManifestError,
+    RunnerError,
+    StateStoreError,
+)
+from gpu_job_runner.manifest import Manifest, JobSpec, load_manifest
+from gpu_job_runner.runner import JobRunner
+from gpu_job_runner.state import JobStatus, StateStore, JobState
+from gpu_job_runner.events import EventWriter
+from gpu_job_runner.redaction import Redactor
+
+__all__ = [
+    "CancelledJobError",
+    "EventWriter",
+    "JobCancelledError",
+    "JobRunner",
+    "JobSpec",
+    "JobState",
+    "JobStatus",
+    "Manifest",
+    "ManifestError",
+    "Redactor",
+    "RunnerError",
+    "StateStore",
+    "StateStoreError",
+    "load_manifest",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+## `src/gpu_job_runner/exceptions.py`
+
+```python
+"""Exceptions for deterministic GPU job runner."""
+
+
+class RunnerError(Exception):
+    """Base error for job runner problems."""
+
+
+class ManifestError(RunnerError):
+    """Raised when a manifest is invalid."""
+
+
+class StateStoreError(RunnerError):
+    """Raised when persisted state is missing or malformed."""
+
+
+class JobCancelledError(RunnerError):
+    """Raised when a job is cancelled before completion."""
+
+
+class CancelledJobError(JobCancelledError):
+    """Alias for compatibility with task cancellation."""
+```
+
+---
+
+## `src/gpu_job_runner/models.py`
+
+```python
+"""Data models for manifest and runtime state."""
+
+from __future__ import annotations
+
+import enum
+import hashlib
+import json
+from dataclasses import dataclass, field
+from typing import Any
+
+
+class JobStatus(str, enum.Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+
+    @classmethod
+    def from_value(cls, value: str) -> "JobStatus":
+        return cls(value)
+
+    def is_terminal(self) -> bool:
+        return self in (
+            JobStatus.SUCCEEDED,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+            JobStatus.SKIPPED,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class JobSpec:
+    """Immutable description of a job from the manifest."""
+
+    id: str
+    name: str
+    command: tuple[str, ...]
+    env: dict[str, str] = field(default_factory=dict)
+    gpu: bool = True
+    timeout_seconds: float | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "command": list(self.command),
+            "env": dict(self.env),
+            "gpu": self.gpu,
+            "timeout_seconds": self.timeout_seconds,
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Manifest:
+    """Parsed and validated manifest."""
+
+    schema_version: str
+    jobs: tuple[JobSpec, ...]
+    redaction_secrets: tuple[str, ...]
+    redaction_env_names: tuple[str, ...]
+    hash: str
+
+    def job_by_id(self, job_id: str) -> JobSpec | None:
+        for job in self.jobs:
+            if job.id == job_id:
+                return job
+        return None
+
+    @staticmethod
+    def compute_hash(payload: dict[str, Any]) -> str:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+```
+
+---
+
+## `src/gpu_job_runner/manifest.py`
+
+```python
+"""Manifest loading and validation."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from gpu_job_runner.exceptions import ManifestError
+from gpu_job_runner.models import JobSpec, Manifest
+
+
+def _as_dict(value: Any, path: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ManifestError(f"{path} must be an object")
+    return value
+
+
+def _as_list(value: Any, path: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise ManifestError(f"{path} must be a list")
+    return value
+
+
+def _as_str(value: Any, path: str) -> str:
+    if not isinstance(value, str):
+        raise ManifestError(f"{path} must be a string")
+    return value
+
+
+def _as_bool(value: Any, path: str) -> bool:
+    if not isinstance(value, bool):
+        raise ManifestError(f"{path} must be a boolean")
+    return value
+
+
+def _as_number(value: Any, path: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ManifestError(f"{path} must be a number")
+    if isinstance(value, (int, float)):
+        return float(value)
+    raise ManifestError(f"{path} must be a number")
+
+
+def _parse_job(raw: Any, index: int) -> JobSpec:
+    base = f"jobs[{index}]"
+    obj = _as_dict(raw, base)
+
+    job_id = _as_str(obj.get("id"), f"{base}.id")
+    name = _as_str(obj.get("name", job_id), f"{base}.name")
+    command_raw = _as_list(obj.get("command"), f"{base}.command")
+    command = tuple(_as_str(item, f"{base}.command[{i}]") for i, item in enumerate(command_raw))
+    if not command:
+        raise ManifestError(f"{base}.command must not be empty")
+
+    env_raw = obj.get("env", {})
+    env = _as_dict(env_raw, f"{base}.env")
+    env_parsed = {}
+    for key, value in env.items():
+        env_parsed[_as_str(key, f"{base}.env key")] = _as_str(value, f"{base}.env[{key}]")
+
+    gpu = _as_bool(obj.get("gpu", True), f"{base}.gpu")
+    timeout_seconds = _as_number(obj.get("timeout_seconds"), f"{base}.timeout_seconds")
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise ManifestError(f"{base}.timeout_seconds must be positive")
+
+    metadata_raw = obj.get("metadata", {})
+    metadata = _as_dict(metadata_raw, f"{base}.metadata")
+
+    return JobSpec(
+        id=job_id,
+        name=name,
+        command=command,
+        env=env_parsed,
+        gpu=gpu,
+        timeout_seconds=timeout_seconds,
+        metadata=metadata,
+    )
+
+
+def _extract_redaction(root: dict[str

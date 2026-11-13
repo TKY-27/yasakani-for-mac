@@ -1,0 +1,545 @@
+Below is a complete, self-contained Python 3.11 package. Every file is in its own fenced block with its path. The package is deterministic (no wall-clock timestamps in state/events, no randomness, stable ordering), enforces a single active GPU job, persists state atomically, resumes completed work, streams structured JSONL events, handles SIGINT, and redacts configured secrets.
+
+## Layout
+
+```
+gpu_job_runner/
+├── pyproject.toml
+├── gpu_job_runner/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── manifest.py
+│   ├── redaction.py
+│   ├── state.py
+│   ├── events.py
+│   ├── runner.py
+│   └── cli.py
+└── tests/
+    ├── conftest.py
+    ├── test_manifest.py
+    ├── test_redaction.py
+    ├── test_state.py
+    ├── test_events.py
+    └── test_runner.py
+```
+
+---
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-job-runner"
+version = "0.1.0"
+description = "Deterministic asynchronous GPU job runner with atomic state, resume, JSONL events, SIGINT handling, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Example" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+gpu-job-runner = "gpu_job_runner.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gpu_job_runner*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+```
+
+---
+
+### `gpu_job_runner/__init__.py`
+
+```python
+"""Deterministic asynchronous GPU job runner."""
+
+from .manifest import Job, Manifest, load_manifest, validate_manifest
+from .redaction import Redactor
+from .state import StateStore
+from .events import EventStream
+from .runner import JobRunner, RunnerConfig
+
+__all__ = [
+    "Job",
+    "Manifest",
+    "load_manifest",
+    "validate_manifest",
+    "Redactor",
+    "StateStore",
+    "EventStream",
+    "JobRunner",
+    "RunnerConfig",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+### `gpu_job_runner/manifest.py`
+
+```python
+"""Manifest loading and validation.
+
+A manifest is a JSON document describing a set of GPU jobs. The schema is
+intentionally small and deterministic:
+
+{
+  "version": 1,
+  "jobs": [
+    {
+      "id": "train-0",
+      "command": ["python", "train.py", "--epochs", "1"],
+      "gpu": 0,
+      "timeout_seconds": 300,
+      "env": {"CUDA_VISIBLE_DEVICES": "0"},
+      "secrets": ["API_KEY"]
+    }
+  ]
+}
+
+`secrets` lists environment variable names whose values must be redacted from
+any emitted event. The values themselves are never stored in the manifest.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+class ManifestError(ValueError):
+    """Raised when a manifest is structurally invalid."""
+
+
+@dataclass(frozen=True)
+class Job:
+    """A single GPU job definition."""
+
+    id: str
+    command: tuple[str, ...]
+    gpu: int
+    timeout_seconds: float
+    env: dict[str, str]
+    secrets: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "command": list(self.command),
+            "gpu": self.gpu,
+            "timeout_seconds": self.timeout_seconds,
+            "env": dict(self.env),
+            "secrets": list(self.secrets),
+        }
+
+
+@dataclass(frozen=True)
+class Manifest:
+    """A validated collection of jobs."""
+
+    version: int
+    jobs: tuple[Job, ...]
+
+    def job_ids(self) -> tuple[str, ...]:
+        return tuple(j.id for j in self.jobs)
+
+    def get(self, job_id: str) -> Job:
+        for job in self.jobs:
+            if job.id == job_id:
+                return job
+        raise KeyError(job_id)
+
+
+def _require_str(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ManifestError(f"{field_name} must be a non-empty string")
+    return value
+
+
+def _require_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ManifestError(f"{field_name} must be an integer")
+    return value
+
+
+def _require_non_negative_number(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ManifestError(f"{field_name} must be a number")
+    if value < 0:
+        raise ManifestError(f"{field_name} must be >= 0")
+    return float(value)
+
+
+def _parse_job(raw: Any, index: int) -> Job:
+    if not isinstance(raw, dict):
+        raise ManifestError(f"jobs[{index}] must be an object")
+
+    job_id = _require_str(raw.get("id"), f"jobs[{index}].id")
+
+    command_raw = raw.get("command")
+    if not isinstance(command_raw, list) or not command_raw:
+        raise ManifestError(f"jobs[{index}].command must be a non-empty list")
+    command = tuple(_require_str(c, f"jobs[{index}].command[{i}]") for i, c in enumerate(command_raw))
+
+    gpu = _require_int(raw.get("gpu", 0), f"jobs[{index}].gpu")
+    if gpu < 0:
+        raise ManifestError(f"jobs[{index}].gpu must be >= 0")
+
+    timeout = _require_non_negative_number(raw.get("timeout_seconds", 0), f"jobs[{index}].timeout_seconds")
+
+    env_raw = raw.get("env", {})
+    if not isinstance(env_raw, dict):
+        raise ManifestError(f"jobs[{index}].env must be an object")
+    env = {}
+    for k, v in env_raw.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            raise ManifestError(f"jobs[{index}].env entries must be string->string")
+        env[k] = v
+
+    secrets_raw = raw.get("secrets", [])
+    if not isinstance(secrets_raw, list):
+        raise ManifestError(f"jobs[{index}].secrets must be a list")
+    secrets = tuple(_require_str(s, f"jobs[{index}].secrets[{i}]") for i, s in enumerate(secrets_raw))
+
+    return Job(
+        id=job_id,
+        command=command,
+        gpu=gpu,
+        timeout_seconds=timeout,
+        env=env,
+        secrets=secrets,
+    )
+
+
+def validate_manifest(data: Any) -> Manifest:
+    """Validate a decoded manifest dict and return a Manifest."""
+    if not isinstance(data, dict):
+        raise ManifestError("manifest root must be an object")
+
+    version = _require_int(data.get("version", 1), "version")
+    if version != 1:
+        raise ManifestError(f"unsupported manifest version: {version}")
+
+    jobs_raw = data.get("jobs")
+    if not isinstance(jobs_raw, list):
+        raise ManifestError("jobs must be a list")
+
+    jobs = tuple(_parse_job(j, i) for i, j in enumerate(jobs_raw))
+
+    seen: set[str] = set()
+    for job in jobs:
+        if job.id in seen:
+            raise ManifestError(f"duplicate job id: {job.id}")
+        seen.add(job.id)
+
+    return Manifest(version=version, jobs=jobs)
+
+
+def load_manifest(path: str | Path) -> Manifest:
+    """Load and validate a manifest from a JSON file."""
+    p = Path(path)
+    if not p.exists():
+        raise ManifestError(f"manifest not found: {p}")
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ManifestError(f"cannot read manifest {p}: {exc}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ManifestError(f"invalid JSON in manifest {p}: {exc}") from exc
+    return validate_manifest(data)
+```
+
+---
+
+### `gpu_job_runner/redaction.py`
+
+```python
+"""Secret redaction.
+
+A Redactor replaces occurrences of configured secret *values* with a
+placeholder. Because secrets are referenced by environment variable name in
+the manifest, the runner resolves the value from the process environment at
+runtime and registers it with the Redactor. The value never appears in
+persisted state or emitted events.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from typing import Iterable
+
+REDACTED = "***REDACTED***"
+
+
+class Redactor:
+    """Redacts a set of secret values from arbitrary strings."""
+
+    def __init__(self, secrets: Iterable[str] = ()) -> None:
+        # Keep the longest secrets first so that a longer secret is not
+        # partially consumed by a shorter one.
+        self._secrets: list[str] = sorted(
+            (s for s in secrets if isinstance(s, str) and s),
+            key=len,
+            reverse=True,
+        )
+        self._pattern: re.Pattern[str] | None = None
+        if self._secrets:
+            escaped = [re.escape(s) for s in self._secrets]
+            self._pattern = re.compile("|".join(escaped))
+
+    def add(self, secret: str) -> None:
+        if not isinstance(secret, str) or not secret:
+            return
+        if secret in self._secrets:
+            return
+        self._secrets.append(secret)
+        self._secrets.sort(key=len, reverse=True)
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        if not self._secrets:
+            self._pattern = None
+            return
+        escaped = [re.escape(s) for s in self._secrets]
+        self._pattern = re.compile("|".join(escaped))
+
+    def redact(self, text: str) -> str:
+        if not isinstance(text, str) or not text:
+            return text
+        if self._pattern is None:
+            return text
+        return self._pattern.sub(REDACTED, text)
+
+    def redact_env(self, env: dict[str, str], secret_names: Iterable[str]) -> dict[str, str]:
+        """Return a copy of env with secret values replaced by the placeholder."""
+        out = dict(env)
+        for name in secret_names:
+            if name in out:
+                out[name] = REDACTED
+        return out
+
+    @staticmethod
+    def resolve_secret(name: str, env: dict[str, str] | None = None) -> str | None:
+        """Resolve a secret value from the environment (or a provided mapping)."""
+        source = env if env is not None else os.environ
+        value = source.get(name)
+        return value if value else None
+```
+
+---
+
+### `gpu_job_runner/state.py`
+
+```python
+"""Atomic, resumable state persistence.
+
+State is a single JSON file. Writes are atomic: we write to a temporary file
+in the same directory and then `os.replace` it onto the target, which is
+atomic on POSIX and Windows. A checksum is stored so readers can detect
+corruption.
+
+The state is deterministic: it contains no wall-clock timestamps. Ordering
+is derived from the manifest, and progress is tracked by job id.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+STATE_VERSION = 1
+
+
+@dataclass
+class JobRecord:
+    """Per-job persisted state."""
+
+    id: str
+    status: str  # "pending" | "running" | "succeeded" | "failed" | "cancelled"
+    attempts: int = 0
+    exit_code: int | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "status": self.status,
+            "attempts": self.attempts,
+            "exit_code": self.exit_code,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "JobRecord":
+        return cls(
+            id=data["id"],
+            status=data["status"],
+            attempts=int(data.get("attempts", 0)),
+            exit_code=data.get("exit_code"),
+            error=data.get("error"),
+        )
+
+
+@dataclass
+class State:
+    """Top-level persisted state."""
+
+    version: int
+    manifest_hash: str
+    jobs: dict[str, JobRecord] = field(default_factory=dict)
+    active_job: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "manifest_hash": self.manifest_hash,
+            "active_job": self.active_job,
+            "jobs": {k: v.to_dict() for k, v in self.jobs.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "State":
+        jobs = {k: JobRecord.from_dict(v) for k, v in data.get("jobs", {}).items()}
+        return cls(
+            version=int(data.get("version", STATE_VERSION)),
+            manifest_hash=data.get("manifest_hash", ""),
+            jobs=jobs,
+            active_job=data.get("active_job"),
+        )
+
+
+def manifest_hash(manifest_dict: dict[str, Any]) -> str:
+    """Deterministic hash of the manifest (canonical JSON, no timestamps)."""
+    canonical = json.dumps(manifest_dict, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class StateStore:
+    """Reads and atomically writes state to a JSON file."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    def _checksum(self, payload: bytes) -> str:
+        return hashlib.sha256(payload).hexdigest()
+
+    def load(self) -> State | None:
+        """Load state, or None if the file does not exist."""
+        if not self.path.exists():
+            return None
+        raw = self.path.read_bytes()
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        stored_checksum = data.get("checksum")
+        payload = data.get("payload")
+        if stored_checksum is None or payload is None:
+            return None
+        payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if self._checksum(payload_bytes) != stored_checksum:
+            return None
+        return State.from_dict(payload)
+
+    def save(self, state: State) -> None:
+        """Atomically persist state."""
+        payload = state.to_dict()
+        payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        checksum = self._checksum(payload_bytes)
+        document = {"checksum": checksum, "payload": payload}
+        document_bytes = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(self.path.parent), prefix=".state-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(document_bytes)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_name, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+```
+
+---
+
+### `gpu_job_runner/events.py`
+
+```python
+"""Structured JSONL event streaming.
+
+Each event is a single-line JSON object. Events are deterministic: they carry
+a monotonically increasing sequence number and no wall-clock timestamps.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any, TextIO
+
+
+@dataclass
+class EventStream:
+    """Writes structured JSONL events to a text stream."""
+
+    stream: TextIO
+    _seq: int = field(default=0, init=False)
+
+    def emit(self, event_type: str, **fields: Any) -> dict[str, Any]:
+        """Build, write, and return an event."""
+        self._seq += 1
+        event = {"seq": self._seq, "type": event_type, **fields}
+        line = json.dumps(event, sort_keys=True, separators=(",", ":"))
+        self.stream.write(line + "\n")
+        self.stream.flush()
+        return event
+
+    def close(self) -> None:
+        try:
+            self.stream.flush()
+        except Exception:
+            pass
+```
+
+---
+
+### `gpu_job_runner/runner.py`
+
+```python
+"""The asynchronous job runner.
+
+Responsibilities:
+  * Enforce at most one active GPU job at a time.
+  * Execute jobs deterministically in manifest order.
+  * Persist state atomically after every transition.
+  * Resume: skip jobs already marked succeeded; re-run pending/failed/cancelled.
+  * Stream structured JSONL events.
+  * Handle SIG

@@ -1,0 +1,10 @@
+# llama.cpp b11700, official Windows CUDA build (llama-server.exe), native on Windows. One request at a time.
+# Target: ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF, file Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf (3-bit IQ3_S with the MTP head)
+# Draft for the DFlash 2 setting: ggml-org/Qwen3.8-27B-GGUF, file dflash-Qwen3.8-27B-Q4_0.gguf
+# -c 16384 for the short tests, -c 49152 for the long-input test.
+
+# MTP setting
+llama-server.exe -m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -ngl 99 -c 16384 -fa on --parallel 1 --jinja --no-webui --host 127.0.0.1 --port 8091 --spec-type draft-mtp --spec-draft-n-max 2
+
+# DFlash 2 setting
+llama-server.exe -m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -ngl 99 -c 16384 -fa on --parallel 1 --jinja --no-webui --host 127.0.0.1 --port 8091 -md dflash-Qwen3.8-27B-Q4_0.gguf -ngld all --spec-type draft-dflash --spec-draft-n-max 15

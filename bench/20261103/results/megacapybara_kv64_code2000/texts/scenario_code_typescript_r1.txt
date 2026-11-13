@@ -1,0 +1,256 @@
+Here's a complete, self-contained TypeScript 5 service. It uses only Node built-ins (no third-party runtime deps), so it runs as-is.
+
+```
+metrics-service/
+├── package.json
+├── tsconfig.json
+├── README.md
+└── src/
+    ├── types.ts          # strict domain + API types
+    ├── schema.ts         # hand-rolled validation (no schema libs)
+    ├── stats.ts          # mean / median / sample stddev
+    ├── store.ts          # bounded in-memory aggregation
+    ├── parser.ts         # incremental NDJSON parsing
+    ├── server.ts         # HTTP endpoints (/health /summary /runs/:id)
+    └── index.ts          # entrypoint
+```
+
+---
+
+### `package.json`
+
+```json
+{
+  "name": "metrics-service",
+  "version": "1.0.0",
+  "description": "Bounded, streaming NDJSON metrics aggregator with health/summary/runs endpoints.",
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.4.5",
+    "vitest": "^2.0.5"
+  }
+}
+```
+
+> No runtime dependencies. `tsx` and `vitest` are dev-only tooling; the production build is plain compiled JS on Node's `http` module.
+
+---
+
+### `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
+```
+
+---
+
+### `src/types.ts`
+
+```ts
+/**
+ * Strict domain and API types for the metrics service.
+ * All numeric fields are finite numbers; strings are non-empty where required.
+ */
+
+/** A single validated request-metric record. */
+export interface MetricRecord {
+  /** Unique identifier of the model under test. */
+  model: string;
+  /** Fixture / dataset identifier. */
+  fixture: string;
+  /** Run identifier this record belongs to. */
+  runId: string;
+  /** Wall-clock timestamp (ISO-8601). */
+  timestamp: string;
+  /** Latency in milliseconds. Must be >= 0. */
+  latencyMs: number;
+  /** Tokens processed (integer >= 0). */
+  tokens: number;
+  /** Whether the request succeeded. */
+  success: boolean;
+  /** Optional error code when success === false. */
+  errorCode?: string;
+}
+
+/** Per-(model, fixture) aggregate statistics. */
+export interface GroupStats {
+  model: string;
+  fixture: string;
+  count: number;
+  mean: number;
+  median: number;
+  /** Sample standard deviation (n-1 denominator); NaN when count < 2. */
+  sampleStdDev: number;
+  min: number;
+  max: number;
+  sum: number;
+  successCount: number;
+  failureCount: number;
+  totalTokens: number;
+}
+
+/** A single run's records and derived stats. */
+export interface RunSummary {
+  runId: string;
+  count: number;
+  groups: GroupStats[];
+  overall: {
+    count: number;
+    mean: number;
+    median: number;
+    sampleStdDev: number;
+    successRate: number;
+  };
+}
+
+/** Full summary across all retained data. */
+export interface SummaryResponse {
+  generatedAt: string;
+  totalRecords: number;
+  droppedMalformed: number;
+  memory: {
+    bytesApprox: number;
+    limitBytes: number;
+    evictedRuns: number;
+    evictedRecords: number;
+  };
+  groups: GroupStats[];
+  runs: Array<{ runId: string; count: number }>;
+}
+
+/** Health probe response. */
+export interface HealthResponse {
+  status: 'ok' | 'degraded';
+  uptimeSec: number;
+  version: string;
+  memory: {
+    bytesApprox: number;
+    limitBytes: number;
+    atLimit: boolean;
+  };
+  counters: {
+    parsed: number;
+    malformed: number;
+    evictedRuns: number;
+    evictedRecords: number;
+  };
+}
+
+/** Malformed-input error surfaced to callers. */
+export class MalformedInputError extends Error {
+  public readonly line: number;
+  public readonly reason: string;
+  constructor(line: number, reason: string, detail?: unknown) {
+    super(`Malformed input at line ${line}: ${reason}`);
+    this.name = 'MalformedInputError';
+    this.line = line;
+    this.reason = reason;
+    if (detail !== undefined) {
+      this.detail = detail;
+    }
+  }
+  public detail?: unknown;
+}
+
+/** Result of ingesting a batch of raw lines. */
+export interface IngestResult {
+  accepted: number;
+  rejected: number;
+  errors: MalformedInputError[];
+}
+```
+
+---
+
+### `src/schema.ts`
+
+```ts
+import type { MetricRecord } from './types.js';
+import { MalformedInputError } from './types.js';
+
+/**
+ * Hand-rolled validation. No third-party schema libraries.
+ * Each check returns a specific reason so operators can triage quickly.
+ */
+
+const MAX_STRING_LEN = 256;
+const MAX_LATENCY_MS = 1_000_000; // 1000 seconds sanity cap
+const MAX_TOKENS = 1_000_000_000;
+
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === 'string' && v.length > 0;
+}
+
+function isBoolean(v: unknown): v is boolean {
+  return typeof v === 'boolean';
+}
+
+function isValidIsoTimestamp(v: string): boolean {
+  // Accept full ISO-8601 with timezone or Z; reject bare dates without time.
+  const re = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/;
+  if (!re.test(v)) return false;
+  const d = new Date(v);
+  return !Number.isNaN(d.getTime());
+}
+
+/**
+ * Validate a raw JSON value into a MetricRecord.
+ * Throws MalformedInputError with a precise reason on any violation.
+ */
+export function validateRecord(raw: unknown, line: number): MetricRecord {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new MalformedInputError(line, 'record must be a JSON object', raw);
+  }
+  const o = raw as Record<string, unknown>;
+
+  const model = o['model'];
+  if (!isNonEmptyString(model)) {
+    throw new MalformedInputError(line, "'model' must be a non-empty string");
+  }
+  if (model.length > MAX_STRING_LEN) {
+    throw new MalformedInputError(line, `'model' exceeds ${MAX_STRING_LEN} chars`);
+  }
+
+  const fixture = o['fixture'];
+  if (!isNonEmptyString(fixture)) {
+    throw new MalformedInputError(line, "'fixture' must be a non-empty string");
+  }
+  if (fixture.length > MAX_STRING_LEN) {
+    throw new MalformedInputError(line, `'fixture' exceeds ${MAX_STRING_LEN} chars

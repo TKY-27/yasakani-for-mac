@@ -1,0 +1,537 @@
+Below is a complete, runnable Python 3.11 package. The design separates concerns into small modules: manifest parsing, GPU gate, atomic state, event bus, redaction, the async runner, a CLI, and a set of pytest tests.
+
+**Key design notes**
+
+- **Determinism**: the runner is fully driven by the JSON manifest. Each job's duration is a constant, and "GPU" is simulated by a single asyncio lock. Tests inject a fake `time.monotonic` so timing is deterministic.
+- **One active GPU job**: a single `asyncio.Lock` serializes GPU jobs.
+- **Atomic state**: `os.replace` over a temp file in the same directory.
+- **Resume**: state is persisted *before* a job starts, so a crash mid-job resumes that job; completed jobs are skipped.
+- **Structured JSONL**: events are written to a `jsonl` file and mirrored to `stderr` (so `stdout` stays clean for the CLI's final summary).
+- **SIGINT**: a signal handler sets a flag and cancels the running job; the runner then stops gracefully and persists state.
+- **Secret redaction**: configured via `secrets` (list) or `secret_env` (env-var names); values are replaced with `***`.
+
+---
+
+`pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deterministic-job-runner"
+version = "0.1.0"
+description = "Deterministic asynchronous GPU job runner"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Example" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.scripts]
+jobrunner = "job_runner.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[tool.setuptools]
+packages = ["job_runner"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+```
+
+---
+
+`job_runner/__init__.py`
+
+```python
+"""Deterministic asynchronous GPU job runner.
+
+Public API:
+    JobRunner   -- the asynchronous runner
+    Job         -- a single job definition
+    Manifest    -- parsed manifest
+    JobStatus   -- status enum
+    RunnerError -- base error type
+"""
+
+from .manifest import Job, JobStatus, Manifest
+from .runner import JobRunner, RunnerError
+
+__all__ = [
+    "JobRunner",
+    "Job",
+    "Manifest",
+    "JobStatus",
+    "RunnerError",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+`job_runner/errors.py`
+
+```python
+"""Error types used across the package."""
+
+
+class RunnerError(Exception):
+    """Base class for all runner errors."""
+
+
+class ManifestError(RunnerError):
+    """Raised when the manifest is missing, unreadable, or invalid."""
+
+
+class StateError(RunnerError):
+    """Raised when state persistence or recovery fails."""
+
+
+class JobExecutionError(RunnerError):
+    """Raised when a job fails to execute."""
+```
+
+---
+
+`job_runner/redact.py`
+
+```python
+"""Redaction of configured secrets from arbitrary text and structured data."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from typing import Any
+
+PLACEHOLDER = "***"
+
+
+def load_secret_values(secrets: list[str], secret_env: list[str]) -> list[str]:
+    """Collect secret values from literal ``secrets`` and named env vars.
+
+    Environment variables referenced by ``secret_env`` that are not set are
+    skipped (nothing to redact).
+    """
+    values: list[str] = []
+    for value in secrets or []:
+        if value:
+            values.append(value)
+    for name in secret_env or []:
+        value = os.environ.get(name)
+        if value:
+            values.append(value)
+    return values
+
+
+def build_redactor(secrets: list[str] | None = None,
+                   secret_env: list[str] | None = None) -> "Redactor":
+    """Build a :class:`Redactor` from manifest configuration."""
+    values = load_secret_values(secrets or [], secret_env or [])
+    return Redactor(values)
+
+
+class Redactor:
+    """Redacts configured secret values from strings and JSON-serializable data."""
+
+    def __init__(self, values: list[str]) -> None:
+        self._values = [v for v in values if v]
+        # Longest-first so a longer secret wins over a shorter prefix.
+        self._values.sort(key=len, reverse=True)
+        if self._values:
+            pattern = re.escape(self._values[0])
+            for value in self._values[1:]:
+                pattern = pattern + "|" + re.escape(value)
+            self._pattern = re.compile(pattern)
+        else:
+            self._pattern = None
+
+    def redact(self, text: str) -> str:
+        if self._pattern is None:
+            return text
+        return self._pattern.sub(PLACEHOLDER, text)
+
+    def redact_obj(self, obj: Any) -> Any:
+        """Recursively redact every string value in a JSON-serializable structure."""
+        if isinstance(obj, str):
+            return self.redact(obj)
+        if isinstance(obj, list):
+            return [self.redact_obj(item) for item in obj]
+        if isinstance(obj, dict):
+            return {key: self.redact_obj(value) for key, value in obj.items()}
+        return obj
+
+    def redact_json(self, obj: Any) -> str:
+        """Serialize ``obj`` to JSON and redact the resulting string."""
+        return self.redact(json.dumps(obj, sort_keys=True))
+```
+
+---
+
+`job_runner/gpu.py`
+
+```python
+"""Single-GPU gate: guarantees at most one active GPU job at a time."""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any, Callable, Coroutine
+
+
+class GpuGate:
+    """An async context manager that enforces a single active GPU job.
+
+    The gate is an ``asyncio.Lock``. Because the runner runs a single job at a
+    time (and the lock is held for the whole GPU job), at most one GPU job is
+    ever active.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+
+    async def __aenter__(self) -> "GpuGate":
+        await self._lock.acquire()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self._lock.release()
+
+    async def run(self, func: Callable[..., Coroutine[Any, Any, Any]], *args: Any,
+                  **kwargs: Any) -> Any:
+        """Run an async callable while holding the GPU gate."""
+        async with self:
+            return await func(*args, **kwargs)
+```
+
+---
+
+`job_runner/state.py`
+
+```python
+"""Atomic, durable job-state persistence and recovery."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any, Dict
+
+from .errors import StateError
+from .manifest import Job, JobStatus
+
+STATE_FILE_NAME = "state.json"
+
+
+def load_state(path: Path) -> Dict[str, Any]:
+    """Load persisted state; return an empty dict if the file is absent."""
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StateError(f"could not read state file {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise StateError(f"state file {path} is not a JSON object")
+    return data
+
+
+def save_state_atomic(path: Path, data: Dict[str, Any]) -> None:
+    """Atomically persist ``data`` to ``path``.
+
+    Writes to a temp file in the same directory, flushes + fsyncs, then
+    ``os.replace`` over the target. On POSIX ``os.replace`` is atomic, so the
+    state file is never observed in a torn/partial state.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=".state-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def recover_state(path: Path, jobs: list[Job]) -> Dict[str, Any]:
+    """Merge persisted state with the current manifest.
+
+    - Jobs that are already completed are kept as completed (resume).
+    - Jobs that are not completed are reset to pending (a crashed run resumes
+      its in-flight job from the beginning).
+    """
+    data = load_state(path)
+    result: Dict[str, Any] = {
+        "version": data.get("version", 1),
+        "jobs": {},
+    }
+    for job in jobs:
+        record = data.get("jobs", {}).get(job.id)
+        if isinstance(record, dict) and record.get("status") == JobStatus.COMPLETED:
+            result["jobs"][job.id] = {
+                "status": JobStatus.COMPLETED,
+                "started_at": record.get("started_at"),
+                "finished_at": record.get("finished_at"),
+                "attempts": record.get("attempts", 1),
+            }
+        else:
+            result["jobs"][job.id] = {
+                "status": JobStatus.PENDING,
+                "started_at": None,
+                "finished_at": None,
+                "attempts": 0,
+            }
+    return result
+```
+
+---
+
+`job_runner/manifest.py`
+
+```python
+"""Manifest data model and validation."""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List
+
+from .errors import ManifestError
+
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class Job:
+    """A single job in the manifest."""
+    id: str
+    name: str
+    uses_gpu: bool
+    duration: float
+    retries: int
+    fail: bool
+    env: Dict[str, str]
+    command: str
+    args: List[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "uses_gpu": self.uses_gpu,
+            "duration": self.duration,
+            "retries": self.retries,
+            "fail": self.fail,
+            "env": self.env,
+            "command": self.command,
+            "args": self.args,
+        }
+
+
+@dataclass
+class Manifest:
+    """Parsed and validated manifest."""
+    jobs: List[Job]
+    secrets: List[str]
+    secret_env: List[str]
+
+    def job_by_id(self, job_id: str) -> Job:
+        for job in self.jobs:
+            if job.id == job_id:
+                return job
+        raise ManifestError(f"unknown job id: {job_id!r}")
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ManifestError(message)
+
+
+def parse_manifest(raw: Dict[str, Any]) -> Manifest:
+    """Validate a raw manifest dict and build a :class:`Manifest`."""
+    _require(isinstance(raw, dict), "manifest root must be an object")
+
+    jobs_raw = raw.get("jobs")
+    _require(isinstance(jobs_raw, list), "manifest 'jobs' must be a list")
+
+    jobs: List[Job] = []
+    seen_ids: set[str] = set()
+    for index, job_raw in enumerate(jobs_raw):
+        _require(isinstance(job_raw, dict), f"jobs[{index}] must be an object")
+
+        job_id = job_raw.get("id")
+        _require(isinstance(job_id, str) and job_id, f"jobs[{index}] missing 'id'")
+        _require(job_id not in seen_ids, f"duplicate job id: {job_id!r}")
+        seen_ids.add(job_id)
+
+        name = job_raw.get("name", job_id)
+        _require(isinstance(name, str) and name, f"job {job_id}: 'name' must be a string")
+
+        uses_gpu = job_raw.get("uses_gpu", False)
+        _require(isinstance(uses_gpu, bool), f"job {job_id}: 'uses_gpu' must be a bool")
+
+        duration = job_raw.get("duration", 0.0)
+        _require(
+            isinstance(duration, (int, float)) and not isinstance(duration, bool)
+            and duration >= 0,
+            f"job {job_id}: 'duration' must be a non-negative number",
+        )
+
+        retries = job_raw.get("retries", 0)
+        _require(
+            isinstance(retries, int) and not isinstance(retries, bool) and retries >= 0,
+            f"job {job_id}: 'retries' must be a non-negative integer",
+        )
+
+        fail = job_raw.get("fail", False)
+        _require(isinstance(fail, bool), f"job {job_id}: 'fail' must be a bool")
+
+        env = job_raw.get("env", {})
+        _require(isinstance(env, dict), f"job {job_id}: 'env' must be an object")
+        for key, value in env.items():
+            _require(
+                isinstance(key, str) and isinstance(value, str),
+                f"job {job_id}: 'env' values must be strings",
+            )
+
+        command = job_raw.get("command", "")
+        _require(isinstance(command, str), f"job {job_id}: 'command' must be a string")
+
+        args = job_raw.get("args", [])
+        _require(
+            isinstance(args, list) and all(isinstance(a, str) for a in args),
+            f"job {job_id}: 'args' must be a list of strings",
+        )
+
+        jobs.append(
+            Job(
+                id=job_id,
+                name=name,
+                uses_gpu=uses_gpu,
+                duration=float(duration),
+                retries=retries,
+                fail=fail,
+                env=env,
+                command=command,
+                args=args,
+            )
+        )
+
+    secrets = raw.get("secrets", [])
+    _require(
+        isinstance(secrets, list) and all(isinstance(s, str) for s in secrets),
+        "manifest 'secrets' must be a list of strings",
+    )
+
+    secret_env = raw.get("secret_env", [])
+    _require(
+        isinstance(secret_env, list) and all(isinstance(s, str) for s in secret_env),
+        "manifest 'secret_env' must be a list of strings",
+    )
+
+    return Manifest(jobs=jobs, secrets=secrets, secret_env=secret_env)
+
+
+def load_manifest(path: Path) -> Manifest:
+    """Read and parse a manifest file from disk."""
+    path = Path(path)
+    if not path.exists():
+        raise ManifestError(f"manifest not found: {path}")
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ManifestError(f"could not parse manifest {path}: {exc}") from exc
+    return parse_manifest(raw)
+
+
+def expand_env(job: Job, environ: Dict[str, str] | None = None) -> Dict[str, str]:
+    """Resolve a job's env against the process environment.
+
+    ``$VAR`` and ``${VAR}`` references are expanded; unset variables expand to
+    an empty string. This mirrors shell behaviour closely enough for the
+    deterministic runner.
+    """
+    environ = dict(os.environ) if environ is None else dict(environ)
+
+    def _substitute(value: str) -> str:
+        for name in set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value)):
+            value = value.replace("${" + name + "}", environ.get(name, ""))
+        for name in set(re.findall(r"\$([A-Za-z_][A-Za-z0-9_]+)", value)):
+            value = value.replace("$" + name, environ.get(name, ""))
+        return value
+
+    return {key: _substitute(value) for key, value in job.env.items()}
+```
+
+---
+
+`job_runner/events.py`
+
+```python
+"""Structured JSONL event bus."""
+
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional
+
+from .redact import Redactor
+
+EVENT_TYPES = (
+    "run_start",
+    "run_end",
+    "job_start",
+    "job_progress",
+    "job_complete",
+    "job_failed",
+    "job_retry",
+    "job_cancelled",
+    "job_skipped",
+    "state_saved",
+    "error",
+)
+
+
+@dataclass
+class Event:
+    """A single structured event."""
+    type: str
+    data: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"type": self.type}
+       

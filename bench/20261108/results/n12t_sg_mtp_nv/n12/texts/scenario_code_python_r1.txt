@@ -1,0 +1,213 @@
+We need answer user's request: Write complete Python 3.11 package for deterministic asynchronous job runner. Must read JSON manifest, enforce one active GPU job, persist atomic state, resume completed work, stream structured JSONL events, handle SIGINT, redact configured secrets, and include pytest tests for success, failure, cancellation, and resume. Present every source file in separate fenced block with path and include pyproject.toml.
+
+We need produce final with code files in fenced blocks each with path. Need complete runnable code. Need think through design.
+
+We need package deterministic asynchronous job runner. Python 3.11. Features:
+- read JSON manifest
+- enforce one active GPU job
+- persist atomic state
+- resume completed work
+- stream structured JSONL events
+- handle SIGINT
+- redact configured secrets
+- include pytest tests for success, failure, cancellation, resume.
+- pyproject.toml.
+
+Need likely create package e.g. gpu_job_runner. Deterministic: use stable ordering, no random. Asynchronous: asyncio. Jobs may be GPU jobs? Enforce one active GPU job. Maybe manifest defines jobs with command? For testing, need deterministic job execution without GPU. Could have runner that executes jobs using asyncio, but to test success/failure/cancellation/resume, we can use a pluggable job executor or commands? Need deterministic and local.
+
+Options:
+1. Runner reads manifest JSON: {name, jobs: [{id, gpu: bool, command: [...], args?}]} and executes subprocess commands. But tests could use commands echo. Cancellation hard to deterministically test? SIGINT maybe. Could make executor plugin for tests? But user asks complete package. Simpler: jobs specify python callables? But manifest JSON cannot reference callables safely. Could use "module:function" with importlib. For tests use built-in test functions in package? Or subprocess commands.
+
+Need handle SIGINT: when received during run, cancel active job, persist state, write event, exit nonzero? Cancellation test may simulate SIGINT or use runner.run with cancel_event.
+
+Need enforce one active GPU job: scheduler ensures only one job with gpu=true runs concurrently. Non-GPU jobs can maybe run concurrently? But deterministic maybe run jobs sequentially? The phrase asynchronous job runner, one active GPU job. Could have semaphore for GPU jobs (1). Non-GPU jobs can run in parallel but deterministic order by manifest order? To be deterministic, maybe run all jobs in topological? Simpler: sequential jobs in manifest order, but GPU semaphore ensures only one active if commands run async. If sequential, one active GPU trivially. But asynchronous could still use asyncio. Need maybe support concurrency for CPU jobs, GPU only one.
+
+Need persist atomic state: write JSON state to temp file then os.replace. State includes status per job, started_at, finished_at, exit_code, events count, next index, cancellation? Atomic. Resume completed work: on startup load state; skip completed jobs; maybe rerun failed? User says resume completed work, so skip completed; maybe failed jobs remain failed? Could optionally resume not completed? For tests resume: run success and failure, then second run should not re-run completed jobs. Need deterministic.
+
+Need stream structured JSONL events: each line JSON with timestamp, event, job_id, status, detail. Redact secrets: configured secrets e.g. env vars or strings; before writing events, replace values. Could redact command args or environment. Since command output may include secrets? We can redact event detail strings based on configured secret values or names. Need deterministic: timestamp? Use logical clock? For deterministic tests, timestamps maybe monotonic counter or ISO from injected clock. Could use event sequence numbers and no real time? But events need timestamp perhaps. To be deterministic, use fixed epoch + sequence or use clock injected. For production use datetime.now(timezone.utc). Tests can use FakeClock. For JSONL stable, include seq.
+
+Need handle SIGINT: register handler that sets cancel event and maybe cancels task. In asyncio, loop.add_signal_handler(SIGINT, handler). For tests on Windows? Could instead provide cancel_event and method request_cancel. Tests can simulate SIGINT via monkeypatch or send signal to own process? Better: runner supports run() accepting cancel_event; also install_signal_handlers() uses loop.add_signal_handler if available. Tests can call runner.request_cancel or send SIGINT to process? We can test cancel by using asyncio event and runner.run(cancel_event=event) then set event while job sleeping. Also test signal handler maybe in separate process? But requirement include tests for cancellation. We can test request_cancel and maybe signal via subprocess.
+
+Need deterministic asynchronous job runner: maybe no nondeterministic task scheduling by using bounded concurrency and gather in manifest order? If CPU jobs run concurrently, order of completion could nondeterministic? If tasks start in order and await all, event sequence might depend on OS. To be deterministic, perhaps execute jobs sequentially by default. But "asynchronous job runner" can be asyncio sequential await. If we want concurrency, use asyncio.gather but events may interleave. Determinism: could use concurrency=1 default, configurable but tests use 1. Or scheduler can run tasks in manifest order with max concurrency but event order may not be deterministic. For safety: deterministic mode processes jobs in manifest order, one at a time, but uses async executor. Enforce one GPU job via semaphore if concurrent. Could still be async.
+
+Maybe design:
+- Package name: det_async_runner or gpu_job_runner.
+- pyproject: name deterministic-gpu-runner, requires-python >=3.11.
+- Files:
+  - gpu_job_runner/__init__.py
+  - gpu_job_runner/manifest.py
+  - gpu_job_runner/state.py
+  - gpu_job_runner/events.py
+  - gpu_job_runner/redaction.py
+  - gpu_job_runner/runner.py
+  - gpu_job_runner/cli.py
+  - gpu_job_runner/__main__.py
+  - tests/test_success.py? Could consolidate tests in tests/test_runner.py.
+But user says present every source file in separate fenced block with path. Need include pyproject.toml. Could include tests as one file or multiple. We'll include all.
+
+Need ensure code runnable and tests pass. Need no external dependencies except maybe pytest. pyproject optional-dependencies test = pytest.
+
+Manifest schema:
+{
+  "name": "pipeline",
+  "version": 1,
+  "jobs": [
+     {"id": "train", "gpu": true, "command": ["python", "-c", "print('ok')"], "timeout_seconds": 10, "environment": {"PATH": "..."}},
+     {"id": "postprocess", "gpu": false, "command": ["python", "-c", "print('done')"]}
+  ]
+}
+Could support "max_gpu_jobs": 1? But enforce one active GPU job regardless. Could have "environment" secrets? Redact configured secrets from command? Hmm.
+
+Job execution: We can't execute arbitrary commands in tests? We can use subprocess. For deterministic tests, commands like ["python", "-c", "import sys; sys.stdout.write('ok')"] okay. But cross-platform? Use sys.executable. In tests can build manifest with sys.executable and -c. For failure command exit 2. For cancellation command sleep long; cancel should terminate. Need subprocess cancellation robust. For async subprocess, task.cancel() cancels waiting, but need terminate process. Implement JobExecutor.run_job: create_process via asyncio.create_subprocess_exec, register process, on cancellation terminate/kill. But if using task.cancel, we need finally handle process. In asyncio, if task cancelled while awaiting process.communicate(), we should terminate process. Could structure:
+async def _execute(command):
+    proc = await asyncio.create_subprocess_exec(*command, stdout=PIPE, stderr=PIPE, env=...)
+    self._process = proc
+    try:
+       stdout, stderr = await proc.communicate()
+    except asyncio.CancelledError:
+       proc.terminate()
+       try: await asyncio.wait_for(proc.wait(), timeout=2)
+       except: proc.kill(); await proc.wait()
+       raise
+    finally:
+       self._process = None
+    if proc.returncode != 0: raise JobError(...)
+Need if cancellation during communicate, after terminate, wait for exit. But if wait_for raises timeout, kill. Ensure process not left.
+
+But cancellation in runner: if cancel_event set before job, skip or cancel active? For SIGINT, we want cancel active job and mark cancelled. We can have runner checks cancel_event before starting each job; if set, status=cancelled and stop. For active job, we need monitor cancel_event concurrently. Could create task for job and waiter for cancel_event; use asyncio.wait FIRST_COMPLETED. If cancel_event wins, cancel job task. But also need handle timeout.
+
+Implementation:
+class DeterministicAsyncJobRunner:
+    def __init__(self, manifest_path, state_dir, event_path, secrets=(), clock=... , executor=None, concurrency=1, max_gpu_jobs=1? enforce 1)
+    def load_state, save_state_atomic.
+    async def run(self, cancel_event=None, event_writer=...): 
+         install? If in CLI, handle signals. For library, maybe accept cancel_event.
+         state = load_state
+         events = EventWriter(path, secret redactor, clock)
+         write runner_started
+         for job in manifest.jobs:
+             if state.jobs[job.id]["status"] == "completed": events.job_skipped_completed; continue
+             if cancel_event and cancel_event.is_set(): state[job.id]=cancelled? break
+             if job.gpu: await gpu_semaphore.acquire()
+             state.job_status=running; save_state
+             events.job_started
+             try:
+                result = await self._execute_with_cancellation(job, cancel_event)
+                status=completed; exit_code=0; save; events.job_completed
+             except asyncio.CancelledError:
+                status=cancelled; events.job_cancelled; save; break
+             except JobError as exc:
+                status=failed; exit_code=exc.exit_code; events.job_failed; save; maybe continue? If failure stops pipeline? Deterministic job runner likely stop on failure. For test failure, run returns False and state failed. Resume skips completed before failure, may rerun failed? User says resume completed work. It may be desirable to resume from failed? But if failed command fails deterministically, resume would loop. Could provide policy: default stop on failure, but failed jobs not skipped. Resume completed work only. That's okay.
+             finally release GPU semaphore.
+         events.runner_finished; save; return True if all completed.
+
+Need cancellation semantics: If cancel_event set while active, _execute_with_cancellation should raise asyncio.CancelledError? Or return CancelledResult. We can catch and set cancelled.
+
+Need deterministic event sequence: Use seq increment. clock can return timestamp. For deterministic tests, use FakeClock returning fixed ISO.
+
+Need atomic state: state file with .tmp and os.replace. State structure:
+{
+  "version":1,
+  "manifest_name":...,
+  "manifest_fingerprint": sha256 of manifest bytes (deterministic),
+  "jobs": {"job_id": {"status":"pending|running|completed|failed|cancelled", "attempt": n, "started_seq": int?, "finished_seq": int?, "exit_code": null}},
+  "runner_status": "running|completed|failed|cancelled",
+  "updated_seq": int
+}
+Need ensure fingerprint mismatch: If manifest changed, state incompatible? Could reset or raise. For resume completed work, if manifest changed maybe start new state? Safer: if fingerprint mismatch, create new state with warning event? But tests use same manifest. We can raise ManifestStateMismatch? But maybe resume should allow. I'll implement: if existing state fingerprint != current manifest fingerprint, reset state to pending but write state_reset event. But then completed work not preserved. Could be acceptable. But to avoid complexity, raise if mismatch. For deterministic and safety. However user only requires resume completed work; no manifest change test.
+
+Need redact secrets: Secrets can be list of strings (values) or dict of env var names? Configured secrets maybe from manifest? E.g. manifest "secrets": ["API_KEY_VALUE"]? Or CLI --secret-file. Need redact configured secrets. Implement Redactor:
+- init(secrets: Iterable[str] | None, env: Mapping[str,str] | None = None)
+- if secret value provided, redact exact value with [REDACTED].
+- if secret name provided (e.g. "API_KEY"), redact values from environment mapping? Also redact names in strings? Maybe not.
+Redact function for strings: for each secret value (if len>0) replace occurrences. Also for dict values. For command args, redact all strings. For event payloads, recursively replace strings.
+Need not leak secrets in events. If command includes secret as arg, event job_started command redacted. If stdout includes secret, redact stdout snippet. We can capture stdout/stderr and include truncated output in events; redact. For deterministic tests, maybe command prints secret; redaction test? User didn't require test redaction but could include. Need maybe test success, failure, cancellation, resume only. But can include extra test redaction.
+
+Need structured JSONL events:
+event = {"seq": 1, "ts": "...", "type": "runner_started", "data": {...}}
+Maybe include "job_id" at top. Use type: runner_started, runner_finished, job_started, job_completed, job_failed, job_cancelled, job_skipped, state_saved? State saved events maybe noisy. We can write event for state persistence? Not required.
+Need JSONL line: json.dumps(event, sort_keys=True, ensure_ascii=True) deterministic. Use redacted event.
+
+Need handle SIGINT: CLI:
+def main(argv=None):
+    parser ...
+    manifest_path, state_dir, events_path, secrets values, concurrency.
+    runner = ...
+    cancel_event = asyncio.Event()
+    loop = asyncio.new_event_loop? In main:
+        loop = asyncio.get_event_loop()
+        for sig in (SIGINT, SIGTERM): loop.add_signal_handler(sig, _on_signal)
+    _on_signal: cancel_event.set(); maybe first SIGINT sets, second force? We can handle one.
+    try: ok = await runner.run(cancel_event=cancel_event)
+    except KeyboardInterrupt: ok=False
+    finally: remove handlers; exit 0 if ok else 1.
+
+But if runner catches cancellation, it may return False. Signal handler sets cancel_event; active job monitor cancels task. If no active job, next loop skip. Good.
+
+Potential issue: loop.add_signal_handler not available on Windows. In CLI, if not available, use signal.signal? Could fallback to threading.Event? For portability, use try. But tests not relying on signal. Need code robust.
+In main:
+    try:
+        loop.add_signal_handler(signal.SIGINT, _request_cancel)
+    except NotImplementedError:
+        signal.signal(signal.SIGINT, lambda s, f: _request_cancel())
+But signal.signal must be main thread. OK.
+
+Need runner monitor cancel_event. Implement _execute_with_cancellation(job, cancel_event):
+    async def _job_task():
+        return await self.executor.execute(job, event? maybe no)
+    if cancel_event is None:
+        return await _job_task()
+    job_task = asyncio.create_task(_job_task())
+    cancel_task = asyncio.create_task(cancel_event.wait())
+    try:
+        done, pending = await asyncio.wait({job_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
+        if cancel_task in done:
+            if not job_task.done():
+                job_task.cancel()
+            # await to ensure cancellation propagated
+            with contextlib.suppress(asyncio.CancelledError):
+                await job_task
+            raise asyncio.CancelledError()
+        return await job_task  # if job_task done (may have raised)
+    finally:
+        if not cancel_task.done(): cancel_task.cancel(); suppress await
+But if job_task completes with exception, return await job_task will raise. Good.
+Need if cancel_event already set before start, maybe raise CancelledError immediately? Could check before.
+
+Need timeout: job timeout_seconds. Could combine with asyncio.wait_for? But if using cancel_event, easier inside executor. The executor can use asyncio.wait_for(process.communicate(), timeout). If TimeoutError, terminate and raise JobTimeoutError. But cancellation monitor separate. Could wrap.
+
+Executor class:
+class SubprocessJobExecutor:
+    def __init__(self, environment=None, output_limit=4096): ...
+    async def execute(self, job: Job) -> ExecutionResult:
+        env = os.environ.copy(); env.update(job.environment)
+        # maybe redact? executor doesn't redact.
+        proc = await asyncio.create_subprocess_exec(*job.command, stdout=PIPE, stderr=PIPE, env=env)
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=job.timeout_seconds)
+        except asyncio.TimeoutError:
+            await self._terminate(proc)
+            raise JobTimeoutError(job.id, job.timeout_seconds)
+        except asyncio.CancelledError:
+            await self._terminate(proc)
+            raise
+        if proc.returncode != 0:
+            raise JobError(job.id, proc.returncode, stdout, stderr)
+        return ExecutionResult(stdout, stderr)
+    async def _terminate(proc):
+        if proc.returncode is None:
+           proc.terminate()
+           try: await asyncio.wait_for(proc.wait(), 1.0)
+           except asyncio.TimeoutError: proc.kill(); await proc.wait()
+
+But if process ignores terminate, kill. If cancellation, after terminate and wait, raise CancelledError. Need avoid awaiting too long in cancellation test. Use short terminate timeout maybe 0.5.
+
+Potential issue: In Python asyncio, when job_task.cancel() called, inside executor communicate is cancelled, raises CancelledError; our except asyncio.CancelledError calls await self._terminate(proc). But if cancellation is pending, await inside except may be immediately cancelled? In Python 3.11, if task cancelled, code can still await in finally/except? It may be cancelled again if another cancel. We only cancel once. Should be okay. But if asyncio.wait_for raises CancelledError? We need ensure process wait. Could use shield? Hmm.
+
+When job_task.cancel() is called, the inner task receives CancelledError at await point. It enters except, calls await proc.wait() maybe. Since task is being cancelled, awaiting may be okay if no further cancel. Should work. To be safe, use asyncio.shield around terminate? But shield creates inner task; cancellation may not affect shield? If outer cancelled, shield inner may continue. But we want terminate to complete. Could do:
+except asyncio.CancelledError:
+    await asyncio.shield(self._terminate(proc))
+    raise
+But if cancellation is requested again, shield may propagate? It may be okay.
+
+Alternatively, monitor cancel_event by cancelling the task, but executor could implement process termination in try/finally using process

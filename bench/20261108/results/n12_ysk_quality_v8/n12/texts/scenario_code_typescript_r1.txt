@@ -1,0 +1,526 @@
+Below is a complete, self-contained TypeScript 5 service. It's organized as a small monorepo: a `src/` library (pure, framework-free, fully unit-tested) and a `server/` HTTP layer (Node's built-in `http` module — no runtime dependencies). Everything compiles and runs with only the dev toolchain.
+
+## File tree
+
+```
+metrics-service/
+├── package.json
+├── tsconfig.json
+├── tsconfig.build.json
+├── vitest.config.ts
+├── README.md
+├── .gitignore
+├── src/
+│   ├── types.ts
+│   ├── errors.ts
+│   ├── parser.ts
+│   ├── stats.ts
+│   ├── aggregator.ts
+│   ├── ingest.ts
+│   └── index.ts
+├── server/
+│   ├── http.ts
+│   └── main.ts
+└── test/
+    ├── parser.test.ts
+    ├── stats.test.ts
+    ├── aggregator.test.ts
+    └── ingest.test.ts
+```
+
+---
+
+### `package.json`
+
+```json
+{
+  "name": "metrics-service",
+  "version": "1.0.0",
+  "description": "Newline-delimited request-metrics ingestion, validation, and aggregation service.",
+  "type": "module",
+  "engines": { "node": ">=18.17.0" },
+  "main": "dist/server/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/server/main.js",
+    "dev": "tsc -p tsconfig.build.json --watch & node --watch dist/server/main.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  }
+}
+```
+
+---
+
+### `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "server/**/*.ts", "test/**/*.ts"]
+}
+```
+
+### `tsconfig.build.json`
+
+```json
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": false
+  },
+  "include": ["src/**/*.ts", "server/**/*.ts"],
+  "exclude": ["test/**/*.ts", "dist"]
+}
+```
+
+### `vitest.config.ts`
+
+```ts
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  test: {
+    include: ['test/**/*.test.ts'],
+    environment: 'node',
+    globals: false,
+    coverage: {
+      provider: 'v8',
+      include: ['src/**/*.ts'],
+    },
+  },
+});
+```
+
+### `.gitignore`
+
+```
+node_modules/
+dist/
+coverage/
+*.log
+.env
+```
+
+---
+
+### `src/types.ts`
+
+```ts
+/**
+ * Core domain types for the metrics service.
+ *
+ * A "record" is one validated request-metric line. Records are grouped by
+ * (model, fixture) into a "group". A "run" is a named batch of records.
+ */
+
+/** The metric a record measures. */
+export type MetricKind = 'latency_ms' | 'tokens' | 'cost_usd';
+
+/** A single validated request-metric record. */
+export interface MetricRecord {
+  /** Stable identifier for the record (used for deduplication). */
+  id: string;
+  /** Model identifier, e.g. "gpt-4o". */
+  model: string;
+  /** Fixture / dataset identifier, e.g. "mmlu". */
+  fixture: string;
+  /** The metric kind. */
+  metric: MetricKind;
+  /** The measured value. */
+  value: number;
+  /** Optional run identifier this record belongs to. */
+  runId?: string;
+  /** Optional ISO-8601 timestamp. */
+  timestamp?: string;
+  /** 1-based line number in the source stream (for diagnostics). */
+  line: number;
+}
+
+/** A record that failed validation, with a machine-readable reason. */
+export interface RejectedRecord {
+  line: number;
+  raw: string;
+  code: string;
+  message: string;
+}
+
+/** Result of parsing a chunk of newline-delimited text. */
+export interface ParseResult {
+  records: MetricRecord[];
+  rejected: RejectedRecord[];
+  /** True if the chunk ended mid-line (a trailing partial line was buffered). */
+  hasPending: boolean;
+}
+
+/** A running aggregate for one (model, fixture, metric) group. */
+export interface GroupStats {
+  model: string;
+  fixture: string;
+  metric: MetricKind;
+  count: number;
+  mean: number;
+  median: number;
+  /** Sample standard deviation (n-1). 0 when count < 2. */
+  stdDev: number;
+  min: number;
+  max: number;
+  sum: number;
+  /** Number of records dropped because the group's memory budget was exceeded. */
+  dropped: number;
+}
+
+/** A named run's aggregate. */
+export interface RunSummary {
+  runId: string;
+  count: number;
+  groups: GroupStats[];
+}
+
+/** The full service summary. */
+export interface Summary {
+  totalRecords: number;
+  totalRejected: number;
+  groups: GroupStats[];
+  runs: RunSummary[];
+}
+
+/** Health probe payload. */
+export interface HealthStatus {
+  status: 'ok';
+  uptimeSec: number;
+  version: string;
+  memory: {
+    rssBytes: number;
+    heapUsedBytes: number;
+    heapTotalBytes: number;
+  };
+  counters: {
+    recordsIngested: number;
+    recordsRejected: number;
+    groups: number;
+    runs: number;
+  };
+}
+```
+
+---
+
+### `src/errors.ts`
+
+```ts
+/**
+ * Error types. `MetricsError` is the base for all domain errors and carries a
+ * stable `code` so callers (and the HTTP layer) can map errors to responses
+ * without string-matching.
+ */
+
+export type MetricsErrorCode =
+  | 'MALFORMED_RECORD'
+  | 'UNKNOWN_METRIC'
+  | 'INVALID_VALUE'
+  | 'MISSING_FIELD'
+  | 'INVALID_TIMESTAMP'
+  | 'RUN_NOT_FOUND'
+  | 'PAYLOAD_TOO_LARGE'
+  | 'INTERNAL';
+
+export class MetricsError extends Error {
+  readonly code: MetricsErrorCode;
+  readonly details?: unknown;
+
+  constructor(code: MetricsErrorCode, message: string, details?: unknown) {
+    super(message);
+    this.name = 'MetricsError';
+    this.code = code;
+    if (details !== undefined) this.details = details;
+  }
+}
+
+/** A single record failed validation. */
+export class MalformedRecordError extends MetricsError {
+  constructor(line: number, message: string, details?: unknown) {
+    super('MALFORMED_RECORD', `line ${line}: ${message}`, details);
+    this.name = 'MalformedRecordError';
+  }
+}
+
+/** A run id was requested but does not exist. */
+export class RunNotFoundError extends MetricsError {
+  constructor(runId: string) {
+    super('RUN_NOT_FOUND', `run "${runId}" not found`);
+    this.name = 'RunNotFoundError';
+  }
+}
+
+/** The request body exceeded the configured size limit. */
+export class PayloadTooLargeError extends MetricsError {
+  constructor(limitBytes: number, receivedBytes: number) {
+    super(
+      'PAYLOAD_TOO_LARGE',
+      `payload of ${receivedBytes} bytes exceeds the ${limitBytes} byte limit`,
+    );
+    this.name = 'PayloadTooLargeError';
+  }
+}
+```
+
+---
+
+### `src/parser.ts`
+
+```ts
+import type { MetricKind, MetricRecord, ParseResult, RejectedRecord } from './types.js';
+import { MalformedRecordError } from './errors.js';
+
+/**
+ * Incremental, dependency-free parser for newline-delimited JSON records.
+ *
+ * The parser is stateful: it buffers a trailing partial line across chunks so
+ * that a record split across two network reads is reassembled correctly.
+ *
+ * Validation is hand-rolled (no schema library):
+ *  - each line must be a JSON object
+ *  - required fields: id, model, fixture, metric, value
+ *  - metric must be one of the known kinds
+ *  - value must be a finite number
+ *  - optional timestamp must be a valid ISO-8601 date
+ */
+
+export const METRIC_KINDS: readonly MetricKind[] = ['latency_ms', 'tokens', 'cost_usd'] as const;
+
+const REQUIRED_FIELDS = ['id', 'model', 'fixture', 'metric', 'value'] as const;
+
+/**
+ * Parse a chunk of text into records.
+ *
+ * @param chunk  The new text to process.
+ * @param pending  The buffered partial line from the previous chunk (if any).
+ * @returns Parsed records, rejected records, and whether a partial line remains.
+ */
+export function parseChunk(chunk: string, pending: string): ParseResult {
+  const records: MetricRecord[] = [];
+  const rejected: RejectedRecord[] = [];
+
+  // Prepend any buffered partial line from the previous chunk.
+  const full = pending.length > 0 ? pending + chunk : chunk;
+
+  // Split on newlines. The last element may be a partial line (no trailing \n).
+  const lines = full.split('\n');
+  const hasTrailingNewline = full.endsWith('\n');
+
+  // If the chunk did not end with a newline, the last element is a partial
+  // line that must be buffered for the next chunk.
+  const lastIsPartial = !hasTrailingNewline && lines.length > 0;
+  const lineCount = lastIsPartial ? lines.length - 1 : lines.length;
+
+  for (let i = 0; i < lineCount; i++) {
+    const raw = lines[i] ?? '';
+    // Skip blank lines (they carry no data).
+    if (raw.trim().length === 0) continue;
+
+    const lineNo = i + 1;
+    try {
+      const record = validateLine(raw, lineNo);
+      records.push(record);
+    } catch (err) {
+      if (err instanceof MalformedRecordError) {
+        rejected.push({
+          line: lineNo,
+          raw,
+          code: err.code,
+          message: err.message,
+        });
+      } else {
+        rejected.push({
+          line: lineNo,
+          raw,
+          code: 'MALFORMED_RECORD',
+          message: `unexpected error: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    }
+  }
+
+  const nextPending = lastIsPartial ? (lines[lines.length - 1] ?? '') : '';
+
+  return { records, rejected, hasPending: nextPending.length > 0 };
+}
+
+/**
+ * Validate and convert a single JSON line into a MetricRecord.
+ * Throws MalformedRecordError on any validation failure.
+ */
+function validateLine(raw: string, line: number): MetricRecord {
+  let obj: unknown;
+  try {
+    obj = JSON.parse(raw);
+  } catch {
+    throw new MalformedRecordError(line, 'not valid JSON');
+  }
+
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) {
+    throw new MalformedRecordError(line, 'record must be a JSON object');
+  }
+
+  const record = obj as Record<string, unknown>;
+
+  // Check required fields are present.
+  for (const field of REQUIRED_FIELDS) {
+    if (!(field in record) || record[field] === undefined || record[field] === null) {
+      throw new MalformedRecordError(line, `missing required field "${field}"`);
+    }
+  }
+
+  // id: non-empty string
+  const id = record['id'];
+  if (typeof id !== 'string' || id.length === 0) {
+    throw new MalformedRecordError(line, 'field "id" must be a non-empty string');
+  }
+
+  // model: non-empty string
+  const model = record['model'];
+  if (typeof model !== 'string' || model.length === 0) {
+    throw new MalformedRecordError(line, 'field "model" must be a non-empty string');
+  }
+
+  // fixture: non-empty string
+  const fixture = record['fixture'];
+  if (typeof fixture !== 'string' || fixture.length === 0) {
+    throw new MalformedRecordError(line, 'field "fixture" must be a non-empty string');
+  }
+
+  // metric: known kind
+  const metric = record['metric'];
+  if (typeof metric !== 'string' || !METRIC_KINDS.includes(metric as MetricKind)) {
+    throw new MalformedRecordError(
+      line,
+      `field "metric" must be one of: ${METRIC_KINDS.join(', ')}`,
+    );
+  }
+
+  // value: finite number
+  const value = record['value'];
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new MalformedRecordError(line, 'field "value" must be a finite number');
+  }
+
+  // runId: optional non-empty string
+  let runId: string | undefined;
+  if (record['runId'] !== undefined) {
+    if (typeof record['runId'] !== 'string' || (record['runId'] as string).length === 0) {
+      throw new MalformedRecordError(line, 'field "runId" must be a non-empty string when present');
+    }
+    runId = record['runId'];
+  }
+
+  // timestamp: optional valid ISO-8601
+  let timestamp: string | undefined;
+  if (record['timestamp'] !== undefined) {
+    if (typeof record['timestamp'] !== 'string') {
+      throw new MalformedRecordError(line, 'field "timestamp" must be a string when present');
+    }
+    const t = record['timestamp'];
+    if (Number.isNaN(Date.parse(t))) {
+      throw new MalformedRecordError(line, 'field "timestamp" is not a valid ISO-8601 date');
+    }
+    timestamp = t;
+  }
+
+  return {
+    id,
+    model,
+    fixture,
+    metric: metric as MetricKind,
+    value,
+    ...(runId !== undefined ? { runId } : {}),
+    ...(timestamp !== undefined ? { timestamp } : {}),
+    line,
+  };
+}
+```
+
+---
+
+### `src/stats.ts`
+
+```ts
+/**
+ * Pure statistical helpers. All functions are deterministic and side-effect
+ * free so they are trivially unit-testable.
+ */
+
+/** Arithmetic mean. Returns 0 for an empty array. */
+export function mean(values: readonly number[]): number {
+  if (values.length === 0) return 0;
+  let sum = 0;
+  for (const v of values) sum += v;
+  return sum / values.length;
+}
+
+/**
+ * Median. Returns 0 for an empty array.
+ * For an even-length array, returns the mean of the two middle values.
+ */
+export function median(values: readonly number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) {
+    return sorted[mid] ?? 0;
+  }
+  const a = sorted[mid - 1] ?? 0;
+  const b = sorted[mid] ?? 0;
+  return (a + b) / 2;
+}
+
+/**
+ * Sample standard deviation (n-1 denominator, Bessel's correction).
+ * Returns 0 when there are fewer than 2 values.
+ */
+export function sampleStdDev(values: readonly number[]): number {
+  const n = values.length;
+  if (n < 2) return 0;
+  const m = mean(values);
+  let ss = 0;
+  for (const v of values) {
+    const d = v - m;
+    ss += d * d;
+  }
+  return Math.sqrt(ss / (n - 1));
+}
+
+/** Minimum. Returns 0 for an empty array. */
+export function min(values: readonly number[]): number {
+  if (values.length === 0) return 0;
+  let m = values[0] ?? 0;
+  for (let i = 1; i < values.length; i++) {
+    const v = values[i] ?? 0;
+    if (v

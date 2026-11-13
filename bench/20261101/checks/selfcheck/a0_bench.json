@@ -1,0 +1,83 @@
+{
+ "version": "0.1.0.dev0",
+ "model": "qwen3.8-27b",
+ "gpu": [
+  "NVIDIA GeForce RTX 5090, 32607 MiB, 3015 MiB, 616.92"
+ ],
+ "tokens_per_test": 256,
+ "runs": [
+  {
+   "test": "explain",
+   "run": 1,
+   "prompt_tokens": 30,
+   "tokens": 256,
+   "seconds": 0.651,
+   "tokens_per_s": 393.1,
+   "tokens_per_pass": 4.27
+  },
+  {
+   "test": "explain",
+   "run": 2,
+   "prompt_tokens": 30,
+   "tokens": 256,
+   "seconds": 0.646,
+   "tokens_per_s": 396.1,
+   "tokens_per_pass": 4.27
+  },
+  {
+   "test": "code",
+   "run": 1,
+   "prompt_tokens": 28,
+   "tokens": 256,
+   "seconds": 0.434,
+   "tokens_per_s": 590.4,
+   "tokens_per_pass": 6.4
+  },
+  {
+   "test": "code",
+   "run": 2,
+   "prompt_tokens": 28,
+   "tokens": 256,
+   "seconds": 0.432,
+   "tokens_per_s": 592.2,
+   "tokens_per_pass": 6.4
+  },
+  {
+   "test": "story",
+   "run": 1,
+   "prompt_tokens": 29,
+   "tokens": 256,
+   "seconds": 1.131,
+   "tokens_per_s": 226.3,
+   "tokens_per_pass": 2.44
+  },
+  {
+   "test": "story",
+   "run": 2,
+   "prompt_tokens": 29,
+   "tokens": 256,
+   "seconds": 1.131,
+   "tokens_per_s": 226.4,
+   "tokens_per_pass": 2.44
+  },
+  {
+   "test": "proof",
+   "run": 1,
+   "prompt_tokens": 24,
+   "tokens": 256,
+   "seconds": 0.463,
+   "tokens_per_s": 552.9,
+   "tokens_per_pass": 5.95
+  },
+  {
+   "test": "proof",
+   "run": 2,
+   "prompt_tokens": 24,
+   "tokens": 256,
+   "seconds": 0.463,
+   "tokens_per_s": 553.2,
+   "tokens_per_pass": 5.95
+  }
+ ],
+ "mean_tokens_per_s": 441.3
+}

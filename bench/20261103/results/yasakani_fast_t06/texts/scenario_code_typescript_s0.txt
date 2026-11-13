@@ -1,0 +1,528 @@
+# Request Metrics Service
+
+Below is a complete, runnable TypeScript 5 service. It streams newline-delimited JSON records from a file (or `stdin`), validates them with a hand-written validator (no schema libraries), groups them by `model` × `fixture`, computes mean / median / sample standard deviation, and serves `/health`, `/summary`, and `/runs/:id`. Memory is bounded by a per-run ring buffer, malformed records are surfaced as structured errors, and the whole thing is unit-tested.
+
+---
+
+## File layout
+
+```
+request-metrics-service/
+├── package.json
+├── tsconfig.json
+├── README.md
+├── src/
+│   ├── index.ts          # entry point / CLI
+│   ├── config.ts         # env parsing + validation
+│   ├── types.ts          # strict domain types
+│   ├── schema.ts         # hand-written validator (no schema libs)
+│   ├── stats.ts          # mean / median / sample stddev
+│   ├── store.ts          # bounded in-memory run store
+│   ├── pipeline.ts       # incremental line parser + aggregator
+│   ├── server.ts         # HTTP endpoints
+│   └── errors.ts         # error types + HTTP mapping
+└── test/
+    └── *.test.ts
+```
+
+---
+
+## `package.json`
+
+```json
+{
+  "name": "request-metrics-service",
+  "version": "1.0.0",
+  "description": "Streams NDJSON request metrics, validates, aggregates by model/fixture, and serves REST endpoints.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "request-metrics-service": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "tsx": "^4.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.5.0"
+  }
+}
+```
+
+---
+
+## `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "rootDir": ".",
+    "outDir": "dist",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "test"]
+}
+```
+
+---
+
+## `src/types.ts`
+
+```ts
+/**
+ * Strict domain types. `unknown` is used at the boundary (raw JSON) and
+ * narrowed by the validator in schema.ts.
+ */
+
+/** A single validated request-metrics record. */
+export interface RequestMetric {
+  /** Unique identifier for the request. */
+  id: string;
+  /** Model that produced the response (e.g. "gpt-4", "llama-70b"). */
+  model: string;
+  /** Test fixture / scenario name (e.g. "long-context", "tool-call"). */
+  fixture: string;
+  /** Wall-clock latency in milliseconds (non-negative finite number). */
+  latencyMs: number;
+  /** Token count (non-negative integer). */
+  tokens: number;
+  /** ISO-8601 timestamp. */
+  timestamp: string;
+  /** Optional HTTP status code (100..599 integer). */
+  statusCode?: number;
+  /** Optional free-form error message. */
+  error?: string;
+}
+
+/** A raw, unvalidated line of NDJSON. */
+export type RawLine = string;
+
+/** A fully parsed + validated record plus its source line number. */
+export interface ValidatedRecord {
+  record: RequestMetric;
+  /** 1-based line number within the source stream. */
+  line: number;
+}
+
+/** A record that failed validation, with structured reasons. */
+export interface MalformedRecord {
+  line: number;
+  raw: string;
+  errors: ValidationError[];
+}
+
+/** A single field-level validation failure. */
+export interface ValidationError {
+  field: string;
+  code: ValidationErrorCode;
+  message: string;
+}
+
+export type ValidationErrorCode =
+  | "INVALID_JSON"
+  | "NOT_OBJECT"
+  | "MISSING_FIELD"
+  | "WRONG_TYPE"
+  | "INVALID_VALUE"
+  | "OUT_OF_RANGE";
+
+/** Aggregate statistics for one (model, fixture) group. */
+export interface GroupStats {
+  model: string;
+  fixture: string;
+  count: number;
+  mean: number;
+  median: number;
+  /** Sample standard deviation (n-1). NaN when count < 2. */
+  sampleStdDev: number;
+  min: number;
+  max: number;
+  sum: number;
+  /** Fraction of records carrying an error field (0..1). */
+  errorRate: number;
+}
+
+/** Everything the /summary endpoint returns. */
+export interface Summary {
+  runId: string;
+  totalRecords: number;
+  validRecords: number;
+  malformedRecords: number;
+  groups: GroupStats[];
+  malformed: MalformedRecord[];
+  generatedAt: string;
+}
+
+/** A single run's full state (used by /runs/:id). */
+export interface Run {
+  id: string;
+  createdAt: string;
+  source: string;
+  status: RunStatus;
+  totalLines: number;
+  validRecords: number;
+  malformedRecords: number;
+  groups: GroupStats[];
+  malformed: MalformedRecord[];
+}
+
+export type RunStatus = "processing" | "complete" | "failed";
+```
+
+---
+
+## `src/errors.ts`
+
+```ts
+import type { ValidationError } from "./types.js";
+
+/** Thrown when a line cannot be parsed/validated. Carries structured reasons. */
+export class MalformedRecordError extends Error {
+  readonly line: number;
+  readonly raw: string;
+  readonly errors: ValidationError[];
+
+  constructor(line: number, raw: string, errors: ValidationError[]) {
+    const first = errors[0]?.message ?? "unknown error";
+    super(`Line ${line}: ${first}`);
+    this.name = "MalformedRecordError";
+    this.line = line;
+    this.raw = raw;
+    this.errors = errors;
+  }
+}
+
+/** Thrown for configuration problems (bad env, bad file path, etc.). */
+export class ConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConfigError";
+  }
+}
+
+/** Thrown when an unknown run id is requested. */
+export class NotFoundError extends Error {
+  constructor(id: string) {
+    super(`Run "${id}" not found`);
+    this.name = "NotFoundError";
+  }
+}
+
+/** Maps a thrown error to an HTTP status + body. */
+export function toHttpError(err: unknown): { status: number; body: unknown } {
+  if (err instanceof MalformedRecordError) {
+    return {
+      status: 400,
+      body: {
+        error: "malformed_record",
+        line: err.line,
+        errors: err.errors,
+      },
+    };
+  }
+  if (err instanceof ConfigError) {
+    return { status: 500, body: { error: "config_error", message: err.message } };
+  }
+  if (err instanceof NotFoundError) {
+    return { status: 404, body: { error: "not_found", message: err.message } };
+  }
+  return { status: 500, body: { error: "internal_error", message: String(err) } };
+}
+```
+
+---
+
+## `src/schema.ts`
+
+```ts
+import type { RequestMetric, ValidationError } from "./types.js";
+
+/**
+ * Hand-written validator. No third-party schema libraries.
+ * `validateRecord` returns either a validated record or a list of errors.
+ */
+
+const ISO_8601 =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+function isInteger(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v);
+}
+
+function isString(v: unknown): v is string {
+  return typeof v === "string";
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** Parse a raw JSON line. Returns the parsed value or a single error. */
+export function parseJsonLine(raw: string): {
+  value?: unknown;
+  error?: ValidationError;
+} {
+  try {
+    const value: unknown = JSON.parse(raw);
+    return { value };
+  } catch {
+    return {
+      error: {
+        field: "<root>",
+        code: "INVALID_JSON",
+        message: "line is not valid JSON",
+      },
+    };
+  }
+}
+
+/**
+ * Validate a parsed JSON value into a RequestMetric.
+ * Returns the record on success, or an array of field errors on failure.
+ */
+export function validateRecord(
+  value: unknown
+): { record?: RequestMetric; errors?: ValidationError[] } {
+  if (!isPlainObject(value)) {
+    return {
+      errors: [
+        {
+          field: "<root>",
+          code: "NOT_OBJECT",
+          message: "record must be a JSON object",
+        },
+      ],
+    };
+  }
+
+  const obj = value as Record<string, unknown>;
+  const errors: ValidationError[] = [];
+
+  // --- id (required, non-empty string) ---
+  if (obj.id === undefined) {
+    errors.push({ field: "id", code: "MISSING_FIELD", message: "id is required" });
+  } else if (!isString(obj.id) || obj.id.length === 0) {
+    errors.push({
+      field: "id",
+      code: "WRONG_TYPE",
+      message: "id must be a non-empty string",
+    });
+  }
+
+  // --- model (required, non-empty string) ---
+  if (obj.model === undefined) {
+    errors.push({ field: "model", code: "MISSING_FIELD", message: "model is required" });
+  } else if (!isString(obj.model) || obj.model.length === 0) {
+    errors.push({
+      field: "model",
+      code: "WRONG_TYPE",
+      message: "model must be a non-empty string",
+    });
+  }
+
+  // --- fixture (required, non-empty string) ---
+  if (obj.fixture === undefined) {
+    errors.push({
+      field: "fixture",
+      code: "MISSING_FIELD",
+      message: "fixture is required",
+    });
+  } else if (!isString(obj.fixture) || obj.fixture.length === 0) {
+    errors.push({
+      field: "fixture",
+      code: "WRONG_TYPE",
+      message: "fixture must be a non-empty string",
+    });
+  }
+
+  // --- latencyMs (required, finite non-negative number) ---
+  if (obj.latencyMs === undefined) {
+    errors.push({
+      field: "latencyMs",
+      code: "MISSING_FIELD",
+      message: "latencyMs is required",
+    });
+  } else if (!isFiniteNumber(obj.latencyMs)) {
+    errors.push({
+      field: "latencyMs",
+      code: "WRONG_TYPE",
+      message: "latencyMs must be a finite number",
+    });
+  } else if (obj.latencyMs < 0) {
+    errors.push({
+      field: "latencyMs",
+      code: "OUT_OF_RANGE",
+      message: "latencyMs must be >= 0",
+    });
+  }
+
+  // --- tokens (required, non-negative integer) ---
+  if (obj.tokens === undefined) {
+    errors.push({
+      field: "tokens",
+      code: "MISSING_FIELD",
+      message: "tokens is required",
+    });
+  } else if (!isInteger(obj.tokens)) {
+    errors.push({
+      field: "tokens",
+      code: "WRONG_TYPE",
+      message: "tokens must be an integer",
+    });
+  } else if (obj.tokens < 0) {
+    errors.push({
+      field: "tokens",
+      code: "OUT_OF_RANGE",
+      message: "tokens must be >= 0",
+    });
+  }
+
+  // --- timestamp (required, ISO-8601 string) ---
+  if (obj.timestamp === undefined) {
+    errors.push({
+      field: "timestamp",
+      code: "MISSING_FIELD",
+      message: "timestamp is required",
+    });
+  } else if (!isString(obj.timestamp)) {
+    errors.push({
+      field: "timestamp",
+      code: "WRONG_TYPE",
+      message: "timestamp must be a string",
+    });
+  } else if (!ISO_8601.test(obj.timestamp)) {
+    errors.push({
+      field: "timestamp",
+      code: "INVALID_VALUE",
+      message: "timestamp must be a valid ISO-8601 string",
+    });
+  }
+
+  // --- statusCode (optional, integer 100..599) ---
+  if (obj.statusCode !== undefined) {
+    if (!isInteger(obj.statusCode)) {
+      errors.push({
+        field: "statusCode",
+        code: "WRONG_TYPE",
+        message: "statusCode must be an integer",
+      });
+    } else if (obj.statusCode < 100 || obj.statusCode > 599) {
+      errors.push({
+        field: "statusCode",
+        code: "OUT_OF_RANGE",
+        message: "statusCode must be between 100 and 599",
+      });
+    }
+  }
+
+  // --- error (optional, string) ---
+  if (obj.error !== undefined && !isString(obj.error)) {
+    errors.push({
+      field: "error",
+      code: "WRONG_TYPE",
+      message: "error must be a string",
+    });
+  }
+
+  if (errors.length > 0) {
+    return { errors };
+  }
+
+  // All required fields validated; build the record.
+  const record: RequestMetric = {
+    id: obj.id as string,
+    model: obj.model as string,
+    fixture: obj.fixture as string,
+    latencyMs: obj.latencyMs as number,
+    tokens: obj.tokens as number,
+    timestamp: obj.timestamp as string,
+  };
+  if (obj.statusCode !== undefined) record.statusCode = obj.statusCode as number;
+  if (obj.error !== undefined) record.error = obj.error as string;
+
+  return { record };
+}
+```
+
+---
+
+## `src/stats.ts`
+
+```ts
+import type { GroupStats, RequestMetric } from "./types.js";
+
+/**
+ * Running (online) statistics for a single (model, fixture) group.
+ * Uses Welford's algorithm for the mean and the two-pass-free
+ * variance update so memory stays O(1) per group.
+ */
+export class GroupAccumulator {
+  private count = 0;
+  private sum = 0;
+  private mean = 0;
+  private m2 = 0; // sum of squared deviations (for variance)
+  private min = Number.POSITIVE_INFINITY;
+  private max = Number.NEGATIVE_INFINITY;
+  private errorCount = 0;
+
+  add(rec: RequestMetric): void {
+    const x = rec.latencyMs;
+    this.count += 1;
+    this.sum += x;
+    const delta = x - this.mean;
+    this.mean += delta / this.count;
+    this.m2 += delta * (x - this.mean);
+    if (x < this.min) this.min = x;
+    if (x > this.max) this.max = x;
+    if (rec.error !== undefined) this.errorCount += 1;
+  }
+
+  /** Sample standard deviation (n-1). NaN when count < 2. */
+  private sampleStdDev(): number {
+    if (this.count < 2) return Number.NaN;
+    const variance = this.m2 / (this.count - 1);
+    return Math.sqrt(Math.max(0, variance));
+  }
+
+  toStats(model: string, fixture: string): GroupStats {
+    return {
+      model,
+      fixture,
+      count: this.count,
+      mean: this.count === 0 ? 0 : this.mean,
+      median: this.median(),
+      sampleStdDev: this.sampleStdDev(),
+      min: this.count === 0 ? 0 : this.min,
+      max: this.count === 0 ? 0 : this.max,
+      sum:

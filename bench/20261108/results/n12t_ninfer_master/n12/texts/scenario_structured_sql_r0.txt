@@ -1,0 +1,185 @@
+We need answer user's request. Need produce one PostgreSQL script no Markdown fences. Need define normalized tables models, fixtures, runs, request_metrics; include PK/FK, checks, useful indexes, two views, one transaction-safe upsert function, at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Script must run in dependency order.
+
+Need think through schema and data. Need likely one script plain text no fences. Need ensure valid PostgreSQL. Dependency order: drop? Maybe use CREATE OR REPLACE? To run safely? User says script must run in dependency order. We can create schema, tables, functions, views, insert, queries. If repeated run, need idempotent? Could DROP objects CASCADE at start. But if drop, okay. Need no markdown fences. Need one PostgreSQL script. Need at least 80 realistic INSERT rows spanning two models and four fixture kinds. Rows probably request_metrics rows? Could be combined. We can insert models 2, fixtures 4, runs maybe multiple, request_metrics 80. Need spans two models and four fixture kinds. Need request_metrics tied to runs and fixtures and models? Normalized tables:
+models(model_id PK, name, family, param_count, context_length, created_at maybe)
+fixtures(fixture_id PK, kind, description, maybe input_tokens, output_tokens)
+runs(run_id PK, model_id FK, fixture_id FK, started_at, finished_at, status check, throughput? maybe settings)
+request_metrics(metric_id PK, run_id FK, request_id, input_tokens, output_tokens, latency_ms, ttft_ms, tps, mtp_proposed, mtp_accepted, checks)
+Need FKs. Maybe request_metrics references run, and run references model/fixture. Or request_metrics directly references model, fixture, run? Normalized means metrics reference run, run references model/fixture. Could include model_id fixture_id in metrics for convenience? But normalized maybe avoid redundant. But analytic queries can join.
+
+Need checks: latency nonnegative, tokens positive, tps nonnegative, status in values, mtp accepted <= proposed? maybe. Context tokens <= model.context_length? cross-type check? Could use CHECK (input_tokens > 0), (output_tokens >=0), (latency_ms >=0), (ttft_ms >=0), (throughput_tps >=0), (mtp_proposed >=0), (mtp_accepted <= mtp_proposed). For runs: finished_at >= started_at, status check.
+
+Useful indexes: on runs(model_id, started_at), runs(fixture_id, started_at), request_metrics(run_id), request_metrics(model? via join) maybe index request_metrics(run_id, latency_ms), request_metrics(run_id, mtp_proposed). But request_metrics no model_id, so for analytical by model join. Could add composite indexes. Maybe partial indexes? Keep simple.
+
+Two views: v_run_summary aggregates per run/model/fixture; v_model_fixture_performance aggregates across runs. Or v_long_context_retention? We need six analytical SELECT queries for throughput, variability, long-context retention, MTP acceptance. Views can be two.
+
+Function: transaction-safe upsert function. Need one function. It should upsert model, fixture, run, request_metrics? Maybe function insert_request_metrics_upsert(p_model_name text, p_fixture_kind text, p_fixture_desc text, p_run_id uuid/int, p_metrics record?). Simpler: create function upsert_run_metric(model_name text, fixture_kind text, fixture_desc text, run_id int, request_id int, input_tokens int, output_tokens int, latency_ms numeric, ttft_ms numeric, throughput_tps numeric, mtp_proposed int, mtp_accepted int) returns int. It should use savepoint? transaction-safe: if inside transaction, use SAVEPOINT? Or handle exceptions with exception block and savepoint. But if upsert all FK tables, ensure transaction safety. Use ON CONFLICT. Need maybe return run_id and metric_id. Could return record.
+
+PostgreSQL function in SQL: CREATE OR REPLACE FUNCTION upsert_run_metric(... ) RETURNS TABLE(run_id int, metric_id int) LANGUAGE plpgsql AS $$ ... $$; Use GET DIAGNOSTICS? Need insert returning. Use ON CONFLICT DO UPDATE. But if inserting model, fixture, run, metric in one function. For run upsert: maybe run_id provided; conflict on run_id. Need set status? Could be 'active'. But if run already exists, do nothing? For metric conflict on (run_id, request_id) unique. Need ensure model/fixture exist. Use INSERT ... ON CONFLICT (model_id) DO NOTHING? If model_id assigned maybe. We can auto assign IDs: models.id generated? To upsert by natural keys: model_name unique; fixture_kind unique; run_id natural. Use serial? For function, use INSERT INTO models (name) VALUES (p_model_name) ON CONFLICT (name) DO UPDATE SET name=EXCLUDED.name RETURNING model_id INTO v_model_id. Similarly fixtures ON CONFLICT (kind). Runs: INSERT INTO runs(run_id, model_id, fixture_id, started_at, finished_at, status) VALUES ... ON CONFLICT (run_id) DO UPDATE SET model_id=EXCLUDED.model_id, fixture_id=EXCLUDED.fixture_id, started_at=EXCLUDED.started_at, finished_at=COALESCE(EXCLUDED.finished_at, runs.finished_at), status=EXCLUDED.status RETURNING run_id. Then metric INSERT ... ON CONFLICT (run_id, request_id) DO UPDATE SET ... RETURNING metric_id.
+
+Need transaction-safe: Use BEGIN ... EXCEPTION WHEN OTHERS THEN ROLLBACK TO SAVEPOINT upsert_sp; RAISE; END; But inside function, if not in transaction? PostgreSQL functions run in transaction if called. Savepoint works. Could also use DECLARE savepoint. Use SAVEPOINT upsert_sp; BEGIN ...; EXCEPTION WHEN OTHERS THEN ROLLBACK TO SAVEPOINT upsert_sp; RAISE; END. But if SAVEPOINT statement outside BEGIN? In PL/pgSQL, SAVEPOINT is statement. To use rollback to savepoint in exception, must create savepoint in inner BEGIN. Example:
+CREATE FUNCTION ... RETURNS int LANGUAGE plpgsql AS $$
+DECLARE v_model int; ...
+BEGIN
+  SAVEPOINT upsert_sp;
+  BEGIN
+    ...
+  EXCEPTION WHEN OTHERS THEN
+    ROLLBACK TO SAVEPOINT upsert_sp;
+    RAISE;
+  END;
+  RETURN v_metric_id;
+END $$;
+But if success, need RELEASE SAVEPOINT? Optional. Could release to avoid lingering? In function, after inner begin: RELEASE SAVEPOINT upsert_sp; If exception, rollback. But if called within transaction, RELEASE okay. Or not. Need if SAVEPOINT not allowed? It is.
+
+But note if function called in transaction and inner exception catches, then rollback to savepoint, raise; outer transaction can handle. That's transaction-safe.
+
+Alternatively use SECURITY DEFINER? Not needed.
+
+Need INSERT rows. At least 80 realistic INSERT rows. Could use explicit multi-row INSERT. Need ensure 80 request_metrics rows. We can generate 80 rows manually? Need careful valid data. Could use INSERT INTO request_metrics (...) VALUES (...), ...; 80 rows. Need span two models and four fixture kinds. If request_metrics only references run_id, need runs rows. Could insert 4 runs? But to span two models and four fixture kinds, if each run model+fixture, need at least? Could have 8 runs (2 models x 4 fixtures) and 10 metrics per run = 80. That's manageable but large. Or have 20 runs and 4 metrics each. Need realistic. We can generate with arrays? But requirement at least 80 realistic INSERT rows. Could use single INSERT with 80 tuples. It might be long but okay. Need ensure FKs. We can define runs 1-20 maybe: model 1 or 2, fixture 1-4. Each run 4 metrics => 80. That's easier: 20 runs (10 per model? 5 per fixture maybe) and 4 metrics each. Need at least 80 INSERT rows could refer to all INSERT statements? Likely means at least 80 rows inserted. We can have request_metrics 80. Also models 2, fixtures 4, runs 20. Total >80. Good.
+
+Need design IDs. models: 1 'phi-2-mini', 2 'llama-3-8b-instruct' maybe. fixtures: 1 'short_qa', 2 'code_completion', 3 'long_document', 4 'multi_turn_chat'. Runs 1-20. Need mapping. Could runs:
+1 model1 fixture1
+2 model1 fixture2
+3 model1 fixture3
+4 model1 fixture4
+5 model1 fixture1
+6 model1 fixture2
+7 model1 fixture3
+8 model1 fixture4
+9 model1 fixture1
+10 model1 fixture2
+11 model2 fixture3
+12 model2 fixture4
+13 model2 fixture1
+14 model2 fixture2
+15 model2 fixture3
+16 model2 fixture4
+17 model2 fixture1
+18 model2 fixture2
+19 model2 fixture3
+20 model2 fixture4
+This spans all. Could have started_at dates. status 'completed' or 'completed' maybe some 'completed' all. Checks: finished_at >= started_at.
+
+Need request_metrics 80: for each run, request_id 1-4. Need input_tokens/output_tokens/latency_ms/ttft_ms/throughput_tps/mtp_proposed/mtp_accepted. Need realistic for two models. Maybe model1 smaller faster, model2 bigger slower. Need MTP acceptance: maybe model2 supports MTP? Or both? MTP (multi-token prediction) acceptance. Could have some 0. Need check mtp_accepted <= mtp_proposed. For MTP acceptance, maybe proposed 0 accepted 0 for runs without MTP, and some proposed >0. Need long-context retention query: compare accuracy? We don't have accuracy table. request_metrics can include output_tokens? Long-context retention maybe measure accuracy by fixture kind long_document? But no ground truth. Could include columns in request_metrics: correctness? Or maybe runs include fixture long-context, request_metrics includes input_tokens high and output_tokens? Retention could be proxy: average output token similarity? Need define a column like retention_score numeric (0-1) or accuracy? User asks normalized tables for models, fixtures, runs, and request_metrics. Need analytical queries for long-context retention. We can include request_metrics.retention_score? But request_metrics usually latency. Could add correctness or retention_score in request_metrics. But normalized? It's metric. Check between 0 and 1. Then long-context retention query can filter fixture kind 'long_document' and maybe input_tokens > threshold, compute avg retention_score by model. Need include check retention_score between 0 and 1. Good.
+
+Alternatively fixtures have expected_context? Could compute retention by average overlap? Not enough. Add retention_score in request_metrics.
+
+Need MTP acceptance query: select model, fixture, avg accepted/proposed where proposed >0. Could include mtp_acceptance = sum(mtp_accepted)/sum(mtp_proposed). Need guard zero.
+
+Six analytical SELECT queries:
+1 Throughput by model and fixture kind: average tps, total output tokens/sum latency? Could compute avg(throughput_tps), avg(requests/sec). Maybe throughput as output tokens per second. 
+2 Variability: stddev/mean ratio (CV) of latency and tps by model, fixture.
+3 Long-context retention: by model and maybe context bucket (input_tokens >= 8000 etc) average retention_score.
+4 MTP acceptance: by model, fixture kind, sum accepted/proposed.
+5 Throughput trend by date? Or p50/p95 latency.
+6 Combined? Need six queries covering throughput, variability, long-context retention, and MTP acceptance. Could be:
+Q1 model/fixture throughput avg_tps and requests_per_hour.
+Q2 latency percentiles by model/fixture (throughput/latency) p50/p95.
+Q3 variability by model/fixture: stddev(latency), cv latency, cv tps.
+Q4 long-context retention by model and context bucket.
+Q5 MTP acceptance by model and fixture kind.
+Q6 MTP acceptance impact on throughput/latency: accepted vs not? Or model-level overall. Need six distinct.
+
+Need finish with six analytical SELECT queries. They can be at end. Should they be just queries, not output? yes.
+
+Need no Markdown fences. So final answer plain SQL.
+
+Need ensure script runs in dependency order. We can start with DROP VIEW IF EXISTS ... CASCADE; DROP FUNCTION ... CASCADE; DROP TABLE ... CASCADE; then create. Or use CREATE IF NOT EXISTS? For dependency, drop ensures order. But if run multiple times, insert duplicate? Use TRUNCATE? Could use DROP TABLE CASCADE. But if function exists before drop? Drop function after tables? Dependency: function maybe uses tables? Drop function first? It references tables maybe not. Order: DROP VIEW, DROP FUNCTION, DROP TABLE. Then create tables, indexes, function, views, data, queries. Or CREATE OR REPLACE and TRUNCATE ... CASCADE; but drops simpler. Need no issue if objects don't exist.
+
+Need ensure function created after tables (because function body references tables? In PL/pgSQL function can be created before tables? It can, but at runtime needs tables. For dependency order, create tables first. Views after function? Views may not depend on function. Can create after tables before function? But finish queries use views maybe. Need dependency order: tables, indexes, function, views, data, queries. Views can be after data? Doesn't matter. But if queries use views, create before queries. Good.
+
+Potential issue: INSERT data after creating views? Fine.
+
+Need indexes: Could be on tables.
+
+Detailed schema:
+CREATE TABLE models (
+ model_id integer PRIMARY KEY,
+ name text NOT NULL UNIQUE,
+ family text NOT NULL,
+ parameter_billions numeric(10,2) CHECK (parameter_billions > 0),
+ max_context_tokens integer CHECK (max_context_tokens > 0),
+ created_at timestamptz NOT NULL DEFAULT now()
+);
+Maybe name unique.
+
+fixtures:
+fixture_id integer PRIMARY KEY,
+kind text NOT NULL UNIQUE,
+description text NOT NULL,
+base_input_tokens integer NOT NULL CHECK (base_input_tokens > 0),
+base_output_tokens integer NOT NULL CHECK (base_output_tokens >= 0)
+);
+
+runs:
+run_id integer PRIMARY KEY,
+model_id integer NOT NULL REFERENCES models(model_id),
+fixture_id integer NOT NULL REFERENCES fixtures(fixture_id),
+started_at timestamptz NOT NULL,
+finished_at timestamptz,
+status text NOT NULL DEFAULT 'running' CHECK (status IN ('running','completed','failed','canceled')),
+client_concurrency integer NOT NULL DEFAULT 1 CHECK (client_concurrency > 0),
+notes text,
+CHECK (finished_at IS NULL OR finished_at >= started_at)
+);
+
+request_metrics:
+metric_id bigserial PRIMARY KEY,
+run_id integer NOT NULL REFERENCES runs(run_id),
+request_id integer NOT NULL CHECK (request_id >= 0),
+input_tokens integer NOT NULL CHECK (input_tokens > 0),
+output_tokens integer NOT NULL CHECK (output_tokens >= 0),
+latency_ms numeric(12,3) NOT NULL CHECK (latency_ms >= 0),
+ttft_ms numeric(12,3) NOT NULL CHECK (ttft_ms >= 0),
+throughput_tps numeric(10,3) NOT NULL CHECK (throughput_tps >= 0),
+retention_score numeric(6,4) CHECK (retention_score IS NULL OR (retention_score >= 0 AND retention_score <= 1)),
+mtp_proposed integer NOT NULL DEFAULT 0 CHECK (mtp_proposed >= 0),
+mtp_accepted integer NOT NULL DEFAULT 0 CHECK (mtp_accepted >= 0),
+CHECK (mtp_accepted <= mtp_proposed),
+CHECK (ttft_ms <= latency_ms),
+CHECK (throughput_tps = 0 OR latency_ms > 0), maybe.
+UNIQUE (run_id, request_id);
+);
+
+Need check input_tokens maybe <= model max? Cannot cross reference in CHECK unless function. Could skip.
+
+Indexes:
+CREATE INDEX idx_runs_model_started ON runs (model_id, started_at DESC);
+CREATE INDEX idx_runs_fixture_started ON runs (fixture_id, started_at DESC);
+CREATE INDEX idx_runs_status ON runs (status, started_at DESC);
+CREATE INDEX idx_metrics_run_request ON request_metrics (run_id, request_id); (unique already creates index)
+CREATE INDEX idx_metrics_run_latency ON request_metrics (run_id, latency_ms);
+CREATE INDEX idx_metrics_run_tps ON request_metrics (run_id, throughput_tps DESC);
+CREATE INDEX idx_metrics_mtp ON request_metrics (run_id, mtp_proposed DESC) WHERE mtp_proposed > 0;
+Could include retention_score index? Not necessary.
+
+Views:
+CREATE OR REPLACE VIEW v_run_summary AS
+SELECT r.run_id, m.model_id, m.name AS model_name, f.fixture_id, f.kind AS fixture_kind,
+ r.started_at, r.finished_at, r.status,
+ count(x.metric_id) AS request_count,
+ sum(x.input_tokens) AS total_input_tokens,
+ sum(x.output_tokens) AS total_output_tokens,
+ avg(x.latency_ms) AS avg_latency_ms,
+ percentile_cont(0.5) WITHIN GROUP (ORDER BY x.latency_ms) AS p50_latency_ms,
+ avg(x.throughput_tps) AS avg_tps,
+ sum(x.mtp_proposed) AS mtp_proposed,
+ sum(x.mtp_accepted) AS mtp_accepted
+FROM runs r JOIN models m ON ... JOIN fixtures f ... LEFT JOIN request_metrics x ...
+GROUP BY r.run_id, m.model_id, m.name, f.fixture_id, f.kind, r.started_at, r.finished_at, r.status;
+
+CREATE OR REPLACE VIEW v_model_fixture_performance AS
+SELECT m.model_id, m.name, f.fixture_id, f.kind,
+ count(DISTINCT r.run_id) AS run_count,
+ count(x.metric_id) AS request_count,
+ avg(x.throughput_tps) AS avg_tps,
+ stddev(x.throughput_tps) AS tps_stddev,
+ avg(x.latency_ms) AS avg_latency_ms,
+ stddev(x.latency_ms) AS latency_stddev,
+ avg(x.retention_score) FILTER (WHERE x.retention_score IS NOT NULL) AS avg_retention_score,
+ sum(x.mtp_proposed) AS mtp_proposed,
+ sum(x.mtp_accepted) AS mtp_accepted,
+ CASE WHEN sum(x.mtp_proposed) > 0 THEN sum(x.mtp_accepted)::numeric / sum(x.mtp_proposed) ELSE NULL END AS mtp_accept_rate
+FROM models m JOIN fixtures f ... LEFT JOIN runs r ON ... LEFT JOIN request_metrics x ...
+GROUP BY m.model_id, m.name, f.fixture_id, f

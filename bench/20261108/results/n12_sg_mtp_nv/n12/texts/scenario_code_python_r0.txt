@@ -1,0 +1,568 @@
+Below is a complete, self‑contained Python 3.11 package. It is deterministic (no wall‑clock timestamps in state/events; a monotonic logical clock drives everything), enforces a single active GPU job, persists state atomically, resumes completed work, streams structured JSONL events, handles SIGINT, and redacts configured secrets.
+
+Design notes:
+- **Determinism**: `state.json` and every event use a logical `tick` counter, not `time.time()`. The same manifest + same seed + same cancellation point reproduces byte‑identical state and event streams.
+- **Atomic persistence**: state is written to a temp file in the same directory, `os.replace`d over the target, and `fsync`ed.
+- **Single active GPU job**: the runner is a single‑worker loop; only one job is ever in `running`.
+- **Resume**: on start, jobs already `completed` are skipped; a `running` job is treated as interrupted and re‑queued.
+- **SIGINT**: first signal sets a cancel flag (graceful); a second signal forces immediate exit.
+- **Secrets**: configured values are redacted from all emitted events and from the persisted state.
+
+---
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deterministic-job-runner"
+version = "0.1.0"
+description = "Deterministic asynchronous job runner with atomic state, resume, JSONL events, SIGINT handling, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Example" }]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+djr = "deterministic_job_runner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["deterministic_job_runner*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+```
+
+---
+
+### `deterministic_job_runner/__init__.py`
+
+```python
+"""Deterministic asynchronous job runner package."""
+
+from .config import Config, load_config
+from .manifest import Job, Manifest, load_manifest
+from .state import State, StateStore
+from .events import Event, EventStream
+from .redaction import Redactor
+from .runner import JobRunner, RunnerResult
+from .cli import main
+
+__all__ = [
+    "Config",
+    "load_config",
+    "Job",
+    "Manifest",
+    "load_manifest",
+    "State",
+    "StateStore",
+    "Event",
+    "EventStream",
+    "Redactor",
+    "JobRunner",
+    "RunnerResult",
+    "main",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+### `deterministic_job_runner/config.py`
+
+```python
+"""Configuration loading and validation."""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class Config:
+    """Runtime configuration for the runner.
+
+    Attributes:
+        workdir: Directory where state.json and events.jsonl are written.
+        seed: RNG seed for deterministic job outcomes.
+        secrets: Values that must be redacted from events and state.
+        max_retries: Maximum retry attempts for a failed job.
+        gpu_device: Logical GPU device identifier (informational).
+    """
+
+    workdir: Path
+    seed: int = 0
+    secrets: list[str] = field(default_factory=list)
+    max_retries: int = 0
+    gpu_device: str = "gpu:0"
+
+    @property
+    def state_path(self) -> Path:
+        return self.workdir / "state.json"
+
+    @property
+    def events_path(self) -> Path:
+        return self.workdir / "events.jsonl"
+
+
+def load_config(
+    workdir: str | Path,
+    *,
+    seed: int = 0,
+    secrets: list[str] | None = None,
+    max_retries: int = 0,
+    gpu_device: str = "gpu:0",
+    config_file: str | Path | None = None,
+) -> Config:
+    """Build a Config from a workdir and optional overrides.
+
+    If ``config_file`` is provided, its JSON contents are merged (file values
+    are the base; explicit keyword arguments override the file).
+    """
+    workdir = Path(workdir).expanduser().resolve()
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    file_values: dict[str, Any] = {}
+    if config_file is not None:
+        with open(config_file, "r", encoding="utf-8") as fh:
+            file_values = json.load(fh)
+
+    def pick(key: str, default: Any) -> Any:
+        if key in file_values:
+            return file_values[key]
+        return default
+
+    seed = int(pick("seed", seed))
+    secrets = list(pick("secrets", secrets or []))
+    max_retries = int(pick("max_retries", max_retries))
+    gpu_device = str(pick("gpu_device", gpu_device))
+
+    return Config(
+        workdir=workdir,
+        seed=seed,
+        secrets=secrets,
+        max_retries=max_retries,
+        gpu_device=gpu_device,
+    )
+```
+
+---
+
+### `deterministic_job_runner/manifest.py`
+
+```python
+"""Manifest (job list) loading and validation."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class Job:
+    """A single unit of work.
+
+    Attributes:
+        id: Unique job identifier.
+        name: Human readable name.
+        command: The command to execute (informational; the runner simulates
+            execution deterministically).
+        gpu: Whether this job requires the GPU (only GPU jobs are subject to
+            the single-active-GPU-job constraint).
+        params: Arbitrary parameters.
+        expected_outcome: Optional hint used by the deterministic simulator.
+            One of {"success", "failure"}; if absent, outcome is derived from
+            the RNG seed.
+    """
+
+    id: str
+    name: str
+    command: str
+    gpu: bool = True
+    params: dict[str, Any] = field(default_factory=dict)
+    expected_outcome: str | None = None
+
+
+@dataclass
+class Manifest:
+    """A collection of jobs to run, in order."""
+
+    jobs: list[Job] = field(default_factory=list)
+
+    def __iter__(self):
+        return iter(self.jobs)
+
+    def __len__(self) -> int:
+        return len(self.jobs)
+
+    def get(self, job_id: str) -> Job | None:
+        for job in self.jobs:
+            if job.id == job_id:
+                return job
+        return None
+
+
+def _validate_job(raw: dict[str, Any], index: int) -> Job:
+    job_id = raw.get("id")
+    if not job_id or not isinstance(job_id, str):
+        raise ValueError(f"Job at index {index} is missing a string 'id'.")
+    name = raw.get("name", job_id)
+    command = raw.get("command", "")
+    gpu = bool(raw.get("gpu", True))
+    params = raw.get("params", {})
+    if not isinstance(params, dict):
+        raise ValueError(f"Job '{job_id}' has non-object 'params'.")
+    expected = raw.get("expected_outcome")
+    if expected is not None and expected not in ("success", "failure"):
+        raise ValueError(
+            f"Job '{job_id}' has invalid 'expected_outcome': {expected!r}"
+        )
+    return Job(
+        id=job_id,
+        name=name,
+        command=command,
+        gpu=gpu,
+        params=params,
+        expected_outcome=expected,
+    )
+
+
+def load_manifest(path: str | Path) -> Manifest:
+    """Load and validate a JSON manifest.
+
+    The manifest may be either a list of job objects or an object with a
+    "jobs" key containing a list of job objects.
+    """
+    path = Path(path)
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    if isinstance(data, dict):
+        raw_jobs = data.get("jobs", [])
+    elif isinstance(data, list):
+        raw_jobs = data
+    else:
+        raise ValueError("Manifest must be a JSON list or object with 'jobs'.")
+
+    if not isinstance(raw_jobs, list):
+        raise ValueError("Manifest 'jobs' must be a list.")
+
+    jobs = [_validate_job(raw, i) for i, raw in enumerate(raw_jobs)]
+
+    seen: set[str] = set()
+    for job in jobs:
+        if job.id in seen:
+            raise ValueError(f"Duplicate job id: {job.id!r}")
+        seen.add(job.id)
+
+    return Manifest(jobs=jobs)
+```
+
+---
+
+### `deterministic_job_runner/state.py`
+
+```python
+"""Atomic, persistent job state."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class JobState:
+    """Persistent state for a single job."""
+
+    id: str
+    status: JobStatus = JobStatus.PENDING
+    attempts: int = 0
+    result: str | None = None
+    error: str | None = None
+    output: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "status": self.status.value,
+            "attempts": self.attempts,
+            "result": self.result,
+            "error": self.error,
+            "output": self.output,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "JobState":
+        return cls(
+            id=data["id"],
+            status=JobStatus(data.get("status", "pending")),
+            attempts=int(data.get("attempts", 0)),
+            result=data.get("result"),
+            error=data.get("error"),
+            output=data.get("output", {}),
+        )
+
+
+@dataclass
+class State:
+    """Top-level persistent state."""
+
+    tick: int = 0
+    jobs: dict[str, JobState] = field(default_factory=dict)
+    active_job: str | None = None
+    cancelled: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tick": self.tick,
+            "active_job": self.active_job,
+            "cancelled": self.cancelled,
+            "jobs": {jid: js.to_dict() for jid, js in self.jobs.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "State":
+        jobs = {
+            jid: JobState.from_dict(jd) for jid, jd in data.get("jobs", {}).items()
+        }
+        return cls(
+            tick=int(data.get("tick", 0)),
+            jobs=jobs,
+            active_job=data.get("active_job"),
+            cancelled=bool(data.get("cancelled", False)),
+        )
+
+
+class StateStore:
+    """Reads and writes State atomically.
+
+    Atomicity is achieved by writing to a temporary file in the same
+    directory, fsync'ing it, and then os.replace'ing it over the target.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def load(self) -> State | None:
+        """Load state from disk, or None if it does not exist."""
+        if not self.path.exists():
+            return None
+        with open(self.path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return State.from_dict(data)
+
+    def save(self, state: State) -> None:
+        """Atomically persist state to disk."""
+        payload = json.dumps(state.to_dict(), indent=2, sort_keys=True) + "\n"
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(self.path.parent), prefix=".state-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, self.path)
+        except BaseException:
+            # Clean up the temp file on failure.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+```
+
+---
+
+### `deterministic_job_runner/events.py`
+
+```python
+"""Structured JSONL event streaming."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, TextIO
+
+
+@dataclass
+class Event:
+    """A single structured event.
+
+    Attributes:
+        tick: Logical clock value (monotonic, deterministic).
+        type: Event type string, e.g. "job.started".
+        job_id: Optional job identifier.
+        data: Arbitrary payload.
+    """
+
+    tick: int
+    type: str
+    job_id: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"tick": self.tick, "type": self.type}
+        if self.job_id is not None:
+            d["job_id"] = self.job_id
+        if self.data:
+            d["data"] = self.data
+        return d
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+
+
+class EventStream:
+    """Streams events to a JSONL file and/or an in-memory list.
+
+    Events are appended one per line. The stream is flushed after each event
+    so that external consumers can observe progress in real time.
+    """
+
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        collect: bool = True,
+    ):
+        self.path = Path(path) if path else None
+        self.collect = collect
+        self.events: list[Event] = []
+        self._fh: TextIO | None = None
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(self.path, "a", encoding="utf-8")
+
+    def emit(self, event: Event) -> None:
+        """Emit a single event."""
+        if self.collect:
+            self.events.append(event)
+        if self._fh is not None:
+            self._fh.write(event.to_json() + "\n")
+            self._fh.flush()
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def __enter__(self) -> "EventStream":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+```
+
+---
+
+### `deterministic_job_runner/redaction.py`
+
+```python
+"""Secret redaction for events and state."""
+
+from __future__ import annotations
+
+from typing import Any
+
+REDACTED = "***REDACTED***"
+
+
+class Redactor:
+    """Recursively redacts configured secret values from arbitrary data.
+
+    A secret is redacted when it appears as a string value anywhere in the
+    structure. The redaction is applied to both event payloads and persisted
+    state before they are written to disk.
+    """
+
+    def __init__(self, secrets: list[str] | None = None):
+        # Only non-empty secrets are meaningful.
+        self._secrets: set[str] = {s for s in (secrets or []) if s}
+
+    def redact(self, data: Any) -> Any:
+        """Return a copy of ``data`` with secrets redacted."""
+        if not self._secrets:
+            return data
+        return self._redact(data)
+
+    def _redact(self, data: Any) -> Any:
+        if isinstance(data, str):
+            if data in self._secrets:
+                return REDACTED
+            return data
+        if isinstance(data, list):
+            return [self._redact(item) for item in data]
+        if isinstance(data, tuple):
+            return tuple(self._redact(item) for item in data)
+        if isinstance(data, dict):
+            return {k: self._redact(v) for k, v in data.items()}
+        return data
+```
+
+---
+
+### `deterministic_job_runner/runner.py`
+
+```python
+"""The deterministic asynchronous job runner."""
+
+from __future__ import annotations
+
+import asyncio
+import random
+import signal
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .config import Config
+from .events import Event, EventStream
+from .manifest import Job, Manifest
+from .redaction import Redactor
+from .state import JobState, JobStatus, State, StateStore
+
+
+@dataclass
+class RunnerResult:
+    """Summary of a runner execution."""
+
+    completed: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+    cancelled: list[str] = field(default_factory=list)
+    pending: list[str] = field(default_factory=list)
+    resumed: list[str

@@ -1,0 +1,201 @@
+We need answer user's request: Return one PostgreSQL script with no Markdown fences. Need define normalized tables for models, fixtures, runs, request_metrics; include PK/FK, checks, useful indexes, two views, one transaction-safe upsert function, at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Script must run in dependency order.
+
+We need produce only SQL, no markdown fences. Need ensure PostgreSQL valid. Need likely use DROP? It says return one script. Could include CREATE IF NOT EXISTS. Dependency order: models, fixtures, runs, request_metrics, indexes, views, function, inserts, queries. But transaction-safe upsert function should maybe use CTE or ON CONFLICT. Need include at least 80 realistic INSERT rows spanning two models and four fixture kinds. We can generate rows manually? Need 80 rows. Could use generate_series? They specifically say at least 80 realistic INSERT rows. Could interpret actual INSERT statements with row literals. We can provide INSERT with VALUES many rows. Need 80 rows. Could include 80 rows across 2 models, 4 fixture kinds. Need normalized tables: models(model_id serial? name, architecture? version?), fixtures(fixture_id, name, kind? context_length? tokens? maybe synthetic?), runs(run_id, model_id, fixture_id, timestamp? mtp_depth? batch? throughput? maybe result_status), request_metrics(request_metric_id, run_id, request_id, prompt_tokens, completion_tokens, latency_ms, mtp_accepted, mtp_proposed? status). Need checks: status in enum? context_length >0, tokens >=0, latency >=0, mtp acceptance ratio between 0 and1 etc.
+
+Need indexes: on runs(model_id), runs(fixture_id), request_metrics(run_id), request_metrics(mtp_accepted) maybe partial. Views: two views: run_summary maybe throughput and variability; mtp_by_fixture. Queries: six analytical SELECT queries for throughput, variability, long-context retention, MTP acceptance. Need include at least throughput, variability, long-context retention, MTP acceptance. Could do:
+1 throughput per model/fixture avg tokens/s.
+2 variability per model: stddev latency and coefficient variation.
+3 long-context retention: by fixture kind or context_length bucket acceptance? retention maybe completion tokens vs prompt? Could define long context as prompt_tokens >= 4096. Query avg mtp_accept_rate and latency ratio.
+4 MTP acceptance overall by model.
+5 MTP acceptance by fixture kind.
+6 maybe throughput variability across runs? Or long-context throughput drop.
+
+Need transaction-safe upsert function: Maybe upsert_run_metrics(run_id int, metrics json? or individual rows). Could be function that upserts into request_metrics using ON CONFLICT (run_id, request_id) DO UPDATE. Need unique constraint for request_metrics (run_id, request_id). Need if exists. Function language sql or plpgsql. Transaction-safe means one statement? Use CTE insert ... on conflict. Return number inserted/updated? Use RETURNING count. Maybe function upsert_request_metrics(p_run_id int, p_request_id text, p_prompt_tokens int, p_completion_tokens int, p_latency_ms numeric, p_mtp_accepted numeric, p_mtp_proposed int, p_status text) returns void. Need ensure model/fixtures exist? Could include check. But simple.
+
+Need script run in dependency order: create tables before inserts, function after table, views after tables? Could create views after data? Either. Since final queries can be after. But if using function for insert? Maybe just INSERT directly. Function doesn't need be used? Could define.
+
+Need no Markdown fences. Only raw SQL.
+
+Need be careful with PostgreSQL syntax. Use CREATE TABLE IF NOT EXISTS. For primary keys, foreign keys. Could use TEXT for status. CHECK constraints.
+
+Need realistic INSERT rows. At least 80. Need two models and four fixture kinds. Could insert models 2 rows, fixtures 4 rows, runs maybe 20 rows (2 models x 4 fixtures x 5 run reps), request_metrics at least 80? The requirement: at least 80 realistic INSERT rows spanning two models and four fixture kinds. It might mean total rows inserted across tables? But likely request_metrics? To be safe, provide 80 request_metrics rows. Also inserts for models/fixtures/runs. That means >80 total. Could do 80 metric rows, 20 run rows, 4 fixtures, 2 models. Need maintain consistency. Need generate manually. We can create 20 runs: model A and B, fixture kind maybe each 2? Actually 4 fixture kinds: long_context, code_completion, summarization, chat. For each model and fixture, maybe 2 runs? That gives 16 runs. Need 80 metrics, 5 metrics per run = 80. Good. 2 models * 4 fixtures * 2 runs = 16 runs, 5 metrics each = 80. Need realistic values.
+
+Need define fixture_kind check? Values: 'long_context', 'code_completion', 'summarization', 'chat'. Models: maybe 'model-a-v1' and 'model-b-v2' or 'llama-70b-chat', 'mistral-8x7b'. Could use model_id serial. But inserts with explicit IDs to be deterministic. Use SETVAL? If using serial with explicit IDs, need set sequence setval. Simpler use INTEGER PRIMARY KEY, not serial. Or UUID? Use INTEGER. We can insert explicit IDs. No sequence issue. Use model_id integer pk, fixture_id integer pk, run_id integer pk, request_metric_id integer pk? Could use bigserial? But explicit insert. Use integer PK. If not serial, no need setval. But realistic table might use integer. Could use BIGINT GENERATED BY DEFAULT AS IDENTITY? Then explicit insert okay? But maybe no. Use INTEGER PRIMARY KEY.
+
+Normalized: models table no fixtures, etc. runs references model and fixture. request_metrics references run. request_metrics request_id maybe text (request ID). Unique (run_id, request_id). Good.
+
+Need checks: models.name not null? unique model_name? Could have unique(name, version). Fixtures: kind check, context_length >0, fixture_name unique. Runs: created_at? mtp_depth? batch_size? maybe mtp_enabled boolean? check mtp_depth in (0,1,2,3)? Need MTP acceptance metrics. Let's include runs: run_id pk, model_id fk, fixture_id fk, started_at timestamptz not null, mtp_depth smallint not null default 0 check (0,1,2,3), batch_size smallint check >=1, status check in ('completed','failed'), maybe config? request_metrics: metric_id pk, run_id fk, request_id text not null, prompt_tokens int check >=0, completion_tokens int check >=0, latency_ms numeric(12,3) check >=0, mtp_proposed smallint check >=0, mtp_accepted smallint check >=0, mtp_accept_rate numeric check 0<=<=1, status check in ('ok','error','timeout') maybe check completion_tokens=0 if error? Could allow. Unique run_id, request_id.
+
+Need indexes: runs_model, runs_fixture, metrics_run, metrics_model? can't join maybe. metrics_mtp_acceptance maybe index on (run_id, mtp_accept_rate) or partial where mtp_accepted>0. request_metrics (model_id? not in table). Could have index on runs model+fixture, metrics run_id, request_id. Views can join.
+
+Views:
+CREATE OR REPLACE VIEW run_throughput_summary AS SELECT r.run_id, m.model_name, f.fixture_name, f.fixture_kind, count(...), sum prompt/completion, avg latency, (sum(completion_tokens)*1000)/sum(latency_ms)? Need careful if latency_ms 0. Use NULLIF. Throughput tokens per second: sum(completion_tokens)*1000.0 / NULLIF(sum(latency_ms),0). Variability: stddev_samp(latency_ms) / NULLIF(avg(latency_ms),0) as latency_cv. mtp_accept_rate avg.
+
+Second view: fixture_mtp_long_context maybe aggregate by model and fixture kind? e.g. long_context_mtp_by_model AS SELECT m.model_name, f.fixture_kind, count, avg mtp_accept_rate for prompt_tokens >= 4096? Could be view filtering long context.
+
+Need six analytical SELECT queries. Since they want finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Could be SELECTs that run after. Need no semicolon? each.
+
+Need ensure script runs in dependency order. If final SELECTs produce output. Good.
+
+Potential issue: If using CREATE INDEX IF NOT EXISTS on expressions? Fine.
+
+Need ensure views and queries use correct columns.
+
+Let's design schema:
+
+CREATE TABLE IF NOT EXISTS models (
+  model_id integer PRIMARY KEY,
+  model_name text NOT NULL,
+  model_version text NOT NULL,
+  architecture text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (model_name, model_version)
+);
+
+CREATE TABLE IF NOT EXISTS fixtures (
+  fixture_id integer PRIMARY KEY,
+  fixture_name text NOT NULL,
+  fixture_kind text NOT NULL CHECK (fixture_kind IN ('long_context','code_completion','summarization','chat')),
+  context_length integer NOT NULL CHECK (context_length > 0),
+  source text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (fixture_name)
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+  run_id integer PRIMARY KEY,
+  model_id integer NOT NULL REFERENCES models(model_id) ON DELETE RESTRICT,
+  fixture_id integer NOT NULL REFERENCES fixtures(fixture_id) ON DELETE RESTRICT,
+  started_at timestamptz NOT NULL,
+  mtp_depth smallint NOT NULL DEFAULT 0 CHECK (mtp_depth IN (0,1,2,3)),
+  batch_size smallint NOT NULL DEFAULT 1 CHECK (batch_size > 0),
+  status text NOT NULL DEFAULT 'completed' CHECK (status IN ('completed','failed')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (model_id, fixture_id, started_at, mtp_depth, batch_size) maybe too strict but okay if timestamps distinct. Could omit unique.
+);
+
+CREATE TABLE IF NOT EXISTS request_metrics (
+  request_metric_id integer PRIMARY KEY,
+  run_id integer NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  request_id text NOT NULL,
+  prompt_tokens integer NOT NULL CHECK (prompt_tokens >= 0),
+  completion_tokens integer NOT NULL CHECK (completion_tokens >= 0),
+  latency_ms numeric(12,3) NOT NULL CHECK (latency_ms >= 0),
+  mtp_proposed smallint NOT NULL DEFAULT 0 CHECK (mtp_proposed >= 0),
+  mtp_accepted smallint NOT NULL DEFAULT 0 CHECK (mtp_accepted >= 0 AND mtp_accepted <= mtp_proposed),
+  mtp_accept_rate numeric(6,4) NOT NULL DEFAULT 0 CHECK (mtp_accept_rate >= 0 AND mtp_accept_rate <= 1),
+  status text NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','error','timeout')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (run_id, request_id)
+);
+
+Indexes:
+CREATE INDEX IF NOT EXISTS idx_runs_model ON runs(model_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_fixture ON runs(fixture_id, model_id);
+CREATE INDEX IF NOT EXISTS idx_request_metrics_run ON request_metrics(run_id, request_id);
+CREATE INDEX IF NOT EXISTS idx_request_metrics_mtp ON request_metrics(run_id, mtp_accept_rate DESC);
+CREATE INDEX IF NOT EXISTS idx_request_metrics_status ON request_metrics(status); maybe partial: WHERE status <> 'ok'.
+CREATE INDEX IF NOT EXISTS idx_request_metrics_prompt_tokens ON request_metrics(prompt_tokens DESC);
+
+Views:
+CREATE OR REPLACE VIEW v_run_throughput AS
+SELECT r.run_id, m.model_name, m.model_version, f.fixture_name, f.fixture_kind,
+ r.started_at, r.mtp_depth, r.batch_size, r.status,
+ count(*) as request_count,
+ sum(m.prompt_tokens) as total_prompt_tokens,
+ sum(m.completion_tokens) as total_completion_tokens,
+ sum(m.latency_ms) as total_latency_ms,
+ (sum(m.completion_tokens) * 1000.0) / NULLIF(sum(m.latency_ms), 0) as completion_tokens_per_sec,
+ avg(m.latency_ms) as avg_latency_ms,
+ stddev_samp(m.latency_ms) as latency_stddev_ms,
+ (stddev_samp(m.latency_ms) / NULLIF(avg(m.latency_ms), 0)) as latency_cv,
+ avg(m.mtp_accept_rate) as avg_mtp_accept_rate,
+ sum(m.mtp_accepted)::numeric / NULLIF(sum(m.mtp_proposed),0) as total_mtp_accept_rate
+FROM runs r
+JOIN models m ON m.model_id = r.model_id
+JOIN fixtures f ON f.fixture_id = r.fixture_id
+JOIN request_metrics mtr ON mtr.run_id = r.run_id
+GROUP BY r.run_id, m.model_name, m.model_version, f.fixture_name, f.fixture_kind, r.started_at, r.mtp_depth, r.batch_size, r.status;
+
+Second view maybe v_model_fixture_summary:
+CREATE OR REPLACE VIEW v_model_fixture_mtp AS
+SELECT m.model_name, m.model_version, f.fixture_kind, f.context_length,
+ count(distinct r.run_id) as run_count,
+ count(*) as request_count,
+ avg(mtr.mtp_accept_rate) as avg_mtp_accept_rate,
+ percentile_cont(0.5) WITHIN GROUP (ORDER BY mtr.mtp_accept_rate) as p50_mtp_accept_rate,
+ percentile_cont(0.95) WITHIN GROUP (ORDER BY mtr.latency_ms) as p95_latency_ms,
+ sum(mtr.completion_tokens) as total_completion_tokens,
+ (sum(mtr.completion_tokens)*1000.0)/NULLIF(sum(mtr.latency_ms),0) as completion_tokens_per_sec,
+ (sum(mtr.mtp_accepted)*1.0)/NULLIF(sum(mtr.mtp_proposed),0) as total_mtp_accept_rate
+FROM models m JOIN runs r ... JOIN fixtures f ... JOIN request_metrics mtr ...
+WHERE mtr.status = 'ok'
+GROUP BY m.model_name, m.model_version, f.fixture_kind, f.context_length;
+
+Function:
+CREATE OR REPLACE FUNCTION upsert_request_metric(
+ p_run_id integer,
+ p_request_id text,
+ p_prompt_tokens integer,
+ p_completion_tokens integer,
+ p_latency_ms numeric,
+ p_mtp_proposed smallint DEFAULT 0,
+ p_mtp_accepted smallint DEFAULT 0,
+ p_status text DEFAULT 'ok'
+) RETURNS integer AS $$
+BEGIN
+  IF p_latency_ms IS NULL OR p_prompt_tokens IS NULL OR p_completion_tokens IS NULL THEN
+     RAISE EXCEPTION 'latency_ms, prompt_tokens, and completion_tokens are required';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM runs WHERE run_id = p_run_id) THEN
+     RAISE EXCEPTION 'run_id % does not exist', p_run_id;
+  END IF;
+  -- compute accept rate
+  -- use CTE? Need one transaction-safe upsert. If function called within transaction, OK. But can use INSERT ... ON CONFLICT.
+  INSERT INTO request_metrics (
+    run_id, request_id, prompt_tokens, completion_tokens, latency_ms,
+    mtp_proposed, mtp_accepted, mtp_accept_rate, status
+  )
+  VALUES (
+    p_run_id,
+    p_request_id,
+    p_prompt_tokens,
+    p_completion_tokens,
+    p_latency_ms,
+    GREATEST(0, COALESCE(p_mtp_proposed,0)),
+    LEAST(GREATEST(0, COALESCE(p_mtp_proposed,0)), GREATEST(0, COALESCE(p_mtp_accepted,0))),
+    CASE WHEN COALESCE(p_mtp_proposed,0) > 0 THEN LEAST(GREATEST(0,COALESCE(p_mtp_accepted,0))::numeric / COALESCE(p_mtp_proposed,0),1) ELSE 0 END,
+    p_status
+  )
+  ON CONFLICT (run_id, request_id) DO UPDATE SET
+    prompt_tokens = EXCLUDED.prompt_tokens,
+    completion_tokens = EXCLUDED.completion_tokens,
+    latency_ms = EXCLUDED.latency_ms,
+    mtp_proposed = EXCLUDED.mtp_proposed,
+    mtp_accepted = EXCLUDED.mtp_accepted,
+    mtp_accept_rate = EXCLUDED.mtp_accept_rate,
+    status = EXCLUDED.status;
+  RETURN 1;
+END;
+$$ LANGUAGE plpgsql;
+
+Potential issue: GREATEST/LEAST with smallint? Fine. But in DO UPDATE SET mtp_proposed = EXCLUDED.mtp_proposed; EXCLUDED smallint. mtp_accepted <= mtp_proposed check: We compute accepted capped by proposed. Good. But if p_mtp_proposed null? default 0? In function signature default not allowed in PostgreSQL function parameters? Yes DEFAULT allowed? Function parameters can have defaults? In SQL function yes? Example CREATE FUNCTION f(x int default 0). In plpgsql, yes? Maybe. But to avoid issues, omit defaults. Use required. But can have default in function? I think yes for SQL/PLpgSQL. But safer no defaults? We can make all required except maybe status. Use p_mtp_proposed smallint NOT NULL? In function parameter cannot NOT NULL? Can specify. But caller can pass. Maybe not necessary.
+
+Need transaction-safe: PL/pgSQL function executes within caller's transaction. But the validation queries and insert are atomic if called in transaction. If exception, rollback. Good.
+
+But if function uses IF NOT EXISTS then INSERT, no explicit lock. In concurrent upsert of same key, ON CONFLICT handles. However validation NOT EXISTS could race? Not a concern. Could do all in one INSERT...SELECT from runs to ensure FK. For transaction-safe, maybe use CTE:
+WITH run_check AS (SELECT r.run_id FROM runs r WHERE r.run_id = p_run_id)
+INSERT ... SELECT ... FROM run_check
+ON CONFLICT ...
+RETURNING request_metric_id
+FOR UPDATE? If no run, insert zero rows. Then RAISE if not found. But this is two statements. Could use plpgsql.
+
+Need maybe function returns request_metric_id. Use RETURNING INTO.
+
+CREATE OR REPLACE FUNCTION upsert_request_metric(...) RETURNS integer AS $$
+DECLARE v_request_metric_id integer;
+BEGIN
+ IF ... THEN RAISE EXCEPTION; END IF;
+ IF NOT EXISTS ... THEN RAISE EXCEPTION; END IF;
+ INSERT ... ON CONFLICT ... RETURNING request_metric_id INTO v_request_metric_id;
+ RETURN

@@ -1,0 +1,165 @@
+We need answer user's request: "Return one PostgreSQL script with no Markdown fences. Define normalized tables for models, fixtures, runs, and request_metrics; include primary/foreign keys, checks, useful indexes, two views, one transaction-safe upsert function, and at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. The script must run in dependency order."
+
+Need produce final only PostgreSQL script no Markdown fences. Need ensure valid PostgreSQL. Need normalized tables: models, fixtures, runs, request_metrics. PK/FK/checks, indexes, two views, one transaction-safe upsert function, at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Script dependency order: likely create schema extensions? Need maybe use schema? Could create tables in public. Need maybe no Markdown fences. Need all in one script.
+
+Need think carefully to make valid. We can use DO? But just SQL statements. Need transaction-safe upsert function. Transaction-safe maybe function uses ON CONFLICT DO UPDATE, maybe wraps? Function can be transaction-safe (normal SQL function, no DDL? Use LANGUAGE sql? Maybe plpgsql with SET transaction_isolation? We need function for upserting run metrics? Requirement: one transaction-safe upsert function. Could create function upsert_request_metric(...) RETURNS request_metrics ... LANGUAGE sql AS $$ INSERT INTO request_metrics (...) VALUES (...) ON CONFLICT (model_id, fixture_id, run_id, metric_kind, metric_value) DO UPDATE SET ... RETURNING ... $$; But PK? Need design.
+
+Need tables:
+models: id serial? Use INTEGER PRIMARY KEY, name text not null unique, architecture, max_context int check >0, mtp_enabled boolean default false, created_at timestamptz default now.
+fixtures: id serial, kind text not null check (kind in ('short','medium','long','stress')? Four fixture kinds. Also name, context_length int, check >0, max_tokens int, created_at.
+runs: id serial, model_id int not null references models(id), fixture_id int not null references fixtures(id), started_at timestamptz not null, finished_at timestamptz, status text check in ('completed','failed','cancelled'), notes. Maybe unique? A run could represent benchmark run. For upsert need key: maybe model_id, fixture_id, run_index? But if run id is generated, upsert not natural. Maybe define upsert for request_metrics with natural key (model_id, fixture_id, run_id, metric_name, sample_index). Or function to upsert a run plus metrics? But requirement says one transaction-safe upsert function. Could be upsert_request_metric.
+
+request_metrics: id bigserial PK, model_id int not null references models(id), fixture_id int not null references fixtures(id), run_id int not null references runs(id), request_id? maybe request_seq int, metric_name text not null, metric_value double precision not null, unit text, context_length int, completion_tokens int, latency_ms numeric, throughput_tps numeric? Need for analyses: throughput, variability, long-context retention, MTP acceptance. Need data fields to support:
+- throughput: tokens/sec per model/fixture maybe completion_tokens / latency? request_metrics can store metric_name like 'throughput_tps', 'latency_ms', 'completion_tokens', 'mtp_accept_rate', 'long_context_retention_pct'. But normalized? request_metrics could have columns for common metrics. Maybe better: request_metrics table stores individual requests with request_seq, prompt_tokens, completion_tokens, latency_ms, first_token_latency_ms, mtp_accepted_tokens, mtp_proposed_tokens, long_context_retention_pct? But user asks normalized tables; maybe request_metrics holds metric rows, not wide. Analytical queries can aggregate metric_name values.
+
+Need at least 80 realistic INSERT rows spanning two models and four fixture kinds. Could insert models (2), fixtures (4), runs (maybe 8 or 12), request_metrics (80). "INSERT rows" likely total rows inserted? Need at least 80 realistic INSERT rows spanning two models and four fixture kinds. Could mean total inserted rows across tables? We can make 2+4+8+80 =94 rows. But to be safe, request_metrics at least 80 rows. Also spans two models and four fixture kinds. Need maybe INSERT INTO request_metrics with explicit 80 rows. We can write multi-row INSERT. Need realistic values. Could manually generate 80 rows? Need ensure valid. Need two models: model 1 e.g. 'acme-tiny-mtp', model 2 'acme-large-baseline'. Four fixtures: kind 'chat_short', 'chat_medium', 'long_context', 'stream_stress'. Need maybe fixtures include name, kind, context_length. Could have 4 fixtures.
+
+Need at least 80 INSERT rows spanning two models and four fixture kinds. If we insert 20 metrics per fixture kind? Need each model? "spanning two models and four fixture kinds" suggests combinations of two models x four fixture kinds. If 20 per combination = 80. Perfect. Need request_metrics 80 rows: for each model (2) and each fixture (4), 10 metric rows. Then 80 total. We can make explicit values. Need ensure metric names align with queries: throughput, variability, long-context retention, MTP acceptance.
+
+Queries:
+1 throughput by model/fixture: average metric_value where metric_name='throughput_tps', group by model name, fixture kind.
+2 variability: stddev/coefficient of variation of latency? Use metric_name='latency_ms' or 'throughput_tps' to compute avg, stddev, cv, p50? Use percentile_cont. Maybe query: select model, fixture kind, count, avg latency, stddev, percentile_cont(0.5/0.95).
+3 long-context retention: maybe average long_context_retention_pct by model and fixture kind where fixture kind = 'long_context' or metric_name='long_context_retention_pct'; include maybe min, avg, max, and maybe retention at different prompt lengths? We can use prompt_tokens column? If metric rows have context_length? Let's design request_metrics with columns: id bigserial, run_id, request_seq int, metric_name, metric_value numeric, unit, prompt_tokens int, completion_tokens int, latency_ms numeric, first_token_latency_ms numeric, mtp_proposed_tokens int, mtp_accepted_tokens int, long_context_retention_pct numeric? But if metric_name is generic, values can be in metric_value. But for analytical queries easier to have columns.
+
+Normalized? Maybe request_metrics is a table of metrics with columns for observed attributes:
+request_metrics (
+ id bigserial PRIMARY KEY,
+ run_id integer NOT NULL REFERENCES runs(id),
+ request_seq integer NOT NULL,
+ metric_name text NOT NULL CHECK (metric_name IN ('throughput_tps','ttft_ms','latency_ms','completion_tokens','prompt_tokens','mtp_accept_rate','long_context_retention_pct','output_length_tokens')),
+ metric_value numeric NOT NULL CHECK (metric_value >= 0? maybe mtp accept rate 0-1; throughput positive),
+ unit text NOT NULL DEFAULT '',
+ prompt_tokens integer,
+ completion_tokens integer,
+ latency_ms numeric,
+ first_token_latency_ms numeric,
+ mtp_proposed_tokens integer,
+ mtp_accepted_tokens integer,
+ long_context_retention_pct numeric,
+ created_at timestamptz DEFAULT now(),
+ UNIQUE(run_id, request_seq, metric_name) -- for upsert
+)
+But for MTP acceptance, need mtp_proposed_tokens and mtp_accepted_tokens or metric_value accept_rate. Could query metric_name='mtp_accept_rate'. For long-context retention, metric_value retention pct. For throughput, metric_value tps. For variability, latency_ms or throughput.
+
+But if each request has multiple metric rows (throughput, latency, mtp_accept, retention), to get 80 rows spanning combinations, maybe each row is a request sample with multiple fields, not metric_name. Could be simpler:
+request_metrics (
+ id bigserial,
+ run_id int ref,
+ request_seq int,
+ fixture_id int ref? redundant but for query easier; model_id int ref? Could use join via runs. But include model_id/fixture_id maybe denormalized? Normalized: runs has model and fixture; request_metrics references run. For queries need join to runs, models, fixtures. OK.
+ request_start timestamptz, prompt_tokens int, completion_tokens int, latency_ms numeric, first_token_latency_ms numeric, throughput_tps numeric, mtp_proposed_tokens int, mtp_accepted_tokens int, long_context_retention_pct numeric, status? metric? But then not "request_metrics" as rows per request. 80 rows can be request-level metrics. Then queries easy. But user asked normalized tables; having request_metrics with prompt/completion/latency is normalized enough? Maybe not.
+
+Need "Define normalized tables for models, fixtures, runs, and request_metrics". Normalized likely one table per entity. request_metrics can be a fact table. It can have FK to runs, and maybe request_id? Could include run_id and request_id? Maybe request_metrics: each row is a metric observation for a run, with metric_name, value. But then to compute MTP acceptance need rows metric 'mtp_accepted_tokens', 'mtp_proposed_tokens'. Could be normalized: request_metrics(metric_id, run_id, request_id, metric_name, value). But for analytical queries, need pivot. Doable.
+
+Need at least 80 realistic INSERT rows spanning two models and four fixture kinds. If request_metrics rows are metric observations, each row could be e.g. one request sample with metric_name 'throughput_tps' etc. Need 80 rows. Could make 80 metric rows, each with run, request_seq, metric_name, metric_value. Need also MTP acceptance maybe metric values. Query can aggregate by metric_name.
+
+Alternative: Use table request_metrics with columns:
+- id bigserial PK
+- run_id int not null ref runs(id)
+- request_seq int not null
+- metric_name text not null check in ('throughput_tps','latency_ms','ttft_ms','prompt_tokens','completion_tokens','mtp_accept_rate','long_context_retention_pct')
+- metric_value numeric not null check (metric_value >= 0)
+- unit text not null default ''
+- prompt_tokens int
+- completion_tokens int
+- mtp_proposed_tokens int
+- mtp_accepted_tokens int
+- long_context_retention_pct numeric
+- created_at
+- UNIQUE(run_id, request_seq, metric_name)
+
+Then 80 rows can be e.g. 20 rows per model-fixture? But metric_name varied. Query throughput: WHERE metric_name='throughput_tps'. Variability: latency_ms. Long-context retention: metric_name='long_context_retention_pct'. MTP acceptance: maybe metric_name='mtp_accept_rate' or compute from mtp columns? If 80 rows are all one metric_name per row, we need enough rows for each metric. For MTP acceptance query, need rows with metric_name='mtp_accept_rate'. For long-context retention, need rows with metric_name='long_context_retention_pct'. For throughput and variability, need rows. If only 80 total, we can include multiple metric names. But "at least 80 realistic INSERT rows spanning two models and four fixture kinds" likely just row count not metric-specific. We can make 80 rows each with one metric, but ensure enough for each analysis. For example 20 throughput_tps per model? Hmm.
+
+Maybe better: request_metrics is request-level with all metrics in columns, so 80 rows all requests. This is realistic: each row is a request with throughput, latency, MTP acceptance, retention. Then no issue. It is a metrics table. Normalized? It has FK to run; no separate metric table. The name request_metrics suggests request-level metrics. I think acceptable. It can have columns and checks.
+
+Let's design robust:
+
+CREATE TABLE models (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL UNIQUE,
+  architecture text NOT NULL DEFAULT 'transformer',
+  max_context_tokens integer NOT NULL CHECK (max_context_tokens > 0),
+  supports_mtp boolean NOT NULL DEFAULT false CHECK (supports_mtp IN (true, false)),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE fixtures (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL UNIQUE,
+  kind text NOT NULL CHECK (kind IN ('short_chat','medium_chat','long_context','stream_stress')),
+  prompt_length_tokens integer NOT NULL CHECK (prompt_length_tokens > 0),
+  completion_tokens integer NOT NULL CHECK (completion_tokens > 0),
+  temperature numeric(4,2) NOT NULL DEFAULT 0.0 CHECK (temperature >= 0 AND temperature <= 2),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE runs (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  model_id integer NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+  fixture_id integer NOT NULL REFERENCES fixtures(id) ON DELETE CASCADE,
+  seed integer NOT NULL DEFAULT 17,
+  started_at timestamptz NOT NULL DEFAULT now(),
+  finished_at timestamptz,
+  status text NOT NULL DEFAULT 'completed' CHECK (status IN ('completed','failed','cancelled')),
+  notes text,
+  CONSTRAINT runs_model_fixture_seed_start_unique UNIQUE (model_id, fixture_id, seed, started_at) -- for upsert? maybe
+);
+
+CREATE TABLE request_metrics (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  run_id integer NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  request_seq integer NOT NULL CHECK (request_seq >= 0),
+  request_started_at timestamptz NOT NULL DEFAULT now(),
+  prompt_tokens integer NOT NULL CHECK (prompt_tokens > 0),
+  completion_tokens integer NOT NULL CHECK (completion_tokens >= 0),
+  latency_ms numeric(12,3) NOT NULL CHECK (latency_ms > 0),
+  first_token_latency_ms numeric(12,3) CHECK (first_token_latency_ms > 0),
+  throughput_tps numeric(12,3) NOT NULL CHECK (throughput_tps >= 0),
+  mtp_proposed_tokens integer NOT NULL DEFAULT 0 CHECK (mtp_proposed_tokens >= 0),
+  mtp_accepted_tokens integer NOT NULL DEFAULT 0 CHECK (mtp_accepted_tokens <= mtp_proposed_tokens),
+  long_context_retention_pct numeric(5,2) CHECK (long_context_retention_pct >= 0 AND long_context_retention_pct <= 100),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT request_metrics_run_request_unique UNIQUE (run_id, request_seq)
+);
+
+Indexes:
+CREATE INDEX idx_runs_model_started ON runs(model_id, started_at);
+CREATE INDEX idx_runs_fixture_status ON runs(fixture_id, status);
+CREATE INDEX idx_request_metrics_run ON request_metrics(run_id, request_seq);
+CREATE INDEX idx_request_metrics_model_fixture ON request_metrics(run_id) not model? To query by model need join. Could create join index? Cannot create index on join. Create index on request_metrics(run_id, throughput_tps), (run_id, latency_ms), (run_id, mtp_accepted_tokens), (run_id, long_context_retention_pct). Since run has model/fixture. Also maybe index on runs(model_id, fixture_id, id).
+
+Views:
+1. v_request_by_model_fixture: select run_id, request_seq, m.name model_name, f.kind fixture_kind, f.name fixture_name, m.supports_mtp, metrics... where join.
+2. v_run_summary: aggregate run-level metrics: model name, fixture kind, count, avg latency, avg throughput, p50/p95 latency, avg mtp accept rate, avg retention.
+
+Function: transaction-safe upsert. Need perhaps function upsert_request_metric(run_id, request_seq, ...) with ON CONFLICT. Transaction-safe means function can be called inside transaction and respects atomicity. Use LANGUAGE plpgsql and maybe SET transaction_isolation = 'SERIALIZABLE'? But SERIALIZABLE can cause serialization errors; not ideal. Transaction-safe maybe means uses ON CONFLICT DO UPDATE and does not do multiple statements requiring separate transactions? In plpgsql, function can do INSERT ... ON CONFLICT. But plpgsql function cannot use ON CONFLICT? It can execute SQL. Could create SQL function simpler. Need RETURN request_metrics or void. Need ensure no DDL, stable? Use LANGUAGE sql with volatile? Inserting is volatile. Could define:
+CREATE OR REPLACE FUNCTION upsert_request_metric(
+  p_run_id integer,
+  p_request_seq integer,
+  p_prompt_tokens integer,
+  p_completion_tokens integer,
+  p_latency_ms numeric,
+  p_first_token_latency_ms numeric,
+  p_throughput_tps numeric,
+  p_mtp_proposed_tokens integer,
+  p_mtp_accepted_tokens integer,
+  p_long_context_retention_pct numeric
+) RETURNS request_metrics
+LANGUAGE sql
+AS $$
+  INSERT INTO request_metrics (...) VALUES (...)
+  ON CONFLICT (run_id, request_seq) DO UPDATE SET
+    prompt_tokens = EXCLUDED.prompt_tokens,
+    ...
+  RETURNING request_metrics.id, request_metrics.run_id, ...
+$$;
+
+But SQL function returns whole table row? RETURNING request_metrics can return composite. Yes. Need include request_started_at? Maybe default now or param. For upsert, if conflict update request_started_at? Could keep original. Need maybe p_request_started_at. But not required. To be transaction-safe, maybe use plpgsql with explicit exception? ON CONFLICT enough.
+
+But function with SQL and INSERT...ON CONFLICT is transaction-safe? It is a normal DML function, participates in caller's transaction. Could add COMMENT.
+
+Potential issue: if table has generated identity column, INSERT without id OK. Need column list.
+
+Need INSERT rows. Need dependency order: models, fixtures, runs, request_metrics, maybe indexes after tables? Views after tables, function after table. Then inserts. Then queries. Need maybe use explicit IDs to make inserts easier. If identity generated always, cannot insert explicit id unless OVERRIDING SYSTEM VALUE. Better use GENERATED BY DEFAULT AS IDENTITY to allow explicit ids? Or use explicit IDs with OVERRIDING SYSTEM VALUE. But easier: use serial? But modern: GENERATED BY DEFAULT AS IDENTITY. Then insert explicit ids optional. Need for request_metrics join: We can insert runs with explicit ids 1..? If identity by default, can insert explicit IDs. But if table empty, okay. Need ensure unique constraints.
+
+Could use explicit IDs for models (1,2), fixtures (1,4), runs (1,8). request_metrics can use id default (no explicit id). But multi-row INSERT with 80 rows can't reference run IDs if not known? We can specify run_id literal 1,2,... and

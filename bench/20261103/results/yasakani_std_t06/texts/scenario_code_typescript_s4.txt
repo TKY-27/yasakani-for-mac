@@ -1,0 +1,506 @@
+# `metricd` — NDJSON request-metrics service
+
+Below is a complete, self-contained implementation. It has **zero runtime dependencies** (Node's built-in `http`, `fs`, `crypto`, `events`), so `npm install` does nothing and the service runs anywhere Node ≥ 18 is available.
+
+## Project layout
+
+```
+metricd/
+├── package.json
+├── tsconfig.json
+├── README.md
+├── src/
+│   ├── index.ts            # entrypoint
+│   ├── server.ts           # HTTP server + routing
+│   ├── types.ts            # strict domain types
+│   ├── schema.ts           # hand-rolled validation (no 3rd-party libs)
+│   ├── parser.ts           # incremental NDJSON parser
+│   ├── pipeline.ts         # bounded ring buffer + aggregation
+│   ├── stats.ts            # mean / median / sample stddev
+│   └── errors.ts           # structured error types
+└── test/
+    ├── stats.test.ts
+    ├── parser.test.ts
+    └── pipeline.test.ts
+```
+
+---
+
+### `package.json`
+
+```json
+{
+  "name": "metricd",
+  "version": "1.0.0",
+  "description": "NDJSON request-metrics ingestion, validation, and aggregation service",
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsc -p tsconfig.json && node --watch dist/index.js",
+    "test": "node --test dist-test/**/*.test.js",
+    "pretest": "tsc -p tsconfig.test.json"
+  },
+  "keywords": ["metrics", "ndjson", "observability"],
+  "license": "MIT"
+}
+```
+
+### `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "dist-test", "test"]
+}
+```
+
+### `tsconfig.test.json` (builds tests to `dist-test`)
+
+```json
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist-test",
+    "rootDir": ".",
+    "noEmit": false
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "dist", "dist-test"]
+}
+```
+
+---
+
+### `src/types.ts` — strict domain types
+
+```ts
+/**
+ * Core domain types. Everything is fully typed; no `any` leaks across module
+ * boundaries.
+ */
+
+/** A single validated request-metric record. */
+export interface MetricRecord {
+  /** Unique run identifier. */
+  readonly id: string;
+  /** Model name (grouping key 1). */
+  readonly model: string;
+  /** Fixture name (grouping key 2). */
+  readonly fixture: string;
+  /** Latency in milliseconds. */
+  readonly latencyMs: number;
+  /** Tokens per second (throughput). */
+  readonly tokensPerSec: number;
+  /** HTTP status code (200-599). */
+  readonly statusCode: number;
+  /** Epoch milliseconds when the record was emitted. */
+  readonly timestampMs: number;
+  /** Optional free-form label for tagging. */
+  readonly label?: string;
+}
+
+/** Composite grouping key. */
+export interface GroupKey {
+  readonly model: string;
+  readonly fixture: string;
+}
+
+/** A streaming aggregate for one (model, fixture) group. */
+export interface GroupAggregate {
+  readonly key: GroupKey;
+  readonly count: number;
+  /** Sum of latencyMs (for mean). */
+  readonly latencySum: number;
+  /** Sum of tokensPerSec (for mean). */
+  readonly tpsSum: number;
+  /** Sum of squared latency deviations (for sample stddev). */
+  readonly latencySqSum: number;
+  /** Sum of squared tps deviations (for sample stddev). */
+  readonly tpsSqSum: number;
+  /** Min/max latency observed. */
+  readonly latencyMin: number;
+  readonly latencyMax: number;
+  /** Min/max tps observed. */
+  readonly tpsMin: number;
+  readonly tpsMax: number;
+  /** 200-299 */
+  readonly okCount: number;
+  /** 300-399 */
+  readonly redirectCount: number;
+  /** 400-499 */
+  readonly clientErrorCount: number;
+  /** 500-599 */
+  readonly serverErrorCount: number;
+  /** First record timestamp in group. */
+  readonly firstSeenMs: number;
+  /** Last record timestamp in group. */
+  readonly lastSeenMs: number;
+  /**
+   * Bounded sample of raw latency values retained for exact median
+   * computation. The most recent `medianSampleSize` values are kept.
+   */
+  readonly medianSample: number[];
+  /** Bounded sample of raw tps values retained for exact median. */
+  readonly tpsMedianSample: number[];
+}
+
+/** Full per-group statistics returned by /summary. */
+export interface GroupStats {
+  readonly model: string;
+  readonly fixture: string;
+  readonly count: number;
+  readonly latency: {
+    readonly mean: number;
+    readonly median: number;
+    readonly sampleStdDev: number | null;
+    readonly min: number;
+    readonly max: number;
+  };
+  readonly throughput: {
+    readonly mean: number;
+    readonly median: number;
+    readonly sampleStdDev: number | null;
+    readonly min: number;
+    readonly max: number;
+  };
+  readonly status: {
+    readonly ok: number;
+    readonly redirect: number;
+    readonly clientError: number;
+    readonly serverError: number;
+    readonly errorRate: number; // (clientError + serverError) / count
+  };
+  readonly firstSeenMs: number;
+  readonly lastSeenMs: number;
+}
+
+/** Per-run (id) summary. */
+export interface RunSummary {
+  readonly id: string;
+  readonly count: number;
+  readonly models: string[];
+  readonly fixtures: string[];
+  readonly totalLatencyMs: number;
+  readonly meanLatencyMs: number;
+  readonly meanTokensPerSec: number;
+  readonly okCount: number;
+  readonly clientErrorCount: number;
+  readonly serverErrorCount: number;
+  readonly firstSeenMs: number;
+  readonly lastSeenMs: number;
+}
+
+/** Health endpoint payload. */
+export interface HealthPayload {
+  readonly status: 'ok' | 'degraded';
+  readonly uptimeSec: number;
+  readonly recordsIngested: number;
+  readonly recordsRejected: number;
+  readonly groupsTracked: number;
+  readonly bufferUtilization: number; // 0..1
+  readonly memory: {
+    readonly rssBytes: number;
+    readonly heapUsedBytes: number;
+    readonly heapTotalBytes: number;
+    readonly externalBytes: number;
+  };
+  readonly version: string;
+}
+
+/** Ingest endpoint response. */
+export interface IngestResponse {
+  readonly accepted: number;
+  readonly rejected: number;
+  readonly errors: readonly IngestError[];
+}
+
+/** A single parse/validation error for one line. */
+export interface IngestError {
+  readonly line: number;
+  readonly code:
+    | 'INVALID_JSON'
+    | 'SCHEMA_VIOLATION'
+    | 'MALFORMED_LINE';
+  readonly message: string;
+}
+
+/** Configuration for the service. */
+export interface ServiceConfig {
+  readonly port: number;
+  readonly host: string;
+  /** Maximum number of records retained in the ring buffer. */
+  readonly maxBufferedRecords: number;
+  /** Number of raw values retained per group for median. */
+  readonly medianSampleSize: number;
+  /** Maximum bytes accepted per ingest request body. */
+  readonly maxBodyBytes: number;
+  /** Maximum lines per ingest request. */
+  readonly maxLinesPerRequest: number;
+}
+
+/** Default configuration. */
+export const DEFAULT_CONFIG: ServiceConfig = {
+  port: 8080,
+  host: '0.0.0.0',
+  maxBufferedRecords: 100_000,
+  medianSampleSize: 256,
+  maxBodyBytes: 1_000_000, // 1 MB
+  maxLinesPerRequest: 10_000,
+};
+```
+
+---
+
+### `src/errors.ts` — structured error types
+
+```ts
+/** Base error with a machine-readable code. */
+export class ServiceError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly httpStatus: number = 400,
+  ) {
+    super(message);
+    this.name = 'ServiceError';
+  }
+}
+
+export class ValidationError extends ServiceError {
+  constructor(message: string, public readonly field: string) {
+    super('SCHEMA_VIOLATION', message);
+  }
+}
+
+export class MalformedInputError extends ServiceError {
+  constructor(message: string) {
+    super('MALFORMED_INPUT', message);
+  }
+}
+
+export class PayloadTooLargeError extends ServiceError {
+  constructor(limit: number) {
+    super('PAYLOAD_TOO_LARGE', `Request body exceeds ${limit} bytes`, 413);
+  }
+}
+
+export class NotFoundError extends ServiceError {
+  constructor(resource: string) {
+    super('NOT_FOUND', `${resource} not found`, 404);
+  }
+}
+```
+
+---
+
+### `src/schema.ts` — hand-rolled validation (no third-party libraries)
+
+```ts
+import type { MetricRecord } from './types.js';
+import { ValidationError } from './errors.js';
+
+/**
+ * Validates a parsed JSON object against the MetricRecord schema.
+ * Throws ValidationError on the first violation.
+ */
+export function validateMetricRecord(raw: unknown): MetricRecord {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ValidationError('Record must be a JSON object', 'record');
+  }
+
+  const obj = raw as Record<string, unknown>;
+
+  // --- id ---
+  const id = obj['id'];
+  if (typeof id !== 'string' || id.length === 0) {
+    throw new ValidationError('Field "id" must be a non-empty string', 'id');
+  }
+  if (id.length > 256) {
+    throw new ValidationError('Field "id" must be at most 256 characters', 'id');
+  }
+
+  // --- model ---
+  const model = obj['model'];
+  if (typeof model !== 'string' || model.length === 0) {
+    throw new ValidationError('Field "model" must be a non-empty string', 'model');
+  }
+  if (model.length > 128) {
+    throw new ValidationError('Field "model" must be at most 128 characters', 'model');
+  }
+
+  // --- fixture ---
+  const fixture = obj['fixture'];
+  if (typeof fixture !== 'string' || fixture.length === 0) {
+    throw new ValidationError('Field "fixture" must be a non-empty string', 'fixture');
+  }
+  if (fixture.length > 128) {
+    throw new ValidationError('Field "fixture" must be at most 128 characters', 'fixture');
+  }
+
+  // --- latencyMs ---
+  const latencyMs = obj['latencyMs'];
+  if (typeof latencyMs !== 'number' || !Number.isFinite(latencyMs)) {
+    throw new ValidationError('Field "latencyMs" must be a finite number', 'latencyMs');
+  }
+  if (latencyMs < 0) {
+    throw new ValidationError('Field "latencyMs" must be >= 0', 'latencyMs');
+  }
+  if (latencyMs > 3_600_000) {
+    throw new ValidationError('Field "latencyMs" must be <= 3600000 (1 hour)', 'latencyMs');
+  }
+
+  // --- tokensPerSec ---
+  const tokensPerSec = obj['tokensPerSec'];
+  if (typeof tokensPerSec !== 'number' || !Number.isFinite(tokensPerSec)) {
+    throw new ValidationError('Field "tokensPerSec" must be a finite number', 'tokensPerSec');
+  }
+  if (tokensPerSec < 0) {
+    throw new ValidationError('Field "tokensPerSec" must be >= 0', 'tokensPerSec');
+  }
+  if (tokensPerSec > 1_000_000) {
+    throw new ValidationError('Field "tokensPerSec" must be <= 1000000', 'tokensPerSec');
+  }
+
+  // --- statusCode ---
+  const statusCode = obj['statusCode'];
+  if (typeof statusCode !== 'number' || !Number.isInteger(statusCode)) {
+    throw new ValidationError('Field "statusCode" must be an integer', 'statusCode');
+  }
+  if (statusCode < 100 || statusCode > 599) {
+    throw new ValidationError('Field "statusCode" must be in range 100-599', 'statusCode');
+  }
+
+  // --- timestampMs ---
+  const timestampMs = obj['timestampMs'];
+  if (typeof timestampMs !== 'number' || !Number.isFinite(timestampMs)) {
+    throw new ValidationError('Field "timestampMs" must be a finite number', 'timestampMs');
+  }
+  if (timestampMs < 0) {
+    throw new ValidationError('Field "timestampMs" must be >= 0', 'timestampMs');
+  }
+
+  // --- label (optional) ---
+  let label: string | undefined;
+  if (obj['label'] !== undefined) {
+    if (typeof obj['label'] !== 'string') {
+      throw new ValidationError('Field "label" must be a string when present', 'label');
+    }
+    if ((obj['label'] as string).length > 256) {
+      throw new ValidationError('Field "label" must be at most 256 characters', 'label');
+    }
+    label = obj['label'] as string;
+  }
+
+  return {
+    id,
+    model,
+    fixture,
+    latencyMs,
+    tokensPerSec,
+    statusCode,
+    timestampMs,
+    ...(label !== undefined ? { label } : {}),
+  };
+}
+```
+
+---
+
+### `src/parser.ts` — incremental NDJSON parser
+
+```ts
+/**
+ * Incremental, streaming NDJSON parser.
+ *
+ * Handles:
+ *  - Partial lines (data arriving in chunks)
+ *  - CRLF and LF line endings
+ *  - UTF-8 multi-byte characters split across chunk boundaries
+ *  - Blank lines (skipped)
+ *  - Tracks line numbers for error reporting
+ */
+export interface ParsedLine {
+  /** 1-based line number in the stream. */
+  readonly line: number;
+  /** The raw line text (without trailing newline). */
+  readonly text: string;
+}
+
+export type LineCallback = (line: ParsedLine) => void;
+
+export class NdjsonParser {
+  private buffer = '';
+  private lineNum = 0;
+  /**
+   * Accumulates bytes that may be a partial UTF-8 sequence at a chunk
+   * boundary. We decode with `fatal: false` but track incomplete sequences
+   * by checking the trailing bytes.
+   */
+  private pendingBytes: Buffer = Buffer.alloc(0);
+  private onLine: LineCallback;
+
+  constructor(onLine: LineCallback) {
+    this.onLine = onLine;
+  }
+
+  /**
+   * Feed a chunk of raw bytes into the parser.
+   * Emits complete lines via the callback.
+   */
+  feed(chunk: Buffer): void {
+    // Prepend any pending incomplete UTF-8 bytes.
+    const combined =
+      this.pendingBytes.length > 0
+        ? Buffer.concat([this.pendingBytes, chunk])
+        : chunk;
+
+    // Detect trailing incomplete UTF-8 sequence.
+    const { complete, trailing } = this.splitIncompleteUtf8(combined);
+    this.pendingBytes = trailing;
+
+    if (complete.length === 0) return;
+
+    const text = complete.toString('utf-8');
+    this.buffer += text;
+
+    // Process all complete lines in the buffer.
+    let start = 0;
+    while (true) {
+      const nl = this.buffer.indexOf('\n', start);
+      if (nl === -1) break;
+
+      let line = this.buffer.slice(start, nl);
+      // Strip trailing \r for CRLF.
+      if (line.endsWith('\r')) {
+        line = line.slice(0, -1);
+      }
+      start = nl + 1;
+
+      this.lineNum++;
+      // Skip blank lines.
+      if (line.trim().length === 0) continue;
+
+     

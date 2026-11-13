@@ -1,0 +1,142 @@
+The user is asking for a complete TypeScript service:
+
+Requirements:
+1. TypeScript 5
+2. Consumes newline-delimited request metrics
+3. Validates without using third-party schema libraries (no Joi, Zod, etc.)
+4. Groups records by model and fixture
+5. Computes mean / median / sample standard deviation
+6. Exposes endpoints: `/health`, `/summary`, `/runs/:id`
+7. Includes strict types
+8. Incremental parsing
+9. Bounded memory
+10. Malformed-input errors
+11. Unit tests
+12. package.json, tsconfig.json
+13. A concise operations guide
+14. No placeholders
+
+Let's design this carefully.
+
+Architecture:
+- Node.js HTTP server (using the built-in `node:http` module to avoid third-party dependencies, or using a lightweight framework). "No third-party schema libraries" refers to validation, so we could use Express for HTTP, but to keep it dependency-free (and thus easier to run), using node:http directly is safer. Zero runtime dependencies = easy to install and run. Tests: use node:test (built-in test runner) to avoid jest/vitest dependencies. That makes unit tests dependency-free. Actually, the user asks for "unit tests" — using Node's built-in test runner (`node:test`) is a valid approach and keeps node_modules at zero. This is elegant.
+
+But wait — TypeScript 5. Use `tsc` for compilation. devDependencies: typescript, @types/node. That's fine.
+
+Let's define the request-metrics NDJSON format. Each line is a JSON object:
+
+```json
+{
+  "runId": "2024-01-01-exp-a",
+  "model": "llama-7b",
+  "fixture": "arithmetic-100",
+  "latencyMs": 123.45,
+  "tokensPerSecond": 42.1,
+  "success": true,
+  "timestamp": "2024-01-01T00:00:00Z"
+}
+```
+
+Fields:
+- `runId`: string, non-empty, length limit (e.g. 128 chars), maybe regex `[A-Za-z0-9._-]+`.
+- `model`: string
+- `fixture`: string
+- `metrics`: numeric fields, e.g. `latencyMs`, `tokensPerSecond`, `errorCount`? Let's keep a fixed numeric field set for statistics: define a METRIC_KEYS list: ["latencyMs", "tokensPerSecond", "tokensPerRequest"]. To compute mean/median/sample standard deviation for each numeric metric per (model, fixture) group.
+
+Bounded memory: keep per-group aggregate statistics that do not need the full data? But median requires all values or a streaming median structure. Options:
+- Keep all values per group but cap total record count (ring buffer / reject new records once the cap is reached). Bounded memory means we cap the number of stored records. E.g. `MAX_RECORDS = 50_000`. When exceeded, reject with 413/429 error or switch to drop mode. Simpler and more deterministic: reject further ingestion once the cap is reached and report the cap in the health response. Or maintain an approximate median? The requirement is to compute mean / median / sample standard deviation — computing median exactly on bounded data: we can store all values for each group up to the cap. Total cap N records, memory ~ N * small object. That is bounded and documented.
+
+An alternative is streaming statistics: mean and sample standard deviation can be computed incrementally (Welford), but median requires storage. We can store a per-group value buffer with a global cap. That's the cleanest approach: a per-group ring buffer that discards the oldest value when full? That would break the median semantics of "the most recent window" — that's actually fine, it can be documented: statistics are computed over the retained (newest) window. Hmm, but simpler is: a global cap; once exceeded, subsequent ingest requests are rejected with 429 and a clear error. "Bounded memory" is satisfied by the hard cap. Let's implement both: a per-ingest batch limit and a global store cap, and once the cap is reached, the service keeps the data and returns an explicit `at_capacity` error. Also provide a `/reset` endpoint? Not required, but useful operationally. The requirement says "expose /health, /summary, and /runs/:id endpoints". Extra endpoints like /reset are allowed, but keep the core as requested. I'll add /reset because it's purely useful and I'll document it. The spec says "expose" those three endpoints — an addition shouldn't violate it. For operational usefulness, I'll include /reset and document it.
+
+Incremental parsing: a line-based parser that consumes a stream (req stream) incrementally — parse line-by-line, validate each line, track per-batch errors with line numbers. Support partial final line handling (end with no newline: treat the remaining buffer as a final line if non-empty). Also enforce per-line max length to bound memory during parsing.
+
+Malformed input errors:
+- The body must be a single JSON array or NDJSON. Support both: if the trimmed body starts with `[`, parse the whole body as a JSON array; otherwise NDJSON. The requirement says "consume newline-delimited request metrics" so NDJSON is primary. NDJSON only, or also JSON arrays? Keep it strict: NDJSON lines; a single-line JSON array is valid as a line? Each line must be a JSON object; a `[` line would fail the "expected object" validation. Keep it strict and predictable: NDJSON only. Document that.
+
+Line-level errors: report line numbers (1-indexed within the batch), byte offsets if possible, and error codes. Response is 207-style? Simpler: if any line is malformed, return 400 with an `errors` array (line, code, message) and `rejected` count; valid lines are ingested (partial acceptance) or all-or-nothing? All-or-nothing is better for integrity: if a batch has any malformed lines, reject the whole batch with 400 and the full list of errors (capped error list). Hmm, "malformed input errors" — all-or-nothing makes the semantics of statistics clear. Let's do this: validate all lines first (bounded), then ingest; on any invalid line → 400 with error details (up to 100 errors reported, total rejected count). Valid lines only ingested atomically. That's clean.
+
+Also handle non-UTF8/invalid characters, empty lines (skip? or error? — empty lines between payloads: treat trailing/blank lines as ignorable, but internal blank lines? Blank lines are ignored but counted in line numbers. Document it.) Actually stricter is better: blank lines are ignored but counted in line numbers. Document it.
+
+Duplicate elimination? Not needed.
+
+Validation (no third-party schema library):
+- Hand-written type guards: `isRecord`, `isNonEmptyString`, `isFiniteNumber`, etc.
+- Field rules:
+  - runId: string, 1–64 chars, matches ^[A-Za-z0-9][A-Za-z0-9._-]*$
+  - model: string, 1–64 chars
+  - fixture: string, 1–64 chars
+  - At least one numeric metric from METRIC_KEYS, each metric: number, finite, non-negative? Latency should be positive; generically: finite, >= 0? Should we allow negative values? Error counts and latencies should be >= 0; tokensPerSecond >= 0. Keep the generic finite + >= 0? Should we allow negatives? For safety, require finite and >= 0, document it. Hmm, some metric could be negative (delta). Keep it simple: finite and >= 0, documented. Or allow any finite number. To be lenient, allow any finite number, but... latencyMs negative is nonsensical; validation >= 0 is a good example of domain validation. Require >= 0 for latency metrics? Uniformly: finite and >= 0, document. Fine.
+  - timestamp: optional ISO-8601 string, parsed with Date and checked for isFinite.
+  - Unknown fields: reject? To catch typos, strict mode: reject unknown fields with a `unknown_field` error. That's good strictness. Do that.
+  - At least one known metric key must be present, and its value must be an object.
+
+Per-group statistics (key = model + fixture, runId is separate):
+- count
+- per metric: min, max, mean, median, sample standard deviation (n-1), sum? Provide `sampleStdDev` with Bessel's correction; if n === 1 → sample standard deviation undefined (null). Median: sort a copy of the values (per group per metric; sorting per query is O(n log n) per request; with a bounded N it's fine. Or precompute. For simplicity compute on demand: sort a copy. With a cap 50k it's fine.)
+- Also aggregate across runs? /summary returns groups (model+fixture) across all runs, with runs list; /runs/:id filters to that runId: returns per-group statistics for that run + a run-level aggregate (count, first/last timestamp, unique models, fixtures).
+
+Data structure:
+```ts
+interface GroupStats {
+  model: string;
+  fixture: string;
+  count: number;
+  metrics: Record<MetricKey, { values: number[] }>;
+}
+```
+Store per (model, fixture): `Map<string, GroupBucket>` where GroupBucket has `values: Record<MetricKey, number[]>` — only arrays for metrics that were present; each record may have a subset of metrics; per-metric arrays with counts. The median for metric M uses that metric's own array. Sample standard deviation per metric.
+
+Global cap: `maxRecords` (default e.g. 100_000, configurable via env METRICS_MAX_RECORDS). Also a cap on unique group keys (maxGroups) to bound the Map: e.g. default 1000; if a new group appears and the group cap is reached → reject the whole batch with error code `group_limit`? Or drop the record for the new group? Simpler: reject with 400/507-ish code "group_limit_exceeded" — but that would make ingestion permanent. Better: once capacity is reached, further ingestion → 429 with `at_capacity: true` and guidance to /reset. And groups: if a new group would exceed the cap → also 429? 422? Keep it consistent: when the global record cap is reached → 429 `capacity_exceeded`. Group cap: reject the batch with 422 and code `unknown_group_rejected` — hmm complex. Alternative: don't cap groups separately; the record cap bounds total memory; the group map is bounded implicitly by records (each group needs ≥ 1 record, so groups ≤ records). Yes! Unique groups ≤ number of ingested records ≤ cap. So a single cap bounds both.
+
+Memory math: record cap N; each record stores at most 3 metrics × 8-byte doubles in JS (number) plus array overhead; fine, document the approximate ceiling.
+
+Also bounds per request: max batch line count (e.g. 10_000 lines) and max line length (e.g. 64 KB), and a body size cap (streaming counter → 413). Bounded memory while parsing: the line-based reader only reads the entire body into memory as a buffer? To bound, we need to reject with 413 once the body exceeds `maxBodyBytes` — but the stream has already consumed that many bytes into a buffer. To truly bound, track bytes consumed while streaming; once exceeded, stop accumulating (discard the rest) but drain the socket. Implement a LineReader that processes chunks incrementally, accumulates lines, and stops storing once byteCap or lineCap is reached (still drains the rest). Then return 413. Memory stays bounded by the cap.
+
+Incremental parsing design:
+- `createLineStream(req, limits)` → async generator? Simpler: a `LineCollector` class: `feed(chunk: Buffer)` and `finish()` that produces lines. Feed from the `data` event and count bytes.
+
+Endpoints:
+- GET /health → 200 `{ status: "ok", version, uptimeSec, store: { ingestedRecords, capacity, atCapacity, groupCount } }`. Also 503? Health returns 200 with state; at capacity is not unhealthy, just a state field. Maybe include `ready: !atCapacity`? Keep status "ok" and expose fields.
+- POST /ingest → NDJSON body → 200 `{ accepted: n, lines: m, ignoredBlank: k }` or 400 `{ errors: [...] }`, 413 body too large, 429 capacity exceeded, 415 non-JSON content type? NDJSON content type: application/x-ndjson or application/json. Accept both, ignore other content types.
+- GET /summary → 200 with `groups: [ { model, fixture, runs: [runIds], count, metrics: { latencyMs: {count, mean, median, sampleStdDev, min, max} } } ]` sorted by model, fixture; plus `totals`.
+- GET /runs/:id → 404 with error if unknown run; otherwise per-group statistics for that run, run metadata (record count, distinct models, distinct fixtures, first/last timestamp).
+- (extra) POST /reset → clear the store, 200 `{ reset: true, recordsBefore }`.
+
+/runs/:id response shape:
+```json
+{
+  "runId": "...",
+  "recordCount": 120,
+  "models": ["a","b"],
+  "fixtures": [...],
+  "timestampRange": {"first": "...", "last": "..."} | null,
+  "metrics": { "latencyMs": {mean, median, sampleStdDev, count, min, max} },
+  "groups": [ { model, fixture, count, metrics: {...} } ]
+}
+```
+Run-level metrics computed across all records for that run (all groups). Note: metric arrays per run: group buckets are global per model+fixture across runs, so per-run computation would need to store per (run, model, fixture)? If a run appears multiple times (batches), records accumulate into the same bucket — per-run statistics must distinguish per-run values. So data layout: Map<runId, Map<groupKey, bucket>>. Yes: `runs: Map<runId, RunState>` where RunState = { records: number, timestamps: number[] (as ms, bounded? just keep first/last), groups: Map<groupKey, { metrics: Record<MetricKey, number[]> }> }. /summary aggregates across runs: Map<groupKey, { counts, per-run? metrics merged from all runs: for summary statistics on model+fixture across runs — merge arrays? That would duplicate memory. Instead, /summary computes by iterating runs and their groups, building a temporary array per group per metric — bounded by record cap, fine per request. Or cache. A per-request allocation is acceptable and simpler; document it.
+
+Alternatively, store per-group arrays globally and tag each entry with runId — that's the same as per-run. Sticking with the per-run layout.
+
+Timestamps: store as ISO strings? For range computation, store as numbers (epoch ms) and reformat. Store as `firstTs: number | null, lastTs: number | null` (ms), output as ISO.
+
+Sample standard deviation: Welford per batch? Simpler: compute statistics at request time from stored arrays (mean, median via sorted copy, sample std dev via two-pass or Welford). With a bounded cap it's fine and accurate (no incremental drift). Document: statistics are computed on demand.
+
+Edge cases: sampleStdDev is null when count < 2. Median for even/odd.
+
+Unit tests (node:test):
+- Validator tests: valid record; missing field; wrong type; unknown field; non-finite number; empty string; bad runId; negative metric; bad timestamp.
+- Statistics tests: known mean/median/sample std dev (e.g. values [2,4,4,4,5,5,7,9] mean 5, median 4.5, population std dev 2, sample std dev 2.5819... sqrt(32/7)≈2.138? Let's compute: values 2,4,4,4,5,5,7,9: mean=5, deviations: 9,1,1,1,0,0,4,16 sum=32, sample variance=32/7≈4.5714, std≈2.138. Population variance=4 → 2. Use these known numbers: sample std dev = sqrt(32/7). In the test compute with the same expected expression, or hard-code ~2.138090044751... sqrt(4.571428571)=2.138089943... Let me compute exactly: 32/7 = 4.571428571428571; sqrt = 2.13808996... sqrt(4.5714) ≈ 2.13809. Hard-code the expected value with tolerance 1e-9 computed from Math.sqrt(32/7) in the test.
+- LineReader: multi-chunk boundaries, no trailing newline, byte cap, line cap.
+- Store: ingest, capacity limit, reset, per-run and summary statistics.
+- HTTP: use `server.listen(0)` on an ephemeral port and use fetch (Node 18+ has global fetch) to hit /health, /summary, /runs/:id, /ingest 400, 429, 413.
+
+Package.json:
+```json
+{
+  "name": "request-metrics-service",
+  "version": "1.0.0",
+  "type": "commonjs"? or module
+}
+```
+TS 5, target ES2022, module NodeNext, strict true. CommonJS or ESM: ESM is modern; "type": "module". With node:test and NodeNext ESM, imports need `.js` extension. Test files import from `./src/...js` — but the tests run

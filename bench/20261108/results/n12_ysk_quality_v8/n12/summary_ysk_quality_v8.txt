@@ -1,0 +1,15 @@
+label ysk_quality_v8  model qwen3.8-27b  temperature 0.00
+cat         fixture                            mean      min      max   ntok
+code        scenario_code_cuda                474.6    474.2    474.9   4096
+code        scenario_code_python              514.1    513.8    514.4   4096
+code        scenario_code_typescript          468.1    468.0    468.2   4096
+story       scenario_story_zh_scifi           181.3    181.2    181.3   2386
+story       scenario_story_en_mystery         433.1    432.1    434.1   4033
+story       scenario_story_zh_dialogue        175.9    175.7    176.2   3447
+translation scenario_translation_zh_en        597.4    596.1    598.7    826
+translation scenario_translation_en_zh        476.6    475.5    477.7    830
+translation scenario_translation_markdown     375.8    375.0    376.7    829
+structured  scenario_structured_jsonl        1132.3   1129.6   1134.9   4096
+structured  scenario_structured_csv           922.5    919.9    925.1   4096
+structured  scenario_structured_sql           736.1    735.6    736.6   4096
+per category (mean of runs): code 485.6, story 263.4, translation 483.3, structured 930.3

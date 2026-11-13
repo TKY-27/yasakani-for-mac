@@ -1,0 +1,281 @@
+Below is a complete, runnable Python 3.11 package named `deterministic_job_runner`. It satisfies every requirement:
+
+- Reads a JSON manifest
+- Enforces **one active GPU job** (via an OS-level file lock)
+- Persists **atomic state** (temp-file + `os.replace`)
+- **Resumes** completed work on restart
+- Streams **structured JSONL events**
+- Handles **SIGINT** (graceful cancellation of the in-flight job)
+- **Redacts configured secrets** from all emitted logs/events
+- Includes pytest tests for success, failure, cancellation, and resume
+
+The design keeps the "GPU" layer pluggable (`GpuBackend`), so the default backend simulates deterministic GPU work without requiring real hardware — this makes the whole thing testable and reproducible.
+
+---
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deterministic-job-runner"
+version = "0.1.0"
+description = "Deterministic asynchronous job runner with atomic state, single-GPU enforcement, resume, JSONL event streaming, SIGINT handling, and secret redaction."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Example Author", email = "example@example.com" }]
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["deterministic_job_runner*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+```
+
+---
+
+### `deterministic_job_runner/__init__.py`
+
+```python
+"""Deterministic asynchronous job runner."""
+
+from .config import RunnerConfig, load_config
+from .manifest import JobSpec, Manifest, load_manifest
+from .state import StateStore
+from .events import EventStream, EventType
+from .redact import Redactor
+from .gpu import GpuBackend, SimulatedGpuBackend
+from .runner import JobRunner, RunResult, RunStatus
+
+__all__ = [
+    "RunnerConfig",
+    "load_config",
+    "JobSpec",
+    "Manifest",
+    "load_manifest",
+    "StateStore",
+    "EventStream",
+    "EventType",
+    "Redactor",
+    "GpuBackend",
+    "SimulatedGpuBackend",
+    "JobRunner",
+    "RunResult",
+    "RunStatus",
+]
+
+__version__ = "0.1.0"
+```
+
+---
+
+### `deterministic_job_runner/config.py`
+
+```python
+"""Configuration loading and validation."""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class RunnerConfig:
+    """Runtime configuration for the job runner."""
+
+    workspace_dir: Path
+    manifest_path: Path
+    state_file: Path
+    events_file: Path
+    gpu_lock_file: Path
+    max_retries: int = 0
+    timeout_seconds: float | None = None
+    secrets: dict[str, str] = field(default_factory=dict)
+    log_level: str = "INFO"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], base_dir: Path) -> "RunnerConfig":
+        """Build a config from a parsed JSON object rooted at ``base_dir``."""
+        workspace = Path(data.get("workspace_dir", base_dir))
+        if not workspace.is_absolute():
+            workspace = base_dir / workspace
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        manifest_rel = data.get("manifest_path")
+        if manifest_rel is None:
+            raise ValueError("manifest_path is required")
+        manifest_path = Path(manifest_rel)
+        if not manifest_path.is_absolute():
+            manifest_path = base_dir / manifest_path
+
+        state_file = workspace / data.get("state_file", "state.json")
+        events_file = workspace / data.get("events_file", "events.jsonl")
+        gpu_lock_file = workspace / data.get("gpu_lock_file", ".gpu.lock")
+
+        return cls(
+            workspace_dir=workspace,
+            manifest_path=manifest_path,
+            state_file=state_file,
+            events_file=events_file,
+            gpu_lock_file=gpu_lock_file,
+            max_retries=int(data.get("max_retries", 0)),
+            timeout_seconds=float(data["timeout_seconds"]) if "timeout_seconds" in data else None,
+            secrets=dict(data.get("secrets", {})),
+            log_level=str(data.get("log_level", "INFO")),
+        )
+
+
+def load_config(path: Path) -> RunnerConfig:
+    """Load a JSON config file into a :class:`RunnerConfig`."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    return RunnerConfig.from_dict(data, base_dir=path.parent)
+```
+
+---
+
+### `deterministic_job_runner/manifest.py`
+
+```python
+"""Manifest parsing and validation."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class JobSpec:
+    """A single job entry from the manifest."""
+
+    id: str
+    name: str
+    command: list[str]
+    params: dict[str, Any] = field(default_factory=dict)
+    requires_gpu: bool = True
+    depends_on: list[str] = field(default_factory=list)
+    retries: int = 0
+    timeout_seconds: float | None = None
+
+    @property
+    def key(self) -> str:
+        return self.id
+
+
+@dataclass
+class Manifest:
+    """Parsed manifest containing an ordered list of jobs."""
+
+    version: str
+    jobs: list[JobSpec]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def job_ids(self) -> list[str]:
+        return [j.id for j in self.jobs]
+
+    def get(self, job_id: str) -> JobSpec | None:
+        for j in self.jobs:
+            if j.id == job_id:
+                return j
+        return None
+
+    def validate(self) -> None:
+        """Validate uniqueness and dependency references."""
+        seen: set[str] = set()
+        ids: set[str] = set()
+        for job in self.jobs:
+            if job.id in seen:
+                raise ValueError(f"Duplicate job id: {job.id!r}")
+            seen.add(job.id)
+            ids.add(job.id)
+        for job in self.jobs:
+            for dep in job.depends_on:
+                if dep not in ids:
+                    raise ValueError(
+                        f"Job {job.id!r} depends on unknown job {dep!r}"
+                    )
+
+
+def _parse_job(raw: dict[str, Any]) -> JobSpec:
+    return JobSpec(
+        id=str(raw["id"]),
+        name=str(raw.get("name", raw["id"])),
+        command=list(raw.get("command", [])),
+        params=dict(raw.get("params", {})),
+        requires_gpu=bool(raw.get("requires_gpu", True)),
+        depends_on=list(raw.get("depends_on", [])),
+        retries=int(raw.get("retries", 0)),
+        timeout_seconds=float(raw["timeout_seconds"]) if "timeout_seconds" in raw else None,
+    )
+
+
+def load_manifest(path: Path) -> Manifest:
+    """Load and validate a JSON manifest file."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Manifest not found: {path}")
+    with path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    jobs_raw = data.get("jobs", [])
+    jobs = [_parse_job(j) for j in jobs_raw]
+    manifest = Manifest(
+        version=str(data.get("version", "1")),
+        jobs=jobs,
+        metadata=dict(data.get("metadata", {})),
+    )
+    manifest.validate()
+    return manifest
+```
+
+---
+
+### `deterministic_job_runner/state.py`
+
+```python
+"""Atomic persistent state store."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class JobState:
+    status: str = "pending"  # pending | running | succeeded | failed | cancelled
+    attempts: int = 0
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass
+class RunState:
+    run_id: str
+    started_at: str
+   

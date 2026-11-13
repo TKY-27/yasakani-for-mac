@@ -1,0 +1,203 @@
+We need answer user's request: Return one PostgreSQL script with no Markdown fences. Need define normalized tables for models, fixtures, runs, request_metrics; include PK/FK, checks, useful indexes, two views, one transaction-safe upsert function, and at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Script must run in dependency order.
+
+We need produce only SQL script no markdown fences. Need ensure valid PostgreSQL. Let's design schema.
+
+Normalized tables:
+models: model_id PK, model_name unique, provider?, family?, context_window? maybe. fixtures: fixture_id PK, fixture_name unique, fixture_kind check in ('short','long','multi-turn','retrieval') maybe four fixture kinds. Need at least 80 INSERT rows spanning two models and four fixture kinds. Could insert models 2 rows, fixtures 4 rows, runs many, request_metrics many? "at least 80 realistic INSERT rows spanning two models and four fixture kinds" likely total rows across runs/request_metrics? Need ensure at least 80 INSERT rows. Could do runs 20 rows? request_metrics 64 rows? total 84? They probably mean data rows spanning two models and four fixtures. We can insert 2 models + 4 fixtures + 80 runs? But request_metrics maybe per run? Let's make enough rows. Need realistic. Could insert 80 run rows (each run has model_id, fixture_id, run_date, latency, tokens, etc) and request_metrics maybe 80 rows as well? But at least 80 INSERT rows spanning models/fixtures. If insert 80 runs with 2 models and 4 fixtures, satisfies. But also request_metrics maybe 20 rows. The request asks define normalized tables for models, fixtures, runs, and request_metrics. Need at least 80 realistic INSERT rows spanning two models and four fixture kinds. Could be total across all inserts. To be safe, insert 80 rows into request_metrics (which references runs) or runs. But need 2 models and 4 fixture kinds. If request_metrics has FK to runs, and runs have model/fixture. Need insert runs enough to support metrics. Could make 80 request_metrics rows referencing 20 runs? But runs need 20 rows. Total 2+4+20+80=106. Fine.
+
+Need transaction-safe upsert function. What is upsert? Could be function to upsert run metrics? "one transaction-safe upsert function" maybe function that upserts a run and its metrics? Transaction-safe meaning uses ON CONFLICT? In PostgreSQL functions can be transaction-safe? Maybe they mean safe to call within transaction? Use function with INOUT parameters, uses ON CONFLICT DO UPDATE, returns updated run_id. But to upsert both run and request_metrics maybe need composite key. Could define function upsert_run_metric(model_name, fixture_kind, run_ts, prompt_tokens, completion_tokens, latency_ms, ttft_ms, cache_hit, speculative_acceptance_rate?) It inserts model by name if not exists, fixture by kind/name? But fixture kinds only 4. For normalized, model_name unique, fixture_name unique. Could create function upsert_run_metric(model_name text, fixture_name text, run_ts timestamptz, ... ) returns run_id int. It upserts model if absent, fixture if absent (fixture_kind derived from name? Could require fixture_kind parameter). Better: upsert_run_metric(model_name text, fixture_kind fixture_kind_type, fixture_name text, run_ts timestamptz, prompt_tokens int, completion_tokens int, latency_ms numeric, ttft_ms numeric, cache_hit boolean, mtp_acceptance numeric) but request_metrics is per request maybe multiple per run. Normalization: runs represent a run (experiment), request_metrics are per request? Let's design.
+
+Tables:
+models(model_id serial PK, model_name text not null unique, provider text, base_context_tokens int check >0, created_at timestamptz default now())
+fixtures(fixture_id serial PK, fixture_name text not null unique, fixture_kind text not null check (in ('short','long','multi_turn','retrieval')), description text, created_at)
+runs(run_id serial PK, model_id int not null FK models, fixture_id int not null FK fixtures, run_ts timestamptz not null default now(), environment text check?, batch_size int check >=1, max_tokens int check >0, created_at; unique(run_id); maybe unique(model_id, fixture_id, run_ts) to upsert by natural key.
+request_metrics(metric_id serial PK, run_id int not null FK runs, request_seq int not null check >=0, prompt_tokens int not null check >=0, completion_tokens int not null check >=0, latency_ms numeric(12,3) check >=0, ttft_ms numeric(12,3) check >=0, throughput_tps numeric(12,3) check >=0, mtp_acceptance numeric(5,4) check between 0 and 1, cache_hit boolean not null default false, unique(run_id, request_seq); indexes.
+
+Need views two:
+1. v_run_summary: aggregate per model/fixture: run count, avg latency, avg ttft, avg throughput, total tokens, avg MTP acceptance, p95? PostgreSQL: percentile_cont(0.95) within group. Need check valid.
+2. v_fixture_kind_retention: long-context retention? maybe by model and fixture_kind: median completion_tokens? Or retention accuracy? We don't have accuracy. Could add field to request_metrics? Maybe "long_context_retention_score" numeric 0-1? For long-context retention. The query asks six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. Need include metric for retention. Could add retention_score numeric(5,4) to request_metrics, check between 0 and 1. But MTP acceptance separate. We can define request_metrics with retention_score for long context fixture maybe null for non-long? Check? Could be not null? For realism, for short/multi-turn/retrieval maybe null? Check not null? If check not null maybe set all. Better not null with realistic values. Or nullable with check (retention_score is null or between 0 and 1). But view can use retention_score. We need long-context retention analytical query. Add retention_score numeric(5,4) not null default 0? For all fixtures maybe meaningful? "long-context retention" likely for fixture_kind='long'. Could have retention_score only meaningful for long, but nullable. Check if not null or between 0 and1.
+
+But if insert 80 rows need many values. We can use generated data manually? Need no code? Could use INSERT with SELECT generate_series to produce many rows. That's realistic? "at least 80 realistic INSERT rows" Could be a single INSERT ... SELECT generate_series(1,80) with deterministic pseudo-random via md5? Is that considered 80 rows? It says at least 80 realistic INSERT rows. Maybe better to have literal INSERT statements with 80 rows? That's long but possible. But no Markdown fences, output can be long. Need ensure at least 80 rows. We can use INSERT with SELECT generate_series, but some might not count as "INSERT rows" if one statement. User likely wants rows. To be safe, explicit VALUES with 80 rows? Could be tedious but possible. Need 2 models and 4 fixture kinds. We can insert 80 runs literal rows. But then request_metrics? If only runs have 80 rows, and request_metrics maybe 20. But "request_metrics" table also needs data? Maybe not but likely yes. The script must be runnable. If request_metrics empty, queries still run but no data. Better insert metrics. Could insert 80 request_metrics rows literal referencing 20 runs? Need 20 run literal rows plus 80 metric literal rows = 100 data rows. Could do.
+
+Need dependency order: create types? create tables, constraints, indexes, views, function, then inserts? For upsert function, if it references tables, create after tables. Views after tables. Inserts after views/function? Can insert after all objects. But if function uses types, create type? Use domain? Could avoid custom type by check. Function can be created after tables. But if function includes ON CONFLICT into models/fixtures, runs, request_metrics. Could be after tables. Then insert data maybe using function? But if function upserts models/fixtures and runs/metrics, could use it to insert 80 rows? But they requested INSERT rows. Could use direct INSERT statements.
+
+Need no Markdown fences. Final just SQL.
+
+Need ensure PostgreSQL compatibility.
+
+Let's plan schema details.
+
+-- tables
+
+CREATE TABLE models (
+    model_id serial primary key,
+    model_name text not null,
+    provider text not null default 'local',
+    architecture text not null default 'decoder',
+    base_context_tokens integer not null default 8192 check (base_context_tokens > 0),
+    created_at timestamptz not null default now()
+);
+ALTER TABLE models ADD CONSTRAINT uq_models_name UNIQUE (model_name);
+
+CREATE TABLE fixtures (
+ fixture_id serial primary key,
+ fixture_name text not null,
+ fixture_kind text not null check (fixture_kind in ('short','long','multi_turn','retrieval')),
+ description text not null default '',
+ created_at timestamptz not null default now()
+);
+ALTER TABLE fixtures ADD CONSTRAINT uq_fixtures_name UNIQUE (fixture_name);
+
+CREATE TABLE runs (
+ run_id serial primary key,
+ model_id integer not null references models(model_id) on delete restrict,
+ fixture_id integer not null references fixtures(fixture_id) on delete restrict,
+ run_ts timestamptz not null default now(),
+ environment text not null default 'dev' check (environment in ('dev','staging','prod')),
+ batch_size integer not null default 1 check (batch_size >= 1),
+ max_output_tokens integer not null default 256 check (max_output_tokens > 0),
+ seed integer not null default 42 check (seed >= 0),
+ created_at timestamptz not null default now(),
+ constraint uq_runs_natural_key unique (model_id, fixture_id, run_ts)
+);
+
+CREATE TABLE request_metrics (
+ metric_id serial primary key,
+ run_id integer not null references runs(run_id) on delete cascade,
+ request_seq integer not null default 0 check (request_seq >= 0),
+ prompt_tokens integer not null check (prompt_tokens >= 0),
+ completion_tokens integer not null check (completion_tokens >= 0),
+ latency_ms numeric(12,3) not null check (latency_ms >= 0),
+ ttft_ms numeric(12,3) not null check (ttft_ms >= 0),
+ throughput_tps numeric(12,3) not null check (throughput_tps >= 0),
+ mtp_acceptance numeric(5,4) not null default 0 check (mtp_acceptance between 0 and 1),
+ retention_score numeric(5,4) check (retention_score is null or retention_score between 0 and 1),
+ cache_hit boolean not null default false,
+ created_at timestamptz not null default now(),
+ constraint uq_request_metrics_run_seq unique (run_id, request_seq)
+);
+
+Indexes:
+CREATE INDEX idx_runs_model_fixture ON runs(model_id, fixture_id);
+CREATE INDEX idx_runs_run_ts ON runs(run_ts);
+CREATE INDEX idx_request_metrics_run ON request_metrics(run_id, request_seq);
+CREATE INDEX idx_request_metrics_latency ON request_metrics(latency_ms);
+CREATE INDEX idx_request_metrics_mtp ON request_metrics(mtp_acceptance);
+CREATE INDEX idx_request_metrics_retention ON request_metrics(retention_score);
+
+Views:
+CREATE VIEW v_run_performance AS
+SELECT
+ r.run_id,
+ m.model_name,
+ f.fixture_kind,
+ f.fixture_name,
+ r.run_ts,
+ r.batch_size,
+ count(q.metric_id) AS request_count,
+ avg(q.latency_ms) AS avg_latency_ms,
+ percentile_cont(0.50) within group (order by q.latency_ms) AS median_latency_ms,
+ percentile_cont(0.95) within group (order by q.latency_ms) AS p95_latency_ms,
+ avg(q.throughput_tps) AS avg_throughput_tps,
+ sum(q.prompt_tokens) AS total_prompt_tokens,
+ sum(q.completion_tokens) AS total_completion_tokens,
+ avg(q.mtp_acceptance) AS avg_mtp_acceptance,
+ avg(q.retention_score) FILTER (WHERE f.fixture_kind='long') AS long_context_retention_score
+FROM runs r
+JOIN models m ON ...
+JOIN fixtures f ...
+LEFT JOIN request_metrics q ON q.run_id=r.run_id
+GROUP BY r.run_id, m.model_name, f.fixture_kind, f.fixture_name, r.run_ts, r.batch_size;
+
+But view with aggregate per run. Good.
+
+Second view:
+CREATE VIEW v_model_fixture_summary AS
+SELECT
+ m.model_id,
+ m.model_name,
+ f.fixture_kind,
+ f.fixture_name,
+ count(DISTINCT r.run_id) AS run_count,
+ count(q.metric_id) AS metric_count,
+ avg(q.latency_ms) AS avg_latency_ms,
+ stddev_samp(q.latency_ms) AS latency_stddev_ms,
+ percentile_cont(0.95) within group (order by q.latency_ms) AS p95_latency_ms,
+ avg(q.throughput_tps) AS avg_throughput_tps,
+ percentile_cont(0.95) within group (order by q.throughput_tps) DESC? For variability maybe. Need view maybe.
+ avg(q.mtp_acceptance) AS avg_mtp_acceptance,
+ min(q.retention_score) FILTER (WHERE f.fixture_kind='long') AS min_long_context_retention,
+ avg(q.retention_score) FILTER (WHERE f.fixture_kind='long') AS avg_long_context_retention
+FROM ...
+GROUP BY m.model_id, m.model_name, f.fixture_kind, f.fixture_name;
+
+Need two views only? "include ... two views" could have exactly two? It says two views, likely at least two? To be safe exactly two.
+
+Function: transaction-safe upsert. Let's define:
+
+CREATE OR REPLACE FUNCTION upsert_request_metric(
+    p_model_name text,
+    p_provider text default 'local',
+    p_base_context_tokens integer default 8192,
+    p_fixture_name text,
+    p_fixture_kind text,
+    p_run_ts timestamptz default now(),
+    p_environment text default 'dev',
+    p_batch_size integer default 1,
+    p_max_output_tokens integer default 256,
+    p_seed integer default 42,
+    p_request_seq integer default 0,
+    p_prompt_tokens integer default 0,
+    p_completion_tokens integer default 0,
+    p_latency_ms numeric default 0,
+    p_ttft_ms numeric default 0,
+    p_throughput_tps numeric default 0,
+    p_mtp_acceptance numeric default 0,
+    p_retention_score numeric default null,
+    p_cache_hit boolean default false
+) RETURNS integer LANGUAGE plpgsql AS $func$
+DECLARE
+ v_model_id integer;
+ v_fixture_id integer;
+ v_run_id integer;
+BEGIN
+ IF p_fixture_kind IS NULL OR p_fixture_kind NOT IN ('short','long','multi_turn','retrieval') THEN
+   RAISE EXCEPTION 'invalid fixture_kind %', p_fixture_kind;
+ END IF;
+ IF p_retention_score IS NOT NULL AND (p_retention_score < 0 OR p_retention_score > 1) THEN
+   RAISE EXCEPTION 'retention_score out of range';
+ END IF;
+ ...
+ INSERT INTO models (model_name, provider, base_context_tokens)
+ VALUES (p_model_name, p_provider, p_base_context_tokens)
+ ON CONFLICT (model_name) DO UPDATE
+ SET provider = EXCLUDED.provider, base_context_tokens = EXCLUDED.base_context_tokens
+ RETURNING model_id INTO v_model_id;
+
+ INSERT INTO fixtures (fixture_name, fixture_kind)
+ VALUES (p_fixture_name, p_fixture_kind)
+ ON CONFLICT (fixture_name) DO UPDATE
+ SET fixture_kind = EXCLUDED.fixture_kind
+ RETURNING fixture_id INTO v_fixture_id;
+
+ INSERT INTO runs (...)
+ VALUES (...)
+ ON CONFLICT (model_id, fixture_id, run_ts) DO UPDATE
+ SET environment=EXCLUDED.environment, batch_size=..., max_output_tokens=..., seed=...
+ RETURNING run_id INTO v_run_id;
+
+ INSERT INTO request_metrics (...)
+ VALUES (...)
+ ON CONFLICT (run_id, request_seq) DO UPDATE
+ SET prompt_tokens=EXCLUDED.prompt_tokens, ...
+ RETURNING metric_id? But function returns run_id? Maybe return request metric id? "transaction-safe upsert function" maybe upsert run metrics. Return run_id? Could return metric_id. It says transaction-safe upsert function singular. Could be upsert_model_fixture_run_metric returning metric_id. We'll return metric_id integer. Need v_metric_id.
+
+Need use ON CONFLICT target requires unique constraints. For models unique model_name. For fixtures unique fixture_name. For runs unique model_id, fixture_id, run_ts. For request_metrics unique run_id, request_seq.
+
+Transaction-safe: It is a single function, plpgsql. In Postgres, functions automatically participate in transaction. Maybe use "transaction-safe" means not using autocommit; plpgsql runs in caller's transaction. Could comment.
+
+But if function is used before data inserted? We'll create after tables. We can optionally use function for some inserts? But user asked INSERT rows; direct inserts easier.
+
+Need insert at least 80 realistic INSERT rows spanning two models and four fixture kinds. We can insert models (2 rows), fixtures (4 rows), runs maybe 20 rows, request_metrics 80 rows. Need ensure 20 run ids 1-20 after inserts; if we directly insert runs with explicit run_id? Since serial, we can insert explicit run_id to control FK. Better insert runs with run_id 1..20. But if table uses serial and insert explicit values, setval sequence later. Need handle: INSERT INTO runs (run_id, ...) VALUES (1, ...), ...; SELECT setval('runs_run_id_seq', (SELECT max(run_id) FROM runs)); Then request_metrics can use run_id 1..20. Similarly for models/fixtures explicit ids to keep simple. Then setval sequences.
+
+Need at least 80 rows. Could be 20 runs + 80 metrics + 2 models + 4 fixtures = 106. Need all 4 fixture kinds and 2 models across runs/metrics. We can make 20 runs: 10 for model 1, 10 for model 2, each fixture repeated. 80 metrics: 4 per run (request_seq 0-3). That's 80 rows. Good.

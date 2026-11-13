@@ -1,0 +1,391 @@
+# BF16 Row-Normalization on sm_120a (CUDA 13.1 / C++20)
+
+Below is a complete, self-contained program plus a `CMakeLists.txt`. It:
+
+- Parses CLI arguments (rows, cols, seed, warmup, iterations, tolerance).
+- Generates deterministic input on the host (LCG → BF16).
+- Uses RAII device buffers with unified error checking.
+- Runs a **vectorized** kernel that reads each row as 128-bit (8×bf16) chunks, computes the L2 norm in FP32, and writes the normalized row.
+- Computes a **numerically stable FP32 reference** (two-pass: scale by row max, then sum-of-squares, then divide).
+- Performs warm-up, CUDA-event timing, and tolerance-based verification (max/mean absolute + relative error).
+
+## `bf16_row_norm.cu`
+
+```cpp
+// ============================================================================
+// bf16_row_norm.cu
+//
+// CUDA 13.1 / C++20 program that normalizes a large BF16 matrix row by row
+// on an sm_120a GPU.
+//
+// Build (see CMakeLists.txt):
+//   cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=120a
+//   cmake --build build
+//
+// Usage:
+//   ./bf16_row_norm [options]
+//     --rows <R>          number of rows            (default 4096)
+//     --cols <C>          number of columns         (default 8192)
+//     --seed <S>          RNG seed                  (default 12345)
+//     --warmup <N>        warm-up iterations        (default 5)
+//     --iters <N>         timed iterations          (default 50)
+//     --tol <f>           max allowed rel error     (default 2e-2)
+//     --print-layout      print memory/launch info  (default off)
+//     --help              show usage
+// ============================================================================
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <limits>
+#include <string>
+#include <vector>
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+// ---------------------------------------------------------------------------
+// Small RAII helpers + unified error checking
+// ---------------------------------------------------------------------------
+
+[[noreturn]] void die(const char* msg, cudaError_t err) {
+    std::fprintf(stderr, "CUDA error: %s (%s)\n", msg, cudaGetErrorString(err));
+    std::exit(EXIT_FAILURE);
+}
+
+inline void check(cudaError_t err, const char* what) {
+    if (err != cudaSuccess) {
+        die(what, err);
+    }
+}
+
+// RAII device buffer.
+struct DeviceBuffer {
+    void* ptr = nullptr;
+    std::size_t bytes = 0;
+
+    DeviceBuffer() = default;
+    explicit DeviceBuffer(std::size_t n_bytes) : bytes(n_bytes) {
+        if (bytes == 0) return;
+        check(cudaMalloc(&ptr, bytes), "cudaMalloc");
+    }
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    DeviceBuffer(DeviceBuffer&& o) noexcept
+        : ptr(std::exchange(o.ptr, nullptr)),
+          bytes(std::exchange(o.bytes, 0)) {}
+    ~DeviceBuffer() {
+        if (ptr) cudaFree(ptr);
+    }
+};
+
+// RAII pinned host buffer (for fast H2D/D2H).
+struct PinnedBuffer {
+    void* ptr = nullptr;
+    std::size_t bytes = 0;
+
+    PinnedBuffer() = default;
+    explicit PinnedBuffer(std::size_t n_bytes) : bytes(n_bytes) {
+        if (bytes == 0) return;
+        check(cudaMallocHost(&ptr, bytes), "cudaMallocHost");
+    }
+    ~PinnedBuffer() {
+        if (ptr) cudaFreeHost(ptr);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Deterministic input generation (host, LCG -> BF16)
+// ---------------------------------------------------------------------------
+
+// 64-bit linear congruential generator (deterministic, portable).
+struct LCG {
+    uint64_t s;
+    explicit LCG(uint64_t seed) : s(seed ? seed : 1u) {}
+    uint64_t next() {
+        // Numerical Recipes constants.
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        return s >> 32;  // high 32 bits
+    }
+    // Uniform in [0,1)
+    double uniform() {
+        return static_cast<double>(next()) / static_cast<double>(1ULL << 32);
+    }
+};
+
+// Convert a double in [-1,1] to a BF16 bit pattern (round-to-nearest-even).
+// We build the FP32 bits, then round to BF16 by adding 0x7FFF + lsb and
+// truncating the low 16 bits.
+uint16_t f2bf16(double x) {
+    float f = static_cast<float>(x);
+    uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+
+    // Round-to-nearest-even for the 16 discarded low bits.
+    uint32_t lsb = (bits >> 16) & 1u;
+    bits += (0x7FFFu + lsb);
+    uint16_t bf = static_cast<uint16_t>(bits >> 16);
+    return bf;
+}
+
+// Deterministic matrix fill: values in [-1,1], stored as BF16 (2 bytes each).
+// Layout: row-major, row i, col j -> offset (i * cols + j).
+void generate_bf16_matrix(std::vector<uint16_t>& out,
+                          std::size_t rows, std::size_t cols, uint64_t seed) {
+    out.resize(rows * cols);
+    LCG rng(seed);
+    for (std::size_t i = 0; i < rows * cols; ++i) {
+        // Two independent uniforms -> value in [-1,1].
+        double u = rng.uniform();
+        double v = rng.uniform();
+        double val = (u + v) - 1.0;  // in [-1,1]
+        out[i] = f2bf16(val);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vectorized CUDA kernel: normalize each row (L2) in-place.
+//
+// Grid: (1, rows, 1)   -> one block per row.
+// Block: (THREADS, 1, 1)
+// Each thread processes a contiguous run of 8 bf16 (128 bits) per pass.
+// ---------------------------------------------------------------------------
+
+#define BF16_PER_VEC 8
+#define VEC_BYTES 16
+#define THREADS 256
+
+// 128-bit aligned type for vectorized loads/stores.
+struct alignas(16) Vec8bf16 {
+    uint16_t w[BF16_PER_VEC];
+};
+
+__device__ __forceinline__ float bf16_to_f32(uint16_t b) {
+    __nv_bfloat16 h;
+    std::memcpy(&h, &b, sizeof(h));
+    return __bfloat162float(h);
+}
+
+__device__ __forceinline__ uint16_t f32_to_bf16(float f) {
+    __nv_bfloat16 h = __float2bfloat16_rn(f);
+    uint16_t b;
+    std::memcpy(&b, &h, sizeof(b));
+    return b;
+}
+
+// Normalize a single row.
+// row_ptr: device pointer to the row (cols bf16).
+// cols:    number of columns (multiple of 8 for the vectorized fast path).
+template <int T>
+__global__ void row_normalize_kernel(Vec8bf16* __restrict__ rows,
+                                     int rows_count,
+                                     int cols) {
+    int row = blockIdx.y;
+    if (row >= rows_count) return;
+
+    Vec8bf16* row_ptr = rows + row * (cols / BF16_PER_VEC);
+
+    // Each thread handles a strided set of 16-byte vectors.
+    int nvec = cols / BF16_PER_VEC;
+    int tid = threadIdx.x;
+
+    // Pass 1: compute sum of squares in FP32 (numerically stable enough for
+    // verification against the FP32 reference; we also scale by the row max).
+    // To improve stability we first find the row max, then sum (x/max)^2.
+    //
+    // We do this in two device passes over the row (still one block per row).
+
+    // --- find max absolute value in the row ---
+    float local_max = 0.f;
+    for (int v = tid; v < nvec; v += T) {
+        Vec8bf16 x = row_ptr[v];
+#pragma unroll
+        for (int k = 0; k < BF16_PER_VEC; ++k) {
+            float f = bf16_to_f32(x.w[k]);
+            local_max = fmaxf(local_max, fabsf(f));
+        }
+    }
+
+    // Block reduction for max.
+    __shared__ float s_max[T];
+    s_max[tid] = local_max;
+    __syncthreads();
+    for (int stride = T / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float row_max = s_max[0];
+    __syncthreads();
+
+    // --- sum of squares of (x / row_max) ---
+    float local_ss = 0.f;
+    if (row_max > 0.f) {
+        float inv_max = 1.f / row_max;
+        for (int v = tid; v < nvec; v += T) {
+            Vec8bf16 x = row_ptr[v];
+#pragma unroll
+            for (int k = 0; k < BF16_PER_VEC; ++k) {
+                float f = bf16_to_f32(x.w[k]) * inv_max;
+                local_ss += f * f;
+            }
+        }
+    }
+
+    __shared__ float s_ss[T];
+    s_ss[tid] = local_ss;
+    __syncthreads();
+    for (int stride = T / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_ss[tid] += s_ss[tid + stride];
+        }
+        __syncthreads();
+    }
+    float ss_scaled = s_ss[0];
+    float norm = (row_max > 0.f) ? (row_max * sqrtf(ss_scaled)) : 0.f;
+    float inv_norm = (norm > 0.f) ? (1.f / norm) : 0.f;
+    __syncthreads();
+
+    // --- write normalized row ---
+    for (int v = tid; v < nvec; v += T) {
+        Vec8bf16 x = row_ptr[v];
+#pragma unroll
+        for (int k = 0; k < BF16_PER_VEC; ++k) {
+            float f = bf16_to_f32(x.w[k]) * inv_norm;
+            x.w[k] = f32_to_bf16(f);
+        }
+        row_ptr[v] = x;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP32 reference (host, numerically stable)
+// ---------------------------------------------------------------------------
+
+// Decode a BF16 bit pattern to float (exact, since BF16 is a subset of FP32).
+float bf16_bits_to_f32(uint16_t b) {
+    uint32_t bits = static_cast<uint32_t>(b) << 16;
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+// Numerically stable row norm: scale by row max, then sqrt(sum((x/max)^2)*max^2)
+// = max * sqrt(sum((x/max)^2)).
+float stable_row_norm(const float* row, int cols) {
+    float m = 0.f;
+    for (int j = 0; j < cols; ++j) m = std::max(m, std::fabs(row[j]));
+    if (m == 0.f) return 0.f;
+    float inv = 1.f / m;
+    double acc = 0.0;  // accumulate in double for extra stability
+    for (int j = 0; j < cols; ++j) {
+        float s = row[j] * inv;
+        acc += static_cast<double>(s) * static_cast<double>(s);
+    }
+    return m * static_cast<float>(std::sqrt(acc));
+}
+
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+
+struct Options {
+    std::size_t rows = 4096;
+    std::size_t cols = 8192;
+    uint64_t seed = 12345;
+    int warmup = 5;
+    int iters = 50;
+    double tol = 2e-2;
+    bool print_layout = false;
+};
+
+void print_usage(const char* prog) {
+    std::printf(
+        "Usage: %s [options]\n"
+        "  --rows <R>        number of rows            (default 4096)\n"
+        "  --cols <C>        number of columns         (default 8192)\n"
+        "  --seed <S>        RNG seed                  (default 12345)\n"
+        "  --warmup <N>      warm-up iterations        (default 5)\n"
+        "  --iters <N>       timed iterations          (default 50)\n"
+        "  --tol <f>         max allowed rel error     (default 2e-2)\n"
+        "  --print-layout    print memory/launch info\n"
+        "  --help            show this message\n",
+        prog);
+}
+
+bool parse_args(int argc, char** argv, Options& opt) {
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto need = [&](const char* name) -> std::string {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "Missing value for %s\n", name);
+                std::exit(EXIT_FAILURE);
+            }
+            return argv[++i];
+        };
+        if (a == "--rows") {
+            opt.rows = std::stoul(need("--rows"));
+        } else if (a == "--cols") {
+            opt.cols = std::stoul(need("--cols"));
+        } else if (a == "--seed") {
+            opt.seed = std::stoull(need("--seed"));
+        } else if (a == "--warmup") {
+            opt.warmup = std::stoi(need("--warmup"));
+        } else if (a == "--iters") {
+            opt.iters = std::stoi(need("--iters"));
+        } else if (a == "--tol") {
+            opt.tol = std::stod(need("--tol"));
+        } else if (a == "--print-layout") {
+            opt.print_layout = true;
+        } else if (a == "--help" || a == "-h") {
+            print_usage(argv[0]);
+            std::exit(EXIT_SUCCESS);
+        } else {
+            std::fprintf(stderr, "Unknown option: %s\n", a.c_str());
+            print_usage(argv[0]);
+            std::exit(EXIT_FAILURE);
+        }
+    }
+    if (opt.cols % BF16_PER_VEC != 0) {
+        std::fprintf(stderr,
+                     "cols must be a multiple of %d for vectorized path "
+                     "(got %zu); padding to %zu\n",
+                     BF16_PER_VEC, opt.cols,
+                     ((opt.cols / BF16_PER_VEC) + 1) * BF16_PER_VEC);
+        opt.cols = ((opt.cols / BF16_PER_VEC) + 1) * BF16_PER_VEC;
+    }
+    if (opt.rows == 0 || opt.cols == 0) {
+        std::fprintf(stderr, "rows and cols must be > 0\n");
+        std::exit(EXIT_FAILURE);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+
+struct VerifyResult {
+    double max_abs = 0.0;
+    double max_rel = 0.0;
+    double mean_abs = 0.0;
+    bool passed = false;
+};
+
+// Compare GPU output (bf16) against FP32 reference (bf16-encoded).
+VerifyResult verify(const uint16_t* gpu_bf16,
+                    const float* ref_f32,
+                    std::size_t rows, std::size_t cols, double tol) {
+    VerifyResult r;
+    double sum_abs = 0.0;
+    std::size_t n = rows * cols;
+    for (std::size_t i = 0; i < n; ++i) {
+        float g = bf16_bits_to_f32(gpu_bf16[i]);
+        float e = ref_f32[i];
+        double d = std::fabs(static_cast<double
