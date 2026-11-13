@@ -417,13 +417,15 @@ configuration agreement do not establish the published full-set quality.
 ## D12 — Metal backend for the compressed linear operator
 
 Decision (2026-11-14): the compressed linear operator's exact signed-64
-weighted sums run on the GPU through `crates/yskn-metal`. The CPU kernel
+weighted sums run on the GPU kernel (first built as the crate `crates/yskn-metal`,
+merged into `crates/yskn-engine` by D14). The CPU kernel
 (D10) remains the fallback and the test oracle for real tensors. Design,
-bounds and rejected variants: `crates/yskn-metal/DESIGN.md`.
+bounds and rejected variants: `crates/yskn-engine/METAL.md`.
 
 Measurement (M2 in `docs/port/STATE.md`), with no scoring run, build or test
 running:
-`cargo run --release -p yskn-metal --example bench_metal -- ~/models/qwen38-speed/qwen38_27b_speed.yskn`
+`cargo run --release -p yskn-engine --example bench_metal -- MODEL.yskn`
+(at the time of measurement the example lived in `-p yskn-metal`)
 Apple M5, threadgroup 32x4, the whole 10,311,344,128-byte mapping as one
 no-copy buffer, 401 matrices, 9,758,310,400 code bytes per pass, 7 passes
 after a warm-up, measured at the pre-rebase probe commit 4e5fe32. Before
