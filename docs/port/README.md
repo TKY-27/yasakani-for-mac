@@ -32,7 +32,7 @@ targets build without it. All pre-existing upstream files remain unchanged.
 | `yskn-ref::model` | Chapter 01, loading, layer order and sequence state |
 | `compressed_linear` | Chapter 02, integer compressed projection and coded embedding |
 | `gated_deltanet` | Chapter 03, dense gates, convolution and recurrence |
-| `attention` | Chapter 04, Int8 cache and per-row causal attention under D7–D9 |
+| `attention` | Chapter 04, Int8/Int8Profile/Kv5 caches and per-row causal attention under D7–D9/D13 |
 | `residual_norm_mlp` | Chapter 05, residual rounding, deferred norm and MLP |
 | `output_head_sampler` | Chapter 06, logits, greedy, sampler versions 2/3 and NLL |
 | `portable_math` | Permitted `pm_math.cuh` algorithms, exact scalar square root and D7 exp2 |
@@ -71,6 +71,16 @@ Container payloads are loaded into ordinary vectors, while matrices retain
 their compressed codes. The reference uses no memory mapping, dense
 model-weight expansion, threading or architecture-specific code. Execution is deliberately
 slow and is not intended as a competitive inference backend.
+
+`Model::load_folder_with(folder, KvMode::Int8Profile)` and
+`Model::load_folder_with(folder, KvMode::Kv5)` select the profile modes.
+`load_folder` (and the other existing loaders) still defaults to plain
+`KvMode::Int8`. Profile modes load `files.kv_profile` from the manifest,
+defaulting to `kvq_u5.bin`, and reject missing/malformed profiles or model
+attention-count/KV-head mismatches. Both weights and profile paths must stay
+inside the folder, including symlink targets. Plain Int8 needs no profile.
+`from_container_with_kv` accepts an explicit `Arc<KvProfile>` for in-memory
+or direct-file callers. See D13 for packed score/mean/rounding rules.
 
 ## Mapped engine API and commands
 
@@ -139,8 +149,16 @@ mapping, and no build/test during a timed run.
 
 ```sh
 cargo run --release -p yskn-ref --example score_windows -- \
-  /path/to/model-folder tools/quality/windows_own_thinking.json
+  /path/to/model-folder tools/quality/windows_own_thinking.json --kv kv5
 ```
+
+`--kv int8|int8-profile|kv5` defaults to `int8`. The upstream published
+“int8” quality configuration corresponds to `int8-profile`, not plain
+`int8`. Shared `quality::parse_kv_mode`/`score_with_kv` and
+`model::model_location_with_kv`/`load_weights_with_kv` let the mapped engine
+select a mode in a follow-up; its existing API still uses plain Int8.
+The score example passes the selected mode to its loader through the shared
+scoring helper, preserving the ordered NLL fold.
 
 The folder's optional `yasakani.json` supplies `files.weights`; otherwise
 the documented `qwen38_27b_e3x.yskn` default is used. `Model::load_folder` (and
@@ -187,7 +205,13 @@ full-model invariant test. A 73-row mixed sequence starting at position 3
 checks all logit bits across provisional, single-row and uneven-chunk
 execution, including subsequent committed state. Attention unit tests
 verify that masked cache contents cannot affect outputs and that masked
-value operations are skipped.
+value operations are skipped. Profile-mode tests add a mixed GDN/two-attention
+model with packable and fallback sides, means, a guard and a basis group.
+All three modes have frozen logit digests and distinct outputs; profile modes
+check the 73-row position-3 invariance, reset, continuation and failure
+atomicity. Hand-derived attention cases check packed means, key-mean omission,
+BF16 base/weight boundaries and unread masked slots. No released weights or
+full quality scoring were run for this integration.
 
 The portable-math port was also checked with a temporary scalar C++ harness
 including only the unchanged permitted `pm_math.cuh`, with contraction

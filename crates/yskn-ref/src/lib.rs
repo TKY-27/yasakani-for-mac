@@ -14,6 +14,7 @@ pub mod residual_norm_mlp;
 
 use std::fmt;
 
+pub use attention::KvMode;
 pub use model::{Model, ModelDimensions};
 pub use output_head_sampler::{Sampler, SamplingParameters, SamplingVersion};
 

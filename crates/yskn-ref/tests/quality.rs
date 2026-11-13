@@ -93,3 +93,45 @@ fn scoring_uses_next_tokens_resets_windows_and_folds_losses_in_position_order() 
     assert_eq!(model.position, 17);
     assert_eq!(model.resets, 0);
 }
+
+#[test]
+fn shared_quality_mode_parser_and_loader_receive_each_explicit_mode() {
+    use yskn_ref::{
+        KvMode,
+        quality::{parse_kv_mode, score_with_kv},
+    };
+    let windows = TokenWindows {
+        n_ctx: 2048,
+        first_scored_position: 1024,
+        last_scored_position: 2046,
+        windows: vec![TokenWindow { ids: vec![0; 2048] }],
+    };
+    for (name, expected) in [
+        ("int8", KvMode::Int8),
+        ("int8-profile", KvMode::Int8Profile),
+        ("kv5", KvMode::Kv5),
+    ] {
+        let mode = parse_kv_mode(std::ffi::OsStr::new(name)).unwrap();
+        assert_eq!(mode, expected);
+        let mut observed = None;
+        let result = score_with_kv(
+            mode,
+            |selected| {
+                observed = Some(selected);
+                Ok(Sequence {
+                    position: 0,
+                    resets: 0,
+                    rows: Vec::new(),
+                })
+            },
+            &windows,
+            0..1,
+            16,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(observed, Some(expected));
+        assert_eq!(result.scored_positions, 1023);
+    }
+    assert!(parse_kv_mode(std::ffi::OsStr::new("int4")).is_err());
+}

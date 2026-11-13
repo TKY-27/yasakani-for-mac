@@ -4,7 +4,8 @@ Baseline: merged specification PR #1, commit
 `157e33eac8d5ddd0e031b1826fe28e67f57f3787`. Implementation sources are
 `docs/FORMAT.md`, `docs/spec/`, and the explicitly permitted
 `src/pm_math.cuh`. No other upstream implementation file was opened in that baseline round.
-D13 explicitly ports the upstream KV codec source under brief 05a.
+D13 explicitly ports the upstream KV codec source under brief 05a and its
+attention consumers under brief 05b.
 
 ## D1 — Internal bit consistency
 
@@ -78,11 +79,11 @@ prefix sums retain their documented order.
 ## D4 — Int8 KV cache only
 
 Historical plain `Int8` baseline. [D13](#d13--profile-quantized-kv-row-codec)
-adds the profile codec as separate modules; attention wiring follows later.
+adds selectable profile modes; the default loader still uses this baseline.
 
 Attention stores signed byte key/value codes and one binary32 scale per head
 and token, with the chapter 04 signed cache rotation. Query operands retain
-their specified BF16 rounding. No KV5/KV4 packing, profile codec, or 16-bit
+their specified BF16 rounding. This mode does not use KV5/KV4 packing or the profile codec. No 16-bit
 cache alternative is implemented. A main-model folder load consequently
 needs only its weights and optional `yasakani.json`; it does not require a
 drafter, KV profile or tokenizer when callers already supply token IDs.
@@ -627,9 +628,8 @@ The shipping build defines mode 3 (`CMakeLists.txt:46`) and runs profile
 requantization even with packed capacity disabled (`src/engine35.cpp:688-704`).
 Its published perplexities 2.075900 and 2.0759369 differ by much less than the
 quality gate's 0.001 tolerance. Perplexity therefore cannot prove codec
-correctness. D4 remains available; the row codec is implemented separately
-in `kv_profile.rs` and `kv_codec.rs`, without changing attention or model
-loading in this brief.
+correctness. D4 remains available. The row codec is implemented in `kv_profile.rs` and
+`kv_codec.rs`; brief 05b wires it into reference attention and model loading.
 
 The reader checks every referenced region before indexing or allocation,
 including directories, table indices, consumed means/bases, finite numeric
@@ -690,10 +690,10 @@ CI uses synthesized profiles, with optional real-file assertions only when
 all 256 base operands for reuse. Packed decode selects a BF16-rounded
 codebook entry, **not** the encoder's unrounded reconstruction, and leaves
 scale and mean separate (`src/kvq_atxpk.hpp:39-42`, `src/q35_atxpk.cu:69-74`).
-For the next attention brief: retain BF16 query operands, use the BF16 table
-operand for packed keys/values, and retain the existing BF16 rounding on
-prefix `probability * value_scale`; self weights remain FP32. Key means
-are ignored; add `split_denominator * value_mean[channel]` to each packed
+Attention retains BF16 query operands, uses the BF16 table operand for
+packed keys/values, and retains the existing BF16 rounding on
+prefix `probability * value_scale`; self weights remain FP32, including the current token's own encoded row. Key means
+are ignored; attention adds `split_denominator * value_mean[channel]` to each packed
 value split numerator after the self contribution and before split
 combination (`docs/spec/04_ATTENTION.md`, “Packing, decoding, and the int8
 fallback”; `src/q35_atxpk3.cuh:343-380,412-468`,
@@ -715,4 +715,86 @@ legality, explicit tie rules, 4/5-bit word packing and BF16 decode boundaries,
 guard/mean/basis/mode-1 behavior, row independence and frozen SHA-256
 synthetic output digests. Digests freeze the source port, not a CUDA golden
 capture. Native CUDA execution/equality and end-to-end perplexity are not
-verified by this codec-only brief.
+verified by these synthetic proofs.
+
+
+### D13 attention integration and loading (brief 05b)
+
+`KvMode::{Int8, Int8Profile, Kv5}` is selectable through
+`Model::load_folder_with(folder, mode)`, or
+`Model::from_container_with_kv(container, mode, profile)` with an explicit
+`Arc<KvProfile>`. The existing `load`, `from_container`, `load_folder` and
+`load_weights` entry points **default to plain `Int8`**, preserving the
+pre-D13 logits and digests. Profile modes require a profile. A folder reads
+`files.kv_profile` from `yasakani.json`, defaulting to `kvq_u5.bin`; both
+profile and weights paths must remain relative to and inside the folder,
+including symlink targets. `Int8` does not read or require a profile.
+A direct weights path with a profile mode needs the explicit-container API.
+
+The loader checks attention-layer count, KV heads and 256-channel width
+against the profile before loading tensors. Group index is
+`((attention_ordinal * kv_heads + head) * 2 + side)`; recurrent layers do
+not increment the ordinal (`src/kvq_atxpk.hpp:65-68`). Mode, profile and
+ordinal live on each immutable `Attention`; `prepare_row` encodes at the
+absolute position, including guard bypass. The existing public stage
+signatures are unchanged. The profile uses `Arc` so the mapped engine's
+parallel prepared-row/output stages can continue sharing attention.
+
+Reads are defined as follows:
+
+- `Int8` and `Int8Profile` consume exact signed-int8 base operands and the
+  row's FP32 scale through the unchanged D3/D7/D9 operation schedule.
+- `Kv5` consumes BF16-rounded codebook operands for packed rows, including
+  self. A packed key score is `dot(query_bf16, codebook_bf16) *
+  (row_scale * 0.0625)`, with separately rounded products. Prefix uses D3;
+  self uses the four interleaved partials and XOR fold. The shipping
+  `QK8=false` branch has no extra table-int8 scale and no key mean
+  (`src/q35_atxpk3.cuh:343-380,423-444`,
+  `src/q35_atxpk4.cuh:287-325,365-386`, `src/kvq_atxpk.hpp:42-45`).
+- Prefix rounds **probability times value scale** to BF16; self keeps that
+  product FP32. Both multiply the BF16 table base
+  (`src/q35_atxpk3.cuh:402-406,445-458`,
+  `src/q35_atxpk4.cuh:345-349,387-400`, `src/q35_atxpk.cu:55-56,66`).
+- After self and before emitting each split, packed values add
+  `split_denominator * mean[channel]`. That FP32 denominator includes
+  self and uses unrounded probabilities, rather than the rounded/scaled
+  value weights. Missing means are zero, and int8 fallbacks receive no
+  extra term because the codec already restored their basis/mean
+  (`src/q35_atxpk3.cuh:443-475`, `src/q35_atxpk4.cuh:385-417`,
+  `src/kvq_fast.cuh:214-218,234`).
+
+The four rules stated in brief 05b hold exactly in both pk3 and pk4.
+Chapter 04 already had the correct key-mean asymmetry and BF16 operand;
+its revised wording makes the denominator/self and shipping-int8
+interpretations explicit. D1 remains internal consistency, D3 provisional
+scalar dot order, D7 portable exp2, and D9 per-row absolute tiles with no
+masked value operations. Synthetic profiles may exercise side combinations
+beyond the shipping CUDA dispatch (whose five-bit value-only path errors,
+`src/q35_atxpk.cu:722-724`); the scalar mode applies the same specified row
+operands to any packable side.
+
+Synthetic proofs cover actual packed cache contents and int8 fallback,
+key-mean independence, exact value-mean output with a zero codebook,
+prefix/self rounding, unread masked packed slots, delayed stage output
+with future cache entries, absolute guard positions, profile dimensions,
+folder containment, and codec failures after an earlier row succeeds.
+A mixed three-layer model (GDN plus two attention layers) checks 73 rows
+starting at position 3 in one pass, singles and uneven chunks, then
+continuation, reset and provisional replay. The logits differ across all
+three modes. Their frozen SHA-256 values (seed 107, prefix `[8,21,5]`,
+73 tokens `(17*row+4)%128`, row-major little-endian f32 bits) are:
+
+| Mode | SHA-256 |
+|---|---|
+| Int8 | `1e9a723c945f8b0b36a5204b16cf237500fdc2183727e5beb07b841b148114fd` |
+| Int8Profile | `3b952134c81b86e93601de75379c10e80ac898cae92e30275f22265d781710dd` |
+| Kv5 | `5d474ca9559bcc6d8eb367a2634e578842c0813fc66a55a862f054f4521422e4` |
+
+These freeze this source port, not a CUDA capture. Existing D11 Int8
+baselines remain unchanged. The scalar score example accepts
+`--kv int8|int8-profile|kv5`; shared `quality::parse_kv_mode` and
+`score_with_kv` pass the mode to a backend loader without changing the
+shared NLL/position fold. A mapped-engine follow-up only needs to select a
+mode, call `model_location_with_kv` and `load_weights_with_kv`, and route
+its score CLI through these helpers. Its stage calls need no changes.
+No engine source, real weights or full quality run is part of brief 05b.
