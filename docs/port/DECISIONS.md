@@ -175,6 +175,128 @@ whose unspecified masked operand bits could otherwise change signed-zero
 arithmetic under D3. Every row's result is independent of the other rows
 sharing its pass.
 
+## D10 — Mapped CPU compressed integer kernel
+
+`yskn-engine` shares one read-only `Arc<Mmap>` across matrix handles. A
+`Container<Cursor<&[u8]>>` runs the existing header, actual-length, padding,
+shape and payload-range checks; no second parser or format change is needed.
+Code words remain in the file's `row` or `warp` layout. Their public view is
+little-endian bytes because the format permits unaligned payloads. The
+mapping constructor is unsafe only for the external-file invariant: callers
+must prevent modification/truncation until all matrix handles are dropped.
+Malformed, stable files are validated before execution. Derived table/scales
+use the same quantization helper as the scalar reference; signs use the
+format reader's generators. `memmap2` is the only added external dependency.
+
+Each worker visits 32 output rows × 512 columns, decoding one row's two
+256-weight sequences into a reusable 512-byte stack buffer. That buffer is
+consumed by up to 16 activation rows before advancing. Larger M is chunked
+at 16. Sequence scratch is 33 words (132 bytes), including a zero sentinel;
+there is no persistent decoded matrix or repacked code stream. Warp
+addressing uses the *global sequence index*, including when physical rows
+are not divisible by 32. Bits 6 and 8 use constant-shift windows (16 and 8
+pairs per decode block); bits 4, 5 and 7 use the general 12-bit window.
+Zero extension applies to every negative starting bit, including step 1 at
+bits 4/5. All indexing of file bytes remains checked Rust.
+
+Portable Rust, NEON widening multiply/pairwise widening add, and NEON SDOT
+are explicitly selectable. SDOT uses four independent i32 accumulators.
+Each 512-term dot is bounded even for activation -128; multiplication by
+integer scale widens to i64 and accumulation is checked. The result is
+row-major M × physical_rows, including padding, with a prefix API for head
+slices. The reference's exposed `weighted_sums` also supplies `project`'s
+integer stage, preserving the subsequent float operation order.
+
+`Engine::new(kernel, threads)` rejects unavailable variants. `from_env()`
+reads `YSKN_KERNEL` once per process; absent an override it chooses detected
+SDOT, then NEON, then portable. Architecture-specific functions are gated by
+`is_aarch64_feature_detected!`; the portable implementation has no intrinsics.
+Only the engine crate requires Rust 1.98, where `vdotq_s32` became stable;
+the existing crates retain their MSRV. Workers live until engine drop, with
+no thread creation per projection. Shared activation copies are small and
+per-call; weights remain mapped. Workers claim 256-row tasks from an atomic
+counter (32-row tasks for small matrices) and return owned integer results
+through channels. This balances P/E cores without affinity or unsafe
+cross-thread output pointers. The default is min(available CPUs, 10).
+
+### Measurements and rejected alternatives
+
+Measured on the supplied 4P+6E M5 machine with Rust 1.100 release builds.
+Every pass calls all 400 body matrices plus the head, reading 9,758,310,400
+code bytes logically once for M <= 16. Each configuration warms up first
+and reports seven full passes, with no other build/test/timing process of
+this task running. The code-rate is logical bytes / time, **not** a hardware
+DRAM-bandwidth counter. Timings below are median milliseconds:
+
+| Implementation / scheduling | Threads | M=1 | M=16 |
+|---|---:|---:|---:|
+| General window, single SDOT accumulator, static | 4 | 1793.587 | 4204.389 |
+| Constant 6/8-bit shifts, single SDOT accumulator, static | 4 | 1513.296 | 3012.675 |
+| Array-sized decode slices + four SDOT accumulators, static | 4 | 1384.643 | 2632.731 |
+| Same decode, portable products, static | 4 | 1441.599 | 3066.136 |
+| Same decode, widening NEON products, static | 4 | 2857.873 | 5949.387 |
+| Four SDOT accumulators, static | 1 | 3351.644 | — |
+| Four SDOT accumulators, static | 2 | 1754.274 | — |
+| Four SDOT accumulators, static | 6 | 1021.967 | 1855.703 |
+| Four SDOT accumulators, static | 8 | 922.710 | 1674.221 |
+| Four SDOT accumulators, static | 10 | 846.821 | 1513.512 |
+| Four SDOT accumulators, dynamic | 8 | 792.665 | 1466.976 |
+| Four SDOT accumulators, dynamic | 10 | 814.367 | 1267.494 |
+
+There was scheduler/load variation: the NEON M=1 minimum was 1308.668 ms,
+and the first dynamic 10-thread M=1 minimum was 683.152 ms. A focused
+seven-pass M=1 confirmation of dynamic 4/6/8/10 workers gave medians
+940.354 / 827.898 / 735.930 / 683.797 ms (minima 925.875 / 816.996 /
+727.697 / 681.410). Ten workers win that confirmation and M=16; callers
+can reduce the count. Static equal partitions, general decoding for released
+bit widths, and the single SDOT dependency chain were rejected. Portable
+and widening NEON remain forced fallbacks; the clear M=16 SDOT advantage
+justifies the additional runtime variant. i8mm and SME were not implemented
+or benchmarked; no performance claim is made for them or other CPUs.
+
+Final proof run, default SDOT with ten dynamic workers (seven samples per M):
+
+| M | Median ms | Minimum ms | Code bytes | GB/s median | GB/s minimum |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 641.124 | 631.342 | 9758310400 | 15.221 | 15.456 |
+| 2 | 687.818 | 684.961 | 9758310400 | 14.187 | 14.247 |
+| 4 | 778.207 | 773.383 | 9758310400 | 12.539 | 12.618 |
+| 8 | 940.028 | 936.071 | 9758310400 | 10.381 | 10.425 |
+| 16 | 1259.312 | 1254.213 | 9758310400 | 7.749 | 7.780 |
+
+These times include worker dispatch, activation copies and output allocation;
+model validation, table preparation and random input generation are outside
+the timed passes. All six brief proof commands passed locally; debug and
+release each passed 60 tests, and all twelve real-tensor/variant comparisons
+passed. No remote CI run was performed.
+
+Reproduce the selected configuration with `bench_linear MODEL.yskn`; use
+`--kernel portable|neon|dotprod --threads N --m 1,16` for focused comparisons.
+Omitting `--m` always measures 1, 2, 4, 8 and 16. Historical decode/scheduling
+alternatives above are measurements of intermediate implementations, not
+extra production switches.
+
+The M=1 confirmation is about 14.27 GB/s logical code rate, far below the
+nominal 307 GB/s (31.8 ms code-only ideal). The decode improvements and
+M-row amortization indicate decode/table-lookup and execution throughput,
+not streaming DRAM capacity, as the main remaining cost; this is an
+inference, not a hardware-counter profile. Next experiments, in expected
+gain order: vectorized state extraction with fewer scalar lookup/load
+instructions; multiple output rows decoded together to overlap table-load
+latency; then i8mm/SME for larger M if measured product cost warrants the
+packing/dispatch complexity. Do not repack the full code stream.
+
+Synthetic tests compare every host variant with the scalar integer oracle
+across both layouts, bits 4–8, required K/M, padded/partial rows, unaligned
+payloads, extreme bytes and signed scales, one/many workers, and distinct
+rows across the M=16 boundary. Mapped corruption/truncation and mapping
+ownership are also tested. Real verification covers GDN qkv, MLP down,
+attention q, and the first 4096 head rows for M=3. No new specification
+error was found; the previously documented bits 4/5 negative-start wording
+and the distinction between logical and physical output rows remain
+important. This crate implements the integer operator, not a complete
+floating-point inference backend.
+
 ## Sequence API and quality reporting
 
 `prefill(tokens)` commits all supplied input rows. `run_provisional(tokens)`
