@@ -1,7 +1,7 @@
 //! Scalar int8 attention from [chapter 04](../../../docs/spec/04_ATTENTION.md).
 
 use crate::gated_deltanet::xor_sum32;
-use crate::portable_math::{bfloat, exp, exp2, require_exp2, rsqrt, sigmoid, sincos};
+use crate::portable_math::{bfloat, exp, exp2, rsqrt, sigmoid, sincos};
 use crate::{Error, Result};
 
 const FREQUENCY_BITS: [u32; 32] = [
@@ -175,10 +175,6 @@ impl Attention {
             ));
         }
         self.validate_projected_rows(projected_query_gate, projected_key, projected_value)?;
-        // The missing portable exp2 algorithm must be resolved before state is changed.
-        // See docs/port/SPEC_GAPS.md, MATH-01; exp(x * ln(2)) would invent new bits.
-        require_exp2()?;
-        require_masked_operands_spec()?;
         let prepared = self.prepare_row(
             position,
             projected_query_gate,
@@ -360,7 +356,7 @@ impl Attention {
                 let first = split_index * per_split;
                 let last = first.saturating_add(per_split).min(length);
                 let prefix_end = first.max(last.min(length - 1));
-                // A canonical single-row tile range makes batching numerically irrelevant.
+                // D9: visit only absolute 32-slot tiles intersecting this row's prefix.
                 if first < prefix_end {
                     let mut tile_start = first / 32 * 32;
                     while tile_start < prefix_end {
@@ -484,15 +480,11 @@ impl Attention {
         let mut value_weights = [0.0; 32];
         for (tile_index, weight) in value_weights.iter_mut().enumerate() {
             let position = tile_start + tile_index;
-            let value_scale = if visible.contains(&position) {
-                prefix[position].values[kv_head].scale
-            } else {
-                todo!(
-                    "docs/port/SPEC_GAPS.md#att-mask-01: masked value scales depend on the unspecified loaded extent"
-                )
-            };
-            // Prefix probability times the row scale rounds to BF16 before the value dot.
-            *weight = bfloat(probabilities[tile_index] * value_scale);
+            if visible.contains(&position) {
+                let value_scale = prefix[position].values[kv_head].scale;
+                // Prefix probability times the row scale rounds to BF16 before the value dot.
+                *weight = bfloat(probabilities[tile_index] * value_scale);
+            }
         }
         for half in 0..2 {
             for channel in 0..self.dimensions.head_dim {
@@ -501,14 +493,11 @@ impl Attention {
                     value_weights[half * 16..(half + 1) * 16].iter().enumerate()
                 {
                     let position = tile_start + half * 16 + offset;
-                    let value = if visible.contains(&position) {
-                        f32::from(prefix[position].values[kv_head].integers[channel])
-                    } else {
-                        todo!(
-                            "docs/port/SPEC_GAPS.md#att-mask-01: the masked value operand bits are unspecified"
-                        )
-                    };
-                    split.numerator[channel] += value_weight * value;
+                    // D9 skips masked operations entirely, including zero-valued products.
+                    if visible.contains(&position) {
+                        let value = f32::from(prefix[position].values[kv_head].integers[channel]);
+                        split.numerator[channel] += value_weight * value;
+                    }
                 }
             }
         }
@@ -555,11 +544,6 @@ impl Attention {
         finite(&[split.denominator], "attention self denominator")?;
         finite(&split.numerator, "attention self numerator")
     }
-}
-
-fn require_masked_operands_spec() -> Result<()> {
-    // Zero probabilities do not determine the sign of zero products with masked values.
-    Err(Error::SpecGap("ATT-MASK-01"))
 }
 
 fn cache_sign(channel: usize) -> f32 {
@@ -722,15 +706,107 @@ mod tests {
     }
 
     #[test]
-    fn missing_exp2_returns_gap_without_mutating_cache() {
+    fn successful_step_appends_cache_and_failed_step_preserves_it() {
         let layer = layer();
         let mut state = layer.new_state().unwrap();
+        let output = layer
+            .step(&mut state, 0, &[0.0; 1024], &[0.0; 512], &[0.0; 512])
+            .unwrap();
+        assert_eq!(state.len(), 1);
+        assert!(output.iter().all(|value| value.is_finite()));
         let original = state.clone();
         assert!(matches!(
-            layer.step(&mut state, 0, &[0.0; 1024], &[0.0; 512], &[0.0; 512]),
-            Err(Error::SpecGap("MATH-01"))
+            layer.step(
+                &mut state,
+                1,
+                &[0.0; 1024],
+                &[f32::INFINITY; 512],
+                &[0.0; 512]
+            ),
+            Err(Error::NonFinite(_))
         ));
         assert_eq!(state, original);
+    }
+
+    #[test]
+    fn masked_prefix_cache_contents_cannot_change_output_bits() {
+        let layer = layer();
+        let mut prefix = vec![
+            CacheToken {
+                keys: vec![
+                    Int8CacheRow {
+                        integers: vec![2; 256],
+                        scale: 0.25
+                    };
+                    2
+                ],
+                values: vec![
+                    Int8CacheRow {
+                        integers: vec![-3; 256],
+                        scale: 0.125
+                    };
+                    2
+                ],
+            };
+            64
+        ];
+        let visible = 35..38;
+        let evaluate = |prefix: &[CacheToken]| {
+            let mut split = AttentionSplit {
+                maximum: EMPTY_MAXIMUM,
+                denominator: 0.0,
+                numerator: vec![0.0; 256],
+            };
+            layer
+                .prefix_tile(&mut split, &[0.25; 256], 0, prefix, 32, visible.clone())
+                .unwrap();
+            (
+                split.maximum.to_bits(),
+                split.denominator.to_bits(),
+                split
+                    .numerator
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let expected = evaluate(&prefix);
+        assert_eq!(expected.0, 2.0_f32.to_bits());
+        assert_eq!(expected.1, 3.0_f32.to_bits());
+        assert_eq!(expected.2, vec![(-1.125_f32).to_bits(); 256]);
+        for (position, token) in prefix.iter_mut().enumerate() {
+            if !visible.contains(&position) {
+                for row in token.keys.iter_mut().chain(&mut token.values) {
+                    row.scale = f32::NAN;
+                    row.integers.fill(-127);
+                }
+            }
+        }
+        assert_eq!(evaluate(&prefix), expected);
+        // Neither future slots nor padding beyond the causal cache need to exist.
+        prefix.truncate(visible.end);
+        assert_eq!(evaluate(&prefix), expected);
+
+        // Substituting +0 operands for masked slots would erase these negative zeros.
+        for token in &mut prefix[visible.clone()] {
+            token.keys[0].integers.fill(0);
+            token.values[0].scale = f32::from_bits(32);
+            token.values[0].integers.fill(-127);
+        }
+        let mut split = AttentionSplit {
+            maximum: 0.0,
+            denominator: 0.0,
+            numerator: vec![-0.0; 256],
+        };
+        layer
+            .prefix_tile(&mut split, &[0.0; 256], 0, &prefix, 32, visible)
+            .unwrap();
+        assert!(
+            split
+                .numerator
+                .iter()
+                .all(|value| value.to_bits() == (-0.0_f32).to_bits())
+        );
     }
 
     #[test]

@@ -307,6 +307,12 @@ The prefix computation processes 32-key tiles. For numerical fidelity, each grou
 
 ## Prefix score, online softmax, and value accumulation
 
+**Scalar reference note:** [D7](../port/DECISIONS.md#d7--portable-exp2-construction)
+defines portable exp2; [D9](../port/DECISIONS.md#d9--per-row-prefix-tiles-and-skipped-masked-values)
+uses only absolute 32-slot tiles intersecting each row's own prefix, with
+masked scores of negative infinity, probabilities of `+0.0` in the sum,
+and entirely skipped masked value operations (no zero operands).
+
 For this section define `Kbase[position,channel]` and `Vbase[position,channel]` as the BF16 codebook values selected by a packed row, or the exact signed-int8 integer values widened to BF16 for an int8 row. `Kscale`/`Vscale` are the corresponding FP32 row scales. Keep them separate; rounding `Kbase*Kscale` or `Vbase*Vscale` to BF16 before attention would change this path. Sources: `src/q35_atxpk.cu:55-66`, `src/q35_atxpk3.cuh:343-380`, `src/q35_atxpk3.cuh:402-406`, `src/q35_atx.cu:57-61`, `src/q35_atx.cu:478-520`.
 
 The query/key prefix dot product visits sixteen consecutive 16-channel chunks. For a valid key in the current tile, its scalar schedule is below; invalid keys are assigned negative infinity after the score calculation. Source fixes this chunk order, while `mma16` remains the explicitly identified uncertainty ATT-01. Sources: `src/q35_atxpk3.cuh:343-380`, `src/q35_atxpk4.cuh:287-326`, `src/q35_atx.cu:478-497`.

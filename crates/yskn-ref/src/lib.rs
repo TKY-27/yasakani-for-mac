@@ -24,7 +24,6 @@ pub enum Error {
     InvalidModel(String),
     InvalidInput(String),
     NonFinite(&'static str),
-    SpecGap(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -36,11 +35,6 @@ impl fmt::Display for Error {
             Self::InvalidModel(message) => write!(formatter, "invalid model: {message}"),
             Self::InvalidInput(message) => write!(formatter, "invalid input: {message}"),
             Self::NonFinite(stage) => write!(formatter, "non-finite value in {stage}"),
-            Self::SpecGap(entry) => write!(
-                formatter,
-                "unresolved specification {entry}: docs/port/SPEC_GAPS.md#{}",
-                entry.to_ascii_lowercase()
-            ),
         }
     }
 }

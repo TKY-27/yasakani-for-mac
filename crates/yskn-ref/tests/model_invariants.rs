@@ -145,7 +145,7 @@ fn invalid_token_pass_is_atomic_and_reset_reproduces_the_initial_state() {
 }
 
 #[test]
-fn mixed_model_reports_the_documented_gap() {
+fn mixed_model_loads_with_qwen3_5_rotary_width() {
     let bytes = synthetic_model(
         79,
         &[
@@ -155,8 +155,39 @@ fn mixed_model_reports_the_documented_gap() {
             "full_attention",
         ],
     );
-    let result = Model::from_container(Container::from_bytes(bytes).unwrap());
-    assert!(matches!(result, Err(Error::SpecGap("ARCH-01"))));
+    let model = Model::from_container(Container::from_bytes(bytes).unwrap()).unwrap();
+    assert_eq!(model.dimensions().layer_count, 4);
+    assert_eq!(model.dimensions().attention_head_width, 256);
+}
+
+#[test]
+fn mixed_model_rejects_wrong_head_width_and_unknown_architecture() {
+    for (field, value, expected_message) in [
+        (
+            "head_dim",
+            serde_json::json!(128),
+            "qwen3_5 requires model.head_dim=256 (D8)",
+        ),
+        (
+            "arch",
+            serde_json::json!("other"),
+            "main reference requires arch=qwen3_5",
+        ),
+    ] {
+        let mut bytes = synthetic_model(79, &["linear_attention", "full_attention"]);
+        let header_length = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let data_offset = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+        let mut header: serde_json::Value =
+            serde_json::from_slice(&bytes[32..32 + header_length]).unwrap();
+        header["model"][field] = value;
+        let header = serde_json::to_vec(&header).unwrap();
+        assert!(32 + header.len() <= data_offset);
+        bytes[32..data_offset].fill(0);
+        bytes[32..32 + header.len()].copy_from_slice(&header);
+        bytes[8..16].copy_from_slice(&(header.len() as u64).to_le_bytes());
+        let result = Model::from_container(Container::from_bytes(bytes).unwrap());
+        assert!(matches!(result, Err(Error::InvalidModel(message)) if message == expected_message));
+    }
 }
 
 #[test]
@@ -230,7 +261,6 @@ fn model_folder_manifest_rounds_context_capacity_and_selects_weights() {
 }
 
 #[test]
-#[ignore = "ARCH-01, MATH-01 and ATT-MASK-01: rotary-width header rule, portable exp2 and masked operands are unspecified"]
 fn mixed_model_row_and_chunk_invariants() {
     let bytes = synthetic_model(
         83,
@@ -258,4 +288,45 @@ fn mixed_model_row_and_chunk_invariants() {
     batched.prefill(&[19]).unwrap();
     individual.prefill(&[19]).unwrap();
     assert_eq!(bits(batched.row_logits()), bits(individual.row_logits()));
+}
+
+#[test]
+fn mixed_model_unaligned_long_pass_matches_single_rows_and_uneven_chunks() {
+    let bytes = synthetic_model(107, &["linear_attention", "full_attention"]);
+    let mut batched = Model::from_container(Container::from_bytes(bytes).unwrap()).unwrap();
+    let mut individual = batched.new_session().unwrap();
+    let mut chunked = batched.new_session().unwrap();
+    let prefix = [8, 21, 5];
+    for model in [&mut batched, &mut individual, &mut chunked] {
+        model.prefill(&prefix).unwrap();
+    }
+    // Start at position 3 and cross the absolute boundaries at 32 and 64.
+    let tokens: Vec<u32> = (0..73).map(|row| (row * 17 + 4) % 128).collect();
+    batched.run_provisional(&tokens).unwrap();
+    assert_eq!(batched.position(), prefix.len());
+    let expected = bits(batched.row_logits());
+    assert_eq!(expected.len(), tokens.len());
+    assert!(expected[0].windows(2).any(|pair| pair[0] != pair[1]));
+    assert!(expected.windows(2).any(|pair| pair[0] != pair[1]));
+    let mut actual = Vec::new();
+    for &token in &tokens {
+        individual.prefill(&[token]).unwrap();
+        actual.extend(bits(individual.row_logits()));
+    }
+    assert_eq!(actual, expected);
+    actual.clear();
+    let mut start = 0;
+    for count in [1, 31, 2, 33, 6] {
+        chunked.prefill(&tokens[start..start + count]).unwrap();
+        actual.extend(bits(chunked.row_logits()));
+        start += count;
+    }
+    assert_eq!(start, tokens.len());
+    assert_eq!(actual, expected);
+    batched.commit(tokens.len()).unwrap();
+    for model in [&mut batched, &mut individual, &mut chunked] {
+        model.prefill(&[19]).unwrap();
+    }
+    assert_eq!(bits(batched.row_logits()), bits(individual.row_logits()));
+    assert_eq!(bits(batched.row_logits()), bits(chunked.row_logits()));
 }

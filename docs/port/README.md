@@ -1,9 +1,9 @@
 # Rust scalar reference
 
 This workspace implements the documented container and the executable
-Gated DeltaNet main-model path. Full-attention execution is blocked by
-the three entries in [SPEC_GAPS.md](SPEC_GAPS.md). Read those entries before
-using this as a complete mixed-model reference.
+mixed Gated DeltaNet/full-attention main-model path. The three historical
+gaps in [SPEC_GAPS.md](SPEC_GAPS.md) are resolved by D7–D9 in
+[DECISIONS.md](DECISIONS.md).
 
 ## Build and check
 
@@ -27,10 +27,10 @@ All pre-existing upstream files remain unchanged.
 | `yskn-ref::model` | Chapter 01, loading, layer order and sequence state |
 | `compressed_linear` | Chapter 02, integer compressed projection and coded embedding |
 | `gated_deltanet` | Chapter 03, dense gates, convolution and recurrence |
-| `attention` | Chapter 04, int8 cache and attention through the documented gaps |
+| `attention` | Chapter 04, Int8 cache and per-row causal attention under D7–D9 |
 | `residual_norm_mlp` | Chapter 05, residual rounding, deferred norm and MLP |
 | `output_head_sampler` | Chapter 06, logits, greedy, sampler versions 2/3 and NLL |
-| `portable_math` | Permitted `pm_math.cuh` algorithms and exact scalar square root |
+| `portable_math` | Permitted `pm_math.cuh` algorithms, exact scalar square root and D7 exp2 |
 
 ## Model API
 
@@ -55,8 +55,9 @@ fn run() -> yskn_ref::Result<()> {
 }
 ```
 
-The API currently loads recurrent-only models. A mixed model returns a
-named specification error. `new_session()` shares immutable model weights
+The API loads recurrent-only and mixed models with `model.arch=qwen3_5`
+and `head_dim=256`, using the fixed rotary width 64 under D8.
+`new_session()` shares immutable model weights
 and starts an independent empty sequence. A pending provisional pass must
 be committed or discarded before another pass. Commit replay is intentional:
 this implementation prioritizes one readable scalar operation order.
@@ -80,10 +81,9 @@ the committed window format: 2,048 token IDs per window and scored positions
 position count, mean negative log-likelihood and perplexity, and reports
 per-window progress on stderr.
 
-**On the released mixed architecture this command currently exits with
-ARCH-01 and prints no metric.** Resolving that mapping also requires resolving
-MATH-01 and ATT-MASK-01 before full attention can execute. Neither a published
-quality number nor full mixed-model bit equivalence has been reproduced.
+Full attention is executable under D7–D9. No released model was loaded for
+this validation: neither a published quality number nor CUDA mixed-model
+bit equivalence has been reproduced.
 
 ## Verification evidence
 
@@ -98,8 +98,12 @@ The synthetic writer uses seeded streams, binary16 tables/scales and BF16
 vectors. Recurrent models exercise complete embedding-to-logit execution,
 two layer transitions, row/chunk/commit invariants and both samplers. A second
 model changes hidden and FFN widths to 1,024 and vocabulary to 65 with padded
-head rows. The mixed fixture is generated and decoded but its full-model
-invariant test is explicitly ignored pending the three gaps.
+head rows. The four-layer mixed fixture is generated, decoded and executed by its
+full-model invariant test. A 73-row mixed sequence starting at position 3
+checks all logit bits across provisional, single-row and uneven-chunk
+execution, including subsequent committed state. Attention unit tests
+verify that masked cache contents cannot affect outputs and that masked
+value operations are skipped.
 
 The portable-math port was also checked with a temporary scalar C++ harness
 including only the unchanged permitted `pm_math.cuh`, with contraction
