@@ -118,6 +118,29 @@ pub fn quantize_activation(input: &[f32], input_signs: &[i8]) -> Result<Prepared
     })
 }
 
+/// Quantize a lookup table and fold its scale into the physical row scales.
+pub fn quantize_weight_table(table: &[f32], scales: &[f32]) -> Result<(Vec<i8>, Vec<f32>)> {
+    require_finite(table, "weight lookup table")?;
+    require_finite(scales, "weight row scales")?;
+    let table_maximum = table
+        .iter()
+        .fold(0.0_f32, |maximum, value| maximum.max(value.abs()));
+    if table_maximum == 0.0 {
+        return Err(Error::InvalidModel(
+            "a compressed projection cannot use an all-zero lookup table (LIN-01)".into(),
+        ));
+    }
+    // D1 fixes the upstream host's unspecified rounding mode to RNE.
+    let table_scale = table_maximum / 127.0;
+    let weight_table8 = table
+        .iter()
+        .map(|&value| (value / table_scale).round_ties_even().clamp(-127.0, 127.0) as i8)
+        .collect();
+    let effective_row_scale: Vec<_> = scales.iter().map(|&scale| scale * table_scale).collect();
+    require_finite(&effective_row_scale, "effective weight row scales")?;
+    Ok((weight_table8, effective_row_scale))
+}
+
 /// A compressed matrix keeps its codes; it never expands the dense weights.
 #[derive(Debug)]
 pub struct CompressedLinear {
@@ -130,17 +153,8 @@ pub struct CompressedLinear {
 impl CompressedLinear {
     /// `output_rotation` follows the consumer: body=true, vocabulary head=false.
     pub fn new(tensor: Tensor, output_rotation: bool) -> Result<Self> {
-        require_finite(tensor.table(), "weight lookup table")?;
-        require_finite(tensor.scales(), "weight row scales")?;
-        let table_maximum = tensor
-            .table()
-            .iter()
-            .fold(0.0_f32, |maximum, value| maximum.max(value.abs()));
-        if table_maximum == 0.0 {
-            return Err(Error::InvalidModel(
-                "a compressed projection cannot use an all-zero lookup table (LIN-01)".into(),
-            ));
-        }
+        let (weight_table8, effective_row_scale) =
+            quantize_weight_table(tensor.table(), tensor.scales())?;
         if output_rotation
             && (tensor.physical_rows() % ROTATION_BLOCK != 0 || tensor.output_signs().is_none())
         {
@@ -148,19 +162,6 @@ impl CompressedLinear {
                 "a body projection requires complete 512-row output rotations".into(),
             ));
         }
-        // D1 fixes the upstream host's unspecified rounding mode to RNE.
-        let table_scale = table_maximum / 127.0;
-        let weight_table8 = tensor
-            .table()
-            .iter()
-            .map(|&value| (value / table_scale).round_ties_even().clamp(-127.0, 127.0) as i8)
-            .collect();
-        let effective_row_scale: Vec<_> = tensor
-            .scales()
-            .iter()
-            .map(|&scale| scale * table_scale)
-            .collect();
-        require_finite(&effective_row_scale, "effective weight row scales")?;
         Ok(Self {
             tensor,
             weight_table8,
@@ -181,6 +182,59 @@ impl CompressedLinear {
         self.tensor.input_signs()
     }
 
+    /// Integer weighted sums for the first `rows` physical output rows.
+    ///
+    /// `activation8` contains one input row and `integer_scale` contains one
+    /// scale per 512 input columns, as produced by [`quantize_activation`].
+    pub fn weighted_sums(
+        &self,
+        activation8: &[i8],
+        integer_scale: &[i32],
+        rows: usize,
+    ) -> Result<Vec<i64>> {
+        if activation8.len() != self.cols() {
+            return Err(Error::InvalidModel(
+                "projection input width does not match the prepared activation".into(),
+            ));
+        }
+        if integer_scale.len() != self.cols() / ROTATION_BLOCK {
+            return Err(Error::InvalidModel(
+                "projection integer scales must match the number of 512-column groups".into(),
+            ));
+        }
+        if rows > self.tensor.physical_rows() {
+            return Err(Error::InvalidModel(
+                "requested projection rows exceed the physical row count".into(),
+            ));
+        }
+        let mut output = vec![0; rows];
+        for (row, sum) in output.iter_mut().enumerate() {
+            let mut weighted_sum = 0_i64;
+            for (group, &integer_scale) in integer_scale.iter().enumerate() {
+                let mut dot = 0_i32;
+                // Two adjacent 256-weight sequences form one 512-term dot.
+                // Reset only here; scaling each sequence separately differs.
+                for sequence_in_group in 0..2 {
+                    let sequence = group * 2 + sequence_in_group;
+                    for step in 0..128 {
+                        let state = usize::from(self.tensor.state(row, sequence, step)?);
+                        for component in 0..2 {
+                            let column = sequence * 256 + step * 2 + component;
+                            dot += i32::from(self.weight_table8[state * 2 + component])
+                                * i32::from(activation8[column]);
+                        }
+                    }
+                }
+                let weighted_dot = i64::from(integer_scale) * i64::from(dot);
+                weighted_sum = weighted_sum.checked_add(weighted_dot).ok_or_else(|| {
+                    Error::InvalidModel("compressed integer accumulation exceeds i64".into())
+                })?;
+            }
+            *sum = weighted_sum;
+        }
+        Ok(output)
+    }
+
     pub fn project(
         &self,
         prepared: &PreparedActivation,
@@ -194,32 +248,16 @@ impl CompressedLinear {
         if inverse_rms.is_some_and(|value| !value.is_finite()) {
             return Err(Error::NonFinite("deferred inverse RMS"));
         }
+        let weighted_sums = self.weighted_sums(
+            &prepared.activation8,
+            &prepared.integer_scale,
+            self.tensor.physical_rows(),
+        )?;
         let mut output = vec![0.0; self.tensor.physical_rows()];
         for (row, linear) in output.iter_mut().enumerate() {
-            let mut weighted_sum = 0_i64;
-            for (group, &integer_scale) in prepared.integer_scale.iter().enumerate() {
-                let mut dot = 0_i32;
-                // Two adjacent 256-weight sequences form one 512-term dot.
-                // Reset only here; scaling each sequence separately differs.
-                for sequence_in_group in 0..2 {
-                    let sequence = group * 2 + sequence_in_group;
-                    for step in 0..128 {
-                        let state = usize::from(self.tensor.state(row, sequence, step)?);
-                        for component in 0..2 {
-                            let column = sequence * 256 + step * 2 + component;
-                            dot += i32::from(self.weight_table8[state * 2 + component])
-                                * i32::from(prepared.activation8[column]);
-                        }
-                    }
-                }
-                let weighted_dot = i64::from(integer_scale) * i64::from(dot);
-                weighted_sum = weighted_sum.checked_add(weighted_dot).ok_or_else(|| {
-                    Error::InvalidModel("compressed integer accumulation exceeds i64".into())
-                })?;
-            }
             // There is exactly one i64->f32 conversion. Restore scales in the
             // specified order; neither reassociation nor an FMA is equivalent.
-            *linear = weighted_sum as f32 * prepared.row_quantum;
+            *linear = weighted_sums[row] as f32 * prepared.row_quantum;
             if let Some(inverse_rms) = inverse_rms {
                 *linear *= inverse_rms;
             }
