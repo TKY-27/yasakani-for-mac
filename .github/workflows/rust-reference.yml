@@ -17,7 +17,9 @@ concurrency:
 jobs:
   scalar-reference:
     name: Apple Silicon / stable
-    runs-on: macos-15
+    # The product refuses macOS older than 26 at start (D23), and its tests
+    # run those checks.
+    runs-on: macos-26
     # The product tests brought the job to 29 minutes before the test-time
     # reduction; keep headroom until the new duration has been measured.
     timeout-minutes: 45
