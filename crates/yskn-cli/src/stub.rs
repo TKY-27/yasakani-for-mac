@@ -218,11 +218,14 @@ impl Engine for StubEngine {
         Ok(Generation {
             prefill_ms: 0.01 * (prompt.len() - cached_tokens) as f64,
             gen_ms: 0.1 * ids.len() as f64,
+            rows_verified: ids.len(),
             ids,
             finish,
             cached_tokens,
             snap_mode,
             passes,
+            guesses_offered: 0,
+            guesses_accepted: 0,
         })
     }
 }
