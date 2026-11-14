@@ -4,7 +4,7 @@ This file is the single resumable record of the port. It is written so the
 orchestrator can continue from it alone. Update it at every merge, decision
 and measurement.
 
-Last updated: 2026-11-14 08:30 JST (steps 1, 2 and 4 merged; step 3 score running; KV codec, engine-on-Metal and tokenizer in progress).
+Last updated: 2026-11-14 10:10 JST (steps 1, 2, 4 done; main model validated with the plain int8 cache; the two real gate runs are in progress; step 5 units B, C, D, I merged; generation machinery and product layer in progress).
 
 ## Goal and release criteria
 
@@ -41,21 +41,34 @@ Release criteria (all must hold):
    feature choice, portable fallback), bit-identical, model memory-mapped.
    **Done (PR #4).** Crate `crates/yskn-engine`; design in DECISIONS D10.
 3. Validate the main model with `score_windows` (gate for everything later).
-   **Running, and its meaning changed (finding F1 below).** PR #6 merged
-   the layer-major engine model, `score_windows` and `verify_model`
-   (four CPU configurations agree bit for bit over 24 real rows). The
-   full 20-window run with the plain int8 cache started 2026-11-14 07:46
-   JST from `.work/runs/` (binary of commit 09266e0 = b9bd460 after
-   rebase); output `.work/runs/score_int8_09266e0.{out,err,json,exit}`;
-   about 7.3 minutes per window, due about 10:13 JST. Windows 0 and 1:
-   NLL sums 508.71858607572784 and 528.80243264123135.
-   The gate itself is: `Int8Profile` cache vs 2.075900 and `Kv5` cache vs
-   2.0759369, both within 0.001 (needs the KV codec, units B to D below).
+   **Main model validated; the two published configurations are running.**
+   - Plain int8 cache (D4), all 20 windows on the Metal backend:
+     perplexity **2.075440** over 20,460 positions (M4). Upstream's "int8"
+     record is 2.075900 for profile-requantized rows (finding F1), so the
+     difference of 0.00046 is inside the 0.001 tolerance and has the
+     expected sign (no 5-bit quantization of keys and values).
+   - The engine equals the scalar reference on real weights for the first
+     2 rows, and six CPU and Metal configurations agree over 24 rows (M6).
+   - **Running since 2026-11-14 10:05 JST** (`.work/runs/gate_kv.sh`,
+     binaries `.work/runs/05b/` built from 18dd49a = main 0f91f2e):
+     `verify_model --kv int8-profile`, `verify_model --kv kv5`, then
+     `score_windows --kv int8-profile --backend metal --rows-per-pass 16`
+     and the same with `--kv kv5`. Outputs
+     `.work/runs/verify_{int8-profile,kv5}.log` and
+     `.work/runs/score_{int8-profile,kv5}_metal.{out,err,json,exit}`.
+     Gate: 2.075900 and 2.0759369, each within 0.001.
 4. Backend decision by measurement (NEON vs Metal at 1, 2, 4, 8, 16 rows).
-   **Done: D12, Metal** (PR #8 merged, crate `crates/yskn-metal`,
-   DECISIONS D12). Engine integration is brief `04c` (in progress).
+   **Done: D12, Metal** (PR #8). The engine's `Model` runs on it (PR #13,
+   D14); the Metal code now lives in `crates/yskn-engine/src/metal.rs`.
 5. Draft model, speculation loop, prompt snapshots, long-prompt prefill, KV5.
+   **In progress**: see the unit table under "Step 5 plan".
 6. Product binary: terminal chat, OpenAI-compatible server, benchmark.
+   **In progress.** `crates/yskn-text` merged (PR #12): tokenizer, chat
+   template, stream decoding, tool helpers; 153 goldens generated from
+   upstream's Python, all matching id for id. Brief `06d` (Sol, worktree
+   `.work/wt/06d`, branch `feat/06d-cli`, crate `crates/yskn-cli`, binary
+   `yskn`): chat logic and the hyper-based API server ported from
+   upstream's Python and its tests, against an engine trait with a stub.
 7. Optimization to the machine limit (stop after five attempts under 2%).
 8. Other Macs: feature detection, forced fallbacks, memory check at start.
 9. SwiftUI chat app (only after the engine passes every criterion; tag first).
@@ -108,18 +121,30 @@ Units (B, C, I can run in parallel; F before D because both touch `model.rs`):
 
 | Unit | What | Status |
 |---|---|---|
-| A | Survey of the real `kvq_u5.bin`, draft and `.shead` headers | folded into B/C and I |
-| B | `yskn-ref/src/kv_profile.rs`: KVQP reader, fully validated | brief `05a`, Sol, in progress |
-| C | `yskn-ref/src/kv_codec.rs`: row codec ported from `src/kvq_fast.cuh`, `kvq_vit2.cuh`, `kvx_codec.cuh` | brief `05a`, Sol, in progress |
-| D | Cache modes in `attention.rs` and model load; real scoring in each mode | after C and F |
-| E | KV codec fast path (CPU threads first, GPU if prefill needs it) | after D |
-| F | Main-model hooks: residual capture after layers 5, 19, 33, 47, 61; head rows All/Last; snapshot/restore | not started |
-| G | Speculation loop over Verifier and Proposer traits; lossless tests with oracle, random, adversarial proposers | not started |
-| H | Engine `run_provisional`/`commit` without full replay; equals reference replay bit for bit | not started |
-| I | Draft model reference (chapter 07) and `.shead` | not started |
-| J | Draft fast path | after I |
-| K | Prompt reuse modes (reset, live prefix, snapshot) | after F |
-| L | Long-prompt prefill: bounded memory, head on last row only, large-M kernel | after H |
+| A | Survey of the real `kvq_u5.bin`, draft and `.shead` headers | done inside B/C and I (facts in D13, D15 and the spec) |
+| B | `yskn-ref/src/kv_profile.rs`: KVQP reader, fully validated | merged, PR #11 (Sol; Astra review) |
+| C | `yskn-ref/src/kv_codec.rs`: row codec ported from the source | merged, PR #11 |
+| D | Cache modes `Int8`, `Int8Profile`, `Kv5` in the reference attention, model load and the engine | merged, PR #14 (Sol; Astra reviewed the reference against the source, Opus the engine wiring); real scoring running |
+| E | KV codec fast path | not started; the codec runs inside the engine's parallel row preparation, measure first |
+| F | Main-model hooks: residual capture after layers 5, 19, 33, 47, 61; snapshot/restore; head rows | snapshot and head rows are in brief `05e`; residual capture is the next brief |
+| G | Speculation loop over Verifier and Proposer traits, lossless tests | brief `05e` (Sol), worktree `.work/wt/05e`, branch `feat/05e-speculation`, in progress |
+| H | Engine `run_provisional`/`commit` without cloning the attention cache | brief `05e`, in progress |
+| I | Draft model reference (chapter 07) and `.shead` | merged, PR #15, D15 (Sol; Astra review against the source) |
+| J | Draft fast path | after F and I |
+| K | Prompt reuse modes (reset, live prefix, snapshot) | after `05e` |
+| L | Long-prompt prefill: bounded memory, head on last row only, large-M kernel | after `05e` |
+
+Feature-capture contract for the draft model (confirmed by Astra against
+the source): for each committed input position, the residual right after
+the MLP down projection's residual add of zero-based layers 5, 19, 33, 47,
+61; the value is `bf(old_residual + bf(down_projection))` expanded to
+binary32; one block of 5 × 5120 per position. Before a proposal the
+draft's ring holds committed input positions 0..p (frontier excluded);
+after a verification the old frontier row and the accepted rows are
+pushed, never rejected rows or the new frontier; flush at the end.
+Sources: `src/engine35.cpp:798-799,830-833,1650,1851`,
+`src/q35_kernels.cu:1437-1444`, `src/q35_bdraft.cu:249-252,490-499`,
+`src/specx.cpp:435-437,464`.
 
 Policy to be decided by measurement, not copied from the RTX 5090 (decision
 D15 to come): number of drafted rows K (each verified row costs about 35 ms
@@ -167,12 +192,23 @@ measured cost model, pick the K and sources that minimise ms per token.
   each merge to main.
 - Codex workers sometimes cannot write `.git` (sandbox). Briefs ask them to
   leave work staged; the orchestrator commits after running the proof.
+- A Codex task can write only under the directory the orchestrator's
+  session is in when it launches the task: launch from the repository
+  root. Codex tasks have no network and no GPU.
+- Force-pushing is refused by the harness. Never rebase a branch after
+  pushing it: merge main into it, or push the rebased work under a new
+  branch name and open a new pull request (PR #10 became #12 this way).
+- Long real-model runs are started with `nohup` from `.work/runs/` and
+  watched with a background wait on their `.exit` file.
 - Parallel workers get their own git worktree under `.work/wt/`.
 
 ## Decisions
 
-D1 to D10 are in [DECISIONS.md](DECISIONS.md) (D10: mapped CPU kernel
-design, by Astra). Owner-decided gaps:
+D1 to D15 are in [DECISIONS.md](DECISIONS.md): D10 mapped CPU kernel,
+D11 layer-major engine model, D12 Metal backend, D13 KV cache modes and
+codec, D14 engine on Metal with parallel recurrent heads, D15 draft model
+math and tie rule. D16 (generation state and speculation loop) is being
+written in brief `05e`. Owner-decided gaps:
 
 - **D7** exp2(t) = portable exp of the binary32 product t × ln 2
   (bits 0x3f317218). Reason: upstream calls `exp2f(x * log2e)` and has no
@@ -256,12 +292,27 @@ Orchestrator decisions:
 | 2026-11-14 | 3 | PR #6: layer-major engine `Model`, shared scoring, `verify_model` (Sol; Opus review approve with 6 nits, carried into brief `04c`). | `cargo run --release -p yskn-engine --example verify_model -- MODEL_FOLDER tools/quality/windows_own_thinking.json` (PASS) |
 | 2026-11-14 | 4 | PR #8: `crates/yskn-metal` (Opus; Sol review found a table-cache key bug and a racy duplicate table write, both fixed and re-approved). Metal tests also run on CI's paravirtual GPU (448 threads per threadgroup limit; default 128 works). | `cargo test -p yskn-metal --release`; M2 below |
 
+| 2026-11-14 | 5 B/C | PR #11: KV profile reader and row codec (Sol). Astra compared it with the CUDA source statement by statement: approve. Real profile: 128 groups, all 5-bit mode 0, 9 multipliers, 16 key and 13 value sides packable. | `cargo run --release -p yskn-ref --example kv_profile_info -- MODEL_FOLDER/kvq_u5.bin` |
+| 2026-11-14 | 3/4 | PR #13: engine `Model` on Metal with grouped dispatch, recurrent heads in parallel, review nits (Opus; Sol review approve). | M5, M6 below |
+| 2026-11-14 | 6 | PR #12: `crates/yskn-text` (Sol; two Opus reviews; final goldens by Luna). | `YSKN_MODEL_DIR=MODEL_FOLDER cargo test -p yskn-text --release` (127 model-backed and 26 model-free goldens pass); regenerating goldens with upstream's Python is byte-identical |
+| 2026-11-14 | 5 D | PR #14: KV cache modes in reference and engine (Sol; Astra and Opus reviews; fixes for result-file identification and test strength). | `cargo test --workspace --release` (Metal cases ran) |
+| 2026-11-14 | 5 I | PR #15: draft model reference and reduced head (Sol; Astra review against the source: approve, two test gaps carried forward). | `YSKN_MODEL_DIR=MODEL_FOLDER cargo test -p yskn-ref --release draft`; one scalar `propose` on the real files takes about 90 s |
+| 2026-11-14 | 3 | Plain int8 perplexity 2.075440 (M4): main model validated. | M4 below |
+
 ## Known debts
 
-- Pool test nit from the Sol review of PR #4: add a case where a job fails
-  with i64 overflow (row layout, bits 6, N=96, K=264704, table all 1.0,
-  activations all -128, scales all i32::MIN) and the same engine then
-  succeeds on a zero input.
+- Draft tests (from Astra's review of PR #15): a rank-projection test with
+  off-diagonal entries and rank different from hidden width; a synthetic
+  draft with query heads different from KV heads (real: 32 and 8, mapping
+  head / 4); a rotary expectation at a non-zero position; an attention test
+  with non-zero queries and keys; head scales other than 1;
+  source-derived expectations for the correction chain.
+- The KV codec's tie-path equality with the source is argued from the code,
+  not proven by a test with source-derived expected values (none exist).
+- The bandwidth ceiling for this chip is not measured yet (see Environment).
+- D12 in DECISIONS.md and M2 below were measured before two review fixes to
+  the Metal shader; re-measure on a quiet machine during step 7.
+
 - `MappedModel::open` is an `unsafe fn` (file must not change while mapped).
   The product binary needs a safe wrapper that documents this.
 
@@ -321,6 +372,42 @@ compute-bound by a factor of about 20. The decode is scalar (one table
 lookup per pair of weights, bounds-checked) and each added row costs about
 40 ms. CPU features present: NEON, dotprod, i8mm, SME, SME2
 (`sysctl hw.optional.arm`).
+
+### M4: perplexity, plain int8 cache, Metal backend (2026-11-14)
+
+Command (run alone on the model, started 08:50 JST, binaries of commit
+1f7c378 whose content is main 61c8b03):
+`./score_windows ~/models/qwen38-speed tools/quality/windows_own_thinking.json --backend metal --rows-per-pass 16 --json score_int8_metal.json`
+(the example is `cargo run --release -p yskn-engine --example score_windows`).
+
+Result: scored_positions 20460, mean negative log-likelihood
+0.730173179294, **perplexity 2.075439999788**. Upstream: 2.075899908604469
+("int8", profile-requantized), 2.0759369466709248 (KV5), 2.065188190523882
+(original model). Per-window NLL sums are in
+`.work/runs/score_int8_metal.err`; windows 0 to 6 equal, to all 17 digits,
+the sums of the earlier CPU-backend run that was stopped after 7 windows
+(508.71858607572784, 528.80243264123135, 586.94446558963762,
+771.03391286075657, 1075.0259708577341, 903.68640769976059,
+1080.9851932527472). About 211 to 265 s per window with other work
+running on the CPU.
+
+### M5: where a 16-row pass of the whole model goes, Metal backend (2026-11-14)
+
+From the M4 run's stderr at context about 190, seconds per pass: total
+1.17, kernel 0.69, recurrence 0.22, attention 0.14, rest 0.11. Before
+PR #13 (CPU kernel, sequential recurrent heads, M3): 2.86, 1.20, 1.39,
+0.14, 0.12.
+
+### M6: engine against the scalar reference on real weights (2026-11-14)
+
+- `./verify_model ~/models/qwen38-speed tools/quality/windows_own_thinking.json`:
+  all 24 logit rows bit-identical across four CPU configurations (dotprod
+  10 threads at 16 and 1 rows per pass, portable at 5, dotprod 1 thread at
+  7) and two Metal configurations (16 and 1 rows per pass).
+- `./dump_logits ~/models/qwen38-speed tools/quality/windows_own_thinking.json 2 reference-2.json`
+  (pure scalar reference, alone): 273.39 s, 10.23 GB resident. Then
+  `./verify_model ... --reference reference-2.json`: the first 2 logit rows
+  equal the scalar reference.
 
 ## Blocked on the owner
 
