@@ -31,7 +31,11 @@ sections ("Round 2") also report the real model.
   `maxBufferLength = 14,302,248,960`. The 10.3 GB model file fits. The first
   round tried no-copy over a read-only mapping on the synthetic file only;
   the real file is accepted the same way (D12, D14), and round two (D22)
-  measured with it.
+  measured with it. Since D23 a mapping longer than `maxBufferLength` is
+  wrapped in several no-copy buffers instead (each starts at the page of the
+  first code stream it holds and is as long as the limit allows; a stream is
+  never split), still without copying; only a single stream longer than the
+  limit is an error. `MetalEngine::with_limits` forces a small limit in tests.
 - **Threads.** One SIMD lane computes one output row: a threadgroup is 32
   consecutive rows × `splits` SIMD groups (default 4 → 128 threads). SIMD
   group `k` takes sequences `k, k+splits, …` of those rows. With the `warp`
@@ -42,7 +46,11 @@ sections ("Round 2") also report the real model.
   threadgroup memory, widened to 4,096 `short2` (16 KB). Each entry is
   written by one thread: the stride is the whole 32 × `splits` threadgroup
   (`uint2 [[threads_per_threadgroup]]`; a scalar declaration is only the
-  width, 32). The same memory is reused for the final reduction. The host
+  width, 32). When a device or pipeline allows fewer than 32 × `splits`
+  threads (448 on CI's paravirtual GPU), a call uses
+  `maxTotalThreadsPerThreadgroup / 32` SIMD groups instead (D23); the sums
+  are exact for any count. `MetalEngine::new` requires SIMD width 32 (one lane
+  per row) and 16 KB of threadgroup memory, and fails otherwise. The same memory is reused for the final reduction. The host
   caches one table buffer per (mapping, lookup-table offset), because
   tensors may share a code stream but not a table.
 - **Decode.** 32 steps of `bits` bits are exactly `bits` 32-bit words. So
@@ -85,7 +93,9 @@ sections ("Round 2") also report the real model.
 - **CPU share (D22).** `weighted_sums_split` gives the CPU kernel the last
   share(M)·N rows of each matrix, rounded down to the 32-row tile and leaving
   the GPU at least one tile (no CPU rows below N = 64), from a constant
-  table or `YSKN_METAL_CPU_SHARE` (read like `YSKN_METAL_MAC`). It commits
+  table or `YSKN_METAL_CPU_SHARE` (read like `YSKN_METAL_MAC`). Since D23 the
+  table (`CpuShare::Auto`) applies only on the device it was measured on, an
+  Apple M5 with 10 CPU workers; anywhere else `Auto` is GPU-only. It commits
   the GPU part, runs the CPU part, waits and interleaves the rows. Every
   commit returns a guard that waits for completion when dropped, so an
   error or a panic in the CPU part cannot leave GPU work reading the reused

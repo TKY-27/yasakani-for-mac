@@ -2787,3 +2787,170 @@ the differences between rounds of the same configuration (up to 30 %) are
 larger than the effect, so no whole-pass gain is claimed there; the
 kernel-only measurements (items 1 and 2) are the evidence. These numbers
 need the quiet-machine repetition.
+
+## D23 — Other Macs: feature detection, forced-off fallbacks, start-up checks (brief 10a)
+
+Requirement: Apple Silicon and macOS 26 or later, run-time feature detection,
+forced-off fallbacks that are tested, and a start-up memory check that says
+what does not fit. Every fast path is bit-identical to the scalar reference,
+so a fallback can only cost speed; what this decision adds is that on a
+machine unlike the M5 the program either runs on a fallback or stops with a
+message naming the requirement and the value found.
+
+### Inventory
+
+"Before" is the state at `21291a5`; "now" is this branch.
+
+| Dependency | Where | Detected at run time | When it fails | Test |
+|---|---|---|---|---|
+| NEON | CPU kernel `neon`, CPU stages (`cpu_stages/`), draft float stages (`draft_math.rs`) | `is_aarch64_feature_detected!("neon")`; the draft's float stages follow the kernel (portable → scalar) | before and now: next variant / reference stages; a forced unavailable kernel is an error | product: portable kernel, reference stages; engine: every variant vs the oracle (D10, D20) |
+| dotprod (SDOT) | CPU kernel `dotprod` | `is_aarch64_feature_detected!("dotprod")` | `Kernel::fastest` takes NEON, then portable | as above |
+| i8mm, SME, FP16 arithmetic, other CPU features | not used | — | — | — (grep: only `neon` and `dotprod` are enabled) |
+| Core counts and types | default CPU workers (`Engine::default_threads`) | before: `min(available_parallelism, 10)`, ten assumed; now: Σ `hw.perflevel{i}.physicalcpu` for i < `hw.nperflevels`, else `hw.physicalcpu`, else `available_parallelism`, else 1; never above `available_parallelism` | before: a 16-core Mac got 10 workers; now: one per physical core (10 on the M5, unchanged) | unit test with missing names (`machine.rs`); product: one thread |
+| Ten workers in the CPU share table | `CPU_SHARE` in `metal.rs` | before: none (applied everywhere); now: applies only to device "Apple M5" with 10 CPU workers | before: another CPU could make the GPU wait (D22); now: GPU only | unit test `share_table_applies_only_to_the_calibrated_machine`; product: share off and 0.5 |
+| Metal device | `MetalEngine::new` | `MTLCreateSystemDefaultDevice` | before: explicit constructors error; `Model::load`/product default fell to CPU only when no device | product: unit test of the selection with a failing probe |
+| Shader compilation | `newLibraryWithSource` with `MTLMathMode::Safe` (macOS 15 API); language version not pinned (the OS's newest) | compile result | before: product load failed; now: default selection falls back to the CPU with one stderr line; explicit Metal is an error | same unit test (the probe returns the compile error) |
+| SIMD width 32 | the shader maps one lane to one row of a 32-row tile | before: assumed; now: `threadExecutionWidth` of the compiled empty kernel must be 32 | before: undefined (wrong rows); now: `MetalEngine::new` fails, so the default selection uses the CPU | not forceable here (every Apple GPU reports 32); covered by the selection test's failing probe |
+| Threadgroup memory 16 KB | the shader's `shared_memory[2048]` (table, then reduction) | before: assumed; now: `maxThreadgroupMemoryLength >= 16384` | as above | as above |
+| Threads per threadgroup | 32 × `splits` (default 4 → 128) | before: an error when `maxTotalThreadsPerThreadgroup` < 32 × splits; now: a call uses `min(splits, limit / 32)` SIMD groups; below 32 an error | before: the 448-thread paravirtual GPU failed `set_splits(16+)` (tests skipped them) | `threadgroup_limit_below_the_default_chooses_fewer_simd_groups` (limits 127, 96, 64, 32, and 31 = error); the split-count test no longer skips |
+| `half`, `long`, SIMD-group attributes, function constants | `linear.metal` | compile result (above) | as shader compilation | Metal tests on the M5 |
+| `maxBufferLength` vs the 10.3 GB file | one no-copy buffer per mapping | before: an error when the file was larger; now: several no-copy windows, each starting at the page of the stream it was created for; only a single stream above the limit is an error | before: the model could not run on Metal on such a device | `mapping_larger_than_the_buffer_limit_is_wrapped_in_several_buffers` (limit = longest stream + 1 page, below the file size; and one page = error) |
+| Shared storage, unified memory | no-copy buffers over the read-only mapping (`StorageModeShared`) | — (Apple silicon GPUs are unified) | — | architecture check refuses everything else |
+| GPU working set | the 10 GB buffer referenced by every command buffer | not checked; `info` reports `recommendedMaxWorkingSetSize` | unknown on smaller Macs (here: 19,069,665,280 bytes recommended on 24 GB; not measured elsewhere) | not testable here |
+| Memory size | start-up estimate (D19) | `sysctl -n hw.memsize`, Foundation fallback | before: refused with needed/physical; now: also every part, what `--draft none`, smaller `--ctx` and `--kv int8` each save, and the largest fitting choices | `published_model_memory_table_matches_the_readme`, existing memory tests |
+| macOS version | APIs used: `mathMode` (macOS 15), `sysctlbyname` names `hw.nperflevels`/`hw.perflevel*` (macOS 12), `kern.osproductversion` (10.13.4); nothing newer than 26 is used | before: not checked; now: `kern.osproductversion` major ≥ 26 (16.x read as 26), unreadable = error | before: whatever failed first | `platform_check_requires_apple_silicon_and_macos_26_and_names_the_value_found` |
+| Architecture | everything | before: compile-time cfg only; now: the product refuses anything but macOS/aarch64, naming what it found (an x86_64 build under Rosetta included) | | same test |
+| Page size | no-copy buffers (`getpagesize`), memmap2 | at run time | — (16 KB here; any power of two works) | the buffer-limit test uses the run-time page size |
+| CPU share table | `CPU_SHARE` (M5, 10 workers, D22) | now: device name and worker count | now: off elsewhere; `info` says so and how to calibrate | as above |
+| Draft cost table | `CostModel::apple_m5_neural` (D21) | not detected: kept on every chip because it only changes depth, never output | slower or faster depth choices only | `info` field `draft_cost_table` names its origin and, off the M5, says it only affects speed |
+| Model folder | manifest, weights, profile, draft, tokenizer | before: the first missing file failed with an OS error, sometimes without its name; now: every missing file the configuration needs, with the option that needs it, before anything is opened | | `incomplete_model_folder_lists_every_missing_file_and_the_option_needing_it` |
+
+### Decisions
+
+- **Machine facts** (`yskn_engine::machine`): read-only `sysctlbyname`
+  queries (a null new-value pointer, so nothing can be set); a missing name
+  is `None`. `Machine::default_threads` sums the physical cores of every
+  performance level. On the M5 that is 4 + 6 = 10, the count D10 measured
+  best, so nothing changes here; D10's "min(available CPUs, 10)" is
+  superseded. More workers on larger chips is an untested assumption.
+- **Explicit choices in the library.** `Model::set_cpu_stages(CpuStages)`
+  and `Model::set_metal_options` / `FastDraft::set_metal_options` take the
+  CPU stages, Metal arithmetic and CPU share explicitly; explicit
+  constructors still read no option from the environment except D20's
+  process-wide `YSKN_CPU_STAGES` default, which the explicit setter
+  overrides. The setter is refused while a provisional pass is pending,
+  because its working state was prepared for the previous choice.
+- **CPU share off the calibrated machine.** `CpuShare::Auto` uses the D22
+  table only when the Metal device is "Apple M5" and the CPU pool has 10
+  workers: a CPU slower than calibrated makes the GPU wait, and no other chip
+  was measured, so no numbers are invented for them. `--cpu-share F` sets a
+  share measured with `bench_metal --shares`. Limitation: the name does not
+  distinguish M5 variants with fewer GPU cores.
+- **Draft cost table** stays everywhere: it only decides how many guesses are
+  offered, which cannot change output. `info` says where it was measured.
+- **Metal limits.** Several no-copy windows instead of one buffer when the
+  mapping exceeds `maxBufferLength`; fewer SIMD groups when the threadgroup
+  limit is low; SIMD width 32 and 16 KB threadgroup memory checked when the
+  engine is created. `MetalEngine::with_limits(max_buffer_length,
+  max_threads_per_threadgroup)` lowers the device's limits for tests; it is
+  not reachable from the product or the environment.
+- **Backend selection in the product.** Without `--backend`/`YSKN_BACKEND`,
+  `yskn` creates a `MetalEngine` once as a probe (device, shader, features).
+  If that fails it prints one line on stderr, "yskn: Metal is unavailable
+  (REASON); using the CPU backend, whose compressed projections take about 6
+  times as long (646 instead of 111 ms per pass at one row on an Apple M5,
+  D12). --backend metal makes this an error.", and runs on the CPU. An
+  explicit Metal backend that does not work is an error. The probe compiles
+  the shader library once more than before at start-up.
+- **One interface for the product: options with environment fallbacks.**
+  `--backend`/`YSKN_BACKEND`, `--kernel`/`YSKN_KERNEL`,
+  `--cpu-stages`/`YSKN_CPU_STAGES`, `--metal-mac`/`YSKN_METAL_MAC`,
+  `--cpu-share`/`YSKN_METAL_CPU_SHARE`, `--threads`. The variable names are
+  the ones the engine's examples already read, so a command line copied
+  from D20–D22 means the same to `yskn`. The option wins; both are parsed,
+  so an invalid value is an error wherever it comes from, naming its source.
+  `cli.rs` is the only place that reads them; `RealEngineConfig` carries
+  them (`backend`, `kernel`, `cpu_stages`, `metal`, `threads`) and the
+  library receives them through explicit constructors and setters. Before,
+  `RealEngine::load` itself read `YSKN_KERNEL` and `YSKN_BACKEND`, and
+  ignored `YSKN_METAL_MAC`/`YSKN_METAL_CPU_SHARE`. `yskn info` shows
+  `backend`, `device`, `kernel`, `cpu_stages`, `metal_mac`, `cpu_share`,
+  `threads`, `backend_fallback`, `draft_cost_table` and `machine` (chip,
+  macOS, cores per level, page size, `maxBufferLength`, recommended working
+  set). Help and `crates/yskn-cli/README.md` list the switches.
+- **Start-up checks** run in `RealEngineConfig::validate` (called by `info`,
+  every load and, before the tokenizer, by the terminal/server runner):
+  architecture, macOS version, option values, model-folder completeness;
+  then the memory estimate in `RealEngine::load`. All read facts only and
+  fail closed. 16.x is read as 26 because macOS 26 can report 16.x to
+  programs built with an older SDK (as macOS 11 reported 10.16); this
+  compatibility behaviour was not observed here.
+- **Memory message.** `MemoryFacts` (header-derived sizes) now prices any
+  context and draft choice, so the refusal lists the shortfall, every part
+  of the estimate, the saving of `--draft none`, of each power-of-two
+  `--ctx` down to 4096 and of `--kv int8`, and the largest fitting context
+  for each draft/cache choice, or that nothing fits. The formula is D19's,
+  unchanged; for the published defaults it still gives 20,435,462,454
+  bytes. `info` reports `memory.fits`, the message (`memory.check`) and the
+  facts. The table for 16, 24, 32 and 48 GB is in
+  `crates/yskn-cli/README.md` ("What a smaller Mac can run"); a 16 GB Mac
+  cannot run the neural draft at any context and runs the default context
+  only with `--draft none --kv int8`.
+
+### Tested by forcing
+
+- Product, synthetic model, fast draft `both` with the adaptive depth, greedy
+  and seeded, each against the default configuration and the scalar loop:
+  CPU backend; portable kernel; reference CPU stages; integer Metal
+  arithmetic; CPU share off; CPU share 0.5 (CPU rows on any device); one
+  thread (`forced_off_switches_give_the_default_tokens_greedy_and_seeded`),
+  each also checking what `info` reports.
+- Switch parsing through the binary: options, environment, precedence,
+  every invalid value (`product_switches_are_validated_and_info_shows_the_effective_choices`).
+- Metal fallback and explicit-Metal error with an injected failing probe
+  (`platform::tests`); calibrated-machine test of the share table.
+- Metal buffer and threadgroup limits forced through `with_limits` (above).
+- Thread defaults with missing sysctl names (`machine::tests`).
+- Platform check with injected architecture/OS/version values; folder check
+  by deleting files; memory table and messages for 8, 16 and 24 GB from the
+  published model's facts.
+- Explicit CPU-stage choice in the engine against the scalar reference
+  through a provisional pass and partial commit
+  (`explicit_cpu_stage_choice_overrides_the_process_default_with_identical_bits`).
+
+### Not tested: only one machine exists
+
+- Other chips' GPUs (M1–M4, Pro/Max/Ultra, other M5 variants): SIMD width,
+  threadgroup limits, `maxBufferLength` and shader compilation are checked
+  at run time, but no other GPU was run. The several-buffer path ran only
+  with a forced limit; no device with a real limit below 10.3 GB was seen.
+- macOS 26 itself: only macOS 27.2.1 was available. The version check, the
+  16.x reading and the API inventory are by inspection and unit tests.
+- 16, 32 and 48 GB Macs: the memory table is the accounting's prediction,
+  not a run. GPU residency of the 10 GB buffer under a 16 GB Mac's working
+  set limit is unknown.
+- CPU share and worker counts on other core layouts: no calibration exists;
+  `Auto` is off there by design.
+- CI: `.github/workflows/rust-reference.yml` runs on `macos-15`, which the
+  new macOS check refuses, so the product tests that load a model fail
+  there until the runner is `macos-26` or later. This brief may not change
+  `.github/`.
+
+### Real model (2026-11-14, macOS 27.2.1, Apple M5, 24 GB)
+
+`yskn info --model-dir $HOME/models/qwen38-speed` reports the facts used by
+the README table (`memory.facts`), `needed_bytes` 20,435,462,454 for the
+defaults, Metal "Apple M5" with `maxBufferLength` 14,302,248,960 (one code
+buffer), CPU share "auto: calibrated table (Apple M5, 10 CPU workers)", 10
+threads from 4 + 6 cores. `yskn selfcheck --model-dir $HOME/models/qwen38-speed`,
+model lock held around each run, all `YSKN_*` variables unset, shared machine
+(load 13.8–17.9):
+
+| Configuration | short-answer | thinking | plain-text | Wall |
+|---|---|---|---|---:|
+| defaults | PASS (3) | PASS (160) | PASS (32) | 41 s |
+| `--cpu-share off` | PASS | PASS | PASS | 38 s |
+| `--metal-mac integer` | PASS | PASS | PASS | 44 s |
+| `--cpu-stages reference` | PASS | PASS | PASS | 46 s |
+
+The CPU backend was not run on the real model (too slow for a self-check).
