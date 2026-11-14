@@ -203,74 +203,89 @@ fn shapes() -> Vec<(u64, Shape, usize)> {
     ]
 }
 
-#[test]
-fn rings_proposals_and_top16_match_reference_on_every_backend_and_thread_count() {
-    for (seed, shape, total) in shapes() {
-        let folder = Folder::new(seed, &shape);
-        let width = shape.slots * shape.hidden;
-        let rows: Vec<Vec<f32>> = (0..total)
-            .map(|r| fixture::features_width(r, width))
-            .collect();
-        // Uneven chunks: single rows, small batches, and one batch above the ring.
-        let mut chunks = vec![1, 3, 1, shape.window + 1, 2];
-        chunks.push(total - chunks.iter().sum::<usize>());
-        // The scalar reference runs once per shape; every configuration replays it.
-        let mut reference = Draft::load_with_options(&folder.0, options(&shape)).unwrap();
-        let checkpoints = [0, 2, chunks.len()];
-        let mut rings = Vec::new();
-        let mut results = vec![expected(&reference, &shape)];
-        let mut start = 0;
-        for (i, &n) in chunks.iter().enumerate() {
-            reference
-                .push_context_rows(start, &rows[start..start + n].concat())
-                .unwrap();
-            start += n;
-            rings.push(reference.snapshot());
-            if checkpoints.contains(&(i + 1)) {
-                results.push(expected(&reference, &shape));
-            }
-        }
-        drop(reference);
-        for (name, kernel, threads, backend) in configurations() {
-            let mut fast = fast(&folder, &shape, kernel, threads, backend);
-            assert_eq!(fast.backend(), backend);
-            let context = format!("seed {seed} {name}");
-            let mut results = results.iter();
-            compare_proposals(
-                &mut fast,
-                results.next().unwrap(),
-                &shape,
-                &format!("{context} empty ring"),
-            );
-            let mut start = 0;
-            for (i, &n) in chunks.iter().enumerate() {
-                let batch = &rows[start..start + n];
-                let flat: Vec<f32> = batch.concat();
-                match i % 3 {
-                    0 if n == 1 => fast
-                        .push_context(start, ContextFeatures { values: &batch[0] })
-                        .unwrap(),
-                    1 => fast.push_context_rows(start, &flat).unwrap(),
-                    _ => {
-                        let slices: Vec<&[f32]> = batch.iter().map(Vec::as_slice).collect();
-                        fast.push_rows(start, &slices).unwrap()
-                    }
-                }
-                start += n;
-                assert_eq!(
-                    fast.snapshot(),
-                    rings[i],
-                    "{context} ring after {start} rows"
-                );
-                if checkpoints.contains(&(i + 1)) {
-                    let context = format!("{context} position {start}");
-                    compare_proposals(&mut fast, results.next().unwrap(), &shape, &context);
-                }
-            }
-            assert!(start > shape.window, "ring has wrapped");
-            eprintln!("{context}: {total} rows, rings/proposals/top16/block bits equal");
+fn check_rings(seed: u64, shape: Shape, total: usize) {
+    let folder = Folder::new(seed, &shape);
+    let width = shape.slots * shape.hidden;
+    let rows: Vec<Vec<f32>> = (0..total)
+        .map(|r| fixture::features_width(r, width))
+        .collect();
+    // Uneven chunks: single rows, small batches, and one batch above the ring.
+    let mut chunks = vec![1, 3, 1, shape.window + 1, 2];
+    chunks.push(total - chunks.iter().sum::<usize>());
+    // The scalar reference runs once per shape; every configuration replays it.
+    let mut reference = Draft::load_with_options(&folder.0, options(&shape)).unwrap();
+    let checkpoints = [0, 2, chunks.len()];
+    let mut rings = Vec::new();
+    let mut results = vec![expected(&reference, &shape)];
+    let mut start = 0;
+    for (i, &n) in chunks.iter().enumerate() {
+        reference
+            .push_context_rows(start, &rows[start..start + n].concat())
+            .unwrap();
+        start += n;
+        rings.push(reference.snapshot());
+        if checkpoints.contains(&(i + 1)) {
+            results.push(expected(&reference, &shape));
         }
     }
+    drop(reference);
+    for (name, kernel, threads, backend) in configurations() {
+        let mut fast = fast(&folder, &shape, kernel, threads, backend);
+        assert_eq!(fast.backend(), backend);
+        let context = format!("seed {seed} {name}");
+        let mut results = results.iter();
+        compare_proposals(
+            &mut fast,
+            results.next().unwrap(),
+            &shape,
+            &format!("{context} empty ring"),
+        );
+        let mut start = 0;
+        for (i, &n) in chunks.iter().enumerate() {
+            let batch = &rows[start..start + n];
+            let flat: Vec<f32> = batch.concat();
+            match i % 3 {
+                0 if n == 1 => fast
+                    .push_context(start, ContextFeatures { values: &batch[0] })
+                    .unwrap(),
+                1 => fast.push_context_rows(start, &flat).unwrap(),
+                _ => {
+                    let slices: Vec<&[f32]> = batch.iter().map(Vec::as_slice).collect();
+                    fast.push_rows(start, &slices).unwrap()
+                }
+            }
+            start += n;
+            assert_eq!(
+                fast.snapshot(),
+                rings[i],
+                "{context} ring after {start} rows"
+            );
+            if checkpoints.contains(&(i + 1)) {
+                let context = format!("{context} position {start}");
+                compare_proposals(&mut fast, results.next().unwrap(), &shape, &context);
+            }
+        }
+        assert!(start > shape.window, "ring has wrapped");
+        eprintln!("{context}: {total} rows, rings/proposals/top16/block bits equal");
+    }
+}
+
+#[test]
+fn equal_heads_twice_wrapped_match_reference_on_every_backend_and_thread_count() {
+    let (seed, shape, total) = shapes().remove(0);
+    check_rings(seed, shape, total);
+}
+
+#[test]
+fn grouped_heads_wide_hidden_and_partial_vocab_match_reference_on_every_backend_and_thread_count() {
+    let (seed, shape, total) = shapes().remove(1);
+    check_rings(seed, shape, total);
+}
+
+#[test]
+fn large_ring_and_push_above_256_rows_match_reference_on_every_backend_and_thread_count() {
+    let (seed, shape, total) = shapes().remove(2);
+    check_rings(seed, shape, total);
 }
 
 #[test]
@@ -284,33 +299,47 @@ fn failed_rows_snapshot_restore_and_reset_match_reference() {
     nan[17] = f32::NAN;
     let mut not_bf16 = fixture::features_width(9, 2560);
     not_bf16[3] = 1.0 + f32::EPSILON;
-    for (name, kernel, threads, backend) in configurations() {
-        for (label, bad) in [("nan", &nan), ("not bf16", &not_bf16)] {
-            let mut reference = Draft::load_with_options(&folder.0, options(&shape)).unwrap();
+    for (label, bad) in [("nan", &nan), ("not bf16", &not_bf16)] {
+        let mut reference = Draft::load_with_options(&folder.0, options(&shape)).unwrap();
+        let mut flat = good[..4 * 2560].to_vec();
+        flat.extend_from_slice(bad);
+        flat.extend_from_slice(&good[4 * 2560..]);
+        let reference_error = reference
+            .push_context_rows(0, &flat)
+            .unwrap_err()
+            .to_string();
+        let failed = reference.snapshot();
+        let row = &good[..2560];
+        let position_error = reference
+            .push_context(5, ContextFeatures { values: row })
+            .unwrap_err()
+            .to_string();
+        let width_error = reference
+            .push_context(
+                4,
+                ContextFeatures {
+                    values: &row[..512],
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert_eq!(reference.snapshot(), failed);
+        reference.push_context_rows(4, &good).unwrap();
+        let restored = reference.snapshot();
+        let proposals = expected(&reference, &shape);
+        reference.reset();
+        let empty = reference.snapshot();
+        for (name, kernel, threads, backend) in configurations() {
             let mut fast = fast(&folder, &shape, kernel, threads, backend);
-            // Rows 0..4 commit, row 4 fails, rows after it never run.
-            let mut flat = good[..4 * 2560].to_vec();
-            flat.extend_from_slice(bad);
-            flat.extend_from_slice(&good[4 * 2560..]);
-            let reference_error = reference.push_context_rows(0, &flat).unwrap_err();
             let actual = fast.push_context_rows(0, &flat).unwrap_err();
-            assert_eq!(
-                actual.to_string(),
-                reference_error.to_string(),
-                "{name} {label}"
-            );
-            assert_eq!(fast.snapshot(), reference.snapshot(), "{name} {label}");
+            assert_eq!(actual.to_string(), reference_error, "{name} {label}");
+            assert_eq!(fast.snapshot(), failed, "{name} {label}");
             assert_eq!(fast.position(), 4);
-            // Wrong position and wrong width are rejected without changes.
-            let row = &good[..2560];
             assert_eq!(
                 fast.push_context(5, ContextFeatures { values: row })
                     .unwrap_err()
                     .to_string(),
-                reference
-                    .push_context(5, ContextFeatures { values: row })
-                    .unwrap_err()
-                    .to_string()
+                position_error
             );
             assert_eq!(
                 fast.push_context(
@@ -321,33 +350,23 @@ fn failed_rows_snapshot_restore_and_reset_match_reference() {
                 )
                 .unwrap_err()
                 .to_string(),
-                reference
-                    .push_context(
-                        4,
-                        ContextFeatures {
-                            values: &row[..512]
-                        }
-                    )
-                    .unwrap_err()
-                    .to_string()
+                width_error
             );
-            assert_eq!(fast.snapshot(), reference.snapshot());
-            // Restore a reference ring, propose from it, then reset both.
-            reference.push_context_rows(4, &good).unwrap();
-            fast.restore(&reference.snapshot()).unwrap();
-            let context = format!("{name} restored");
-            compare_proposals(&mut fast, &expected(&reference, &shape), &shape, &context);
+            assert_eq!(fast.snapshot(), failed);
+            fast.restore(&restored).unwrap();
+            compare_proposals(&mut fast, &proposals, &shape, &format!("{name} restored"));
             fast.reset();
-            reference.reset();
-            assert_eq!(fast.snapshot(), reference.snapshot());
+            assert_eq!(fast.snapshot(), empty);
             assert_eq!(fast.position(), 0);
         }
-        let other = Shape {
-            window: 16,
-            ..Shape::default()
-        };
-        let folder_other = Folder::new(5, &other);
-        let wrong = Draft::load_with_options(&folder_other.0, options(&other)).unwrap();
+    }
+    let other = Shape {
+        window: 16,
+        ..Shape::default()
+    };
+    let folder_other = Folder::new(5, &other);
+    let wrong = Draft::load_with_options(&folder_other.0, options(&other)).unwrap();
+    for (name, kernel, threads, backend) in configurations() {
         let mut fast = fast(&folder, &shape, kernel, threads, backend);
         assert!(fast.restore(&wrong.snapshot()).is_err(), "{name}");
     }
@@ -371,24 +390,33 @@ fn processing_failure_keeps_prior_rows_and_matches_reference_on_every_backend() 
     );
     rows[4][..512].fill(largest_bf16);
 
-    for (name, kernel, threads, backend) in configurations() {
-        for api in ["single row", "slice", "batch"] {
-            let mut reference = Draft::load_with_options(&folder.0, options(&shape)).unwrap();
+    for api in ["single row", "slice", "batch"] {
+        let mut reference = Draft::load_with_options(&folder.0, options(&shape)).unwrap();
+        let reference_error = match api {
+            "single row" => rows
+                .iter()
+                .enumerate()
+                .find_map(|(position, row)| {
+                    reference
+                        .push_context(position, ContextFeatures { values: row })
+                        .err()
+                })
+                .expect("row 4 must fail during processing"),
+            "slice" => reference.push_context_rows(0, &rows.concat()).unwrap_err(),
+            "batch" => reference.push_context_rows(0, &rows.concat()).unwrap_err(),
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            &reference_error,
+            yskn_ref::Error::NonFinite("FP16-rounded rotated activation")
+        ));
+        assert_eq!(reference.position(), 4);
+        let embedding = |token| fixture::embedding_width(token, shape.hidden);
+        let expected = reference
+            .propose(3, embedding, DraftChoice::Greedy)
+            .unwrap();
+        for (name, kernel, threads, backend) in configurations() {
             let mut fast = fast(&folder, &shape, kernel, threads, backend);
-            let reference_error = match api {
-                "single row" => rows
-                    .iter()
-                    .enumerate()
-                    .find_map(|(position, row)| {
-                        reference
-                            .push_context(position, ContextFeatures { values: row })
-                            .err()
-                    })
-                    .expect("row 4 must fail during processing"),
-                "slice" => reference.push_context_rows(0, &rows.concat()).unwrap_err(),
-                "batch" => reference.push_context_rows(0, &rows.concat()).unwrap_err(),
-                _ => unreachable!(),
-            };
             let actual_error = match api {
                 "single row" => rows
                     .iter()
@@ -430,9 +458,6 @@ fn processing_failure_keeps_prior_rows_and_matches_reference_on_every_backend() 
             assert_eq!(reference.position(), 4, "{context}: reference position");
 
             let embedding = |token| fixture::embedding_width(token, shape.hidden);
-            let expected = reference
-                .propose(3, embedding, DraftChoice::Greedy)
-                .unwrap();
             let actual = fast.propose(3, embedding, DraftChoice::Greedy).unwrap();
             assert_proposals(&actual, &expected, &context);
         }
