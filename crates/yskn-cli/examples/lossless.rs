@@ -97,6 +97,11 @@ fn run() -> Result<bool> {
             _ => unreachable!(),
         }
     }
+    if profile != "quick" && std::env::var_os("YSKN_LOSSLESS_INJECT_MISMATCH").is_some() {
+        return Err(Error::request(
+            "YSKN_LOSSLESS_INJECT_MISMATCH must be unset for release/full profiles; fault injection is allowed only with --profile quick",
+        ));
+    }
     let names = names.unwrap_or(lossless_support::profile_configs(&profile)?);
     let model_dir = model.ok_or_else(|| Error::request("--model-dir is required"))?;
     let prompts = lossless_support::load_prompts(prompts.as_deref())?;

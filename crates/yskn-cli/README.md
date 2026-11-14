@@ -389,7 +389,8 @@ as blocked failures, never silently skip them or claim a pass.
 ## Real-model lossless check (development example)
 
 ```sh
-CARGO_NET_OFFLINE=true cargo run --release -p yskn --example lossless -- \
+env -u YSKN_LOSSLESS_INJECT_MISMATCH CARGO_NET_OFFLINE=true \
+  cargo run --release -p yskn --example lossless -- \
   --model-dir MODEL_FOLDER --profile release --report lossless.json
 ```
 
@@ -411,10 +412,17 @@ overrides configurations; `none` is always included first. `--max-tokens N`
 Seed 42 uses temperature 0.7, top-p 0.9, top-k 20, min-p 0; hot seed 91
 uses 1.3, 1.0, 20, 0. Seed 2027 keeps the product defaults when temperature
 is positive and top-k is not 1; otherwise it uses the explicit moderate
-settings. Every generation stage records normalized settings, rounded to the
-engine's thousandths boundary, and the effective u32 seed. Each seeded
-sampler must differ from greedy on at least one prompt, and the seeds must
+settings. Every generation stage records the normalized requested sampling
+settings and seed passed to the engine (`requested_sampling_by_stage`); these are
+not a read-back of the sampler the engine built. Each seeded sampler must differ from greedy on at least one prompt, and the seeds must
 differ from each other; otherwise the result is `sampling not exercised`.
+A separate seed-only probe uses the first two prompts, temperature 0.7,
+top-p 0.9, top-k 20 and min-p 0, changing only seed 42 versus 2027.
+Both seeds run twice after explicit resets and must repeat exactly; at
+least one prompt must differ between seeds (`seed not exercised` otherwise).
+It runs on `none` and, when selected, shipping `both-k7-adaptive`, with
+cross-configuration ID comparisons. Each configuration costs at most
+2 prompts × 2 seeds × 2 runs × 8 tokens = 64 tokens (128 by default).
 
 The 24 authored entries request 16 × 32 + 4 × 64 + 4 × 256 = 1,792 tokens.
 The 64-token cases request code or tool arguments; the four long cases ask
@@ -433,12 +441,23 @@ At 5–6 output tokens/s, release's main generation budget is
 24 × 1,792 = 43,008 tokens, or 119.5–143.4 minutes (about 2–2.4 hours).
 Full is 40 × 1,792 = 71,680 tokens, or 199.1–238.9 minutes.
 Quick is 40 × 256 = 10,240 tokens, or 28.4–34.1 minutes.
-Extra one-token unrelated probes add 276/460/460 tokens respectively;
-reuse/recovery probes add 44/55/55 tokens. Thus totals are
-43,328 / 72,195 / 10,755 tokens (120.4–144.4 / 200.5–240.7 /
-29.9–35.9 minutes). Loading, rendering, tokenization and prefill add time;
-EOS, stops and loop guard can shorten generation. These are arithmetic
-budgets, not measured real-model durations.
+Extra one-token unrelated probes add 276/460/460 tokens respectively.
+Reuse/recovery probes cost at most 41 tokens per configuration, plus 17
+if the fixed-text fallback is needed: 164–232 / 205–290 / 205–290 tokens.
+The seed-only probes add 128 tokens to every default profile. Totals are:
+
+| Profile | Main | Unrelated | Reuse/recovery | Seed-only | Total upper budget |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| release | 43,008 | 276 | 164–232 | 128 | 43,576–43,644 |
+| full | 71,680 | 460 | 205–290 | 128 | 72,473–72,558 |
+| quick | 10,240 | 460 | 205–290 | 128 | 11,033–11,118 |
+
+At 5–6 output tokens/s the conservative totals (including fallback) are
+121.2–145.5 / 201.6–241.9 / 30.9–37.1 minutes respectively.
+Loading, rendering, tokenization and prefill add time; EOS, stops and loop
+guard can shorten generation. These are arithmetic budgets, not measured
+real-model durations. Caps/custom prompt sets/configuration overrides
+change the arithmetic.
 
 Every prompt runs twice for every configuration/sampler; both draft runs
 are compared to `none`, and repeat IDs, finish reason and stage boundaries
@@ -448,32 +467,51 @@ fail, including when both sequences would otherwise compare equal. IDs
 include EOS and thinking, exclude bridge input IDs, and are hashed as u32
 little endian. Mismatches report the first differing position and IDs.
 
-Separate greedy probes run once per configuration, excluded from all
-speculation activity gates. They use a shared long ledger system prompt,
-a multi-turn conversation ending in “Name the entry 3”, its extension by
-an assistant answer and one user turn, and a sibling ending in “Name the
-colour 4”. Before execution, rendered IDs must prove that the extension
-strictly starts with the first request's entire generation prefix and that
-the distinct siblings share at least 32 tokens. The first conversation
-requests one output token: the engine retains the prompt up to its pending
-last token, so the extension reaches live reuse without guessing generated
-text or changing thinking. Run order is first, extension, first again;
-then sibling, first; unrelated, first; explicit reset, first; cancelled
-request, first; over-context request, first. Cancellation uses the product's
-callback after a committed token. The over-context failure is expected.
-All first-request repeats compare IDs; observed modes 0 (reset), 1 (live
-prefix), and 2 (snapshot restore) must each occur per configuration.
-Cached tokens and every stage's snapshot mode are recorded; shared system
-text alone does not guarantee restoration of a checkpoint saved later in
-the user message. No template toggle is used. An incompatible template
-fails with the measured prefix relation instead of silently skipping it.
+Separate greedy probes run per configuration, excluded from speculation
+activity gates. They use a shared long ledger system prompt, conversation A
+ending in “Name the entry 3”, continuation B asking “Name its shelf”, and
+sibling C ending in “Name the colour 4”. A generates one token. B uses A's
+actual decoded `Content` events as its assistant turn, re-rendered by the
+product template as a client would send it back. Before B runs, the tool
+records whether A's rendered prompt plus raw answer IDs is a strict prefix
+of B's rendered IDs, along with common/expected prefix lengths and the
+answer text. B's actual reuse mode and cached tokens are recorded.
 
-Every draft configuration **and sampler** must offer and accept positive
-numbers of guesses over its main runs. `both` must offer from both neural
-and n-gram sources for each sampler. Counts come from the product's actual
+B and C each generate up to eight tokens both after the preceding live
+request and after an explicit reset. Their IDs, finish reason and stage
+boundaries must match each reset result and the same no-draft request.
+If the real continuation's strict prefix test fails, it is still compared;
+an additional fixed-answer “Cedar.” pair must preserve A's rendered prompt
+and runs both live and after reset, with the same comparisons.
+The checked-in Python template goldens (`off` and `missing-reasoning`)
+show the same empty `<think>\n\n</think>\n\n` block for non-thinking
+generation and historical assistant text without reasoning. With default
+template options, the real continuation is therefore expected to preserve
+the prefix when the answer decodes/re-encodes unchanged. Token boundaries,
+partial Unicode tokens or template normalization can still break it; the
+measured IDs decide. The real model/template are not exercised in CI.
+The one-token A leaves engine history at its prompt, so the fixed pair
+can still reach live reuse even when A's generated answer is not preserved.
+
+A is also repeated after B, C, an unrelated request, an explicit reset,
+a cancelled request and an over-context failure. Cancellation uses the
+product callback after a committed token; the context failure is expected.
+Observed modes 0 (reset), 1 (live prefix), and 2 (snapshot restore) with
+positive cached tokens for reuse must each occur per configuration.
+No template toggle is used. An incompatible fixed pair fails with the
+measured prefix relation instead of silently skipping live reuse.
+
+Every draft configuration **and sampler** must offer positive numbers of
+guesses over its main runs. Acceptance must be positive for greedy and for
+at least one seeded sampler per draft configuration; a hot sampler may
+legitimately accept zero guesses. Every row reports accepted counts. `both`
+must offer from both neural and n-gram sources for each sampler. Counts come from the product's actual
 post-depth-truncation generation statistics, not its configured draft mode.
 An ID match without this activity fails. The small random synthetic fixture
 intentionally fails some of these coverage gates even though its IDs match.
+A second synthetic uniform-teacher fixture runs the actual example binary
+with every configuration, real proposals and real acceptance; it retains
+the default capture layers, mask ID and shortlist and adds no engine hooks.
 
 `--prompts FILE` accepts an array of `{"id":"unique name","request":{...}}`
 entries (at least two). Sampling fields belong to the harness. Errors name
@@ -492,6 +530,7 @@ example's own failure exit and saved report, build it first with
 `CARGO_NET_OFFLINE=true cargo build --release -p yskn --example lossless`.
 `YSKN_LOSSLESS_INJECT_MISMATCH=1` flips the first returned token once per
 engine load, so the repeat comparison must fail. This diagnostic environment
-variable exists only in the example and must be unset for real measurements.
+variable exists only in the example and is allowed only with `--profile quick`.
+Release and full refuse to start whenever it is set, even to an empty value.
 The integration test launches this binary on authored synthetic weights,
 checks a clean exit/report, then an injected nonzero exit/report.

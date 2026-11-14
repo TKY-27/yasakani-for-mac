@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{cell::RefCell, collections::HashSet, path::Path, rc::Rc, time::Instant};
 use yskn::{
     Error, Result,
-    chat::{ChatParams, ChatRunner},
+    chat::{ChatParams, ChatRunner, Event},
     engine::{Engine, Finish, Generation, Sampling},
     real_engine::{DepthMode, DraftMode, RealEngineConfig},
     request::{RequestDefaults, parse_chat_request},
@@ -171,8 +171,7 @@ impl Engine for Recorder {
             })?;
         let mut c = self.capture.borrow_mut();
         let s = sampling.normalized();
-        let fixed = |v: f64| (v * 1000.0).round_ties_even() / 1000.0;
-        c.sampling.push(json!({"temperature":fixed(s.temperature),"top_p":fixed(s.top_p),"top_k":s.top_k,"min_p":fixed(s.min_p),"seed":s.seed as u32}));
+        c.sampling.push(json!({"temperature":s.temperature,"top_p":s.top_p,"top_k":s.top_k,"min_p":s.min_p,"seed":s.seed}));
         c.cancelled |= g.finish == Finish::Cancelled;
         c.ids.extend_from_slice(&g.ids);
         c.stages.push(g.ids.len());
@@ -191,6 +190,7 @@ struct Observation {
     ids: Vec<u32>,
     stages: Vec<usize>,
     finish: String,
+    answer: String,
 }
 
 fn parameters(
@@ -240,11 +240,18 @@ fn observe_controlled(
     *capture.borrow_mut() = Capture::default();
     let start = Instant::now();
     let prepared = runner.prepare_checked(p)?;
+    let in_reasoning = prepared.1;
+    let mut answer = String::new();
     let usage_result = runner.run_prepared(
         p,
         prepared,
         &|| cancel && capture.borrow().saw_tokens,
-        &mut |_| Ok(()),
+        &mut |event| {
+            if let Event::Content(text) = event {
+                answer.push_str(&text);
+            }
+            Ok(())
+        },
     );
     let c = capture.take();
     let usage = match usage_result {
@@ -277,10 +284,14 @@ fn observe_controlled(
     row["long_generation"] = json!(p.max_tokens >= 256);
     row["ended_early"] = json!(usage.completion_tokens < p.max_tokens);
     row["reasoning_tokens"] = json!(usage.reasoning_tokens);
-    row["answer_stage_reached"] = json!(c.stages.len() > 1 || usage.reasoning_tokens < c.ids.len());
+    row["answer_stage_reached"] = json!(answer_stage_reached(
+        in_reasoning,
+        usage.reasoning_tokens,
+        &c.stages
+    ));
     row["loop_guard"] = json!(usage.loop_guard);
     row["cancelled_after_commit"] = json!(cancel && c.cancelled);
-    row["effective_sampling_by_stage"] = json!(c.sampling);
+    row["requested_sampling_by_stage"] = json!(c.sampling);
     row["token_count"] = json!(c.ids.len());
     row["sha256_ids_le_u32"] = json!(format!("{:x}", digest.finalize()));
     row["finish_reason"] = json!(usage.finish);
@@ -301,7 +312,23 @@ fn observe_controlled(
         ids: c.ids,
         stages: c.stages,
         finish: usage.finish.into(),
+        answer,
     })
+}
+
+fn answer_stage_reached(in_reasoning: bool, reasoning_tokens: usize, stages: &[usize]) -> bool {
+    if stages.iter().skip(1).any(|&n| n > 0) {
+        return true;
+    }
+    let first = stages.first().copied().unwrap_or(0);
+    if in_reasoning {
+        // reasoning_tokens is the closing token's zero-based index, not a count.
+        reasoning_tokens
+            .checked_add(1)
+            .is_some_and(|end| end < first)
+    } else {
+        first > 0
+    }
 }
 
 fn compare(
@@ -343,6 +370,50 @@ fn compare(
     }
 }
 
+// Two prompts, two seeds, two runs, at most eight tokens: 64 tokens/configuration.
+fn seed_probes(
+    runner: &mut ChatRunner,
+    capture: &RefCell<Capture>,
+    prompts: &[Prompt],
+    defaults: &RequestDefaults,
+    name: &str,
+    rows: &mut Vec<Value>,
+    failures: &mut Vec<Value>,
+) -> Result<Vec<Observation>> {
+    let mut outputs = Vec::new();
+    let mut first_seed = Vec::new();
+    let mut differs = false;
+    for seed in [42, 2027] {
+        for (i, prompt) in prompts.iter().take(2).enumerate() {
+            let mut p = parameters(prompt, defaults, 1, 8)?;
+            p.seed = Some(seed);
+            let label = |run| json!({"configuration":name,"sampler":"seed-only","seed":seed,"prompt":prompt.id,"run":run,"probe":true});
+            runner.engine.reset()?;
+            let first = observe(runner, capture, &p, rows, label("seed_first"))?;
+            runner.engine.reset()?;
+            let repeat = observe(runner, capture, &p, rows, label("seed_repeat"))?;
+            compare(
+                &first,
+                &repeat,
+                &label("seed_repeat"),
+                "repeat_mismatch",
+                failures,
+            );
+            if seed == 42 {
+                first_seed.push(first.ids.clone());
+            } else {
+                differs |= first_seed[i] != first.ids;
+            }
+            outputs.push(first);
+            outputs.push(repeat);
+        }
+    }
+    if !differs {
+        failures.push(json!({"kind":"seed not exercised","configuration":name,"seeds":[42,2027]}));
+    }
+    Ok(outputs)
+}
+
 fn common_prefix(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
@@ -354,7 +425,7 @@ fn reuse_probes(
     name: &str,
     rows: &mut Vec<Value>,
     failures: &mut Vec<Value>,
-) -> Result<()> {
+) -> Result<Vec<(String, Observation)>> {
     let system = "Keep the ledger in order. Each entry has a name, count, colour and shelf. Do not change existing entries. ".repeat(8);
     let body = json!({"messages":[
         {"role":"system","content":system},
@@ -363,6 +434,7 @@ fn reuse_probes(
         {"role":"user","content":"Name the entry 3"}],"enable_thinking":false,"max_tokens":1,"temperature":0,"seed":0});
     let first = parse_chat_request(&body, defaults)?;
     let mut extension = first.clone();
+    extension.max_tokens = 8;
     extension
         .messages
         .as_array_mut()
@@ -372,17 +444,11 @@ fn reuse_probes(
             json!({"role":"user","content":"Name its shelf."}),
         ]);
     let mut sibling = first.clone();
+    sibling.max_tokens = 8;
     sibling.messages[3]["content"] = json!("Name the colour 4");
     let (a, _) = runner.prepare_checked(&first)?;
     let (b, _) = runner.prepare_checked(&extension)?;
     let (c, _) = runner.prepare_checked(&sibling)?;
-    if b.len() <= a.len() || !b.starts_with(&a) {
-        return Err(Error::request(format!(
-            "multi-turn extension does not preserve rendered generation prefix ({} of {} tokens)",
-            common_prefix(&a, &b),
-            a.len()
-        )));
-    }
     let shared = common_prefix(&a, &c);
     if a == c || shared < 32 {
         return Err(Error::request(format!(
@@ -391,17 +457,85 @@ fn reuse_probes(
     }
     let label = |run: &str| {
         json!({"configuration":name,"sampler":"greedy","run":run,"probe":true,
-        "extension_prefix_tokens":a.len(),"system_common_prefix_tokens":shared})
+        "system_common_prefix_tokens":shared})
     };
+    let mut compared = Vec::new();
     runner.engine.reset()?;
     let original = observe(runner, capture, &first, rows, label("conversation_first"))?;
-    observe(
+    let mut real = extension.clone();
+    real.messages[4]["content"] = json!(original.answer);
+    let (rendered, _) = runner.prepare_checked(&real)?;
+    let mut answered = a.clone();
+    answered.extend_from_slice(&original.ids);
+    let strict = rendered.len() > answered.len() && rendered.starts_with(&answered);
+    let continuation_label = |run| {
+        let mut row = label(run);
+        row["continuation_strict_prefix"] = json!(strict);
+        row["continuation_common_prefix_tokens"] = json!(common_prefix(&answered, &rendered));
+        row["continuation_expected_prefix_tokens"] = json!(answered.len());
+        row["assistant_answer"] = json!(original.answer);
+        row
+    };
+    let live = observe(
         runner,
         capture,
-        &extension,
+        &real,
         rows,
-        label("conversation_extension"),
+        continuation_label("conversation_extension"),
     )?;
+    runner.engine.reset()?;
+    let reset = observe(
+        runner,
+        capture,
+        &real,
+        rows,
+        continuation_label("conversation_extension_reset"),
+    )?;
+    compare(
+        &reset,
+        &live,
+        &continuation_label("conversation_extension"),
+        "reuse_mismatch",
+        failures,
+    );
+    compared.push(("conversation_extension".into(), live));
+    compared.push(("conversation_extension_reset".into(), reset));
+    if !strict {
+        if b.len() <= a.len() || !b.starts_with(&a) {
+            return Err(Error::request(format!(
+                "fixed-text fallback does not preserve rendered generation prefix ({} of {} tokens)",
+                common_prefix(&a, &b),
+                a.len()
+            )));
+        }
+        runner.engine.reset()?;
+        let again = observe(runner, capture, &first, rows, label("fallback_first"))?;
+        compare(
+            &original,
+            &again,
+            &label("fallback_first"),
+            "repeat_mismatch",
+            failures,
+        );
+        let live = observe(runner, capture, &extension, rows, label("fixed_extension"))?;
+        runner.engine.reset()?;
+        let reset = observe(
+            runner,
+            capture,
+            &extension,
+            rows,
+            label("fixed_extension_reset"),
+        )?;
+        compare(
+            &reset,
+            &live,
+            &label("fixed_extension"),
+            "reuse_mismatch",
+            failures,
+        );
+        compared.push(("fixed_extension".into(), live));
+        compared.push(("fixed_extension_reset".into(), reset));
+    }
     let again = observe(
         runner,
         capture,
@@ -416,7 +550,24 @@ fn reuse_probes(
         "repeat_mismatch",
         failures,
     );
-    observe(runner, capture, &sibling, rows, label("system_sibling"))?;
+    let live = observe(runner, capture, &sibling, rows, label("system_sibling"))?;
+    runner.engine.reset()?;
+    let reset = observe(
+        runner,
+        capture,
+        &sibling,
+        rows,
+        label("system_sibling_reset"),
+    )?;
+    compare(
+        &reset,
+        &live,
+        &label("system_sibling"),
+        "reuse_mismatch",
+        failures,
+    );
+    compared.push(("system_sibling".into(), live));
+    compared.push(("system_sibling_reset".into(), reset));
     let again = observe(runner, capture, &first, rows, label("after_system_sibling"))?;
     compare(
         &original,
@@ -445,10 +596,12 @@ fn reuse_probes(
         "repeat_mismatch",
         failures,
     );
+    let mut cancelled = sibling.clone();
+    cancelled.max_tokens = 1;
     observe_controlled(
         runner,
         capture,
-        &sibling,
+        &cancelled,
         rows,
         label("cancelled_request"),
         true,
@@ -480,7 +633,8 @@ fn reuse_probes(
         "repeat_mismatch",
         failures,
     );
-    Ok(())
+    compared.push(("conversation_first".into(), original));
+    Ok(compared)
 }
 
 fn reuse_exercised(name: &str, rows: &[Value], failures: &mut Vec<Value>) {
@@ -515,14 +669,18 @@ fn speculation_exercised(
     if name == "none" {
         return;
     }
-    for &sampler in samplers {
-        let sampler = SAMPLERS[sampler];
+    let mut seeded_accepted = 0;
+    for &sampler_index in samplers {
+        let sampler = SAMPLERS[sampler_index];
         let own: Vec<_> = rows
             .iter()
             .filter(|r| r["sampler"] == sampler && r["probe"] != true)
             .collect();
         let sum = |key: &str| own.iter().filter_map(|r| r[key].as_u64()).sum::<u64>();
-        if sum("guesses_offered") == 0 || sum("guesses_accepted") == 0 {
+        if sampler_index != 0 {
+            seeded_accepted += sum("guesses_accepted");
+        }
+        if sum("guesses_offered") == 0 || (sampler_index == 0 && sum("guesses_accepted") == 0) {
             failures.push(
                 json!({"kind":"speculation not exercised","configuration":name,"sampler":sampler}),
             );
@@ -534,6 +692,9 @@ fn speculation_exercised(
                 }
             }
         }
+    }
+    if seeded_accepted == 0 {
+        failures.push(json!({"kind":"speculation not exercised","configuration":name,"sampler":"seeded (any)"}));
     }
 }
 
@@ -580,6 +741,8 @@ pub fn check(
     let mut rows = Vec::new();
     let mut failures = Vec::new();
     let mut baseline = Vec::new();
+    let mut seed_baseline = Vec::new();
+    let mut reuse_baseline = std::collections::HashMap::new();
     let outcome = (|| -> Result<()> {
         for name in names {
             eprintln!("loading {name}");
@@ -650,7 +813,31 @@ pub fn check(
                     baseline.extend(first);
                 }
             }
-            reuse_probes(
+            if name == "none" || name == "both-k7-adaptive" {
+                let outputs = seed_probes(
+                    &mut runner,
+                    &capture,
+                    prompts,
+                    defaults,
+                    name,
+                    &mut rows,
+                    &mut failures,
+                )?;
+                if name == "none" {
+                    seed_baseline = outputs;
+                } else {
+                    for (expected, actual) in seed_baseline.iter().zip(&outputs) {
+                        compare(
+                            expected,
+                            actual,
+                            &json!({"configuration":name,"probe":"seed-only"}),
+                            "configuration_mismatch",
+                            &mut failures,
+                        );
+                    }
+                }
+            }
+            let reuse_outputs = reuse_probes(
                 &mut runner,
                 &capture,
                 defaults,
@@ -658,6 +845,23 @@ pub fn check(
                 &mut rows,
                 &mut failures,
             )?;
+            for (run, actual) in reuse_outputs {
+                if name == "none" {
+                    reuse_baseline.insert(run, actual);
+                } else if let Some(expected) = reuse_baseline.get(&run) {
+                    compare(
+                        expected,
+                        &actual,
+                        &json!({"configuration":name,"run":run,"probe":true}),
+                        "configuration_mismatch",
+                        &mut failures,
+                    );
+                } else {
+                    failures.push(
+                        json!({"kind":"reuse probe missing oracle","configuration":name,"run":run}),
+                    );
+                }
+            }
             reuse_exercised(name, &rows[config_start..], &mut failures);
             sampling_exercised(name, samplers, &sampled_outputs, &mut failures);
             speculation_exercised(name, samplers, &rows[config_start..], &mut failures);
@@ -687,6 +891,17 @@ pub fn load_prompts(path: Option<&Path>) -> Result<Vec<Prompt>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_think_token_alone_is_not_an_answer() {
+        assert!(!answer_stage_reached(true, 0, &[1]));
+        assert!(!answer_stage_reached(true, 4, &[5]));
+        assert!(!answer_stage_reached(true, 5, &[5]));
+        assert!(!answer_stage_reached(true, 4, &[5, 0]));
+        assert!(answer_stage_reached(true, 4, &[6]));
+        assert!(answer_stage_reached(true, 5, &[5, 1]));
+        assert!(answer_stage_reached(false, 0, &[1]));
+    }
 
     #[test]
     fn reporting_reset_only_or_zero_cached_tokens_cannot_cover_reuse() {
@@ -720,7 +935,7 @@ mod tests {
                 .iter()
                 .filter(|f| f["kind"] == "speculation not exercised")
                 .count(),
-            3
+            1
         );
         assert_eq!(
             failures
@@ -732,12 +947,15 @@ mod tests {
     }
 
     #[test]
-    fn both_sources_and_acceptance_are_required_in_each_selected_sampler() {
+    fn both_sources_are_required_per_sampler_but_hot_acceptance_may_be_zero() {
         let rows: Vec<_> = SAMPLERS.iter().map(|sampler| json!({"sampler":sampler,"guesses_offered":8,"guesses_accepted":2,"neural_guesses_offered":5,"ngram_guesses_offered":3})).collect();
         let mut failures = vec![];
         speculation_exercised("both-k7-adaptive", &[0, 1, 2, 3], &rows, &mut failures);
         assert!(failures.is_empty());
         let mut missing = rows;
+        missing[3]["guesses_accepted"] = json!(0);
+        speculation_exercised("both-k7-adaptive", &[0, 1, 2, 3], &missing, &mut failures);
+        assert!(failures.is_empty());
         missing[1]["ngram_guesses_offered"] = json!(0);
         speculation_exercised("both-k7-adaptive", &[0, 1, 2, 3], &missing, &mut failures);
         assert_eq!(
@@ -755,6 +973,7 @@ mod tests {
                 ids: vec![],
                 stages,
                 finish: "length".into(),
+                answer: String::new(),
             };
             let mut failures = vec![];
             compare(&empty, &empty, &json!({}), "repeat_mismatch", &mut failures);
