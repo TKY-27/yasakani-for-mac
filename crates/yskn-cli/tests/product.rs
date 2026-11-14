@@ -191,6 +191,86 @@ fn stop_id_is_included_and_stops_at_the_first_matching_prediction() {
     }
 }
 
+fn fast_draft_engine(
+    folder: &Folder,
+    mode: DraftMode,
+    depth: yskn::real_engine::DepthMode,
+    k: usize,
+) -> yskn::real_engine::RealEngine {
+    let mut config = folder.config(mode);
+    config.depth = depth;
+    config.k = k;
+    let mut options = product_support::model::draft::options();
+    options.capture_layers = vec![0];
+    yskn::real_engine::RealEngine::load_with_draft_options(config, options).unwrap()
+}
+
+#[test]
+fn fast_draft_output_equals_no_draft_output_for_adaptive_and_fixed_depths() {
+    use yskn::real_engine::DepthMode;
+    let folder = Folder::new();
+    let prompt = [1, 2, 1, 2, 1, 2, 3];
+    for sampling in [greedy(), sampled()] {
+        let expected = run(&mut folder.engine(DraftMode::None), &prompt, 24, &sampling);
+        assert_eq!(expected.ids, scalar(&folder, &prompt, 24, &sampling));
+        assert_eq!((expected.draft_proposals, expected.draft_updates), (0, 0));
+        for mode in [DraftMode::Neural, DraftMode::Both] {
+            for depth in [DepthMode::Adaptive, DepthMode::Fixed] {
+                for k in [1, 3, 7] {
+                    let mut engine = fast_draft_engine(&folder, mode, depth, k);
+                    let first = run(&mut engine, &prompt, 24, &sampling);
+                    let case = format!("{mode:?} {depth:?} k={k} {sampling:?}");
+                    assert_eq!(first.ids, expected.ids, "{case}");
+                    engine.reset().unwrap();
+                    let again = run(&mut engine, &prompt, 24, &sampling);
+                    assert_eq!(again.ids, expected.ids, "{case}");
+                    assert_eq!(
+                        (again.passes, again.rows_verified, again.draft_proposals),
+                        (first.passes, first.rows_verified, first.draft_proposals),
+                        "{case}: depths must repeat"
+                    );
+                    assert!(first.draft_updates > 0, "{case}");
+                    if depth == DepthMode::Fixed && mode == DraftMode::Neural {
+                        assert!(first.draft_proposals > 0, "{case}");
+                        assert!(first.guesses_offered > 0, "{case}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn draft_work_counts_history_updates_even_without_a_proposal() {
+    use yskn::real_engine::DepthMode;
+    let folder = Folder::new();
+    for mode in [DraftMode::Neural, DraftMode::Both] {
+        let mut engine = fast_draft_engine(&folder, mode, DepthMode::Fixed, 3);
+        assert!(engine.info().draft_proposal_code_bytes > 0);
+        assert!(engine.info().draft_update_code_bytes > 0);
+        // One token: the only pass has no room for a guess, so no proposal
+        // runs, but committing that pass still updates the draft history.
+        let one = run(&mut engine, &[1, 2, 3, 4], 1, &greedy());
+        assert_eq!((one.ids.len(), one.passes), (1, 1));
+        assert_eq!(one.draft_proposals, 0, "{mode:?}");
+        assert_eq!(one.draft_updates, 1, "{mode:?}");
+        engine.reset().unwrap();
+        let more = run(&mut engine, &[7, 8, 9], 6, &greedy());
+        // Every pass commits one run of rows; the pass that ends the request
+        // still updates the history.
+        assert_eq!(more.draft_updates, more.passes, "{mode:?}");
+        if mode == DraftMode::Neural {
+            assert_eq!(more.draft_proposals, more.passes - 1, "{mode:?}");
+        }
+    }
+    for mode in [DraftMode::None, DraftMode::Ngram] {
+        let mut engine = folder.engine(mode);
+        let result = run(&mut engine, &[1, 2, 3, 4], 6, &greedy());
+        assert_eq!((result.draft_proposals, result.draft_updates), (0, 0));
+        assert_eq!(engine.info().draft_proposal_code_bytes, 0);
+    }
+}
+
 #[test]
 fn memory_check_reports_needed_available_and_configuration_remedies() {
     let folder = Folder::new();

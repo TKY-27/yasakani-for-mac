@@ -117,6 +117,7 @@ impl Folder {
             backend: Some(Backend::Cpu),
             draft,
             k: 3,
+            depth: RealEngineConfig::default().depth,
             context: CONTEXT,
             threads: Some(1),
             prefill_width: 2,

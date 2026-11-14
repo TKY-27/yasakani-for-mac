@@ -151,125 +151,116 @@ pub(super) fn bench(args: &Args) -> Result<()> {
     if tokens == 0 {
         return Err(Error::request("--n must be greater than zero"));
     }
-    let drafts = args
-        .comparisons
-        .get("draft")
-        .cloned()
-        .unwrap_or_else(|| vec!["ngram".into()]);
-    let widths = args
-        .comparisons
-        .get("k")
-        .cloned()
-        .unwrap_or_else(|| vec!["3".into()]);
+    let defaults = crate::real_engine::RealEngineConfig::default();
+    let list = |key: &str, default: String| {
+        args.comparisons
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| vec![default])
+    };
+    let drafts = list("draft", defaults.draft.name().into());
+    let widths = list("k", defaults.k.to_string());
+    let depths = list("depth", defaults.depth.name().into());
     let fmt = yskn_text::ChatFormatter::load(args.model_dir()?)?;
     let mut runs = Vec::new();
-    for draft in drafts {
+    let mut settings = Vec::new();
+    for draft in &drafts {
         for k in &widths {
-            let mut config_args = args.clone();
-            config_args.values.insert("draft".into(), draft.clone());
-            config_args.values.insert("k".into(), k.clone());
-            let config = config_args.real_config()?;
-            let mut engine = RealEngine::load(config)?;
-            let info = engine.info().to_json();
-            // Upstream cli.py:339-344 supplies prose/code/proof. CSV conversion
-            // adds the structured-output category required by the product brief.
-            for (task, text, thinking) in [
-                (
-                    "prose",
-                    "Explain how a hash table works, including collisions and resizing, with a short example.",
-                    false,
-                ),
-                (
-                    "code",
-                    "Write a Python function that merges overlapping intervals and add a few tests for it.",
-                    false,
-                ),
-                (
-                    "structured",
-                    "Convert this CSV to a JSON array, with numeric ages: name,age\nAda,36\nLin,28",
-                    false,
-                ),
-                (
-                    "thinking",
-                    "Prove that the square root of 2 is irrational.",
-                    true,
-                ),
-            ] {
-                engine.reset()?;
-                let prompt = fmt
-                    .prompt(
-                        &json!([{"role":"user","content":text}]),
-                        None,
-                        &json!({"enable_thinking":thinking}),
-                    )?
-                    .0;
-                // A fixed token count is a measurement contract: fail rather than
-                // silently benchmarking a smaller output because context is full.
-                if prompt
-                    .len()
-                    .saturating_add(tokens)
-                    .saturating_add(crate::engine::CONTEXT_MARGIN)
-                    > engine.context_capacity()
-                {
-                    return Err(Error::request(format!(
-                        "bench {task}: --ctx cannot fit prompt plus --n tokens and 64-token reserve"
-                    )));
-                }
-                let generated =
-                    engine.generate(&prompt, tokens, &greedy(), None, &mut |_| Ok(true))?;
-                if generated.ids.len() != tokens {
-                    return Err(Error::engine(format!(
-                        "bench {task}: expected {tokens} tokens, generated {}",
-                        generated.ids.len()
-                    )));
-                }
-                let passes = generated.passes;
-                // The shared loop consumes the final pending prompt row in its
-                // first verification pass; prefill timing covers earlier rows.
-                let prefill_tokens = prompt.len() - generated.cached_tokens - 1;
-                let divide = |n: f64, d: f64| if d > 0.0 { n / d } else { 0.0 };
-                let main_bytes = engine.info().code_bytes_per_pass;
-                // Count actual positive-budget neural calls; n-gram-first
-                // combination may never invoke the neural proposer.
-                let neural_passes = engine.last_neural_proposals();
-                let draft_bytes = engine.info().draft_code_bytes_per_pass;
-                let row = json!({
-                    "task":task, "prompt_tokens":prompt.len(), "prefill_ms":generated.prefill_ms,
-                    "prefill_tokens":prefill_tokens,
-                    "prefill_tokens_per_s":divide(prefill_tokens as f64 * 1000.0, generated.prefill_ms),
-                    "generated_tokens":generated.ids.len(), "passes":passes,
-                    "rows_verified":generated.rows_verified,
-                    "generation_ms":generated.gen_ms,
-                    "milliseconds_per_pass":divide(generated.gen_ms, passes as f64),
-                    "tokens_confirmed_per_pass":divide(generated.ids.len() as f64, passes as f64),
-                    "tokens_per_s":divide(generated.ids.len() as f64 * 1000.0, generated.gen_ms),
-                    "guesses_offered":generated.guesses_offered, "guesses_accepted":generated.guesses_accepted,
-                    "main_code_bytes_per_pass":main_bytes, "draft_code_bytes_per_proposal":draft_bytes,
-                    "neural_proposals":neural_passes,
-                    "bytes_read_per_pass":main_bytes as f64 + divide(draft_bytes as f64 * neural_passes as f64, passes as f64),
-                });
-                println!(
-                    "{task:<10} draft={draft:<6} K={k} prompt={} prefill={:.1} tokens/s generated={} passes={} ms/pass={:.3} tokens/pass={:.3} tokens/s={:.3} guesses={}/{} bytes/pass={:.0}",
-                    prompt.len(),
-                    row["prefill_tokens_per_s"].as_f64().unwrap_or_default(),
-                    generated.ids.len(),
-                    passes,
-                    row["milliseconds_per_pass"].as_f64().unwrap_or_default(),
-                    row["tokens_confirmed_per_pass"]
-                        .as_f64()
-                        .unwrap_or_default(),
-                    row["tokens_per_s"].as_f64().unwrap_or_default(),
-                    generated.guesses_accepted,
-                    generated.guesses_offered,
-                    row["bytes_read_per_pass"].as_f64().unwrap_or_default()
-                );
-                runs.push(json!({"configuration":info, "metrics":row}));
+            for depth in &depths {
+                settings.push((draft, k, depth));
             }
+        }
+    }
+    for (draft, k, depth) in settings {
+        let mut config_args = args.clone();
+        config_args.values.insert("draft".into(), draft.clone());
+        config_args.values.insert("k".into(), k.clone());
+        config_args.values.insert("depth".into(), depth.clone());
+        let config = config_args.real_config()?;
+        let mut engine = RealEngine::load(config)?;
+        let info = engine.info().to_json();
+        // Upstream cli.py:339-344 supplies prose/code/proof. CSV conversion
+        // adds the structured-output category required by the product brief.
+        for (task, text, thinking) in crate::cli::BENCH_TASKS {
+            engine.reset()?;
+            let prompt = fmt
+                .prompt(
+                    &json!([{"role":"user","content":text}]),
+                    None,
+                    &json!({"enable_thinking":thinking}),
+                )?
+                .0;
+            // A fixed token count is a measurement contract: fail rather than
+            // silently benchmarking a smaller output because context is full.
+            if prompt
+                .len()
+                .saturating_add(tokens)
+                .saturating_add(crate::engine::CONTEXT_MARGIN)
+                > engine.context_capacity()
+            {
+                return Err(Error::request(format!(
+                    "bench {task}: --ctx cannot fit prompt plus --n tokens and 64-token reserve"
+                )));
+            }
+            let generated = engine.generate(&prompt, tokens, &greedy(), None, &mut |_| Ok(true))?;
+            if generated.ids.len() != tokens {
+                return Err(Error::engine(format!(
+                    "bench {task}: expected {tokens} tokens, generated {}",
+                    generated.ids.len()
+                )));
+            }
+            let passes = generated.passes;
+            // The shared loop consumes the final pending prompt row in its
+            // first verification pass; prefill timing covers earlier rows.
+            let prefill_tokens = prompt.len() - generated.cached_tokens - 1;
+            let divide = |n: f64, d: f64| if d > 0.0 { n / d } else { 0.0 };
+            let main_bytes = engine.info().code_bytes_per_pass;
+            // Count actual positive-budget neural calls; n-gram-first
+            // combination may never invoke the neural proposer.
+            let proposal_bytes = engine.info().draft_proposal_code_bytes;
+            let update_bytes = engine.info().draft_update_code_bytes;
+            // Actual draft calls inside the timed generation: n-gram-first
+            // combination may never propose, yet every commit updates the
+            // draft history.
+            let draft_bytes = generated.draft_proposals as f64 * proposal_bytes as f64
+                + generated.draft_updates as f64 * update_bytes as f64;
+            let row = json!({
+                "task":task, "prompt_tokens":prompt.len(), "prefill_ms":generated.prefill_ms,
+                "prefill_tokens":prefill_tokens,
+                "prefill_tokens_per_s":divide(prefill_tokens as f64 * 1000.0, generated.prefill_ms),
+                "generated_tokens":generated.ids.len(), "passes":passes,
+                "rows_verified":generated.rows_verified,
+                "generation_ms":generated.gen_ms,
+                "milliseconds_per_pass":divide(generated.gen_ms, passes as f64),
+                "tokens_confirmed_per_pass":divide(generated.ids.len() as f64, passes as f64),
+                "tokens_per_s":divide(generated.ids.len() as f64 * 1000.0, generated.gen_ms),
+                "guesses_offered":generated.guesses_offered, "guesses_accepted":generated.guesses_accepted,
+                "main_code_bytes_per_pass":main_bytes, "draft_code_bytes_per_proposal":proposal_bytes,
+                "draft_code_bytes_per_update":update_bytes,
+                "neural_proposals":generated.draft_proposals, "draft_updates":generated.draft_updates,
+                "bytes_read_per_pass":main_bytes as f64 + divide(draft_bytes, passes as f64),
+            });
+            println!(
+                "{task:<10} draft={draft:<6} K={k} depth={depth} prompt={} prefill={:.1} tokens/s generated={} passes={} ms/pass={:.3} tokens/pass={:.3} tokens/s={:.3} guesses={}/{} bytes/pass={:.0}",
+                prompt.len(),
+                row["prefill_tokens_per_s"].as_f64().unwrap_or_default(),
+                generated.ids.len(),
+                passes,
+                row["milliseconds_per_pass"].as_f64().unwrap_or_default(),
+                row["tokens_confirmed_per_pass"]
+                    .as_f64()
+                    .unwrap_or_default(),
+                row["tokens_per_s"].as_f64().unwrap_or_default(),
+                generated.guesses_accepted,
+                generated.guesses_offered,
+                row["bytes_read_per_pass"].as_f64().unwrap_or_default()
+            );
+            runs.push(json!({"configuration":info, "metrics":row}));
         }
     }
     if let Some(path) = args.value("json") {
         let output = json!({"version":env!("CARGO_PKG_VERSION"), "tokens_per_task":tokens, "runs":runs,
-            "bytes_read_definition":"Main body/head compressed streams per verification pass plus actual neural calls times (draft compressed streams + seven * (vocabulary*rank + shortlist*hidden) int8 head bytes), divided by passes; embeddings, vectors, tables, scales and cache excluded; not a DRAM counter."});
+            "bytes_read_definition":"Main body/head compressed streams per verification pass, plus neural proposals during generation times (draft block streams + seven * (vocabulary*rank + shortlist*hidden) int8 head bytes) and draft history updates during generation times (FC + per-layer key/value streams), divided by passes; embeddings, vectors, tables, scales and cache excluded; not a DRAM counter."});
         let mut text = serde_json::to_string_pretty(&output).map_err(Error::engine)?;
         text.push('\n');
         std::fs::write(path, text).map_err(Error::engine)?;
