@@ -276,6 +276,72 @@ mod macos {
         }
     }
 
+    /// Rows shared between the GPU and the CPU kernel (several matrices per call,
+    /// padded and partial tiles) equal the GPU-only and CPU-only sums.
+    #[test]
+    fn cpu_and_gpu_row_split_matches_either_device_alone() {
+        let Some(mut engine) = engine() else { return };
+        let mut cpu = Engine::new(Kernel::fastest(), 4).unwrap();
+        let shapes = [
+            (300, 320, "warp", 6),
+            (70, 75, "row", 5),
+            (17, 32, "row", 8),
+        ];
+        let files: Vec<_> = shapes
+            .iter()
+            .map(|&(rows, physical, layout, bits)| {
+                TempFile::new(&synthetic(bits, layout, rows, physical, 5120, false))
+            })
+            .collect();
+        // SAFETY: the private files are never modified and outlive all mapping owners.
+        let models: Vec<_> = files
+            .iter()
+            .map(|file| unsafe { MappedModel::open(&file.0) }.unwrap())
+            .collect();
+        let matrices: Vec<_> = models.iter().map(|m| m.matrix("linear").unwrap()).collect();
+        let refs: Vec<_> = matrices.iter().collect();
+        let mut seed = 0x5917_c0de_0000_0001;
+        for m in [1, 3, 16, 20] {
+            let activation: Vec<i8> = (0..m * 5120).map(|_| random(&mut seed) as i8).collect();
+            let scales: Vec<i32> = (0..m * 10).map(|_| random(&mut seed) as i32).collect();
+            let expected: Vec<_> = matrices
+                .iter()
+                .map(|matrix| cpu.weighted_sums(matrix, &activation, &scales).unwrap())
+                .collect();
+            for share in [None, Some(0.0), Some(0.3), Some(0.9)] {
+                engine.set_cpu_share(share).unwrap();
+                let split = engine
+                    .weighted_sums_split(&mut cpu, &refs, &activation, &scales)
+                    .unwrap();
+                let gpu = engine
+                    .weighted_sums_shared(&refs, &activation, &scales)
+                    .unwrap();
+                for (i, expected) in expected.iter().enumerate() {
+                    let context = format!("matrix={i} M={m} share={share:?}");
+                    assert_sums(&split[i], expected, &format!("split {context}"));
+                    assert_sums(&gpu[i], expected, &format!("gpu {context}"));
+                }
+            }
+        }
+        assert!(engine.set_cpu_share(Some(0.95)).is_err());
+        assert!(engine.set_cpu_share(Some(-0.1)).is_err());
+        engine.set_cpu_share(Some(0.5)).unwrap();
+        assert_eq!(engine.cpu_share(1), 0.5);
+        engine.set_cpu_share(Some(0.0)).unwrap();
+        assert_eq!(engine.cpu_share(16), 0.0);
+        engine.set_cpu_share(None).unwrap();
+        let calibrated: Vec<_> = [1, 2, 3, 4, 8, 12, 16, 40]
+            .map(|m| engine.cpu_share(m))
+            .to_vec();
+        let table = [0.08, 0.10, 0.11, 0.12, 0.14, 0.145, 0.15, 0.15];
+        assert!(
+            calibrated
+                .iter()
+                .zip(table)
+                .all(|(a, b)| (a - b).abs() < 1e-12)
+        );
+    }
+
     #[test]
     fn unaligned_streams_and_split_counts_match_scalar_reference() {
         let Some(mut engine) = engine() else { return };

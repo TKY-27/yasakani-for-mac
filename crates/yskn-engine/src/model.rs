@@ -896,8 +896,9 @@ impl Compute {
     ) -> Result<Vec<T>> {
         self.engine.map_range(range, function)
     }
-    /// Each matrix's M×N sums for one shared input: one Metal command buffer,
-    /// or one CPU kernel call per matrix.
+    /// Each matrix's M×N sums for one shared input: one Metal command buffer
+    /// (with the CPU kernel computing its calibrated share of the rows meanwhile,
+    /// D21), or one CPU kernel call per matrix.
     pub(crate) fn weighted_sums(
         &mut self,
         matrices: &[&Matrix],
@@ -906,7 +907,7 @@ impl Compute {
     ) -> Result<Vec<Vec<i64>>> {
         #[cfg(target_os = "macos")]
         if let Some(metal) = &mut self.metal {
-            return metal.weighted_sums_shared(matrices, activation, scales);
+            return metal.weighted_sums_split(&mut self.engine, matrices, activation, scales);
         }
         matrices
             .iter()

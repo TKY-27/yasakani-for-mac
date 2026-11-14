@@ -1724,3 +1724,54 @@ run back to back (load 11.1 then 9.4), ms per pass, minimum of five passes
 The cost per added row falls from about 35.8 to 26.2 ms (M = 1 → 16).
 Synthetic file (D12's 8-layer file), GPU time at M = 16: 54.1–55.2 ms
 integer, 41.6–44.0 ms float over four runs.
+
+### 2. CPU kernel on its share of the rows during the GPU pass (`YSKN_METAL_CPU_SHARE`)
+
+While a projection group's command buffer runs, the ten CPU workers were
+idle. `MetalEngine::weighted_sums_split(cpu, matrices, activation, scales)`
+(used by `Model` and the draft through `Compute::weighted_sums`) now commits
+the GPU part, then runs the CPU kernel (D10, the oracle) on the *last* rows
+of every matrix of the group in one batch of pool tasks
+(`Engine::weighted_sums_rows`, which also serves `weighted_sums_prefix`),
+then waits for the GPU — also when the CPU part failed, so no shared buffer
+is reused while the GPU reads it — and interleaves both parts row by row
+into the usual M×N result. The readback no longer zero-fills before
+copying. The split is a pure function of N, M and a constant table: CPU
+rows = share(M)·N rounded down to the 32-row tile, leaving the GPU at least
+one tile; share = 0.08, 0.10, 0.12, 0.14, 0.15 at M = 1, 2, 4, 8, 16,
+linear in between and 0.15 above 16. Nothing is timed inside a pass, so a
+run is repeatable, and both devices return the same exact integers, so the
+split cannot change a bit. `YSKN_METAL_CPU_SHARE=off` restores GPU-only
+projections; a number in 0..=0.9 fixes the share for every M (calibration);
+`auto` or unset selects the table. Tests: the split at shares 0, 0.3, 0.9
+and the table, for three matrices per call (padded and partial tiles, row
+and warp, M = 1, 3, 16, 20), equals the CPU kernel and the GPU-only path;
+CPU row ranges of several matrices (including an empty one) equal slices of
+whole-matrix sums for 1 and 4 workers.
+
+Calibration, real model, engine-like grouping (257 calls per pass, as
+`Model` makes them):
+`cargo run --release -p yskn-engine --example bench_metal -- $HOME/models/qwen38-speed/qwen38_27b_speed.yskn --m 1,4,16 --passes 5 --shares 0,0.03,0.05,0.07,0.09,0.12,0.15,0.18`,
+two sweeps back to back at load 6.3 and 4.6, ms per pass (minimum of five;
+first / second sweep):
+
+| share | M = 1 | M = 4 | M = 16 |
+|---:|---:|---:|---:|
+| 0 (GPU only) | 144.5 / 144.8 | 194.2 / 199.4 | 554.6 / 554.3 |
+| 0.05 | 139.2 / 137.1 | 188.2 / 191.8 | 537.6 / 537.2 |
+| 0.09 | 135.6 / 136.0 | 182.5 / 184.5 | 518.5 / 517.4 |
+| 0.12 | 133.6 / 135.2 | 180.4 / 181.3 | 507.4 / 502.2 |
+| 0.15 | 135.3 / 139.8 | 178.6 / 179.3 | 494.2 / 488.6 |
+| 0.18 | 153.4 / 157.6 | 184.8 / 184.6 | 480.3 / 475.6 |
+
+A third sweep (load 5.4) gave at M = 2: 152.7 (off), 140.8 (0.12), 138.2
+(0.15), 145.9 (0.18); at M = 8: 291.0 (off), 268.1 (0.12), 259.2 (0.15),
+255.2 (0.18), 352 (0.21). At M = 16 a build started during that sweep
+(load rose to 16): 0.15 took 608 ms against 520 ms GPU-only. The CPU kernel
+alone took 735.7 / 1,311 ms at M = 1 / 16 at that time
+(`bench_linear --m 1,16`). Past the optimum the time rises steeply (the GPU
+waits for the CPU), and an external CPU load moves the optimum down, so
+the table sits below the measured optima (0.12 at M = 1, 0.15 at 2 and 4,
+at least 0.18 at 8 and 16). On a quiet machine the optimum should be
+higher; the orchestrator can repeat the sweep and change `CPU_SHARE` in
+`src/metal.rs`.

@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Error, Matrix, Result};
+use crate::{Engine, Error, Matrix, Result};
 use objc2::{rc::Retained, rc::autoreleasepool, runtime::ProtocolObject};
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
@@ -80,6 +80,62 @@ const MAX_GROUPS: usize = 512;
 type Device = ProtocolObject<dyn MTLDevice>;
 type Buffer = ProtocolObject<dyn MTLBuffer>;
 type Pipeline = ProtocolObject<dyn MTLComputePipelineState>;
+type CommandBuffer = ProtocolObject<dyn MTLCommandBuffer>;
+
+/// Largest accepted CPU share of a matrix's rows.
+const MAX_CPU_SHARE: f64 = 0.9;
+
+#[derive(Clone, Copy)]
+enum CpuShare {
+    Off,
+    Fixed(f64),
+    Calibrated,
+}
+
+fn parse_share(share: f64) -> Result<CpuShare> {
+    if share == 0.0 {
+        Ok(CpuShare::Off)
+    } else if (0.0..=MAX_CPU_SHARE).contains(&share) {
+        Ok(CpuShare::Fixed(share))
+    } else {
+        Err(invalid("the CPU share must be within 0..=0.9"))
+    }
+}
+
+/// CPU fraction of each matrix's rows at M = 1, 2, 4, 8 and 16 (linear in between,
+/// constant above 16), from `bench_metal --shares` on the real model on the
+/// 4P+6E M5 with 10 CPU workers (D21). Each value is somewhat below the measured
+/// optimum: a CPU that is slower than calibrated (other load) costs far more
+/// than one that is faster.
+const CPU_SHARE: [(usize, f64); 5] = [(1, 0.08), (2, 0.10), (4, 0.12), (8, 0.14), (16, 0.15)];
+
+fn calibrated_cpu_share(m: usize) -> f64 {
+    let m = m.clamp(1, 16);
+    let upper = CPU_SHARE
+        .iter()
+        .position(|&(rows, _)| rows >= m)
+        .unwrap_or(CPU_SHARE.len() - 1);
+    let (m1, s1) = CPU_SHARE[upper];
+    if m1 == m || upper == 0 {
+        return s1;
+    }
+    let (m0, s0) = CPU_SHARE[upper - 1];
+    s0 + (s1 - s0) * (m - m0) as f64 / (m1 - m0) as f64
+}
+
+/// `YSKN_METAL_CPU_SHARE`: unset or `auto` = calibrated table, `off` = GPU only,
+/// or a fixed fraction in 0..=0.9 for every M.
+fn cpu_share_from_env() -> Result<CpuShare> {
+    match std::env::var("YSKN_METAL_CPU_SHARE").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("auto") => Ok(CpuShare::Calibrated),
+        Ok("off") => Ok(CpuShare::Off),
+        Ok(value) => value
+            .parse::<f64>()
+            .map_err(|_| invalid("YSKN_METAL_CPU_SHARE must be auto, off or 0..=0.9"))
+            .and_then(parse_share),
+        Err(_) => Err(invalid("YSKN_METAL_CPU_SHARE must be auto, off or 0..=0.9")),
+    }
+}
 
 fn metal_error(context: &str, detail: impl std::fmt::Display) -> Error {
     Error::Io(std::io::Error::other(format!("Metal {context}: {detail}")))
@@ -177,23 +233,24 @@ unsafe fn upload(
     Ok(())
 }
 
-/// Copy `len` i64 sums out of a shared output buffer.
+/// Row-major M×(g + c) sums: each activation row's `g` GPU sums from the shared
+/// output buffer (M×g), followed by its `c` CPU sums from `cpu` (M×c, may be empty).
 ///
 /// # Safety
 /// No GPU work may be writing the buffer during the call.
-unsafe fn download(output: &Buffer, len: usize) -> Result<Vec<i64>> {
-    if output.length() < len * 8 {
+unsafe fn download(output: &Buffer, inputs: usize, g: usize, cpu: &[i64]) -> Result<Vec<i64>> {
+    if inputs == 0 || output.length() < inputs * g * 8 || !cpu.len().is_multiple_of(inputs) {
         return Err(metal_error("readback", "output buffer too small"));
     }
-    let mut values = vec![0_i64; len];
-    // SAFETY: the buffer holds at least `len` i64 values (checked above; shared
+    let c = cpu.len() / inputs;
+    // SAFETY: the buffer holds at least M×g i64 values (checked above; shared
     // contents are page-aligned), and the caller guarantees no concurrent GPU write.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            output.contents().as_ptr().cast::<i64>(),
-            values.as_mut_ptr(),
-            len,
-        );
+    let gpu =
+        unsafe { std::slice::from_raw_parts(output.contents().as_ptr().cast::<i64>(), inputs * g) };
+    let mut values = Vec::with_capacity(inputs * (g + c));
+    for row in 0..inputs {
+        values.extend_from_slice(&gpu[row * g..(row + 1) * g]);
+        values.extend_from_slice(&cpu[row * c..(row + 1) * c]);
     }
     Ok(values)
 }
@@ -227,9 +284,16 @@ impl Job {
     pub fn output(&self) -> Vec<i64> {
         // SAFETY: `run` waits for completion and takes jobs mutably, so no GPU work
         // writes this job's buffer while it is borrowed here.
-        unsafe { download(&self.output, self.plan.output_len()) }
-            // The buffer was allocated for exactly this length in `MetalEngine::job`.
-            .expect("job output buffer")
+        unsafe {
+            download(
+                &self.output,
+                self.plan.inputs,
+                self.plan.params.rows as usize,
+                &[],
+            )
+        }
+        // The buffer was allocated for exactly this length in `MetalEngine::job`.
+        .expect("job output buffer")
     }
 
     /// Replace this job's activation rows and integer scales (same M) before a rerun.
@@ -344,6 +408,7 @@ pub struct MetalEngine {
     tables: HashMap<(usize, u64), Retained<Buffer>>,
     splits: usize,
     float_mac: bool,
+    cpu_share: CpuShare,
     /// Reusable input and per-matrix output buffers of `weighted_sums_shared`,
     /// grown on demand and never shrunk.
     scratch_activation: Option<Retained<Buffer>>,
@@ -387,6 +452,7 @@ impl MetalEngine {
             // at 16; 1-2 and 16-32 are slower.
             splits: 4,
             float_mac: float_mac_from_env()?,
+            cpu_share: cpu_share_from_env()?,
             scratch_activation: None,
             scratch_scales: None,
             scratch_outputs: Vec::new(),
@@ -692,15 +758,74 @@ impl MetalEngine {
         activation: &[i8],
         scales: &[i32],
     ) -> Result<Vec<Vec<i64>>> {
+        self.shared(None, matrices, activation, scales)
+    }
+
+    /// As [`Self::weighted_sums_shared`], but the CPU kernel on `cpu` computes
+    /// the last rows of each matrix while the GPU computes the others. The row
+    /// split comes only from the matrix size, M and [`Self::cpu_share`], so a run
+    /// is repeatable; the sums are exact whatever the split.
+    pub fn weighted_sums_split(
+        &mut self,
+        cpu: &mut Engine,
+        matrices: &[&Matrix],
+        activation: &[i8],
+        scales: &[i32],
+    ) -> Result<Vec<Vec<i64>>> {
+        self.shared(Some(cpu), matrices, activation, scales)
+    }
+
+    /// The CPU's fraction of each matrix's rows for M activation rows (0 = GPU only).
+    pub fn cpu_share(&self, m: usize) -> f64 {
+        match self.cpu_share {
+            CpuShare::Off => 0.0,
+            CpuShare::Fixed(share) => share,
+            CpuShare::Calibrated => calibrated_cpu_share(m),
+        }
+    }
+
+    /// Override the CPU share for all M (`None` restores the calibrated table).
+    pub fn set_cpu_share(&mut self, share: Option<f64>) -> Result<()> {
+        self.cpu_share = match share {
+            None => CpuShare::Calibrated,
+            Some(share) => parse_share(share)?,
+        };
+        Ok(())
+    }
+
+    /// CPU rows of an `n`-row matrix: a multiple of the 32-row tile, leaving the
+    /// GPU at least one tile.
+    fn cpu_rows(&self, n: usize, m: usize) -> usize {
+        let rows = (self.cpu_share(m) * n as f64) as usize / ROW_TILE * ROW_TILE;
+        rows.min(n.saturating_sub(ROW_TILE) / ROW_TILE * ROW_TILE)
+    }
+
+    fn shared(
+        &mut self,
+        cpu: Option<&mut Engine>,
+        matrices: &[&Matrix],
+        activation: &[i8],
+        scales: &[i32],
+    ) -> Result<Vec<Vec<i64>>> {
+        let split: Vec<(usize, usize)> = matrices
+            .iter()
+            .map(|matrix| {
+                let d = matrix.descriptor();
+                let n = d.physical_rows;
+                let m = activation.len() / d.cols.max(1);
+                let cpu_rows = if cpu.is_some() {
+                    self.cpu_rows(n, m)
+                } else {
+                    0
+                };
+                (n - cpu_rows, n)
+            })
+            .collect();
         let plans = matrices
             .iter()
-            .map(|m| {
-                self.plan(
-                    m,
-                    activation.len(),
-                    scales.len(),
-                    m.descriptor().physical_rows,
-                )
+            .zip(&split)
+            .map(|(matrix, &(gpu_rows, _))| {
+                self.plan(matrix, activation.len(), scales.len(), gpu_rows)
             })
             .collect::<Result<Vec<_>>>()?;
         let activation_buffer = reserve(
@@ -718,8 +843,9 @@ impl MetalEngine {
             .map(|(plan, slot)| reserve(&self.device, slot, plan.output_len() * 8))
             .collect::<Result<Vec<_>>>()?;
         // SAFETY: the scratch buffers are distinct objects owned by this engine,
-        // which is borrowed mutably here, and every submission waits for
-        // completion, so no GPU work or other reference touches them meanwhile.
+        // which is borrowed mutably here, and every submission is waited for
+        // before this function returns, so no GPU work or other reference
+        // touches them meanwhile.
         unsafe {
             upload(
                 &activation_buffer,
@@ -729,27 +855,51 @@ impl MetalEngine {
                 self.float_mac,
             )
         }?;
-        self.submit(|encoder| {
+        let command = self.commit(|encoder| {
             for (plan, output) in plans.iter().zip(&outputs) {
                 plan.encode(encoder, &activation_buffer, &scales_buffer, output);
             }
         })?;
+        // The CPU rows run while the GPU works; wait for the GPU even if they fail.
+        let cpu_sums = match cpu {
+            Some(cpu) if split.iter().any(|&(gpu_rows, n)| gpu_rows < n) => {
+                let parts: Vec<_> = matrices
+                    .iter()
+                    .zip(&split)
+                    .map(|(matrix, &(gpu_rows, n))| (*matrix, gpu_rows..n))
+                    .collect();
+                cpu.weighted_sums_rows(&parts, activation, scales)
+            }
+            _ => Ok(vec![Vec::new(); matrices.len()]),
+        };
+        Self::wait(&command)?;
+        let cpu_sums = cpu_sums?;
         plans
             .iter()
             .zip(&outputs)
-            .map(|(plan, output)| {
-                // SAFETY: `submit` returned, so the command buffer has completed and
+            .zip(&cpu_sums)
+            .map(|((plan, output), cpu)| {
+                // SAFETY: `wait` returned, so the command buffer has completed and
                 // nothing writes these engine-owned buffers any more.
-                unsafe { download(output, plan.output_len()) }
+                unsafe { download(output, plan.inputs, plan.params.rows as usize, cpu) }
             })
             .collect()
     }
 
     /// Encode with `encode` into one command buffer, commit, and wait for completion.
+    /// Returns the GPU execution time reported by the command buffer.
     fn submit(
         &self,
         encode: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
     ) -> Result<Duration> {
+        Self::wait(&*self.commit(encode)?)
+    }
+
+    /// Encode with `encode` into one command buffer and commit it without waiting.
+    fn commit(
+        &self,
+        encode: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
+    ) -> Result<Retained<CommandBuffer>> {
         autoreleasepool(|_| {
             let command = self
                 .queue
@@ -761,18 +911,23 @@ impl MetalEngine {
             encode(&encoder);
             encoder.endEncoding();
             command.commit();
-            command.waitUntilCompleted();
-            if command.status() != MTLCommandBufferStatus::Completed {
-                let detail = command.error().map_or_else(
-                    || "unknown".into(),
-                    |e| e.localizedDescription().to_string(),
-                );
-                return Err(metal_error("execution", detail));
-            }
-            Ok(Duration::from_secs_f64(
-                (command.GPUEndTime() - command.GPUStartTime()).max(0.0),
-            ))
+            Ok(command)
         })
+    }
+
+    /// Wait for a committed command buffer; its GPU execution time.
+    fn wait(command: &CommandBuffer) -> Result<Duration> {
+        command.waitUntilCompleted();
+        if command.status() != MTLCommandBufferStatus::Completed {
+            let detail = command.error().map_or_else(
+                || "unknown".into(),
+                |e| e.localizedDescription().to_string(),
+            );
+            return Err(metal_error("execution", detail));
+        }
+        Ok(Duration::from_secs_f64(
+            (command.GPUEndTime() - command.GPUStartTime()).max(0.0),
+        ))
     }
 
     /// Wall time of committing and waiting for one trivial one-thread dispatch.
