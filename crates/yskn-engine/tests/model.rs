@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
-use yskn_engine::{Backend, Engine, Kernel, Model};
+use yskn_engine::{Backend, Engine, Kernel, KvMode, Model};
 use yskn_format::Container;
 
 struct Fixture(PathBuf);
@@ -68,19 +68,30 @@ fn digest(rows: &[Vec<f32>]) -> String {
     format!("{:x}", hash.finalize())
 }
 fn compare(bytes: Vec<u8>, count: usize, baseline: &str) {
+    compare_mode(bytes, count, Some(baseline), KvMode::Int8);
+}
+fn compare_mode(bytes: Vec<u8>, count: usize, baseline: Option<&str>, mode: KvMode) {
     let fixture = Fixture::new(&bytes);
-    let mut reference =
-        yskn_ref::Model::from_container(Container::from_bytes(bytes).unwrap()).unwrap();
+    if mode != KvMode::Int8 {
+        fs::write(
+            fixture.0.join("kvq_u5.bin"),
+            support::kv_profile::mixed_profile(),
+        )
+        .unwrap();
+    }
+    let mut reference = yskn_ref::Model::load_folder_with(&fixture.0, mode).unwrap();
     reference.prefill(&[1, 2, 3]).unwrap();
     let initial = reference.row_logits().to_vec();
     let tokens: Vec<_> = (0..count).map(|i| ((i * 7 + 11) % 65) as u32).collect();
     reference.prefill(&tokens).unwrap();
     let expected = reference.row_logits().to_vec();
-    assert_eq!(
-        digest(&expected),
-        baseline,
-        "reference bits changed from pre-change HEAD"
-    );
+    if let Some(baseline) = baseline {
+        assert_eq!(
+            digest(&expected),
+            baseline,
+            "reference bits changed from pre-change HEAD"
+        );
+    }
     reference.prefill(&[17, 21]).unwrap();
     let continuation = reference.row_logits().to_vec();
     reference.reset().unwrap();
@@ -88,6 +99,7 @@ fn compare(bytes: Vec<u8>, count: usize, baseline: &str) {
     let after_reset = reference.row_logits().to_vec();
     let check = |context: &str, mut model: Model| {
         assert_eq!(model.context_capacity(), 320);
+        assert_eq!(model.kv_mode(), mode);
         model.prefill(&[1, 2, 3]).unwrap();
         same(model.row_logits(), &initial, context);
         model.prefill(&tokens).unwrap();
@@ -121,23 +133,53 @@ fn compare(bytes: Vec<u8>, count: usize, baseline: &str) {
         let continued = model.row_logits().to_vec();
         same(&continued, &continuation, context);
     };
-    for kernel in Kernel::available_variants() {
-        for threads in [1, 4] {
-            for rows in [1, 2, 5, 16, 17, 40] {
-                let context = format!("{} threads={threads} rows_per_pass={rows}", kernel.name());
-                check(&context, fixture.model(kernel, threads, rows));
-            }
-        }
-    }
+    let mut backends = vec![Backend::Cpu];
     if metal_device() {
-        for threads in [1, 4] {
-            for rows in [1, 2, 5, 16, 17, 40] {
-                let context = format!("metal threads={threads} rows_per_pass={rows}");
-                let model = fixture.backend_model(Backend::Metal, threads, rows);
-                assert_eq!(model.backend(), Backend::Metal);
-                check(&context, model);
+        backends.push(Backend::Metal);
+    }
+    for backend in backends {
+        let kernels = if mode == KvMode::Int8 {
+            Kernel::available_variants()
+        } else {
+            vec![Kernel::fastest()]
+        };
+        let widths: &[usize] = if mode == KvMode::Int8 {
+            &[1, 2, 5, 16, 17, 40]
+        } else {
+            &[1, 5, 16, 17]
+        };
+        for kernel in kernels {
+            // Metal ignores the projection kernel; only run that backend once per width/pool.
+            if backend == Backend::Metal && kernel != Kernel::fastest() {
+                continue;
+            }
+            for threads in [1, 4] {
+                for &rows in widths {
+                    let context = format!(
+                        "{mode:?} {backend:?} {} threads={threads} rows_per_pass={rows}",
+                        kernel.name()
+                    );
+                    let model = if mode == KvMode::Int8 && backend == Backend::Cpu {
+                        fixture.model(kernel, threads, rows)
+                    } else {
+                        // SAFETY: fixture contents stay immutable until this model is dropped.
+                        unsafe {
+                            Model::with_options(
+                                &fixture.0,
+                                Engine::new(kernel, threads).unwrap(),
+                                backend,
+                                rows,
+                                mode,
+                            )
+                        }
+                        .unwrap()
+                    };
+                    assert_eq!(model.backend(), backend);
+                    check(&context, model);
+                }
             }
         }
+        println!("ran: {mode:?} {backend:?} threads=1,4 rows_per_pass={widths:?}");
     }
 }
 /// A missing device is reported on stdout and is the only way to skip Metal cases.
@@ -171,6 +213,30 @@ fn mixed_model_crosses_attention_tiles_from_position_three_without_bit_changes()
         ),
         73,
         "3cf62a9fb84c5f8d5ff3cdd434f061014b0baafc773fa38166c3091a0142a8ba",
+    );
+}
+#[test]
+fn int8_profile_mixed_model_matches_reference_across_passes_chunks_reset_and_continuation() {
+    compare_mode(
+        support::synthetic_model(
+            107,
+            &["linear_attention", "full_attention", "full_attention"],
+        ),
+        73,
+        None,
+        KvMode::Int8Profile,
+    );
+}
+#[test]
+fn kv5_mixed_model_matches_reference_across_passes_chunks_reset_and_continuation() {
+    compare_mode(
+        support::synthetic_model(
+            107,
+            &["linear_attention", "full_attention", "full_attention"],
+        ),
+        73,
+        None,
+        KvMode::Kv5,
     );
 }
 #[test]
@@ -325,4 +391,68 @@ fn persistent_range_pool_preserves_order_borrows_and_recovers_after_errors() {
     }
     assert_eq!(engine.map_range(0..101, |i| Ok(input[i])).unwrap(), input);
     assert!(engine.map_range(0..0, |_| Ok(())).unwrap().is_empty());
+}
+
+#[test]
+fn load_selects_env_kv_and_explicit_constructors_keep_int8_default() {
+    const CHILD: &str = "YSKN_TEST_KV_FOLDER";
+    if let Some(folder) = std::env::var_os(CHILD) {
+        let value = std::env::var_os("YSKN_KV");
+        let expected = value
+            .as_deref()
+            .map(yskn_ref::quality::parse_kv_mode)
+            .transpose();
+        // SAFETY: the parent keeps this fixture immutable until this child exits.
+        let loaded = unsafe { Model::load(&folder) };
+        match expected {
+            Ok(mode) => assert_eq!(loaded.unwrap().kv_mode(), mode.unwrap_or_default()),
+            Err(_) => assert!(matches!(loaded, Err(yskn_engine::Error::InvalidInput(_)))),
+        }
+        let fixture_engine = || Engine::new(Kernel::Portable, 1).unwrap();
+        // SAFETY: the parent keeps this fixture immutable until this child exits.
+        let cpu = unsafe { Model::with_engine(&folder, fixture_engine(), 5) }.unwrap();
+        // SAFETY: same immutable fixture contract.
+        let backend =
+            unsafe { Model::with_backend(&folder, fixture_engine(), Backend::Cpu, 5) }.unwrap();
+        assert_eq!(cpu.kv_mode(), KvMode::Int8);
+        assert_eq!(backend.kv_mode(), KvMode::Int8);
+        return;
+    }
+    let fixture = Fixture::new(&support::synthetic_model(
+        107,
+        &["linear_attention", "full_attention", "full_attention"],
+    ));
+    fs::write(
+        fixture.0.join("kvq_u5.bin"),
+        support::kv_profile::mixed_profile(),
+    )
+    .unwrap();
+    for value in [
+        None,
+        Some("int8"),
+        Some("int8-profile"),
+        Some("kv5"),
+        Some("invalid"),
+    ] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "load_selects_env_kv_and_explicit_constructors_keep_int8_default",
+            ])
+            .env(CHILD, &fixture.0)
+            .env("YSKN_BACKEND", "cpu")
+            .env("YSKN_KERNEL", "portable")
+            .env_remove("YSKN_KV");
+        if let Some(value) = value {
+            child.env("YSKN_KV", value);
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "kv={value:?}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

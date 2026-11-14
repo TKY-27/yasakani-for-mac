@@ -15,4 +15,4 @@ pub use mapped::{MappedModel, Matrix};
 pub use metal::{Job, MetalEngine};
 pub use model::{Backend, Model, PassTiming};
 pub use pool::Engine;
-pub use yskn_ref::{Error, Result};
+pub use yskn_ref::{Error, KvMode, Result};

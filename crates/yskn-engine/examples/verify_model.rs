@@ -1,17 +1,17 @@
-//! `verify_model MODEL_FOLDER WINDOWS.json [--reference LOGITS.json]`
+//! `verify_model MODEL_FOLDER WINDOWS.json [--kv int8|int8-profile|kv5] [--reference LOGITS.json]`
 //!
 //! Runs the first 24 tokens of window 0 in six backend/kernel/pass-width
 //! configurations and requires all logit bits to agree. With `--reference`,
 //! the first rows are also compared with the scalar reference's logits written
 //! by `yskn-ref`'s `dump_logits`.
-use yskn_engine::{Backend, Engine, Error, Kernel, Model, Result};
-use yskn_ref::quality::TokenWindows;
+use yskn_engine::{Backend, Engine, Error, Kernel, KvMode, Model, Result};
+use yskn_ref::quality::{TokenWindows, parse_kv_mode};
 
 const ROWS: usize = 24;
 
 fn usage() -> Error {
     Error::InvalidInput(
-        "Usage: verify_model MODEL_FOLDER WINDOWS.json [--reference LOGITS.json]".into(),
+        "Usage: verify_model MODEL_FOLDER WINDOWS.json [--kv int8|int8-profile|kv5] [--reference LOGITS.json]".into(),
     )
 }
 
@@ -71,11 +71,20 @@ fn load_reference(path: &str) -> Result<(Vec<u32>, Vec<Vec<f32>>)> {
 
 fn main() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let reference = match arguments.as_slice() {
-        [_, _] => None,
-        [_, _, option, path] if option == "--reference" => Some(load_reference(path)?),
-        _ => return Err(usage()),
-    };
+    if arguments.len() < 2 {
+        return Err(usage());
+    }
+    let mut mode = KvMode::Int8;
+    let mut reference = None;
+    let mut options = arguments[2..].iter();
+    while let Some(option) = options.next() {
+        let value = options.next().ok_or_else(usage)?;
+        match option.as_str() {
+            "--kv" => mode = parse_kv_mode(value.as_ref())?,
+            "--reference" => reference = Some(load_reference(value)?),
+            _ => return Err(usage()),
+        }
+    }
     let windows = TokenWindows::load(&arguments[1])?;
     let tokens = &windows.windows[0].ids[..ROWS];
     let threads = Engine::default_threads();
@@ -92,11 +101,17 @@ fn main() -> Result<()> {
     for (backend, kernel, threads, rows) in configurations {
         // SAFETY: this command requires read-only weights to stay unchanged until exit.
         let mut model = unsafe {
-            Model::with_backend(&arguments[0], Engine::new(kernel, threads)?, backend, rows)?
+            Model::with_options(
+                &arguments[0],
+                Engine::new(kernel, threads)?,
+                backend,
+                rows,
+                mode,
+            )?
         };
         model.prefill(tokens)?;
         let label = format!(
-            "rows={ROWS} backend={} device={} kernel={} threads={threads} rows_per_pass={rows}",
+            "rows={ROWS} backend={} device={} kernel={} threads={threads} rows_per_pass={rows} kv={mode:?}",
             backend.name(),
             model.device(),
             kernel.name()

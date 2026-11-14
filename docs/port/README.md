@@ -89,48 +89,62 @@ mapped weights and the reference's scalar operation order. `load` accepts a
 model folder or a `.yskn` path and defaults to 16 rows per pass. Its
 compressed projections run on the backend named by `YSKN_BACKEND` (`cpu` or
 `metal`); unset, it uses Metal when the process has a Metal device and the
-CPU kernel otherwise. Explicit configuration uses
+CPU kernel otherwise. `YSKN_KV=int8|int8-profile|kv5` selects its KV cache
+mode (default `int8`). Explicit configuration uses
 `Model::with_backend(path, Engine::new(kernel, threads)?, Backend::Metal,
 rows_per_pass)`; `Model::with_engine(path, engine, rows_per_pass)` is the CPU
-backend. Explicit constructors never read the environment, and Metal without
+backend. Both retain the `Int8` default. To select any mode with either
+backend/pool/pass width, use
+`Model::with_options(path, engine, backend, rows_per_pass, KvMode::Kv5)`.
+`KvMode` is re-exported from `yskn_engine`; `kv_mode()` reports the selection.
+Explicit constructors never read the environment, and Metal without
 a device is an error, not a fallback. The CPU pool runs all other work on
 either backend; both backends give identical bits (D14). The constructors
 are unsafe solely because callers must keep the backing weights file
 unchanged and untruncated until model drop. The engine offers `prefill`,
 `row_logits`, `logits`, `position`, `reset`, `context_capacity`,
-`dimensions`, `rows_per_pass`, `backend`, `device` and measured
+`dimensions`, `rows_per_pass`, `kv_mode`, `backend`, `device` and measured
 `pass_timings`. It has no provisional, commit, draft or speculation API.
 See D11 for the causal attention and parallelism contract and D14 for the
 backends and the parallel recurrent heads.
 
 ```sh
 # Six configurations (four CPU, Metal with 16 and 1 rows per pass), first 24
-# tokens of window 0, all vocabulary logit bits.
-cargo run --release -p yskn-engine --example verify_model -- \
-  /path/to/model-folder tools/quality/windows_own_thinking.json
+# tokens of window 0, all vocabulary logit bits, in each KV mode. Run serially.
+export CARGO_NET_OFFLINE=true
+MODEL_FOLDER=/path/to/model-folder
+for kv in int8 int8-profile kv5; do
+  cargo run --release -p yskn-engine --example verify_model -- \
+    "$MODEL_FOLDER" tools/quality/windows_own_thinking.json --kv "$kv" || exit
+done
 
 # Scalar-reference cross-check of the first ROWS rows (2 or 3; about two
 # minutes per row on the real model, heap-loaded weights; run alone), then the
 # same six configurations plus a comparison with that file.
 cargo run --release -p yskn-ref --example dump_logits -- \
-  /path/to/model-folder tools/quality/windows_own_thinking.json 3 reference-3.json
+  /path/to/model-folder tools/quality/windows_own_thinking.json 3 reference-3-kv5.json --kv kv5
 cargo run --release -p yskn-engine --example verify_model -- \
-  /path/to/model-folder tools/quality/windows_own_thinking.json --reference reference-3.json
+  /path/to/model-folder tools/quality/windows_own_thinking.json --kv kv5 --reference reference-3-kv5.json
 
 # One window, with bounded logit memory and measured pass-stage timings.
-# The first stderr line names the backend and device.
+# The first stderr line names the backend, device and KV mode.
 /usr/bin/time -l cargo run --release -p yskn-engine --example score_windows -- \
   /path/to/model-folder tools/quality/windows_own_thinking.json \
-  --backend metal --rows-per-pass 16 --windows 0..1 --json window-0.json
+  --kv kv5 --backend metal --rows-per-pass 16 --windows 0..1 --json window-0.json
 
 # Whole-model pass timings (seven 16-row passes after a warm-up), for example
 # on a synthetic file from `--example synthetic_model -- OUT.yskn 8`.
 cargo run --release -p yskn-engine --example bench_model -- \
-  MODEL.yskn --backend cpu --rows-per-pass 16 --passes 7
+  MODEL.yskn --kv int8 --backend cpu --rows-per-pass 16 --passes 7
 
-# Full quality command (long running; run only when authorized by the gate).
-cargo run --release -p yskn-engine --example score_windows -- \
-  /path/to/model-folder tools/quality/windows_own_thinking.json --json all-windows.json
+# All 20 windows on Metal in both profile modes (long running;
+# run only when authorized by the gate, serially after verification).
+for kv in int8-profile kv5; do
+  cargo run --release -p yskn-engine --example score_windows -- \
+    "$MODEL_FOLDER" tools/quality/windows_own_thinking.json \
+    --kv "$kv" --backend metal --rows-per-pass 16 --windows 0..20 \
+    --json "all-windows-$kv.json" || exit
+done
 ```
 
 `--windows A..B` selects zero-based window indices, end excluded. Each window
@@ -139,7 +153,16 @@ and aggregate metrics; sum counts and NLLs to combine disjoint partial runs
 in ascending window order, with possible last-bit binary64 rounding differences
 from the full per-position fold. Progress and timing lines go to stderr;
 stdout retains the three scalar-reference summary lines. `--backend` overrides
-`YSKN_BACKEND`. `YSKN_KERNEL` selects the CPU kernel `portable`, `neon` or
+`YSKN_BACKEND`. All three engine examples and reference `dump_logits` accept
+`--kv int8|int8-profile|kv5` (default `int8`, independent of `YSKN_KV`);
+`dump_logits` takes the option after its four positional arguments. Profile
+modes require a model folder and use the same manifest/profile validation as
+the scalar loader. Direct `.yskn` paths support plain Int8.
+The `kv_encode` timing is the complete attention row preparation stage,
+including normalization, RoPE, gating and KV encoding, not codec-only time.
+`attention` covers cache append and attention output; `kernel`, `kv_encode`,
+`attention`, `recurrence` and `rest` do not overlap.
+`YSKN_KERNEL` selects the CPU kernel `portable`, `neon` or
 `dotprod`; omission uses the fastest supported variant. The Metal kernel's
 own benchmark is `cargo run --release -p yskn-engine --example bench_metal --
 MODEL.yskn` (design notes in `crates/yskn-engine/METAL.md`). Real model commands must run serially with no concurrent model
@@ -155,8 +178,8 @@ cargo run --release -p yskn-ref --example score_windows -- \
 `--kv int8|int8-profile|kv5` defaults to `int8`. The upstream published
 “int8” quality configuration corresponds to `int8-profile`, not plain
 `int8`. Shared `quality::parse_kv_mode`/`score_with_kv` and
-`model::model_location_with_kv`/`load_weights_with_kv` let the mapped engine
-select a mode in a follow-up; its existing API still uses plain Int8.
+`model::model_location_with_kv`/`load_weights_with_kv` are also used by the
+mapped engine to select the same mode without changing scalar arithmetic.
 The score example passes the selected mode to its loader through the shared
 scoring helper, preserving the ordered NLL fold.
 
@@ -207,7 +230,11 @@ execution, including subsequent committed state. Attention unit tests
 verify that masked cache contents cannot affect outputs and that masked
 value operations are skipped. Profile-mode tests add a mixed GDN/two-attention
 model with packable and fallback sides, means, a guard and a basis group.
-All three modes have frozen logit digests and distinct outputs; profile modes
+Mapped-engine profile-mode tests reuse this synthetic KVQP writer and compare
+all logit bits with the scalar reference for 73 rows starting at position 3,
+pass widths 1, 5, 16 and 17, uneven chunks, reset and continuation on CPU
+(1 and 4 threads) and Metal when available (otherwise explicitly skipped).
+All three reference modes have frozen logit digests and distinct outputs; profile modes
 check the 73-row position-3 invariance, reset, continuation and failure
 atomicity. Hand-derived attention cases check packed means, key-mean omission,
 BF16 base/weight boundaries and unread masked slots. No released weights or
