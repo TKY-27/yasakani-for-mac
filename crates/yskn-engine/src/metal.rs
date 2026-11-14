@@ -898,9 +898,10 @@ impl MetalEngine {
             .map(|(plan, slot)| reserve(&self.device, slot, plan.output_len() * 8))
             .collect::<Result<Vec<_>>>()?;
         // SAFETY: the scratch buffers are distinct objects owned by this engine,
-        // which is borrowed mutably here, and every committed command buffer is
-        // waited for before its `InFlight` guard is dropped, on every exit path
-        // including an unwind, so no GPU work or other reference touches them.
+        // which is borrowed mutably here. Every earlier command buffer of this
+        // engine was waited for by its `InFlight` guard before its call returned
+        // or unwound, and this call has not committed yet, so no GPU work or
+        // other reference touches them.
         unsafe {
             upload(
                 &activation_buffer,
