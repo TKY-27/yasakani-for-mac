@@ -1757,6 +1757,10 @@ async fn a_response_that_is_not_read_is_bounded_by_the_idle_deadline() {
 fn quiet_config() -> Config {
     let mut cfg = Config::default();
     cfg.limits.idle_timeout = Duration::from_millis(200);
+    cfg.limits.keepalive_interval = Duration::from_millis(50);
+    // Hyper's header deadline also starts when it waits for the next request
+    // on a kept-alive connection; far away, only the idle deadline closes it.
+    cfg.limits.header_timeout = Duration::from_secs(3600);
     cfg
 }
 /// Splits an event stream into its comment frames and its JSON events. Every
@@ -1827,7 +1831,8 @@ async fn closed_by_the_server(conn: JoinHandle<()>) {
         .unwrap();
 }
 /// One non-streaming request on a kept-alive connection, then one streamed
-/// request, both answered in full despite the engine's silence.
+/// request, both answered in full despite the engine's silence; the stream
+/// carries keep-alive comments through it.
 async fn survives_silence(h: &Harness, text: &str) {
     h.script(&format!("</think>{text}"));
     let (r, _sender, conn) = kept_alive(h, &body()).await;
@@ -1840,7 +1845,9 @@ async fn survives_silence(h: &Harness, text: &str) {
         .chat(json!({"stream":true,"stream_options":{"include_usage":true}}))
         .await;
     assert_eq!(r.status, 200);
-    let (_, ev) = sse_frames(&r.text);
+    let (comments, ev) = sse_frames(&r.text);
+    // Only the silence is longer than the 50 ms keep-alive interval.
+    assert!(comments > 0, "{}", r.text);
     assert_eq!(ev[0]["choices"][0]["delta"], json!({"role":"assistant"}));
     assert_eq!(pieces(&ev, "content"), text);
     assert_eq!(ev[ev.len() - 2]["choices"][0]["finish_reason"], "stop");
@@ -1901,4 +1908,122 @@ async fn a_request_queued_behind_a_long_one_gets_the_queue_timeout() {
     // The queued request never reached the engine.
     assert_eq!(h.control.observation().calls, 1);
     h.stop().await;
+}
+// A client that leaves while the engine is silent is still noticed, though
+// no idle deadline runs then: Hyper's read sees the disconnect, the request
+// is cancelled, and the engine's next cancellation poll stops it.
+#[tokio::test]
+async fn a_disconnect_during_a_silent_prefill_cancels_the_engine() {
+    let h = Harness::start(quiet_config()).await;
+    h.silence.set(Duration::from_secs(3600), Duration::ZERO);
+    let silence = h.silence.clone();
+    // Non-streaming: nothing at all has been written to the client.
+    let mut s = TcpStream::connect(h.addr).await.unwrap();
+    s.write_all(raw_post(&h, &body()).as_bytes()).await.unwrap();
+    common::until("the silent prefill to start", || {
+        silence.get().prefills == 1
+    })
+    .await;
+    drop(s);
+    common::until("the engine to see the disconnect", || {
+        silence.get().cancelled == 1
+    })
+    .await;
+    // Streaming: keep-alive comments for several idle deadlines first.
+    let (sender, mut body, task) = open_stream(&h, json!({"messages":user(),"stream":true})).await;
+    let mut comments = 0;
+    while comments < 10 {
+        let frame = tokio::time::timeout(common::PATIENCE, body.frame())
+            .await
+            .expect("no keep-alive comment")
+            .unwrap()
+            .unwrap();
+        if frame.data_ref().is_some_and(|d| d.starts_with(b":")) {
+            comments += 1;
+        }
+    }
+    task.abort();
+    drop((sender, body));
+    common::until("the engine to see the disconnect", || {
+        silence.get().cancelled == 2
+    })
+    .await;
+    h.silence.set(Duration::ZERO, Duration::ZERO);
+    h.script("</think>next");
+    let r = h.chat(json!({"max_tokens":20})).await;
+    assert_eq!(r.json()["choices"][0]["message"]["content"], "next");
+    assert_eq!(h.control.observation().calls, 1);
+    h.stop().await;
+}
+// A client that stops reading is still cut off by the idle deadline once
+// output resumes after a silent prefill; keep-alive comments do not hold the
+// connection, and the engine is cancelled. The answer is endless and the
+// backpressure deadline far away, so only the idle deadline can end it.
+#[tokio::test]
+async fn a_stalled_reader_after_a_silent_prefill_still_times_out() {
+    let mut cfg = quiet_config();
+    cfg.limits.max_connections = 1;
+    cfg.limits.stream_timeout = Duration::from_secs(3600);
+    let h = Harness::start_with_capacity(cfg, 4_000_000).await;
+    h.silence.set(Duration::from_millis(1000), Duration::ZERO);
+    h.control.push(Script {
+        ids: ids("unread "),
+        loop_from: Some(0),
+    });
+    let b = json!({"messages":user(),"stream":true,"max_tokens":2_000_000,"enable_thinking":false,"loop_guard":false});
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut s = socket.connect(h.addr).await.unwrap();
+    s.write_all(raw_post(&h, &b).as_bytes()).await.unwrap();
+    // `s` holds the only permit: a served request proves it was dropped.
+    until_a_connection_is_free(&h).await;
+    h.silence.set(Duration::ZERO, Duration::ZERO);
+    h.script("</think>next");
+    let r = h.chat(json!({"max_tokens":20})).await;
+    assert_eq!(r.json()["choices"][0]["message"]["content"], "next");
+    // Stopped while sending output, not during the silence.
+    assert_eq!(h.control.observation().stops, 1);
+    assert_eq!(h.silence.get().cancelled, 0);
+    drop(s);
+    h.stop().await;
+}
+// The idle deadline still bounds a body that stops arriving when the body
+// deadline is far away: the work flag is set only once the body is complete.
+#[tokio::test]
+async fn the_idle_deadline_still_bounds_a_stalled_body() {
+    let mut cfg = quiet_config();
+    cfg.limits.body_timeout = Duration::from_secs(3600);
+    let h = Harness::start(cfg).await;
+    let mut s = TcpStream::connect(h.addr).await.unwrap();
+    s.write_all(
+        format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nContent-Length: 999\r\n\r\n{{",
+            h.addr
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut out = vec![];
+    let read = tokio::time::timeout(common::PATIENCE, s.read_to_end(&mut out))
+        .await
+        .expect("the server never closed the stalled connection");
+    assert!(read.is_ok() || read.is_err_and(|e| e.kind() == ErrorKind::ConnectionReset));
+    assert_eq!(h.control.observation().calls, 0);
+    h.stop().await;
+}
+#[test]
+fn the_keepalive_interval_is_bounded() {
+    for (ms, ok) in [
+        (0, false),
+        (9, false),
+        (10, true),
+        (15_000, true),
+        (3_600_000, true),
+        (3_600_001, false),
+    ] {
+        let mut cfg = Config::default();
+        cfg.limits.keepalive_interval = Duration::from_millis(ms);
+        assert_eq!(cfg.validate().is_ok(), ok, "{ms} ms");
+    }
 }
