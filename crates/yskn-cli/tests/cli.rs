@@ -168,6 +168,9 @@ fn chat_thinking_visibility_effort_and_aliases() {
     ] {
         assert!(text(&r).contains(s), "{}", text(&r));
     }
+    let r = run(&["chat", "--engine", "stub", "--raw"], "hi\n/q\n");
+    assert!(r.status.success(), "{}", text(&r));
+    assert!(text(&r).contains("Stub response"));
     let r = run(
         &["chat", "--engine", "stub", "--hide-thinking"],
         "hi\n/quit\n",

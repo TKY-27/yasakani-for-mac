@@ -23,7 +23,11 @@ for the stub; it makes no model-format fidelity claim.
 
 `chat`: `--system`, `--max-tokens`, `--temperature`, `--top-p`, `--top-k`,
 `--seed`, `--no-think`, `--effort low|medium|xhigh`, `--hide-thinking`,
-`--no-loop-guard`. Plain stdin/stdout supports pipes. Slash commands are
+`--no-loop-guard`, `--raw`. Plain stdin/stdout supports pipes. Model text,
+reasoning text and error messages are printed with C0 control characters other
+than newline and tab, DEL and C1 controls (U+0080 to U+009F) shown as `\xNN`, so
+escape sequences in model output cannot drive the terminal; `--raw` prints them
+unchanged. The HTTP API is unaffected: its text is JSON-encoded. Slash commands are
 `/exit`, `/quit`, `/q`, `/reset`, `/think on|off`, `/effort low|medium|xhigh`,
 `/help`. Thinking appears between `[thinking]` and `[/thinking]` when an answer
 follows. Ctrl+C stops the current generation or exits at the input prompt; the

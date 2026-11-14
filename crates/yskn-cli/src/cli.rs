@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const CHAT_HELP: &str = "commands:  /exit  quit      /reset  forget the conversation      /think on|off  thinking on or off (default on)\n           /effort low|medium|xhigh  how long the model thinks      /help  this text      Ctrl+C while it writes: stop the answer";
-const HELP: &str = "yskn - local Rust chat product (real engine not connected yet)\ncommands: serve, chat, info, bench, selfcheck\n  --engine stub       deterministic demo engine; required until integration\n  --model-dir FOLDER  optional real tokenizer/template, read only\n  --max-ctx N         context capacity (default 262144)\n  --seed0 N           first automatic request seed (default 1)\nserve:\n  --host HOST         default 127.0.0.1\n  --port PORT         default 8765; 0 chooses an ephemeral port\n  --api-key KEY       or YASAKANI_API_KEY; required for remote binds\n  --default-max-tokens N  default 32768\n  --max-tokens-cap N  request upper limit\n  --no-warmup\nchat:\n  --system TEXT --max-tokens N --temperature N --top-p N --top-k N\n  --seed N --no-think --effort low|medium|xhigh --hide-thinking --no-loop-guard\n  /help shows terminal commands\nYASAKANI_THINKING_BUDGET sets the server default (0 = unlimited).\nbench and selfcheck: not available yet\n  --help, -h, --version";
+const HELP: &str = "yskn - local Rust chat product (real engine not connected yet)\ncommands: serve, chat, info, bench, selfcheck\n  --engine stub       deterministic demo engine; required until integration\n  --model-dir FOLDER  optional real tokenizer/template, read only\n  --max-ctx N         context capacity (default 262144)\n  --seed0 N           first automatic request seed (default 1)\nserve:\n  --host HOST         default 127.0.0.1\n  --port PORT         default 8765; 0 chooses an ephemeral port\n  --api-key KEY       or YASAKANI_API_KEY; required for remote binds\n  --default-max-tokens N  default 32768\n  --max-tokens-cap N  request upper limit\n  --no-warmup\nchat:\n  --system TEXT --max-tokens N --temperature N --top-p N --top-k N\n  --seed N --no-think --effort low|medium|xhigh --hide-thinking --no-loop-guard\n  --raw  print control characters in model output unescaped\n  /help shows terminal commands\nYASAKANI_THINKING_BUDGET sets the server default (0 = unlimited).\nbench and selfcheck: not available yet\n  --help, -h, --version";
 struct Args {
     command: String,
     values: HashMap<String, String>,
@@ -93,7 +93,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
             .split_once('=')
             .map_or((arg, None), |(k, v)| (k, Some(v.to_owned())));
         let is_flag = (command == "serve" && key == "no-warmup")
-            || (command == "chat" && matches!(key, "no-think" | "hide-thinking" | "no-loop-guard"));
+            || (command == "chat"
+                && matches!(key, "no-think" | "hide-thinking" | "no-loop-guard" | "raw"));
         if is_flag && inline.is_none() {
             flags.insert(key.into());
             continue;
@@ -201,6 +202,7 @@ pub async fn main(argv: Vec<String>) -> Result<()> {
         "chat" => {
             let p = chat_params(&args)?;
             let hide = args.flag("hide-thinking");
+            let raw = args.flag("raw");
             let writing = Arc::new(AtomicBool::new(false));
             let cancel = Arc::new(AtomicBool::new(false));
             let worker_writing = writing.clone();
@@ -216,6 +218,7 @@ pub async fn main(argv: Vec<String>) -> Result<()> {
                             &mut runner,
                             p,
                             hide,
+                            raw,
                             io::stdin().lock(),
                             // Not locked across the loop: the interrupt handler
                             // writes too, while this thread waits for input.
@@ -270,17 +273,44 @@ fn chat_params(args: &Args) -> Result<ChatParams> {
     };
     Ok(p)
 }
-/// Plain line-oriented chat, usable with any buffered input/output (including pipes).
+/// Shows C0 controls other than newline and tab, DEL and C1 controls as
+/// `\xNN`, so text written to a terminal cannot drive it.
+pub fn visible(text: &str) -> std::borrow::Cow<'_, str> {
+    let control = |c: char| c.is_control() && c != '\n' && c != '\t';
+    if !text.contains(control) {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if control(c) {
+            out.push_str(&format!("\\x{:02x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out.into()
+}
+/// Plain line-oriented chat, usable with any buffered input/output (including
+/// pipes). Model text and errors are passed through [`visible`] unless `raw`.
+#[allow(clippy::too_many_arguments)]
 pub fn chat_loop(
     runner: &mut ChatRunner,
     mut p: ChatParams,
     hide: bool,
+    raw: bool,
     mut input: impl BufRead,
     mut output: impl Write,
     writing: &AtomicBool,
     cancel: &AtomicBool,
 ) -> Result<()> {
     let base = p.messages.as_array().cloned().unwrap_or_default();
+    let shown = |text: &str| -> String {
+        if raw {
+            text.into()
+        } else {
+            visible(text).into_owned()
+        }
+    };
     let mut messages = base.clone();
     writeln!(
         output,
@@ -357,7 +387,7 @@ pub fn chat_loop(
                         }
                         last = kind;
                     }
-                    write!(output, "{text}")
+                    write!(output, "{}", shown(&text))
                         .and_then(|_| output.flush())
                         .map_err(Error::engine)
                 },
@@ -374,12 +404,13 @@ pub fn chat_loop(
             Err(e) => {
                 writeln!(
                     output,
-                    "{}: {e}",
+                    "{}: {}",
                     if e.status == 400 {
                         "cannot do that"
                     } else {
                         "\nengine error"
-                    }
+                    },
+                    shown(&e.message)
                 )
                 .map_err(Error::engine)?;
                 messages.pop();

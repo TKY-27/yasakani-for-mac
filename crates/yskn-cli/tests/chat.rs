@@ -620,6 +620,7 @@ fn terminal_thinking_commands_and_history() {
         &mut r,
         p,
         false,
+        false,
         "hi\n/think off\n/effort low\n/reset\nhi again\n/bogus\n/exit\n".as_bytes(),
         &mut output,
         &AtomicBool::new(false),
@@ -716,7 +717,16 @@ fn terminal_interrupt_stops_the_answer_and_keeps_the_prompt() {
         p.max_tokens = 1_000_000;
         p.loop_guard = false;
         let mut output = vec![];
-        let result = yskn::cli::chat_loop(&mut r, p, false, "hi\n".as_bytes(), &mut output, &w, &k);
+        let result = yskn::cli::chat_loop(
+            &mut r,
+            p,
+            false,
+            false,
+            "hi\n".as_bytes(),
+            &mut output,
+            &w,
+            &k,
+        );
         (result, String::from_utf8(output).unwrap())
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -735,4 +745,61 @@ fn terminal_interrupt_stops_the_answer_and_keeps_the_prompt() {
     assert!(out.contains("[stopped]"), "{out}");
     assert!(!out.contains("tokens/s"), "{out}");
     assert_eq!(c.observation().stops, 1);
+}
+// Review finding: model output reached the terminal unfiltered, so escape
+// sequences in it were interpreted. C0 controls other than newline and tab,
+// DEL and C1 controls are shown in a visible escape form instead.
+#[test]
+fn terminal_shows_control_characters_visibly() {
+    let hostile = "\u{1b}[2J\u{1b}]0;title\u{7}\r\u{7f}\u{9b}31m\tok\n";
+    let chat = |raw: bool| {
+        let (mut r, c) = runner();
+        script(&c, &format!("{hostile}</think>{hostile}"));
+        let mut p = ChatParams::new(json!([]));
+        p.max_tokens = 1000;
+        let mut output = vec![];
+        yskn::cli::chat_loop(
+            &mut r,
+            p,
+            false,
+            raw,
+            "hi\n".as_bytes(),
+            &mut output,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        String::from_utf8(output).unwrap()
+    };
+    let out = chat(false);
+    let shown = "\\x1b[2J\\x1b]0;title\\x07\\x0d\\x7f\\x9b31m\tok\n";
+    assert_eq!(out.matches(shown).count(), 2, "{out}");
+    assert!(
+        !out.chars()
+            .any(|ch| ch.is_control() && ch != '\n' && ch != '\t'),
+        "{out:?}"
+    );
+    // --raw turns the filter off.
+    assert_eq!(chat(true).matches(hostile).count(), 2);
+    assert_eq!(yskn::cli::visible("plain\ttext\n"), "plain\ttext\n");
+    // Error messages too.
+    let (mut r, c) = runner();
+    c.fail_next("engine says \u{1b}[2J");
+    let mut output = vec![];
+    yskn::cli::chat_loop(
+        &mut r,
+        ChatParams::new(json!([])),
+        false,
+        false,
+        "hi\n".as_bytes(),
+        &mut output,
+        &AtomicBool::new(false),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let out = String::from_utf8(output).unwrap();
+    assert!(
+        out.contains("engine error: engine says \\x1b[2J"),
+        "{out:?}"
+    );
 }
