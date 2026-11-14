@@ -126,7 +126,7 @@ SHA-256 and reduces all 32 digest bytes without prefix-dependent branches.
 | Queued engine jobs | 64 (bounded by active HTTP connections) | One per connection |
 | Buffered events per response | 8 | Backpressure reaches the engine quickly |
 | Header read buffer (`header_bytes`, at least 8192) | 32 KiB | Browser and SDK headers are a few KiB |
-| Header count (`max_headers`) | 100 | As common HTTP servers |
+| Header count (`max_headers`) | 100 | As Python's `http.client`, which upstream's server uses |
 | Complete header deadline (`header_timeout`) | 10 s | Slow-header clients cannot hold connections |
 | Complete body deadline (`body_timeout`) | 30 s | 8 MiB at loopback speed takes milliseconds |
 | Idle socket read/write deadline (`idle_timeout`) | 300 s | Long enough for a keep-alive client between requests |
