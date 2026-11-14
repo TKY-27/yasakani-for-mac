@@ -128,3 +128,92 @@ fn cpu_stage_override_rejects_unknown_values_before_opening_weights() {
         assert!(status.success());
     }
 }
+
+#[test]
+fn public_model_runs_vector_and_forced_reference_stages() {
+    const CHILD: &str = "YSKN_CPU_STAGE_VARIANT_CHILD";
+    let Ok(variant) = std::env::var(CHILD) else {
+        // Selection is process-wide: fresh children avoid environment mutation races.
+        for variant in ["auto", "reference"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "public_model_runs_vector_and_forced_reference_stages",
+                    "--nocapture",
+                ])
+                .env(CHILD, variant)
+                .env("YSKN_CPU_STAGES", variant)
+                .status()
+                .unwrap();
+            assert!(status.success(), "CPU stages {variant} failed");
+        }
+        return;
+    };
+    let neon = {
+        #[cfg(target_arch = "aarch64")]
+        {
+            std::arch::is_aarch64_feature_detected!("neon")
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            false
+        }
+    };
+    println!(
+        "CPU stages: requested={variant}, ran={}",
+        if variant == "auto" && neon {
+            "NEON"
+        } else {
+            "scalar"
+        }
+    );
+    let folder = std::env::temp_dir().join(format!("yskn-cpu-stages-{}", std::process::id()));
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(
+        folder.join("weights.yskn"),
+        support::synthetic_model(
+            107,
+            &["linear_attention", "full_attention", "full_attention"],
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        folder.join("kvq_u5.bin"),
+        support::kv_profile::mixed_profile(),
+    )
+    .unwrap();
+    std::fs::write(
+        folder.join("yasakani.json"),
+        r#"{"files":{"weights":"weights.yskn"},"max_ctx":64}"#,
+    )
+    .unwrap();
+    for mode in [KvMode::Int8, KvMode::Int8Profile, KvMode::Kv5] {
+        let mut reference = yskn_ref::Model::load_folder_with(&folder, mode).unwrap();
+        // SAFETY: these synthetic weights remain immutable until both models are dropped.
+        let mut model = unsafe {
+            yskn_engine::Model::with_options(
+                &folder,
+                Engine::new(Kernel::Portable, 4).unwrap(),
+                yskn_engine::Backend::Cpu,
+                16,
+                mode,
+            )
+        }
+        .unwrap();
+        let tokens: Vec<_> = (0..36).map(|i| (i * 7 + 11) % 65).collect();
+        for chunk in [&[1, 2, 3][..], &tokens, &[17, 21]] {
+            reference.prefill(chunk).unwrap();
+            model.prefill(chunk).unwrap();
+            assert_eq!(model.row_logits().len(), reference.row_logits().len());
+            for (actual, expected) in model.row_logits().iter().zip(reference.row_logits()) {
+                assert_eq!(bits(actual), bits(expected), "{variant} {mode:?}");
+            }
+            assert_eq!(
+                model.state_digest(),
+                reference.state_digest(),
+                "{variant} {mode:?}"
+            );
+        }
+    }
+    std::fs::remove_dir_all(folder).unwrap();
+}
