@@ -75,8 +75,15 @@ pub struct Limits {
     pub header_bytes: usize,
     pub header_timeout: Duration,
     pub body_timeout: Duration,
+    /// Longest wait for the client: for request bytes (head, body, the next
+    /// request on a kept-alive connection) and for a write to make progress.
+    /// It does not run while a request is queued or the engine works on it.
     pub idle_timeout: Duration,
     pub stream_timeout: Duration,
+    /// A stream with no output for this long sends an SSE comment line, so
+    /// read timeouts of clients and intermediaries do not fire while the
+    /// engine is silent (a long prefill). 10 ms to 1 hour.
+    pub keepalive_interval: Duration,
     /// Ending a connection after a response half-closes first, then discards
     /// at most `linger_bytes` from the peer for at most `linger_timeout`.
     pub linger_bytes: usize,
@@ -105,6 +112,7 @@ impl Default for Limits {
             body_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(300),
             stream_timeout: Duration::from_secs(30),
+            keepalive_interval: Duration::from_secs(15),
             linger_bytes: 256 * 1024,
             linger_timeout: Duration::from_secs(2),
         }
@@ -155,6 +163,8 @@ impl Config {
             || self.limits.max_connections > 1024
             || self.limits.max_headers == 0
             || self.limits.header_bytes < 8192
+            || !(Duration::from_millis(10)..=Duration::from_secs(3600))
+                .contains(&self.limits.keepalive_interval)
             || self.defaults.max_tokens == 0
             || self.defaults.max_tokens_cap == Some(0)
         {
@@ -292,6 +302,24 @@ fn sse(v: Value) -> Bytes {
     Bytes::from(format!("data: {v}\n\n"))
 }
 
+/// A connection's "the server works on a request" flag, shared between its
+/// `IdleIo` and the request it serves (as an extension). Set from the end of
+/// the request body until the response is complete: queued, prepared,
+/// generating, streaming. Requests served by an embedder carry none.
+#[derive(Clone, Default)]
+struct Working(Arc<AtomicBool>);
+impl Working {
+    fn start(&self) -> WorkingGuard {
+        self.0.store(true, Ordering::Release);
+        WorkingGuard(self.0.clone())
+    }
+}
+struct WorkingGuard(Arc<AtomicBool>);
+impl Drop for WorkingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 struct Cancel(Arc<AtomicBool>);
 impl Drop for Cancel {
     fn drop(&mut self) {
@@ -515,10 +543,11 @@ impl Server {
                     connections.spawn(async move {
                         let _permit=permit;
                         let limits=&api.shared.cfg.limits;
-                        let io=TokioIo::new(IdleIo::new(socket,limits));
+                        let working=Working::default();
+                        let io=TokioIo::new(IdleIo::new(socket,limits,working.0.clone()));
                         let mut builder=http1::Builder::new();
                         builder.timer(TokioTimer::new()).header_read_timeout(limits.header_timeout).max_headers(limits.max_headers).max_buf_size(limits.header_bytes);
-                        let service=service_fn(move |r|{let api=api.clone();async move {Ok::<_,Infallible>(api.call(r).await)}});
+                        let service=service_fn(move |mut r: Request<hyper::body::Incoming>|{r.extensions_mut().insert(working.clone());let api=api.clone();async move {Ok::<_,Infallible>(api.call(r).await)}});
                         let _=builder.serve_connection(io,service).await;
                     });
                 }
@@ -818,6 +847,9 @@ where
         }
         Ok(Ok(b)) => b,
     };
+    // The client has sent everything: until the response is complete the
+    // idle deadline does not apply to reads (see `IdleIo`).
+    let working = r.extensions().get::<Working>().map(Working::start);
     let decoded = match decode(bytes, cfg, &mut charge) {
         Ok(d) => d,
         Err(e) if e.status == 503 => return busy(e),
@@ -854,11 +886,14 @@ where
         let stream = EventBody {
             events,
             cancel,
+            _working: working,
             envelope,
             include_usage: decoded.include_usage,
             calls: 0,
             pending: std::collections::VecDeque::new(),
             ended: false,
+            keepalive: Box::pin(tokio::time::sleep(cfg.limits.keepalive_interval)),
+            interval: cfg.limits.keepalive_interval,
         };
         let mut stream = stream;
         stream.pending.push_back(sse(stream.envelope.chunk(
@@ -891,14 +926,23 @@ where
     drop(cancel);
     error_response(Error::engine("engine worker ended without a completion"))
 }
+/// An SSE comment line; clients ignore it.
+const KEEPALIVE: &[u8] = b": keep-alive\n\n";
 struct EventBody {
     events: mpsc::Receiver<Result<Event>>,
     cancel: Cancel,
+    // Held until the stream ends or the connection drops it.
+    _working: Option<WorkingGuard>,
     envelope: Envelope,
     include_usage: bool,
     calls: usize,
     pending: std::collections::VecDeque<Bytes>,
     ended: bool,
+    /// Fires after `interval` without output. Hyper polls the body only when
+    /// it can buffer more, so a client that does not read gets no more
+    /// comments than the bytes Hyper holds for it anyway.
+    keepalive: Pin<Box<Sleep>>,
+    interval: Duration,
 }
 impl Body for EventBody {
     type Data = Bytes;
@@ -908,8 +952,24 @@ impl Body for EventBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<std::result::Result<Frame<Bytes>, Infallible>>> {
         let this = self.get_mut();
+        let bytes = match this.poll_output(cx) {
+            Poll::Ready(bytes) => bytes,
+            Poll::Pending => {
+                ready!(this.keepalive.as_mut().poll(cx));
+                Some(Bytes::from_static(KEEPALIVE))
+            }
+        };
+        this.keepalive
+            .as_mut()
+            .reset(Instant::now() + this.interval);
+        Poll::Ready(bytes.map(|b| Ok(Frame::data(b))))
+    }
+}
+impl EventBody {
+    fn poll_output(&mut self, cx: &mut Context<'_>) -> Poll<Option<Bytes>> {
+        let this = self;
         if let Some(bytes) = this.pending.pop_front() {
-            return Poll::Ready(Some(Ok(Frame::data(bytes))));
+            return Poll::Ready(Some(bytes));
         }
         if this.ended {
             return Poll::Ready(None);
@@ -966,29 +1026,38 @@ impl Body for EventBody {
                     }
                 }
                 let _ = &this.cancel; // held through the final frame, dropped on disconnect
-                Poll::Ready(this.pending.pop_front().map(|b| Ok(Frame::data(b))))
+                Poll::Ready(this.pending.pop_front())
             }
         }
     }
 }
 
-// Idle deadline covers both reads and writes, including persistent connections
-// and a peer that stops reading a stream. A boxed Sleep keeps pinning safe.
+// The idle deadline bounds every wait for the client: reading a request head
+// or body, the next request on a persistent connection, and a write that makes
+// no progress (a peer that stops reading). While the connection's request is
+// worked on (`Working`), Hyper still reads, but only to notice a disconnect,
+// which cancels the engine; those reads have no deadline, so a long silent
+// prefill is not cut off. A boxed Sleep keeps pinning safe.
 struct IdleIo {
     socket: TcpStream,
     sleep: Pin<Box<Sleep>>,
     timeout: Duration,
+    working: Arc<AtomicBool>,
+    // `working` as last seen by a read: a change restarts the read deadline.
+    was_working: bool,
     linger_bytes: usize,
     linger_timeout: Duration,
     // Some once shutdown has half-closed: the bytes still allowed to discard.
     linger_left: Option<usize>,
 }
 impl IdleIo {
-    fn new(socket: TcpStream, limits: &Limits) -> Self {
+    fn new(socket: TcpStream, limits: &Limits, working: Arc<AtomicBool>) -> Self {
         Self {
             socket,
             sleep: Box::pin(tokio::time::sleep(limits.idle_timeout)),
             timeout: limits.idle_timeout,
+            working,
+            was_working: false,
             linger_bytes: limits.linger_bytes,
             linger_timeout: limits.linger_timeout,
             linger_left: None,
@@ -1008,7 +1077,14 @@ impl AsyncRead for IdleIo {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if this.expired(cx) {
+        let working = this.working.load(Ordering::Acquire);
+        if working != this.was_working {
+            // A response just completed (or work began): the wait starts now,
+            // not at the last bytes before a possibly long silence.
+            this.was_working = working;
+            this.progress();
+        }
+        if !working && this.expired(cx) {
             return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
         }
         let before = buf.filled().len();
@@ -1026,21 +1102,21 @@ impl AsyncWrite for IdleIo {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if this.expired(cx) {
-            return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
-        }
         let r = Pin::new(&mut this.socket).poll_write(cx, buf);
-        if matches!(&r,Poll::Ready(Ok(n)) if *n>0) {
-            this.progress();
+        match &r {
+            Poll::Ready(Ok(n)) if *n > 0 => this.progress(),
+            // Only a write that waits for the peer is held to the deadline: the
+            // first output after a long silence is not refused for the silence.
+            Poll::Pending if this.expired(cx) => {
+                return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
+            }
+            _ => {}
         }
         r
     }
+    // A TCP flush never waits, so it has no deadline of its own.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        if this.expired(cx) {
-            return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
-        }
-        Pin::new(&mut this.socket).poll_flush(cx)
+        Pin::new(&mut self.get_mut().socket).poll_flush(cx)
     }
     // Hyper calls this after flushing every response it ends a connection with,
     // including its own 400/431 parse-error responses. Closing a socket with
@@ -1072,5 +1148,41 @@ impl AsyncWrite for IdleIo {
             }
         }
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    // Hyper 1.12 writes a completed response before it reads again, so the
+    // restart of the read deadline when work ends is checked here directly.
+    #[tokio::test]
+    async fn reads_have_no_deadline_while_working_and_a_fresh_one_after() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let idle = Duration::from_millis(300);
+        let limits = Limits {
+            idle_timeout: idle,
+            ..Limits::default()
+        };
+        let working = Arc::new(AtomicBool::new(true));
+        let mut io = IdleIo::new(socket, &limits, working.clone());
+        let mut byte = [0_u8; 1];
+        // Three idle deadlines of silence while the request is worked on.
+        let silent = tokio::time::timeout(3 * idle, io.read(&mut byte)).await;
+        assert!(silent.is_err(), "{silent:?}");
+        working.store(false, Ordering::Release);
+        let start = Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(30), io.read(&mut byte))
+            .await
+            .expect("the idle deadline never fired");
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= idle, "{:?}", start.elapsed());
+        drop(client);
     }
 }
