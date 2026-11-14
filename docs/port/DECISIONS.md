@@ -1442,10 +1442,14 @@ numbers.
 The default `yskn` engine loads the published model folder. `--engine stub`
 remains an explicit deterministic development fixture. The public
 `RealEngineConfig` holds the same settings used by terminal/server factories:
-cache `Kv5`, n-gram drafting with K=3, context 32,768, prefill width 16,
-normal engine backend selection and normal CPU-worker defaults. None/neural/
-fixed n-gram-first combined drafting are selectable. K remains a plain option;
-there is no new adaptive policy. Neural modes use D17's scalar draft. The
+cache `Kv5`, context 32,768, prefill width 16, normal engine backend selection
+and normal CPU-worker defaults. Drafting defaults changed with brief 06k (D21):
+`--draft both --k 7 --depth adaptive`, where `both` copies long n-gram matches
+and otherwise asks the fast neural draft (D18, with its own pool of the main
+model's kernel and worker count and the same projection backend), K is the
+maximum depth and the adaptive policy picks each pass's depth. None/n-gram/
+neural/both and `--depth fixed` remain selectable. The scalar draft is no
+longer reachable from the product; tests and examples still use it. The
 server creates the model on its existing dedicated engine thread, retaining
 the non-`Send` engine contract and every existing request/security limit.
 Mapped model files must remain unchanged through process exit; command help,
@@ -1522,8 +1526,13 @@ working  = recurrent + W*replay_row + expanded_dense_vectors
          + 8*context + 4*W*vocabulary
 ```
 
-Draft files count twice the draft container plus the reduced-head file to
-cover owned scalar codes/expanded data. D17 ring and capture dimensions are
+Draft files (since D21, for the fast draft) count the mapped draft container
+and reduced-head file once, plus what the fast draft owns: the repacked
+approximate head rows, f32 copies of the head projection and scales, and the
+draft's hidden/final norms, per-layer ln1/ln2/q_norm/k_norm/abase/mbase
+and selector hp expanded to f32. Selector pred/succ stay mapped as BF16;
+their per-row decoding is scratch, not a persistent f32 copy. The scalar
+draft's owned code copy is gone. D17 ring and capture dimensions are
 header-derived and appear in both working/checkpoint owners as appropriate.
 The margin covers process/allocator/OS overhead and unitemized tables/scratch;
 this is a startup fit estimate, not measured peak RSS or free-memory admission.
@@ -1568,12 +1577,21 @@ settings compare their Cartesian product. Printed metrics are also written by
 model file size/name and proposal settings. Prefill rate counts only prompt rows
 processed before the final pending row; the latter is timed in the shared
 loop's first verification pass. Logical code bytes count body/head
-compressed streams once per main pass, plus actual neural proposal code reads
-normalised by main passes. Per neural proposal the model is draft compressed
-body streams plus `7 * (vocabulary*rank + shortlist*hidden)` int8 head reads:
-the seven output positions each score the approximate head and only the
-shortlisted rescore rows (default shortlist 512). It does not count the full
-rescore matrix, whose other rows are untouched. Embedding row reads, vectors, lookup tables, scales,
+compressed streams once per main pass, plus the draft work counted inside the
+timed generation, normalised by main passes (corrected in brief 06k: before,
+history updates were not counted, so `--n 1` with a neural draft reported main
+bytes only). A neural proposal reads the draft block streams (every layer
+matrix; not the FC input projection) plus `7 * (vocabulary*rank +
+shortlist*hidden)` int8 head reads: the seven output positions each score the
+approximate head and only the shortlisted rescore rows (default shortlist
+512). It does not count the full rescore matrix, whose other rows are
+untouched. A history update, one push of the consecutive rows a pass commits
+(the fast draft reads its codes once per push of up to 256 rows), reads the FC
+and every layer's key/value streams. Updates follow every commit, also when no
+proposal ran. `DraftProposer::work` counts both; `Generation` carries the
+counts for the generation call, and `yskn info`/bench JSON report the bytes of
+one proposal (1,740,636,160 for the published model) and of one update
+(91,750,400). Embedding row reads, vectors, lookup tables, scales,
 cache and recurrent traffic are excluded; it is not a hardware DRAM counter.
 Neither synthetic tests nor these accounting definitions establish released
 model throughput. The real-model selfcheck/bench/chat/server commands remain
@@ -2311,8 +2329,242 @@ additional unsafe assembly/scratch and the short-context regression. The
 experiment was removed; the final source is the previously fully verified
 version. The trial binaries/logs are retained only in ignored local evidence.
 
-The implementation and evidence are confined to the allowed files in 07e.
-`git add -A` failed with `Operation not permitted` creating
-`.git/worktrees/07e/index.lock`; staging and commits could not be created in
-this sandbox. No push was attempted. The unchanged starting HEAD is
-`92c7277791f461d35a4cc5cf4b69941c3b0e4dc8`.
+## D21 — Fast draft in the product and an adaptive draft depth
+
+Decision (2026-11-14, brief 06k). The product runs the fast neural draft
+(D18) and chooses, before every pass, how many guesses to request. Defaults:
+`--draft both --k 7 --depth adaptive`. Output is unchanged by construction:
+the policy only changes how many guesses are offered, and the D16 loop keeps
+only guesses equal to the main model's own selections.
+
+### Fast draft in the product
+
+`--draft neural|both` load `DraftProposer<FastDraft>` through the crate's one
+mapping boundary (`map_files`, which maps the main weights and the two draft
+files under the documented file-stability contract). The draft gets its own
+`yskn_engine::Engine` with the main model's kernel and worker count and the
+main model's projection backend; the two pools never run at the same time.
+The scalar `Draft` is no longer reachable from the product. Memory accounting
+(D19) counts the mapped draft files once plus the fast draft's owned data;
+for the published dimensions with the defaults, the formula gives
+`draft_bytes` 2,721,905,176 and `needed_bytes` 20,435,462,454 (19.03 GiB)
+against 25,769,803,776 physical. Corrected in brief 06m: the previous
+estimate double-counted 508,559,360 bytes of mapped BF16 selector tables as
+owned f32, plus 76,283,904 bytes of margin. Matrix code streams and head
+rescoring rows stay mapped; approximate int8 rows are repacked/owned, and
+head projection/scales are copied as f32. Matrix scales/signs/tables and
+short-lived selector rows remain covered by the conservative scratch/margin.
+Product tests with the synthetic draft
+(`crates/yskn-cli/tests/product.rs`) check that the product's output with the
+fast draft, for `neural` and `both`, adaptive and fixed depth, K = 1, 3, 7,
+greedy and seeded, equals the output with `--draft none` and the independent
+scalar loop, and that a repeated request repeats passes, rows and proposals.
+
+### The policy
+
+`yskn_ref::speculation::DepthController` (`crates/yskn-ref/src/draft_depth.rs`):
+
+- **Estimate.** `e[j]` approximates P(accepted prefix >= j) of a neural
+  proposal, j = 1..K, starting from a prior (the measured mean profile,
+  0.84 0.70 0.57 0.50 0.45 0.39 0.34).
+- **Scoring every depth.** The proposer is always asked for its whole budget
+  (the block draft computes all seven tokens anyway); only the offer is
+  truncated. Once later output is known, a proposal's counterfactual accepted
+  prefix (how many of all its guesses equal the output) is exact, because the
+  output does not depend on the proposal. So each proposal updates every
+  `e[j]`, offered or not: `e[j] += 0.25 * ([prefix >= j] - e[j])`, applied when
+  the outcome is decided (at the first mismatch, or when all guesses are
+  confirmed). This is upstream's deferred scoring of pending proposals
+  (`src/specx.cpp:441-447`, `dpend_`), applied to depth.
+- **Choice.** Depth d in 0..=min(K, room) maximizing
+  `(1 + e[1] + ... + e[d]) / (pass(d + 1) + [d > 0] * proposal)`; ties keep
+  the smaller d. d = 0 does not call the draft at all.
+- **Probing and recovery.** Every pass without a proposal moves `e` 5% back
+  toward the prior (old evidence goes stale), and after 4 such passes one
+  proposal at the best positive depth is forced. Since one proposal scores all
+  depths, one probe on easy text measures the whole profile again. Unit tests
+  on synthetic sequences: all accepted reaches K = 7 within 3 passes and stays;
+  none accepted stops proposing within 4 passes and then probes at least every
+  5 passes, at most one pass in three; alternating 120-token regimes back off
+  within 8 passes and return to depth 7 within 3 * (probe_after + 1) + 2 = 17;
+  the same recovery bound holds from estimates of zero for probe intervals
+  0, 2, 4 and 8.
+- **Free guesses.** A proposer may offer guesses that cost nothing worth
+  counting (`Proposer::free_guesses`); they are offered in full, up to K,
+  without consulting or updating the estimate. `--draft both` uses this for an
+  n-gram copy whose most recent match of the last three tokens spans at least
+  six tokens (`ProposalOrder::LongNgramFirst(6)`, also used with a fixed
+  depth). The controller therefore only ever sees neural proposals.
+
+**Cost model and determinism.** The cost model is a fixed table measured on
+this machine (main pass 232, 300, 345, 390, 455, 520, 585, 650 ms for 1..8 rows
+from the brief's measurements, rows 3 and 5..7 interpolated; one fast proposal
+47 ms, D18), `CostModel::apple_m5_neural`. It is not timed inside the loop:
+every decision is a function of the tokens produced so far, the proposals made
+and constants, so the depth sequence repeats exactly for a given input
+(`GenerationStatistics::requested_depths`; tested). A calibration measured at
+start was rejected: this machine is shared and its timings vary by 2x within
+minutes (below), which would make depths, and therefore speed, differ between
+identical runs. Decisions depend on cost ratios, so a uniformly slower or
+faster machine does not change them. Context length raises every row count's
+cost roughly alike; the table is for short context.
+
+Upstream's `src/specx.cpp:143-160,241-265,378-384` adapts the source (draft or
+n-gram, by EMAs of accepted counts on long matches, `dema_`, rate 1/16, with
+periodic draft probes, `bdr_adapt`/`bdr_probe`) and the block width (8 or 16
+rows, `b16_*`, with exponential probe back-off). Its GPU makes extra rows
+nearly free, so it never shortens a block. Here rows are expensive (a pass with
+8 rows costs 2.8 times one row), so the policy chooses the depth itself, down
+to zero.
+
+### What the proposers know (measured)
+
+`draft_trace record` (below) records, before each of 256 one-row passes per
+bench task, the full neural proposal, its per-position confidence margin
+(best minus second corrected score) and the n-gram proposal with its match
+length. Counterfactual P(prefix >= j), j = 1..7:
+
+| Task | Neural | N-gram (n = 3) |
+|---|---|---|
+| prose | .852 .699 .523 .367 .250 .180 .098 | .004 0 0 0 0 0 0 |
+| code | .965 .910 .863 .816 .766 .695 .641 | .023 .012 0 0 0 0 0 |
+| structured | .727 .414 .195 .191 .188 .184 .180 | .793 .781 .770 .016 .008 .004 0 |
+| thinking | .922 .852 .785 .707 .645 .594 .523 | .098 .059 .035 .023 .016 .012 .008 |
+
+The structured task (CSV to JSON with EOS ignored) finishes its answer after
+about 48 tokens and then repeats a three-token cycle that the n-gram copies
+exactly and the neural draft gets mostly wrong. Confidence predicts acceptance
+(prose: guesses with margin < 0.5 are accepted 35%, others 81%; code 50% vs
+96%; structured 11% vs 77%; thinking 55% vs 94%).
+
+**Replay.** `draft_trace replay` runs any policy over the trace with the real
+controller code and reports exact passes, rows and proposals, and time from
+the cost table. Its pass counts equal `yskn bench` exactly for every
+configuration measured below (one discrepancy found this way was a missing
+`free_guesses` forwarding in the product's proposer enum, fixed). Projected
+ms per token, all four tasks (256 tokens each; 96 in parentheses):
+
+| Configuration | prose | code | structured | thinking | all |
+|---|---:|---:|---:|---:|---:|
+| none | 232.0 | 232.0 | 232.0 | 232.0 | 232.0 (232.0) |
+| n-gram K=3 (old default) | 234.6 | 234.9 | 126.8 | 226.2 | 205.6 (216.8) |
+| neural fixed K=2 | 157.5 | 137.2 | 151.4 | 143.9 | 147.5 (160.5) |
+| neural fixed K=3 | 144.9 | 117.0 | 161.8 | 128.9 | 138.2 (148.4) |
+| neural fixed K=4 | 150.6 | 108.3 | 179.8 | 122.5 | 140.3 (145.6) |
+| neural fixed K=7 | 181.2 | 111.8 | 237.5 | 129.3 | 164.9 (171.6) |
+| both, n-gram first (old), fixed K=3 | 149.3 | 124.2 | 110.8 | 137.1 | 130.3 (138.4) |
+| neural adaptive K=7 | 146.1 | 110.3 | 145.9 | 128.7 | 132.8 (143.1) |
+| neural fixed K=7, truncate below margin 1 | 146.4 | 105.1 | 168.1 | 116.5 | 134.0 (142.7) |
+| **both adaptive K=7 (default)** | 146.1 | 110.3 | 110.0 | 126.8 | **123.3** (132.6) |
+
+### What did not help
+
+- **Neural adaptive without the n-gram, or with other rates/probe intervals.**
+  Without free n-gram copies the structured task's three-token cycle can
+  alias with a fixed probe interval: probes every 3 passes always land on the
+  hard position, and the structured task fell to 236 ms/token (rates 0.1-0.5,
+  probe intervals 2 and 8 without relaxation). With the long-match copy, every
+  probe interval 2/4/8, relaxation 0/0.02/0.05 and match length 6/8 gave
+  123.1-125.5 ms/token; the chosen values sit in that flat region.
+- **Confidence truncation.** Stopping a proposal at the first guess with
+  margin below a threshold helps a fixed depth (K=7: 164.9 to 134.0 at margin
+  1) but adds little to the adaptive policy (132.8 to 132.4 at margin 0.25,
+  worse above 1), whose depth already reflects the same information on
+  average; it also biases the counterfactual estimate. Not adopted.
+- **N-gram first for any match (old `both`), or n-gram alone.** Short matches
+  are usually wrong on prose and code; an n-gram-only adaptive policy gave
+  207.2 ms/token, no better than fixed K=3. N-gram mode keeps a fixed K.
+- **Deeper fixed K.** K = 7 offers too many expensive rows on prose and
+  structured text; fixed K = 3-4 is the best fixed depth.
+
+### Measured (`yskn bench --n 96`, Metal, Kv5, 2026-11-14)
+
+The machine was shared with other workers' test suites during every run
+(their test binaries used 1-2 cores; load averages are given per run), so
+times are noisy: the same no-draft configuration measured 461-565 ms per pass
+at 16:38 (load 13.6) and 294-403 at 16:57 (load 6.0), against about 232 on a
+quiet machine. Passes, rows, proposals and bytes are exact and noise-free; the
+projected column applies the cost table to the exact pass shapes. The
+orchestrator repeats the timings on a quiet machine.
+
+| Configuration (start, load) | Task | tokens/s | ms/pass | passes | tokens/pass | rows | proposals | GB read/pass |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| none (16:57, 6.0) | prose | 2.61 | 383 | 96 | 1.000 | 96 | 0 | 9.758 |
+| | code | 2.48 | 403 | 96 | 1.000 | 96 | 0 | 9.758 |
+| | structured | 2.63 | 380 | 96 | 1.000 | 96 | 0 | 9.758 |
+| | thinking | 3.40 | 294 | 96 | 1.000 | 96 | 0 | 9.758 |
+| n-gram fixed K=3 (16:42, 11.1) | prose | 1.72 | 580 | 96 | 1.000 | 96 | 0 | 9.758 |
+| | code | 2.02 | 507 | 94 | 1.021 | 112 | 0 | 9.758 |
+| | structured | 4.69 | 330 | 62 | 1.548 | 109 | 0 | 9.758 |
+| | thinking | 3.49 | 320 | 86 | 1.116 | 113 | 0 | 9.758 |
+| neural fixed K=2 (16:45, 7.7; K=2/4/7 one run) | prose | 5.44 | 420 | 42 | 2.286 | 123 | 41 | 11.549 |
+| | code | 6.53 | 420 | 35 | 2.743 | 103 | 34 | 11.541 |
+| | structured | 4.91 | 434 | 45 | 2.133 | 133 | 44 | 11.552 |
+| | thinking | 5.99 | 433 | 37 | 2.595 | 109 | 36 | 11.544 |
+| neural fixed K=4 (same run) | prose | 4.85 | 618 | 32 | 3.000 | 153 | 31 | 11.536 |
+| | code | 7.59 | 632 | 20 | 4.800 | 100 | 20 | 11.591 |
+| | structured | 4.05 | 624 | 38 | 2.526 | 185 | 37 | 11.545 |
+| | thinking | 6.61 | 631 | 23 | 4.174 | 114 | 23 | 11.591 |
+| neural fixed K=7 (same run) | prose | 3.90 | 849 | 29 | 3.310 | 215 | 28 | 11.531 |
+| | code | 2.94 | 2044 | 16 | 6.000 | 123 | 16 | 11.591 |
+| | structured | 2.94 | 959 | 34 | 2.824 | 260 | 33 | 11.540 |
+| | thinking | 5.29 | 954 | 19 | 5.053 | 148 | 19 | 11.591 |
+| neural fixed K=3 (17:00, 3.5) | prose | 4.36 | 595 | 37 | 2.595 | 143 | 36 | 11.544 |
+| | code | 7.82 | 472 | 26 | 3.692 | 101 | 25 | 11.524 |
+| | structured | 4.75 | 493 | 41 | 2.341 | 161 | 40 | 11.548 |
+| | thinking | 6.99 | 490 | 28 | 3.429 | 112 | 28 | 11.591 |
+| **both adaptive K=7** (17:01, 4.7) | prose | 5.31 | 502 | 36 | 2.667 | 139 | 35 | 11.542 |
+| | code | 7.70 | 657 | 19 | 5.053 | 106 | 19 | 11.591 |
+| | structured | 6.68 | 599 | 24 | 4.000 | 133 | 15 | 10.938 |
+| | thinking | 6.52 | 701 | 21 | 4.571 | 137 | 20 | 11.508 |
+
+Projected from the table for these exact pass shapes (ms per token, mean of
+the four tasks): none 232.0, n-gram K=3 216.8, neural fixed K=2 160.5, K=3
+148.4, K=4 145.6, K=7 171.6, both adaptive 132.6. Compared with neural fixed K=3, the adaptive
+default uses fewer
+passes on code, structured and thinking, and one fewer on prose. This is not
+a minimum across all fixed depths: neural fixed K=7 uses fewer on code
+(16 versus 19) and thinking (19 versus 21). The projected-time comparison
+includes pass width and proposal cost; fewer passes alone need not mean
+less time. Measured back to back at the lowest load (16:57-17:03), the
+default produced 5.31/7.70/6.68/6.52 tokens/s against 2.61/2.48/2.63/3.40
+without drafting (2.0-3.1x) and 4.36/7.82/4.75/6.99 with neural fixed K=3;
+the differences between the drafting configurations are within this run's
+noise, which is why the defaults rest on the exact pass counts. GB read per
+pass: main 9.758 (code streams), plus 1.741 per proposal and 0.092 per
+history update, divided by passes (D19).
+
+Default size, defaults (`yskn bench --model-dir "$M"`, 17:06-17:12, load 4.3
+at start, 6.8 at end; no no-draft run at this size, so no ratio):
+
+| Task | tokens/s | ms/pass | passes | tokens/pass | GB read/pass |
+|---|---:|---:|---:|---:|---:|
+| prose | 6.24 | 558 | 147 | 3.483 | 11.591 |
+| code | 7.05 | 733 | 99 | 5.172 | 11.432 |
+| structured | 8.43 | 475 | 128 | 4.000 | 10.054 |
+| thinking | 6.42 | 699 | 114 | 4.491 | 11.331 |
+
+`yskn selfcheck --model-dir "$M"` with the defaults passed all three cases
+(17:05, load 6.4, 38.2 s wall).
+
+Commands (model lock held around each; `$M` is the model folder):
+
+```sh
+cargo run --release -p yskn --example bench_prompts -- "$M" > prompts.jsonl
+cargo run --release -p yskn-engine --example draft_trace -- record "$M" prompts.jsonl --n 256 --out trace256.json
+cargo run --release -p yskn-engine --example draft_trace -- replay trace256.json --table
+yskn bench --model-dir "$M" --n 96 --draft none
+yskn bench --model-dir "$M" --n 96 --draft ngram --k 3 --depth fixed
+yskn bench --model-dir "$M" --n 96 --draft neural --depth fixed --k 2 --k 3 --k 4 --k 7
+yskn bench --model-dir "$M" --n 96            # defaults: both, K=7, adaptive
+```
+
+The trace run (16:14-16:24, load 7.2 rising to 21) took 628.6 s wall and
+peaked at 2,696,183,808 bytes resident; its own pass timings (310-1,590 ms)
+were too disturbed to replace the table.
+
+**Not verified.** Timings on a quiet machine; long contexts (the table is for
+short ones); sampled requests on the real model (sampled losslessness is
+tested with synthetic models only; the bench is greedy); that the four bench
+tasks, one of which ends in a repetition loop because EOS is ignored,
+represent real use.

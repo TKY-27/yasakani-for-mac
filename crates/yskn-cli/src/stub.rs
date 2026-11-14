@@ -226,6 +226,8 @@ impl Engine for StubEngine {
             passes,
             guesses_offered: 0,
             guesses_accepted: 0,
+            draft_proposals: 0,
+            draft_updates: 0,
         })
     }
 }

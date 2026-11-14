@@ -646,3 +646,143 @@ fn sampled_hook_matches_direct_draft_with_frontier_seed_and_absolute_positions()
     assert_ne!(expected_runs[0], greedy);
     assert_ne!(expected_runs[0], expected_runs[1]);
 }
+
+#[test]
+fn adaptive_truncation_and_free_copy_ring_contains_only_committed_inputs() {
+    use yskn_ref::speculation::{
+        AdaptiveDepth, CombinedProposer, DepthPolicy, NgramProposer, ProposalOrder,
+    };
+    let prompt = [1, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4, 5, 6];
+    for free in [false, true] {
+        let mut main = model(main_bytes());
+        let neural = DraftProposer::new(
+            draft_from(draft_bytes(), support::draft::shead(37)),
+            7,
+            DraftChoice::Greedy,
+        )
+        .unwrap();
+        main.set_capture(neural.capture_options()).unwrap();
+        main.prefill(&prompt[..prompt.len() - 1]).unwrap();
+        let mut proposer = CombinedProposer::new(
+            NgramProposer::new(3, 7).unwrap(),
+            neural,
+            if free {
+                ProposalOrder::LongNgramFirst(6)
+            } else {
+                ProposalOrder::DraftFirst
+            },
+        );
+        let mut limits = GenerationLimits::new(8, main.context_capacity());
+        limits.max_draft_tokens = 7;
+        limits.depth = DepthPolicy::Adaptive(AdaptiveDepth::neural());
+        let mut cancel = |_| false;
+        limits.on_token = Some(&mut cancel);
+        let result = generate(
+            &mut main,
+            &mut proposer,
+            &mut Sampler::Greedy,
+            &prompt,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(result.tokens.len(), 1);
+        if free {
+            assert_eq!(result.statistics.requested_depths, [7]);
+            assert_eq!(proposer.draft().work().proposals, 0);
+        } else {
+            assert_eq!(proposer.draft().work().proposals, 1);
+            assert!(result.statistics.requested_depths[0] > 0);
+            assert!(result.statistics.requested_depths[0] < 7);
+        }
+        // The only committed input is the old frontier (the final prompt ID).
+        // Rebuild from those inputs, excluding every speculative row and the
+        // newly selected frontier, through an independently prefetched model.
+        assert_eq!(main.position(), prompt.len());
+        let mut fresh_main = model(main_bytes());
+        let mut fresh = DraftProposer::new(
+            draft_from(draft_bytes(), support::draft::shead(37)),
+            7,
+            DraftChoice::Greedy,
+        )
+        .unwrap();
+        fresh_main.set_capture(fresh.capture_options()).unwrap();
+        fresh_main.prefill(&prompt).unwrap();
+        fresh.synchronize(&mut fresh_main).unwrap();
+        assert_eq!(
+            proposer.draft().draft().snapshot(),
+            fresh.draft().snapshot(),
+            "free={free}"
+        );
+    }
+}
+
+#[test]
+fn adaptive_request_depths_repeat_after_live_prefix_reuse_and_joint_restore() {
+    use yskn_ref::speculation::{AdaptiveDepth, DepthPolicy, GenerationResult};
+    fn request(
+        main: &mut Model,
+        proposer: &mut impl Proposer,
+        prompt: &[u32],
+        n: usize,
+    ) -> GenerationResult {
+        let mut limits = GenerationLimits::new(n, main.context_capacity());
+        limits.max_draft_tokens = 7;
+        limits.depth = DepthPolicy::Adaptive(AdaptiveDepth::neural());
+        generate(main, proposer, &mut Sampler::Greedy, prompt, limits).unwrap()
+    }
+    fn fresh() -> DraftProposer {
+        DraftProposer::new(
+            draft_from(draft_bytes(), support::draft::shead(37)),
+            7,
+            DraftChoice::Greedy,
+        )
+        .unwrap()
+    }
+    let prompt = [3, 7, 11, 9];
+    let mut oracle = model(main_bytes());
+    oracle.prefill(&prompt[..3]).unwrap();
+    let continuation = request(&mut oracle, &mut NoProposer, &prompt, 16).tokens;
+    let mut target = prompt.to_vec();
+    target.extend_from_slice(&continuation);
+    target.push(13);
+    let mut baseline = model(main_bytes());
+    let mut baseline_draft = fresh();
+    baseline
+        .set_capture(baseline_draft.capture_options())
+        .unwrap();
+    baseline.prefill(&target[..target.len() - 1]).unwrap();
+    let expected = request(&mut baseline, &mut baseline_draft, &target, 24);
+    assert!(
+        expected
+            .statistics
+            .requested_depths
+            .windows(2)
+            .any(|w| w[0] != w[1])
+    );
+    for preceding_n in [8, 16] {
+        for restore in [false, true] {
+            let mut main = model(main_bytes());
+            let mut draft = fresh();
+            main.set_capture(draft.capture_options()).unwrap();
+            main.prefill(&prompt[..3]).unwrap();
+            let checkpoint = draft.snapshot_session(&mut main).unwrap();
+            let previous = request(&mut main, &mut draft, &prompt, preceding_n);
+            assert_eq!(previous.tokens, continuation[..preceding_n]);
+            if restore {
+                draft.restore_session(&mut main, &checkpoint).unwrap();
+            }
+            let position = main.position();
+            main.prefill(&target[position..target.len() - 1]).unwrap();
+            let actual = request(&mut main, &mut draft, &target, 24);
+            assert_eq!(actual.tokens, expected.tokens);
+            assert_eq!(
+                actual.statistics.passes, expected.statistics.passes,
+                "preceding_n={preceding_n} restore={restore}"
+            );
+            assert_eq!(
+                actual.statistics.requested_depths, expected.statistics.requested_depths,
+                "preceding_n={preceding_n} restore={restore}"
+            );
+        }
+    }
+}

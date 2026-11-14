@@ -49,6 +49,10 @@ pub struct Generation {
     pub rows_verified: usize,
     pub guesses_offered: usize,
     pub guesses_accepted: usize,
+    /// Neural block proposals and draft history updates during generation;
+    /// each reads the draft's proposal or update code once (D19).
+    pub draft_proposals: usize,
+    pub draft_updates: usize,
     pub prefill_ms: f64,
     pub gen_ms: f64,
 }

@@ -21,6 +21,15 @@ pub struct SessionSnapshot<T> {
     proposer: DraftProposerSnapshot,
 }
 
+/// Draft calls made by one proposer since it was created; reset keeps them.
+/// Each proposal runs the whole block; each update pushes one run of
+/// consecutive committed rows (`BlockDraft::push_rows`) into the ring.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DraftWork {
+    pub proposals: usize,
+    pub updates: usize,
+}
+
 /// Generic over the draft implementation: the scalar reference by default, or a
 /// fast draft that reproduces it bit for bit.
 pub struct DraftProposer<D: BlockDraft = Draft> {
@@ -29,8 +38,12 @@ pub struct DraftProposer<D: BlockDraft = Draft> {
     choice: DraftChoice,
     context_identity: Option<std::sync::Arc<()>>,
     owner: Rc<()>,
+    work: DraftWork,
 }
 impl<D: BlockDraft> DraftProposer<D> {
+    pub fn work(&self) -> DraftWork {
+        self.work
+    }
     /// Update request-local coupling without invalidating the retained ring/checkpoint.
     pub fn set_choice(&mut self, choice: DraftChoice) {
         self.choice = choice;
@@ -45,6 +58,7 @@ impl<D: BlockDraft> DraftProposer<D> {
             choice,
             context_identity: None,
             owner: Rc::new(()),
+            work: DraftWork::default(),
         })
     }
     pub fn capture_options(&self) -> CaptureOptions {
@@ -185,6 +199,18 @@ impl<D: BlockDraft> DraftProposer<D> {
         drop(verifier.take_captured_rows());
         Ok(())
     }
+    /// The complete block proposal (all seven tokens with their candidates) for
+    /// a pending `last` token, after synchronizing with the verifier.
+    pub fn propose_block<V: Verifier>(
+        &mut self,
+        verifier: &mut V,
+        last: u32,
+    ) -> Result<crate::draft::DraftProposal> {
+        self.synchronize(verifier)?;
+        self.work.proposals += 1;
+        self.draft
+            .propose(last, &mut |token| verifier.embedding(token), self.choice)
+    }
     /// Push maximal runs of consecutive positions as batches. A run that does not
     /// start at the draft position fails exactly as a single-row push would.
     fn push(&mut self, rows: &[&CapturedRow]) -> Result<()> {
@@ -192,6 +218,7 @@ impl<D: BlockDraft> DraftProposer<D> {
         for end in 1..=rows.len() {
             if end == rows.len() || rows[end].position != rows[end - 1].position + 1 {
                 let values: Vec<_> = rows[start..end].iter().map(|r| &r.values[..]).collect();
+                self.work.updates += 1;
                 self.draft.push_rows(rows[start].position, &values)?;
                 start = end;
             }
@@ -230,13 +257,12 @@ impl<D: BlockDraft> Proposer for DraftProposer<D> {
         last: u32,
         max: usize,
     ) -> Result<Vec<u32>> {
-        self.synchronize(verifier)?;
         if max == 0 {
+            self.synchronize(verifier)?;
             return Ok(Vec::new());
         }
         Ok(self
-            .draft
-            .propose(last, &mut |token| verifier.embedding(token), self.choice)?
+            .propose_block(verifier, last)?
             .tokens
             .into_iter()
             .take(self.k.min(max))
@@ -248,9 +274,12 @@ impl<D: BlockDraft> Proposer for DraftProposer<D> {
 pub enum ProposalOrder {
     NgramFirst,
     DraftFirst,
+    /// N-gram only when its match spans at least this many tokens, else the
+    /// draft. Such a copy is also offered as free guesses (D21).
+    LongNgramFirst(usize),
 }
 
-/// First nonempty proposal wins. No adaptive upstream cost/source policy.
+/// First nonempty proposal wins. No upstream cost/source policy.
 pub struct CombinedProposer<D: BlockDraft = Draft> {
     ngram: NgramProposer,
     draft: DraftProposer<D>,
@@ -298,6 +327,14 @@ impl<D: BlockDraft> Proposer for CombinedProposer<D> {
     fn propose(&mut self, history: &[u32], last: u32, max: usize) -> Vec<u32> {
         self.ngram.propose(history, last, max)
     }
+    fn free_guesses(&mut self, history: &[u32], last: u32, max: usize) -> Vec<u32> {
+        match self.order {
+            ProposalOrder::LongNgramFirst(length) => {
+                self.ngram.propose_long(history, last, max, length)
+            }
+            _ => Vec::new(),
+        }
+    }
     fn synchronize<V: Verifier>(&mut self, verifier: &mut V) -> Result<()> {
         self.draft.synchronize(verifier)
     }
@@ -314,13 +351,18 @@ impl<D: BlockDraft> Proposer for CombinedProposer<D> {
         self.synchronize(verifier)?;
         let first = match self.order {
             ProposalOrder::NgramFirst => self.ngram.propose(history, last, max),
+            ProposalOrder::LongNgramFirst(length) => {
+                self.ngram.propose_long(history, last, max, length)
+            }
             ProposalOrder::DraftFirst => self.draft.propose_with(verifier, history, last, max)?,
         };
         if !first.is_empty() {
             return Ok(first);
         }
         match self.order {
-            ProposalOrder::NgramFirst => self.draft.propose_with(verifier, history, last, max),
+            ProposalOrder::NgramFirst | ProposalOrder::LongNgramFirst(_) => {
+                self.draft.propose_with(verifier, history, last, max)
+            }
             ProposalOrder::DraftFirst => Ok(self.ngram.propose(history, last, max)),
         }
     }

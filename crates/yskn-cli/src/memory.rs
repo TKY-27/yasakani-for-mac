@@ -245,7 +245,8 @@ pub(crate) fn inspect(config: &RealEngineConfig) -> Result<ModelInfo> {
         .iter()
         .try_fold(0, |n, v| add(n, mul(v.len as u64, 4)?))?;
     let mut draft_bytes = 0;
-    let mut draft_codes = 0;
+    let mut proposal_codes = 0;
+    let mut update_codes = 0;
     let mut ring = 0;
     let mut captures = 0;
     if config.draft.neural() {
@@ -253,21 +254,57 @@ pub(crate) fn inspect(config: &RealEngineConfig) -> Result<ModelInfo> {
             yskn_ref::draft::model_paths(&config.model_dir).map_err(Error::engine)?;
         let d = Container::open(draft_path).map_err(Error::engine)?;
         let dims = DraftDimensions::read(d.header()).map_err(Error::engine)?;
-        // The scalar draft owns codes and expanded vectors/signs. Twice its
-        // container size is a conservative bound for those owned structures.
-        draft_bytes = add(
-            mul(d.header().file_bytes, 2)?,
-            fs::metadata(&head_path).map_err(Error::engine)?.len(),
-        )?;
         let layout = yskn_ref::draft_head::HeadLayout::read(
-            &mut fs::File::open(head_path).map_err(Error::engine)?,
+            &mut fs::File::open(&head_path).map_err(Error::engine)?,
         )
         .map_err(Error::engine)?;
-        // Seven generated draft rows each scan approximate V*rank int8
-        // weights and rescore precisely shortlist*hidden int8 weights. These
-        // are logical code reads, not a hardware/DRAM bandwidth measurement.
-        draft_codes = add(
-            codes(d.header())?,
+        // Code streams and selector pred/succ stay mapped. Only the norms,
+        // layer vectors and selector hp are expanded to f32 (FastDraft).
+        let len = |range: &std::ops::Range<u64>| range.end - range.start;
+        let owned_head = [0, 1, 2, 4]
+            .into_iter()
+            .try_fold(0, |n, i| add(n, len(&layout.arrays[i])))?;
+        let mut vector_elements = 0;
+        for name in ["bdraft2.hidden_norm", "bdraft2.norm", "bdraft2.sel.hp"] {
+            vector_elements = add(vector_elements, vector(d.header(), name)?)?;
+        }
+        for i in 0..dims.layers {
+            for name in ["ln1", "ln2", "q_norm", "k_norm", "abase", "mbase"] {
+                vector_elements = add(
+                    vector_elements,
+                    vector(d.header(), &format!("bdraft2.layers.{i}.{name}"))?,
+                )?;
+            }
+        }
+        let vectors = mul(vector_elements, 4)?;
+        draft_bytes = [
+            d.header().file_bytes,
+            layout.file_bytes,
+            owned_head,
+            vectors,
+        ]
+        .into_iter()
+        .try_fold(0, add)?;
+        // Logical code reads, not a hardware/DRAM bandwidth measurement. A
+        // proposal runs every block matrix once for its eight rows, and seven
+        // generated rows each scan approximate V*rank int8 weights and rescore
+        // shortlist*hidden int8 weights. A history update (one push of
+        // consecutive committed rows, at most 256 per read) runs the FC input
+        // projection and every layer's key/value projections.
+        let mut fc = None;
+        for t in &d.header().tensors {
+            let kv = t.name.starts_with("bdraft2.layers.")
+                && (t.name.ends_with(".k") || t.name.ends_with(".v"));
+            if t.name == "bdraft2.fc" {
+                fc = Some(t.stream_bytes);
+            }
+            if t.name == "bdraft2.fc" || kv {
+                update_codes = add(update_codes, t.stream_bytes)?;
+            }
+        }
+        let fc = fc.ok_or_else(|| Error::engine("missing bdraft2.fc"))?;
+        proposal_codes = add(
+            codes(d.header())?.checked_sub(fc).ok_or_else(overflow)?,
             reduced_head_code_reads(&layout, 512.min(layout.vocabulary))?,
         )?;
         ring = mul(
@@ -329,7 +366,8 @@ pub(crate) fn inspect(config: &RealEngineConfig) -> Result<ModelInfo> {
         model_file: path,
         model_bytes: weights,
         code_bytes_per_pass: codes(h)?,
-        draft_code_bytes_per_pass: draft_codes,
+        draft_proposal_code_bytes: proposal_codes,
+        draft_update_code_bytes: update_codes,
         layers,
         hidden_width: hidden,
         feed_forward_width: ffn,
@@ -344,6 +382,11 @@ pub(crate) fn inspect(config: &RealEngineConfig) -> Result<ModelInfo> {
         device,
         draft: config.draft.name().into(),
         k: config.k,
+        depth: match config.depth_policy() {
+            yskn_ref::speculation::DepthPolicy::Fixed => "fixed",
+            yskn_ref::speculation::DepthPolicy::Adaptive(_) => "adaptive",
+        }
+        .into(),
         memory: MemoryEstimate {
             weights_bytes: weights,
             draft_bytes,

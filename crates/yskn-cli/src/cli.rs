@@ -27,8 +27,10 @@ commands: serve, chat, info, bench, selfcheck
   --engine real|stub  real is the default; stub is a deterministic demo
   --kv int8|int8-profile|kv5  default kv5
   --backend metal|cpu  default follows Model::load
-  --draft none|ngram|neural|both  default ngram
-  --k N              guesses per pass, default 3
+  --draft none|ngram|neural|both  default both (n-gram on long matches, else neural)
+  --k N              most guesses per pass (neural/both 1..7), default 7
+  --depth adaptive|fixed  adaptive (default) picks 0..K neural guesses per pass;
+                     fixed always offers K
   --ctx N            context capacity, default 32768; --max-ctx is an alias
   --threads N        CPU worker count
   --prefill-width N  cancellable prefill pass width, default 16
@@ -50,6 +52,30 @@ selfcheck:
 YASAKANI_THINKING_BUDGET sets the server default (0 = unlimited).
 Model files must remain unchanged while the program runs.
   --help, -h, --version";
+/// `yskn bench` tasks: (name, user message, thinking). Upstream cli.py:339-344
+/// supplies prose/code/proof; CSV conversion adds the structured-output category.
+pub const BENCH_TASKS: [(&str, &str, bool); 4] = [
+    (
+        "prose",
+        "Explain how a hash table works, including collisions and resizing, with a short example.",
+        false,
+    ),
+    (
+        "code",
+        "Write a Python function that merges overlapping intervals and add a few tests for it.",
+        false,
+    ),
+    (
+        "structured",
+        "Convert this CSV to a JSON array, with numeric ages: name,age\nAda,36\nLin,28",
+        false,
+    ),
+    (
+        "thinking",
+        "Prove that the square root of 2 is irrational.",
+        true,
+    ),
+];
 #[derive(Clone)]
 struct Args {
     command: String,
@@ -94,7 +120,8 @@ impl Args {
             })
     }
     fn real_config(&self) -> Result<RealEngineConfig> {
-        let draft = match self.value("draft").unwrap_or("ngram") {
+        let defaults = RealEngineConfig::default();
+        let draft = match self.value("draft").unwrap_or(defaults.draft.name()) {
             "none" => DraftMode::None,
             "ngram" => DraftMode::Ngram,
             "neural" => DraftMode::Neural,
@@ -117,7 +144,8 @@ impl Args {
                 .transpose()
                 .map_err(Error::engine)?,
             draft,
-            k: self.parse("k", 3)?,
+            k: self.parse("k", defaults.k)?,
+            depth: self.value("depth").map_or(Ok(defaults.depth), str::parse)?,
             context: self.capacity()?,
             threads: self
                 .value("threads")
@@ -173,6 +201,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         "backend",
         "draft",
         "k",
+        "depth",
         "threads",
         "prefill-width",
     ];
@@ -224,7 +253,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         if value.starts_with("--") {
             return Err(Error::request(format!("--{key} requires a value")));
         }
-        if command == "bench" && matches!(key, "draft" | "k") {
+        if command == "bench" && matches!(key, "draft" | "k" | "depth") {
             comparisons
                 .entry(key.into())
                 .or_default()
