@@ -6,7 +6,8 @@ use yskn_ref::draft::{ContextFeatures, Draft};
 use yskn_ref::draft_head::{DraftChoice, ReducedHead};
 use yskn_ref::model::{CaptureOptions, CapturedRow, ModelDimensions};
 use yskn_ref::speculation::{
-    DraftProposer, GenerationLimits, Greedy, Proposer, Verifier, generate,
+    DraftProposer, GenerationError, GenerationLimits, Greedy, NoProposer, Proposer, Verifier,
+    generate,
 };
 use yskn_ref::{Error, Result};
 
@@ -29,6 +30,7 @@ fn features(position: usize, token: u32) -> CapturedRow {
 
 // Independent scripted verifier: row p always selects token p+1, while features
 // encode both the position AND input token to distinguish rejected candidates.
+#[derive(Clone)]
 struct Main {
     identity: std::sync::Arc<()>,
     handed: usize,
@@ -37,6 +39,28 @@ struct Main {
     logits: Vec<Vec<f32>>,
     options: CaptureOptions,
     dimensions: ModelDimensions,
+}
+impl Main {
+    fn new(proposer: &DraftProposer) -> Self {
+        Self {
+            identity: std::sync::Arc::new(()),
+            handed: 0,
+            committed: vec![features(0, 0), features(1, 1)],
+            pending: vec![],
+            logits: vec![],
+            options: proposer.capture_options(),
+            dimensions: ModelDimensions {
+                hidden_width: 512,
+                feed_forward_width: 512,
+                vocabulary_size: 32,
+                layer_count: 5,
+                query_heads: 2,
+                kv_heads: 1,
+                attention_head_width: 256,
+                epsilon: 1e-6,
+            },
+        }
+    }
 }
 impl Verifier for Main {
     type Error = Error;
@@ -102,6 +126,212 @@ impl Verifier for Main {
         self.pending.clear();
     }
 }
+
+struct FailsOnSecondProposal {
+    inner: DraftProposer,
+    calls: usize,
+    proposals: Vec<Vec<u32>>,
+}
+impl Proposer for FailsOnSecondProposal {
+    fn propose(&mut self, _: &[u32], _: u32, _: usize) -> Vec<u32> {
+        unreachable!()
+    }
+    fn synchronize<V: Verifier>(&mut self, verifier: &mut V) -> Result<()> {
+        self.inner.synchronize(verifier)
+    }
+    fn observe_committed(&mut self, rows: &[CapturedRow]) -> Result<()> {
+        self.inner.observe_committed(rows)
+    }
+    fn propose_with<V: Verifier>(
+        &mut self,
+        verifier: &mut V,
+        history: &[u32],
+        last: u32,
+        max: usize,
+    ) -> Result<Vec<u32>> {
+        self.calls += 1;
+        match self.calls {
+            1 => Ok(vec![]),
+            2 => Err(Error::InvalidInput("injected proposal failure".into())),
+            _ => {
+                let guesses = self.inner.propose_with(verifier, history, last, max)?;
+                self.proposals.push(guesses.clone());
+                Ok(guesses)
+            }
+        }
+    }
+}
+
+fn disabled_draft() -> (Main, FailsOnSecondProposal) {
+    let inner = DraftProposer::new(draft(), 3, DraftChoice::Greedy).unwrap();
+    let mut main = Main::new(&inner);
+    let mut expected = main.clone();
+    let baseline = generate(
+        &mut expected,
+        &mut NoProposer,
+        &mut Greedy,
+        &[0, 1, 2],
+        GenerationLimits::new(7, 32),
+    )
+    .unwrap();
+    let mut proposer = FailsOnSecondProposal {
+        inner,
+        calls: 0,
+        proposals: vec![],
+    };
+    let mut limits = GenerationLimits::new(7, 32);
+    limits.max_draft_tokens = 3;
+    let generated = generate(&mut main, &mut proposer, &mut Greedy, &[0, 1, 2], limits).unwrap();
+    assert_eq!(generated.tokens, baseline.tokens);
+    assert_eq!(main.committed, expected.committed);
+    assert_eq!(main.logits(), expected.logits());
+    assert!(main.pending.is_empty());
+    assert_eq!(proposer.calls, 2);
+    assert_eq!(proposer.inner.draft().position(), 3);
+    assert_eq!(main.position(), 9);
+    (main, proposer)
+}
+
+#[test]
+fn disabled_draft_reuse_without_captures_returns_missing_committed_rows_error() {
+    let (mut main, mut proposer) = disabled_draft();
+    let before = main.clone();
+    let error = generate(
+        &mut main,
+        &mut proposer.inner,
+        &mut Greedy,
+        &[9],
+        GenerationLimits::new(4, 32),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationError::Proposer(Error::InvalidInput(message))
+            if message == "draft context has missing committed rows"
+    ));
+    assert_eq!(main.committed, before.committed);
+    assert_eq!(main.logits, before.logits);
+    assert_eq!(main.pending, before.pending);
+    assert_eq!(main.handed, before.handed);
+}
+
+#[test]
+fn disabled_draft_reuse_with_complete_prompt_window_reseeds_and_proposes_correctly() {
+    let (mut main, mut proposer) = disabled_draft();
+    let prompt: Vec<_> = (9..17).collect();
+    main.run_provisional(&prompt).unwrap();
+    main.commit(prompt.len()).unwrap();
+    let mut direct = draft();
+    for row in &main.committed {
+        direct
+            .push_context(
+                row.position,
+                ContextFeatures {
+                    values: &row.values,
+                },
+            )
+            .unwrap();
+    }
+    let expected_guesses = direct
+        .propose(17, support::draft::embedding, DraftChoice::Greedy)
+        .unwrap()
+        .tokens[..3]
+        .to_vec();
+    let mut expected = main.clone();
+    let baseline = generate(
+        &mut expected,
+        &mut NoProposer,
+        &mut Greedy,
+        &[17],
+        GenerationLimits::new(4, 32),
+    )
+    .unwrap();
+    let mut limits = GenerationLimits::new(4, 32);
+    limits.max_draft_tokens = 3;
+    let generated = generate(&mut main, &mut proposer, &mut Greedy, &[17], limits).unwrap();
+    assert_eq!(proposer.proposals[0], expected_guesses);
+    assert_eq!(generated.tokens, baseline.tokens);
+    assert_eq!(main.committed, expected.committed);
+    assert_eq!(main.logits(), expected.logits());
+    for row in &main.committed[17..] {
+        direct
+            .push_context(
+                row.position,
+                ContextFeatures {
+                    values: &row.values,
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(proposer.inner.draft().snapshot(), direct.snapshot());
+}
+
+#[test]
+fn failed_partial_synchronize_binds_identity_before_first_ring_push() {
+    let mut proposer = DraftProposer::new(draft(), 3, DraftChoice::Greedy).unwrap();
+    let mut main = Main::new(&proposer);
+    let mut other = main.clone();
+    other.identity = std::sync::Arc::new(());
+    main.committed[1].values.clear();
+    let error = proposer.synchronize(&mut main).unwrap_err();
+    assert!(
+        matches!(error, Error::InvalidInput(message) if message == "draft context position/shape mismatch")
+    );
+    assert_eq!(proposer.draft().position(), 1);
+    assert_eq!(main.handed, 0);
+    let before = proposer.draft().snapshot();
+    let error = proposer.synchronize(&mut other).unwrap_err();
+    assert!(
+        matches!(error, Error::InvalidInput(message) if message == "main context restored or reset without the draft")
+    );
+    assert_eq!(proposer.draft().snapshot(), before);
+    assert_eq!(other.handed, 0);
+    main.committed[1] = features(1, 1);
+    proposer.synchronize(&mut main).unwrap();
+    let mut direct = draft();
+    for row in &main.committed {
+        direct
+            .push_context(
+                row.position,
+                ContextFeatures {
+                    values: &row.values,
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(proposer.draft().snapshot(), direct.snapshot());
+}
+
+#[test]
+fn unbound_observation_and_prefilled_ring_cannot_adopt_main_context() {
+    let mut proposer = DraftProposer::new(draft(), 3, DraftChoice::Greedy).unwrap();
+    let before = proposer.draft().snapshot();
+    let error = proposer.observe_committed(&[features(0, 0)]).unwrap_err();
+    assert!(
+        matches!(error, Error::InvalidInput(message) if message == "draft context identity is not bound; synchronize first")
+    );
+    assert_eq!(proposer.draft().snapshot(), before);
+
+    let mut prefilled = draft();
+    prefilled
+        .push_context(
+            0,
+            ContextFeatures {
+                values: &features(0, 0).values,
+            },
+        )
+        .unwrap();
+    let mut proposer = DraftProposer::new(prefilled, 3, DraftChoice::Greedy).unwrap();
+    let before = proposer.draft().snapshot();
+    let mut main = Main::new(&proposer);
+    let error = proposer.synchronize(&mut main).unwrap_err();
+    assert!(
+        matches!(error, Error::InvalidInput(message) if message == "main context restored or reset without the draft")
+    );
+    assert_eq!(proposer.draft().snapshot(), before);
+    assert_eq!(main.handed, 0);
+}
+
 struct ScriptedDraft {
     inner: DraftProposer,
     expected: Draft,

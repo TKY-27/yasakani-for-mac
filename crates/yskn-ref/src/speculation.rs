@@ -150,7 +150,7 @@ pub trait Proposer {
     fn synchronize<V: Verifier>(&mut self, _verifier: &mut V) -> Result<()> {
         Ok(())
     }
-    /// Called after commit with its undelivered captures (bounded to the capture window).
+    /// Called after commit with its undelivered captures.
     fn observe_committed(&mut self, _rows: &[CapturedRow]) -> Result<()> {
         Ok(())
     }
@@ -357,7 +357,7 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
         }
         let remaining = limits.max_new_tokens - result.tokens.len();
         let width = room.min(remaining).min(verifier.max_pass_width());
-        let guesses = if drafting {
+        let mut guesses = if drafting {
             match proposer.propose_with(
                 verifier,
                 &history,
@@ -376,10 +376,23 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
         } else {
             Vec::new()
         };
-        if guesses.len() > limits.max_draft_tokens.min(width - 1) {
-            return Err(GenerationError::InvalidInput(
-                "proposer exceeded the requested guess limit",
-            ));
+        let vocabulary = verifier
+            .dimensions()
+            .map(|dimensions| dimensions.vocabulary_size)
+            .or_else(|| verifier.logits().map(<[f32]>::len));
+        let invalid_guesses = if guesses.len() > limits.max_draft_tokens.min(width - 1) {
+            Some("proposer exceeded the requested guess limit")
+        } else if vocabulary.is_some_and(|size| guesses.iter().any(|&id| id as usize >= size)) {
+            Some("proposer returned a token outside the vocabulary")
+        } else {
+            None
+        };
+        if let Some(message) = invalid_guesses {
+            if result.tokens.is_empty() {
+                return Err(GenerationError::InvalidInput(message));
+            }
+            drafting = false;
+            guesses.clear();
         }
         let mut rows = Vec::with_capacity(guesses.len() + 1);
         rows.push(pending);
@@ -585,6 +598,163 @@ mod tests {
         assert_eq!(actual.committed, expected.committed);
         assert_eq!(actual.last, expected.last);
         assert_eq!(proposer.calls, 2);
+    }
+
+    struct FailsOnProposal {
+        calls: usize,
+        fail_on: usize,
+    }
+    impl Proposer for FailsOnProposal {
+        fn propose(&mut self, _: &[u32], _: u32, _: usize) -> Vec<u32> {
+            unreachable!()
+        }
+        fn propose_with<V: Verifier>(
+            &mut self,
+            _: &mut V,
+            _: &[u32],
+            _: u32,
+            _: usize,
+        ) -> Result<Vec<u32>> {
+            self.calls += 1;
+            if self.calls == self.fail_on {
+                Err(Error::InvalidInput("proposal failed".into()))
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
+
+    #[test]
+    fn proposal_failure_after_output_disables_drafting_and_matches_k_zero() {
+        let mut expected = SequenceVerifier::new(&[1, 2], 32, 4);
+        let mut actual = expected.clone();
+        let baseline = generate(
+            &mut expected,
+            &mut NoProposer,
+            &mut Greedy,
+            &[1, 2, 3],
+            GenerationLimits::new(7, 32),
+        )
+        .unwrap();
+        let mut proposer = FailsOnProposal {
+            calls: 0,
+            fail_on: 2,
+        };
+        let mut seen = Vec::new();
+        let mut callback = |token| {
+            seen.push(token);
+            true
+        };
+        let mut limits = GenerationLimits::new(7, 32);
+        limits.max_draft_tokens = 3;
+        limits.on_token = Some(&mut callback);
+        let generated =
+            generate(&mut actual, &mut proposer, &mut Greedy, &[1, 2, 3], limits).unwrap();
+        assert_eq!(generated.tokens, baseline.tokens);
+        assert_eq!(seen, baseline.tokens);
+        assert_eq!(generated.stop_reason, baseline.stop_reason);
+        assert_eq!(actual.committed, expected.committed);
+        assert_eq!(actual.last, expected.last);
+        assert!(actual.pending.is_none());
+        assert_eq!(proposer.calls, 2);
+    }
+
+    #[test]
+    fn proposal_failure_before_output_returns_named_error_without_changing_verifier() {
+        let mut main = SequenceVerifier::new(&[1, 2], 32, 4);
+        let before = main.clone();
+        let mut proposer = FailsOnProposal {
+            calls: 0,
+            fail_on: 1,
+        };
+        let mut limits = GenerationLimits::new(7, 32);
+        limits.max_draft_tokens = 3;
+        let error =
+            generate(&mut main, &mut proposer, &mut Greedy, &[1, 2, 3], limits).unwrap_err();
+        assert!(matches!(
+            error,
+            GenerationError::Proposer(Error::InvalidInput(message)) if message == "proposal failed"
+        ));
+        assert_eq!(main.committed, before.committed);
+        assert_eq!(main.last, before.last);
+        assert_eq!(main.rows, before.rows);
+        assert_eq!(main.pending, before.pending);
+    }
+
+    #[test]
+    fn invalid_guesses_before_output_error_and_after_output_fall_back_losslessly() {
+        struct Misbehaving {
+            calls: usize,
+            fail_on: usize,
+            oversized: bool,
+        }
+        impl Proposer for Misbehaving {
+            fn propose(&mut self, _: &[u32], _: u32, max: usize) -> Vec<u32> {
+                self.calls += 1;
+                if self.calls != self.fail_on {
+                    vec![]
+                } else if self.oversized {
+                    vec![0; max + 1]
+                } else {
+                    vec![8] // SequenceVerifier has vocabulary IDs 0..8.
+                }
+            }
+        }
+        for oversized in [false, true] {
+            for fail_on in [1, 2] {
+                let mut expected = SequenceVerifier::new(&[1, 2], 32, 4);
+                let mut actual = expected.clone();
+                let before = actual.clone();
+                let baseline = generate(
+                    &mut expected,
+                    &mut NoProposer,
+                    &mut Greedy,
+                    &[1, 2, 3],
+                    GenerationLimits::new(7, 32),
+                )
+                .unwrap();
+                let mut proposer = Misbehaving {
+                    calls: 0,
+                    fail_on,
+                    oversized,
+                };
+                let mut seen = Vec::new();
+                let mut callback = |token| {
+                    seen.push(token);
+                    true
+                };
+                let mut limits = GenerationLimits::new(7, 32);
+                limits.max_draft_tokens = 3;
+                limits.on_token = Some(&mut callback);
+                let generated =
+                    generate(&mut actual, &mut proposer, &mut Greedy, &[1, 2, 3], limits);
+                if fail_on == 1 {
+                    let expected_error = if oversized {
+                        "proposer exceeded the requested guess limit"
+                    } else {
+                        "proposer returned a token outside the vocabulary"
+                    };
+                    assert!(matches!(
+                        generated,
+                        Err(GenerationError::InvalidInput(message)) if message == expected_error
+                    ));
+                    assert!(seen.is_empty());
+                    assert_eq!(actual.committed, before.committed);
+                    assert_eq!(actual.last, before.last);
+                    assert_eq!(actual.rows, before.rows);
+                    assert_eq!(actual.pending, before.pending);
+                } else {
+                    let generated = generated.unwrap();
+                    assert_eq!(generated.tokens, baseline.tokens);
+                    assert_eq!(seen, baseline.tokens);
+                    assert_eq!(generated.stop_reason, baseline.stop_reason);
+                    assert_eq!(actual.committed, expected.committed);
+                    assert_eq!(actual.last, expected.last);
+                    assert!(actual.pending.is_none());
+                }
+                assert_eq!(proposer.calls, fail_on);
+            }
+        }
     }
 
     struct GuidedProposer {

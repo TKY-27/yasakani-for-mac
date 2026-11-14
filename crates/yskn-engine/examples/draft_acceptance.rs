@@ -82,6 +82,9 @@ fn main() -> Result<(), Box<dyn StdError>> {
             "Defaults: --windows 0..1 --positions 2 --k 3; positions per window, starting at its first scored input row."
         );
         println!(
+            "Valid input positions: first_scored_position..=min(last_scored_position, n_ctx - K - 1); each verified probe needs K+1 rows."
+        );
+        println!(
             "Scalar neural drafting can take about 90 seconds per proposal on the real model. Run only a handful of positions."
         );
         println!(
@@ -120,7 +123,11 @@ fn main() -> Result<(), Box<dyn StdError>> {
         .first_scored_position
         .checked_add(positions - 1)
         .ok_or_else(|| invalid("position range overflow"))?;
-    if last_position > windows.last_scored_position || last_position + k > windows.n_ctx {
+    if last_position > windows.last_scored_position
+        || last_position
+            .checked_add(k + 1)
+            .is_none_or(|end| end > windows.n_ctx)
+    {
         return Err(invalid("requested positions and K exceed the scored window context").into());
     }
     let backend = backend.map_or_else(Backend::from_env, Ok)?;

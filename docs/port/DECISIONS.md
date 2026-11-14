@@ -1069,6 +1069,10 @@ All earlier slots would have been overwritten upstream, so projecting this
 suffix yields the same ring bits as inserting every prompt row.
 Committed captures and pending-pass captures are exposed separately. Successful
 commits hand over owned rows; failed/discarded passes never advance the ring.
+When a single commit is wider than the capture window, the reference hands over
+only its window-sized suffix while the engine hands over all committed rows.
+Both produce identical final rings. `DraftProposer` never configures a capture
+window smaller than a generation pass.
 Synchronization and direct proposals require a mutable verifier so delivered
 captures can be consumed, rather than retained in the model or its snapshots.
 
@@ -1188,7 +1192,9 @@ one-row verification. Returned tokens, callbacks, stop boundaries and main
 state therefore remain lossless, including tokens from earlier passes. A draft
 failure cannot undo the main commit, so returning only an error would lose
 output; the main model can instead finish the request independently. The failed
-proposer is no longer synchronized and must be rebuilt/restored before reuse.
+proposer may no longer be synchronized: reuse returns a clear missing-capture
+error unless a complete prompt capture window can reseed it, or the caller
+rebuilds/restores it.
 
 New depth-dependent teacher targets are `6..=12` for frontier 5 with history
 tail 0. They distinguish every block successor row and the frontier embedding;

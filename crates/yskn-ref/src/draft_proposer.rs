@@ -129,15 +129,16 @@ impl DraftProposer {
         let identity = verifier
             .context_identity()
             .ok_or_else(|| Error::InvalidInput("draft needs main context identity".into()))?;
-        if self
-            .context_identity
-            .as_ref()
-            .is_some_and(|old| !std::sync::Arc::ptr_eq(old, &identity))
-        {
+        let mismatch = match &self.context_identity {
+            Some(old) => !std::sync::Arc::ptr_eq(old, &identity),
+            None => self.draft.position() != 0,
+        };
+        if mismatch {
             return Err(Error::InvalidInput(
                 "main context restored or reset without the draft".into(),
             ));
         }
+        self.context_identity = Some(identity);
         if self.draft.position() > verifier.position() {
             return Err(Error::InvalidInput(
                 "restore the draft checkpoint with the main checkpoint".into(),
@@ -168,7 +169,6 @@ impl DraftProposer {
                 "draft context has missing committed rows".into(),
             ));
         }
-        self.context_identity = Some(identity);
         drop(verifier.take_captured_rows());
         Ok(())
     }
@@ -190,6 +190,11 @@ impl Proposer for DraftProposer {
         DraftProposer::synchronize(self, verifier)
     }
     fn observe_committed(&mut self, rows: &[CapturedRow]) -> Result<()> {
+        if self.context_identity.is_none() {
+            return Err(Error::InvalidInput(
+                "draft context identity is not bound; synchronize first".into(),
+            ));
+        }
         if rows
             .first()
             .is_some_and(|row| row.position > self.draft.position())

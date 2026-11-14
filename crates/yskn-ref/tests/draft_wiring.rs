@@ -241,17 +241,24 @@ fn synthetic_teacher_accepts_correct_captures_and_rejects_lagged_or_swapped_slot
     for (wiring, state) in states.iter().enumerate() {
         main.restore(&prompt_checkpoint).unwrap();
         let mut draft = draft_from(base_bytes.clone(), blank_head());
-        // Correct wiring is exercised through the production capture hook.
-        // Deliberately corrupted rings start at the same committed position.
-        if wiring != 0 {
+        let proposal = if wiring == 0 {
+            // Correct wiring is exercised through the production capture hook.
+            let mut proposer = DraftProposer::new(draft, 7, DraftChoice::Greedy).unwrap();
+            proposer.synchronize(&mut main).unwrap();
+            assert_eq!(proposer.draft().snapshot(), *state);
+            proposer
+                .propose_with(&mut main, &[3, 7, 11, 0], 0, 7)
+                .unwrap()
+        } else {
+            // Unbound pre-filled rings are rejected by the hook; corrupt the
+            // direct draft to retain the independent lag/slot negative controls.
             draft.restore(state).unwrap();
-        }
-        let mut proposer = DraftProposer::new(draft, 7, DraftChoice::Greedy).unwrap();
-        proposer.synchronize(&mut main).unwrap();
-        assert_eq!(proposer.draft().snapshot(), *state);
-        let proposal = proposer
-            .propose_with(&mut main, &[3, 7, 11, 0], 0, 7)
-            .unwrap();
+            assert_eq!(draft.snapshot(), *state);
+            draft
+                .propose(0, |token| main.embedding(token), DraftChoice::Greedy)
+                .unwrap()
+                .tokens
+        };
         acceptance.push(
             proposal
                 .iter()
