@@ -1437,6 +1437,148 @@ No other heavy process ran at 14:18, but this task's own builds and runs had
 just ended; the orchestrator's quiet-machine re-measurement supersedes these
 numbers.
 
+## D19 — Real engine behind the product commands
+
+The default `yskn` engine loads the published model folder. `--engine stub`
+remains an explicit deterministic development fixture. The public
+`RealEngineConfig` holds the same settings used by terminal/server factories:
+cache `Kv5`, n-gram drafting with K=3, context 32,768, prefill width 16,
+normal engine backend selection and normal CPU-worker defaults. None/neural/
+fixed n-gram-first combined drafting are selectable. K remains a plain option;
+there is no new adaptive policy. Neural modes use D17's scalar draft. The
+server creates the model on its existing dedicated engine thread, retaining
+the non-`Send` engine contract and every existing request/security limit.
+Mapped model files must remain unchanged through process exit; command help,
+startup and info make that contract visible.
+
+### Sampling and stopping
+
+`python/yasakani/engine.py:25-42,165-176` defines the mapping: mode 3 maps to
+reference `SamplingVersion::Gumbel`; temperature <=0 selects greedy, and
+otherwise temperature/top-p/min-p are multiplied by 1000 and rounded with
+Python's nearest-even rule before the integer native call. Rust performs the
+same nearest-even conversion and constructs reference parameters from those
+thousandths. A positive temperature rounding to zero consequently becomes
+greedy. top-k outside 1..20 becomes 20, then is bounded by the actual vocabulary
+for synthetic models. The native signed-int setter narrows seeds to the low
+32 bits, reinterpreted unsigned. Token-keyed noise uses absolute prediction
+positions, retaining reference-loop losslessness across proposal settings.
+Draft Gumbel selection uses that same effective seed and its independent D17
+temperature/candidate policy.
+
+Upstream `python/yasakani/chat.py:20-21,36-41` hardcodes the published
+`generation_config.json` values 1.0/0.95/20/0.0. The product reads those four
+fields from the optional folder file, with those same fallbacks, so a published
+folder can supply its actual request defaults. Per-request validation remains
+unchanged; explicit values override defaults. `RequestDefaults` carries the
+sampling defaults for HTTP and terminal parsing.
+
+`python/yasakani/runtime.py:20-21,54-59` names EOS 248046/248044 and snapshot
+marker 248045. `engine.py:190-212` makes `None` ignore EOS; an explicit stop-ID
+slice instead controls stops. Selfcheck uses the two EOS IDs; fixed-length
+bench ignores them. The existing chat layer continues to own request EOS,
+stop-string, loop-guard and thinking-budget behavior.
+
+### Prompt reuse and bounded work
+
+Reuse follows `docs/spec/08_SPECULATION.md` section 2,
+`src/specx.cpp:94-126` and `src/engine35.cpp:1244-1266,1550-1583`. A nonempty
+committed prefix strictly shorter than the new prompt takes live mode 1;
+otherwise a strict saved prefix restores mode 2; otherwise mode 0 resets.
+Equal prompts do not satisfy either strict-prefix branch. The new suffix's
+last marker determines the snapshot cut immediately after 248045; without
+one, the cut is before the final prompt token. One replaceable joint
+main/draft checkpoint retains the recurrent state, prefix and D17 draft ring;
+attention remains in the main owner and is truncated on restore. Prompt reuse
+reports cached token count and mode, without accumulating request snapshots.
+
+Prefill is divided into configurable passes and checks the callback between
+passes. Only the final requested prompt row needs logits. Captured committed
+prompt rows feed the draft ring as in D17. Generation uses the shared lossless
+reference loop and reports verification passes/rows, guesses offered/accepted,
+prefill time and generation time. Callback cancellation/errors retain the
+existing synchronous engine contract.
+
+### Startup memory estimate
+
+Metadata inspection reads container headers/file sizes, manifest and required
+KV/draft profiles, without mapping main weights or running inference. Context
+is checked against the manifest's unrounded `max_ctx`. The cache allocation
+uses the next power-of-two context capacity to account for vector growth.
+Before load, compare the following conservative estimate with physical memory
+(`sysctl -n hw.memsize` on macOS, falling back to Foundation's
+`NSProcessInfo.physicalMemory` through a fixed `/usr/bin/osascript` program
+when sandboxed sysctl cannot report it); fail with needed/physical byte counts and
+suggest lowering `--ctx`, choosing `--kv int8`, or `--draft ngram/none`:
+
+```text
+W = max(prefill_width, K+1)
+subtotal = weights_file + draft_files + recurrent + cache + snapshot + working
+margin   = ceil(0.15 * subtotal) + 1 GiB
+needed   = subtotal + margin
+snapshot = recurrent + 4*context + 4*vocabulary + draft_ring
+working  = recurrent + W*replay_row + expanded_dense_vectors
+         + 256*W*(hidden+ffn) + draft_ring + draft_captures
+         + 8*context + 4*W*vocabulary
+```
+
+Draft files count twice the draft container plus the reduced-head file to
+cover owned scalar codes/expanded data. D17 ring and capture dimensions are
+header-derived and appear in both working/checkpoint owners as appropriate.
+The margin covers process/allocator/OS overhead and unitemized tables/scratch;
+this is a startup fit estimate, not measured peak RSS or free-memory admission.
+No settings are changed. A physically fitting model may still encounter memory
+pressure from other processes.
+
+For the published architecture from `docs/spec/01_MODEL_ARCHITECTURE.md`, model
+file 10,311,344,128 bytes, context 32,768, W=16, n-gram K=3:
+recurrent = 156,893,184; replay = 94,666,752; dense vectors = 104,953,856;
+snapshot = 158,017,536; working = 464,943,104 bytes. D13's actual Rust row
+representation costs 37,632 bytes/token in either int8 mode and 89,600 in
+real-profile Kv5. Kv5 retains derived BF16 bases and currently allocates more
+than int8; the compact theoretical packed reader is not implemented.
+
+| Cache | Cache bytes | Subtotal bytes | Margin bytes | Needed bytes (GiB) |
+|---|---:|---:|---:|---:|
+| int8 | 1,233,125,376 | 12,324,323,328 | 2,922,390,324 | 15,246,713,652 (14.199609) |
+| int8-profile | 1,233,125,376 | 12,324,323,328 | 2,922,390,324 | 15,246,713,652 (14.199609) |
+| kv5, real profile | 2,936,012,800 | 14,027,210,752 | 3,177,823,437 | 17,205,034,189 (16.023437) |
+
+These figures are derived from the documented architecture/profile, without
+opening the real model during this brief. `yskn info` computes the same formula
+from the actual chosen folder/configuration and is authoritative for that run.
+
+### Selfcheck and benchmark evidence
+
+Selfcheck follows `python/yasakani/cli.py:400-471`: the three fixed cases,
+exact template options, greedy output, little-endian int32 SHA-256, prompt
+and output counts/hashes and twelve-token head. It prints one result per case
+and exits nonzero for any mismatch. A stored mismatch reports a zero-based
+index and both IDs. Published records contain no IDs past the first twelve,
+so a later first-difference index/expected ID cannot be recovered from SHA-256;
+that diagnostic explicitly reports the limitation. An optional full `ids`
+array supports exact later diagnostics without changing the upstream fields.
+
+Bench reuses prose/code/proof text from `python/yasakani/cli.py:339-344` and
+adds a fixed neutral CSV-to-JSON prompt. Each run resets the session, uses
+greedy decoding, ignores EOS and requires exactly `--n` output tokens to fit
+with the prompt plus the unchanged 64-token reserve. Repeated draft and K
+settings compare their Cartesian product. Printed metrics are also written by
+`--json OUT`, including the loaded backend/device, cache, context, threads,
+model file size/name and proposal settings. Prefill rate counts only prompt rows
+processed before the final pending row; the latter is timed in the shared
+loop's first verification pass. Logical code bytes count body/head
+compressed streams once per main pass, plus actual neural proposal code reads
+normalised by main passes. Per neural proposal the model is draft compressed
+body streams plus `7 * (vocabulary*rank + shortlist*hidden)` int8 head reads:
+the seven output positions each score the approximate head and only the
+shortlisted rescore rows (default shortlist 512). It does not count the full
+rescore matrix, whose other rows are untouched. Embedding row reads, vectors, lookup tables, scales,
+cache and recurrent traffic are excluded; it is not a hardware DRAM counter.
+Neither synthetic tests nor these accounting definitions establish released
+model throughput. The real-model selfcheck/bench/chat/server commands remain
+for the orchestrator; this brief never opens the in-use model.
+
 ## D20 — Exact CPU stages around compressed projections (brief 07a)
 
 All new fast paths live in `yskn-engine`. `YSKN_CPU_STAGES=auto` (default)
@@ -1675,12 +1817,9 @@ cache bytes are proposed as an unapproved shortcut.
 
 All measurements below use the CPU projection backend, dotprod/10 workers,
 `CARGO_NET_OFFLINE=true`, and the read-only `$HOME/models/qwen38-speed`.
-Every real-model invocation is enclosed by atomic `mkdir` of
-`/Users/anag2bgod/Projects/yasakani-for-mac/.work/model.lock` and an EXIT
-trap that `rmdir`s only that acquired lock after the process exits. A busy
-lock is waited for, never removed. No model is copied. macOS `sample PID 5 1`
-was attempted after task 1 but denied process inspection by the sandbox;
-stage timers are the available profile, not on-CPU sample counts.
+Model access is exclusive and read-only. macOS `sample PID 5 1` was denied
+process inspection by the sandbox; stage timers are the available profile,
+not on-CPU sample counts.
 
 #### Task 1: integer VIT2 selection
 
@@ -1742,6 +1881,9 @@ against `dense_gate`, in addition to the existing recurrent-state comparisons.
 `bench_model` now exposes `recurrence_prepare` (a subset of recurrence) and
 `dense_gate_work` (elapsed callback time summed across rows, hence overlapping
 for M>1). These are diagnostic subsets and are not subtracted twice from rest.
+Detailed subsets require `Model::set_detailed_timing(true)`, as requested by
+`bench_model`; ordinary passes retain only the coarse stage clocks and skip
+callback clock reads and atomic additions.
 
 The same real-model five-pass command gives, after task 2, minimum/median ms:
 
@@ -1789,8 +1931,7 @@ Tests compare exact bits for every finite half code and midpoint with adjacent
 binary32 values, all BF16 upper words/midpoints (including NaNs), exp branch
 boundaries, signed zero/subnormals and 100,003 random binary32 bit patterns.
 They also check direct exp, non-vector tails and every invalid-value lane.
-Focused tests and clippy pass. Real-model task-3 measurement was queued behind
-another owner's model lock; its result is recorded in the final table below.
+The task-3 measurement is recorded in the final table below.
 
 #### Task 4: long-context attention memory and independent score chains
 
@@ -1822,15 +1963,14 @@ boundary tests also cover the exp2 product before portable exp.
 Stage-only measurement reads the **real model header, actual attention norm
 vectors and profile**, constructs all 16 layers/24 query heads/4 KV heads,
 and uses a deterministic synthetic projected-row bank to fill distinct cache
-allocations. This avoids a minutes-long CPU prefill, respecting short model
-lock holds. It times the actual attention core on the ten-worker CPU pool,
+allocations. This excludes CPU prefill from the timed workload. It times the
+actual attention core on the ten-worker CPU pool,
 including 31/42 splits, self, means and final combination. It excludes query
 preparation, output inverse rotation/gating and compressed projections; it is
-**not a real-token end-to-end context benchmark**. Real header/profile reads
-are protected by the same model lock even though compressed weights are not
+**not a real-token end-to-end context benchmark**. Compressed weights are not
 loaded. Peak cache payload and repeated key reads have the real dimensions.
 
-Build once, then run each invocation under its own acquired model lock:
+Stage-only benchmark commands (exclusive model access):
 
 ```sh
 cargo test --release -p yskn-engine --lib --no-run
@@ -1841,9 +1981,8 @@ YSKN_MODEL_DIR="$HOME/models/qwen38-speed" YSKN_BENCH_CONTEXT=32768 \
   cargo test --release -p yskn-engine --lib bench_real_attention_shapes -- --ignored --nocapture
 ```
 
-The reported runs invoke the already-built test executable, avoiding builds
-under the lock. Before is the task-3 implementation plus this same harness,
-preserved before editing attention. One warmup is excluded in each run.
+The reported measurements exclude compilation and one warmup per run.
+The baseline is the task-3 implementation with the same harness.
 
 | Context / rows / samples | Before min / median (s) | After min / median (s) |
 |---|---:|---:|
@@ -1908,30 +2047,18 @@ codebook makes every candidate error equal and explicitly checks that the
 first candidate's scale bits survive. Integer target extrema also exercise
 the checked scalar fallback.
 
-The four required proof commands passed with `CARGO_NET_OFFLINE=true`:
-
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p yskn-ref -p yskn-format -p yskn-engine --release
-YSKN_CPU_STAGES=reference cargo test -p yskn-engine --release
-```
-
-After expanding the KV proof/benchmark fixture, its focused tests passed again
-in both modes, and fmt/workspace clippy passed again. No production code
-changed after the complete suites. The engine/reference integration coverage
-includes all three cache modes, frozen digests, varied workers/pass widths,
-commit/discard, snapshot/restore and failure atomicity. No tolerance or test
-expectation was weakened. GPU-dependent tests cannot establish Metal execution
-in this sandbox; real Metal and socket tests remain the orchestrator's work.
+Engine/reference integration coverage includes all three cache modes,
+frozen digests, varied workers/pass widths, commit/discard, snapshot/restore
+and failure atomicity, with exact comparisons in both CPU-stage modes.
+GPU-dependent tests cannot establish Metal execution in this sandbox;
+real Metal and socket execution are outside this validation boundary.
 
 Final real-model CPU profile, same five-pass one-row command as task 1.
 Values are minimum / median **milliseconds**. The task-3 serial run is kept
-below despite severe shared-host scheduling variation. Two other runs that
-started after a long lock wait overlapped this task's tests; their logs remain
-in `.work/07c-evidence/*contended*` / `task3.txt` and are excluded from this
-comparison. The final run occurred after all builds/tests and used its own
-model lock, released immediately at exit.
+below despite severe shared-host scheduling variation. Two additional runs
+with concurrent host load are excluded from this comparison. Their logs are
+`.work/07c-evidence/*contended*` / `task3.txt`. The final measurement had no
+concurrent build/test load.
 
 | Stage | After task 3, serial | Before task 5 | Final |
 |---|---:|---:|---:|
@@ -1967,11 +2094,10 @@ stable profile and preserving the mandated reduction orders. No Metal
 latency, real-token 2000/32768-context inference latency, full-model scalar
 logit comparison or full quality-score validation is claimed by this brief.
 
-After the final one-row run showed much lower scheduling variation, the same
-attention before/after binaries and commands were repeated serially, without
-builds/tests, acquiring/releasing the lock separately for each invocation.
-This confirmation resolves the large contention uncertainty in the earlier
-pair; it does not repeat or change any numerical proof.
+The lower-variation attention comparison uses the same before/after binaries
+and commands, measured serially with no concurrent build/test load and
+exclusive model access. It reduces the contention uncertainty in the earlier
+pair.
 
 | Context / rows / samples | Before min / median (s) | Final min / median (s) |
 |---|---:|---:|

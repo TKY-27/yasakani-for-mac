@@ -1,10 +1,12 @@
 //! Chat and local HTTP product layer. Engines stay on their owning thread.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod chat;
 pub mod cli;
 pub mod engine;
 pub mod loopguard;
+pub mod memory;
+pub mod real_engine;
 pub mod request;
 pub mod server;
 pub mod stub;

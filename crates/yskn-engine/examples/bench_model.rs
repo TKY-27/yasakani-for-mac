@@ -40,6 +40,7 @@ fn main() -> Result<()> {
     // SAFETY: this read-only benchmark requires the weights to stay unchanged until exit.
     let mut model =
         unsafe { Model::with_options(&path, Engine::from_env()?, backend, rows, mode)? };
+    model.set_detailed_timing(true);
     println!(
         "backend={} device={} kv={mode:?} cpu_stages={}",
         model.backend().name(),

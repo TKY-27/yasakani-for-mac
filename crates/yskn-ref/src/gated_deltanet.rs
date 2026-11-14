@@ -412,17 +412,18 @@ impl GatedDeltaNet {
             weighted_hidden_bf16,
             inverse_rms,
         )?;
+        if gates_a.len() != self.dimensions.value_heads {
+            return Err(dimension_mismatch());
+        }
+        M::finite(&gates_a, "DeltaNet dense gates")?;
         let gates_b = dense(
             &self.weights.projection_b,
             weighted_hidden_bf16,
             inverse_rms,
         )?;
-        if gates_a.len() != self.dimensions.value_heads
-            || gates_b.len() != self.dimensions.value_heads
-        {
+        if gates_b.len() != self.dimensions.value_heads {
             return Err(dimension_mismatch());
         }
-        M::finite(&gates_a, "DeltaNet dense gates")?;
         M::finite(&gates_b, "DeltaNet dense gates")?;
         Ok(GatedDeltaNetRow {
             projected,
@@ -607,6 +608,7 @@ impl GatedDeltaNet {
 }
 
 /// One dense output, retaining the scalar partition and XOR reduction order.
+/// Final finiteness must be checked after all outputs of this projection.
 pub fn dense_gate(weight: &[f32], hidden: &[f32], inverse_rms: f32) -> Result<f32> {
     dense_gate_with_partials(weight, hidden, inverse_rms, |weight, hidden| {
         let mut partial = [0.0; 128];
@@ -637,9 +639,8 @@ pub fn dense_gate_with_partials(
     let partial = partials(weight, hidden);
     finite(&partial, "DeltaNet dense gate partial")?;
     let grouped = std::array::from_fn(|group| xor_sum32(&partial[group * 32..(group + 1) * 32]));
-    let gate = bfloat(sum4(grouped) * inverse_rms);
-    finite(&[gate], "DeltaNet dense gates")?;
-    Ok(gate)
+    // Later outputs' partial errors precede any final-product error in this batch.
+    Ok(bfloat(sum4(grouped) * inverse_rms))
 }
 
 pub(crate) fn xor_sum32(values: &[f32]) -> f32 {
@@ -715,6 +716,46 @@ mod tests {
             1.0e-6,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn dense_gate_errors_check_all_partials_then_results_then_next_projection() {
+        for (partial_in_a, expected) in [
+            (true, "DeltaNet dense gate partial"),
+            (false, "DeltaNet dense gates"),
+        ] {
+            let mut layer = GatedDeltaNet::new(
+                GatedDeltaNetDimensions {
+                    hidden_width: 512,
+                    query_key_heads: 1,
+                    value_heads: 2,
+                    head_dim: 128,
+                    convolution_width: 4,
+                },
+                GatedDeltaNetWeights {
+                    projection_a: vec![0.0; 1024],
+                    projection_b: vec![0.0; 1024],
+                    convolution_weight: vec![0.0; 2048],
+                    log_decay_weight: vec![0.0; 2],
+                    time_bias: vec![0.0; 2],
+                    normalization_weight: vec![1.0; 128],
+                },
+                1e-6,
+            )
+            .unwrap();
+            layer.weights.projection_a[0] = f32::from_bits(0x7f00_0000);
+            let projection = if partial_in_a {
+                &mut layer.weights.projection_a
+            } else {
+                &mut layer.weights.projection_b
+            };
+            projection[513] = f32::from_bits(0x7f00_0000);
+            let mut hidden = vec![0.0; 512];
+            hidden[..2].copy_from_slice(&[1.0, 4.0]);
+            let zero = vec![0.0; 512];
+            let result = layer.prepare(&[zero.as_slice(); 3], &zero, &[0.0; 256], &hidden, 4.0);
+            assert!(matches!(result, Err(Error::NonFinite(context)) if context == expected));
+        }
     }
 
     #[test]

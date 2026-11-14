@@ -162,6 +162,44 @@ unsafe fn dense_partials(weight: &[f32], hidden: &[f32]) -> [f32; 128] {
 mod tests {
     use super::*;
     use yskn_ref::gated_deltanet::{GatedDeltaNetDimensions, GatedDeltaNetWeights};
+    fn assert_cancellation(width: usize, indices: [usize; 4], expected: f32) {
+        let mut weight = vec![0.0; width];
+        for (index, value) in indices
+            .into_iter()
+            .zip([16_777_216.0, 1.0, -16_777_216.0, 1.0])
+        {
+            weight[index] = value;
+        }
+        let hidden = vec![1.0; width];
+        // Fixed answers detect shared reduction regressions as well as SIMD-only ones.
+        assert_eq!(
+            dense_gate(&weight, &hidden, 1.0).unwrap().to_bits(),
+            expected.to_bits()
+        );
+        assert_eq!(
+            yskn_ref::gated_deltanet::dense_gate(&weight, &hidden, 1.0)
+                .unwrap()
+                .to_bits(),
+            expected.to_bits()
+        );
+    }
+
+    #[test]
+    fn dense_cancellation_preserves_element_order() {
+        assert_cancellation(512, [0, 1, 2, 3], 1.0);
+    }
+
+    #[test]
+    fn dense_cancellation_preserves_chunk_order() {
+        assert_cancellation(4096, [0, 1024, 2048, 3072], 1.0);
+    }
+
+    #[test]
+    fn dense_cancellation_preserves_xor_order() {
+        // Descending XOR distances pair partials 0/16 and 1/17 before combining.
+        assert_cancellation(512, [0, 8, 128, 136], 2.0);
+    }
+
     #[test]
     fn dense_partitions_keep_chunk_element_and_xor_orders() {
         let mut seed = 1729u32;
