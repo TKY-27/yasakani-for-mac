@@ -88,7 +88,7 @@ Release criteria (all must hold):
    feature choice, portable fallback), bit-identical, model memory-mapped.
    **Done (PR #4).** Crate `crates/yskn-engine`; design in DECISIONS D10.
 3. Validate the main model with `score_windows` (gate for everything later).
-   **Main model validated; the two published configurations are running.**
+   **Done: main model validated and both published configurations pass (M8, M9).** The two runs must be repeated on the shipping binary.
    - Plain int8 cache (D4), all 20 windows on the Metal backend:
      perplexity **2.075440** over 20,460 positions (M4). Upstream's "int8"
      record is 2.075900 for profile-requantized rows (finding F1), so the
@@ -117,10 +117,9 @@ Release criteria (all must hold):
    **Done: D12, Metal** (PR #8). The engine's `Model` runs on it (PR #13,
    D14); the Metal code now lives in `crates/yskn-engine/src/metal.rs`.
 5. Draft model, speculation loop, prompt snapshots, long-prompt prefill, KV5.
-   **Merged**, except a wide kernel for long-prompt prefill (brief `07d`)
-   and units K and L's product side (prompt reuse, cancellable prefill),
-   which are in PR #26, still in review: see the unit table under
-   "Step 5 plan".
+   **Merged** (prompt reuse and cancellable prefill came with PR #26).
+   The wide passes of prompt prefill are made cheaper by PR #31, in CI:
+   see the unit table under "Step 5 plan".
 6. Product binary: terminal chat, OpenAI-compatible server, benchmark.
    **In progress.** `crates/yskn-text` merged (PR #12): tokenizer, chat
    template, stream decoding, tool helpers; 153 goldens generated from
@@ -136,9 +135,9 @@ Release criteria (all must hold):
    responses echoing request data outside the budget, budget undercount
    for large strings, uncancellable prompt preparation, an unsound early
    context check, `chat_template_kwargs.tools` bypass, unescaped
-   top-level errors); a second Opus fix round (brief `06g`) is in
-   progress. Still to do after it merges: connect the real engine to the
-   crate's `Engine` trait, prompt reuse, `bench`, `selfcheck`.
+   top-level errors); a second Opus fix round (brief `06g`) followed.
+   The real engine, prompt reuse, `bench` and `selfcheck` came with
+   PR #26 and the draft policy with PR #29 (see the updates below).
    **Update 14:20:** PR #18 merged after Astra's fourth review (approve;
    worst case under default settings by its estimate about 1.4 GiB per
    request and 1.6 GiB for all connections, no permanent stall, no
@@ -166,18 +165,22 @@ Release criteria (all must hold):
    1. CPU stage fast paths, PR #25: one row 264 ms to 232 ms, 12% (M13).
    2. CPU stages round two, PR #30: row encoding 11.8 to 3.6 ms,
       recurrence 40.4 to 13.8 ms, rest 29.1 to 27.4 ms at one row (CPU
-      stage timers, M16): about 30 ms of a 232 ms pass, 13%.
-   3. Grouped attention, PR #30: 2,000 tokens and 16 rows 0.228 to
-      0.086 s; 32,768 tokens and one row 0.452 to 0.192 s (M16). At full
-      context that is more than half of the time per token.
+      stage timers, M16). The stage minima come from separate runs, so
+      their sum (36.5 ms) is not a measured gain of the whole pass; the
+      whole pass is measured in the quiet session.
+   3. Grouped attention, PR #30: the attention stage alone at 2,000
+      tokens and 16 rows 0.228 to 0.086 s, at 32,768 tokens and one row
+      0.452 to 0.192 s (M16): a 57% cut of a stage that at full context
+      was larger than the rest of a one-row pass.
    4. Neural draft with adaptive depth, PR #29: passes for 96 tokens
       36 / 19 / 24 / 21 against 96 (M15); projected 123 ms per token
       against 232 ms.
    5. Exact binary32 arithmetic in the GPU kernel, PR #31: per added
       row 35.8 to 26.2 ms; 16 rows 638 to 492 ms (M17).
    6. CPU share of rows during the kernel, PR #31: 16 rows 554 to
-      476 ms inside the engine; about 7% at one row, not established
-      under load (M17).
+      476 ms in `bench_metal --shares`, which issues the kernel calls in
+      the engine's grouping (257 per pass); about 7% at one row, not
+      established under load (M17).
    7. Submission overhead at one row: nothing kept, 0% (M17). About
       36 ms per pass is fixed latency of 257 command-buffer round trips
       (0.14 ms each); every waiting method tried gave the same.
@@ -198,7 +201,7 @@ record is "int8 rows re-quantized through `kvq_u5.bin`", and the reference's
 D4 cache (plain int8) is a third configuration that upstream never
 published a number for. Consequences:
 
-- The reference needs three cache modes (to be decision D13): `Int8`
+- The reference needs three cache modes (now decision D13): `Int8`
   (plain, D4), `Int8Profile` (upstream's "int8" record), `Kv5` (upstream's
   default, packed 5-bit where packable).
 - The two published values differ by 3.7e-5 and the tolerance is 0.001, so
@@ -207,9 +210,10 @@ published a number for. Consequences:
   trips, frozen digests, facts of the real profile). The encoder uses only
   integers and correctly rounded IEEE operations, so it is ported from the
   source operation for operation.
-- The plain-int8 run in progress still tells whether the rest of the main
-  model is right: its result should be within about 0.001 of 2.0759. A
-  larger gap is a bug or the codec's effect; `Int8Profile` separates the two.
+- The plain-int8 run tells whether the rest of the main model is right:
+  its result should be within about 0.001 of 2.0759 (it was: 2.075440,
+  M4). A larger gap would have been a bug or the codec's effect;
+  `Int8Profile` separates the two.
 
 ## Step 5 plan (from an Opus 5.5 planning pass over chapters 04, 07 to 10)
 
@@ -236,15 +240,15 @@ Units (B, C, I can run in parallel; F before D because both touch `model.rs`):
 | A | Survey of the real `kvq_u5.bin`, draft and `.shead` headers | done inside B/C and I (facts in D13, D15 and the spec) |
 | B | `yskn-ref/src/kv_profile.rs`: KVQP reader, fully validated | merged, PR #11 (Sol; Astra review) |
 | C | `yskn-ref/src/kv_codec.rs`: row codec ported from the source | merged, PR #11 |
-| D | Cache modes `Int8`, `Int8Profile`, `Kv5` in the reference attention, model load and the engine | merged, PR #14 (Sol; Astra reviewed the reference against the source, Opus the engine wiring); real scoring running |
-| E | KV codec fast path | row encoding runs in parallel across heads and sides (PR #25, D20: 45 ms to 13 ms at one row); the codec's candidate selection is still the hottest CPU function (M13) and is in brief `07c` |
+| D | Cache modes `Int8`, `Int8Profile`, `Kv5` in the reference attention, model load and the engine | merged, PR #14 (Sol; Astra reviewed the reference against the source, Opus the engine wiring); both scoring runs passed (M8, M9) |
+| E | KV codec fast path | row encoding runs in parallel across heads and sides (PR #25, D20: 45 ms to 13 ms at one row); the codec's candidate selection, then the hottest CPU function (M13), was vectorized in PR #30: 3.6 ms at one row (M16) |
 | F | Main-model hooks: residual capture after layers 5, 19, 33, 47, 61; snapshot/restore; head rows | merged: PR #17 and PR #19 (D17; Sol; two Opus reviews) |
 | G | Speculation loop over Verifier and Proposer traits, lossless tests | merged, PR #17, D16 (Sol; Opus review) |
 | H | Engine `run_provisional`/`commit` without cloning the attention cache | merged, PR #17 |
 | I | Draft model reference (chapter 07) and `.shead` | merged, PR #15, D15 (Sol; Astra review against the source) |
 | J | Draft fast path (one scalar proposal takes about 90 s on the real files; target under 40 ms, bit-identical) | merged, PR #24, D18 (Opus; Sol review; failure test by Luna): 47 ms per proposal on the real files, bit-identical to the scalar draft (M12) |
-| K | Prompt reuse modes (reset, live prefix, snapshot) | in brief `06i` |
-| L | Long-prompt prefill: bounded memory, head on last row only, large-M kernel | cancellable prefill with last-row logits in brief `06i`; a large-M kernel is step 7 |
+| K | Prompt reuse modes (reset, live prefix, snapshot) | merged, PR #26 |
+| L | Long-prompt prefill: bounded memory, head on last row only, large-M kernel | cancellable prefill with last-row logits merged in PR #26; cheaper wide passes in PR #31 (binary32 arithmetic, CPU share), in CI |
 
 Feature-capture contract for the draft model (confirmed by Astra against
 the source): for each committed input position, the residual right after
@@ -258,8 +262,8 @@ Sources: `src/engine35.cpp:798-799,830-833,1650,1851`,
 `src/q35_kernels.cu:1437-1444`, `src/q35_bdraft.cu:249-252,490-499`,
 `src/specx.cpp:435-437,464`.
 
-Policy to be decided by measurement, not copied from the RTX 5090 (decision
-D15 to come): number of drafted rows K (each verified row costs about 35 ms
+Policy decided by measurement, not copied from the RTX 5090 (decision
+D21, PR #29; the paragraph below is the plan as written before it): number of drafted rows K (each verified row costs about 35 ms
 on the GPU kernel alone), and which proposal sources earn their place.
 Upstream's HCAP side candidates, adaptive 8/16-row blocks and the
 next-token table are not needed for correctness and are skipped unless a
@@ -277,8 +281,9 @@ measured cost model, pick the K and sources that minimise ms per token.
 - **Bandwidth ceiling.** The owner's brief gives 307 GB/s nominal, which is
   the M5 Pro figure. This chip is the base M5; its nominal figure is about
   153 GB/s (recalled from Apple's M5 announcement, not verified here). The
-  highest read rate observed so far is 87.7 GB/s (Metal kernel, M=1). The
-  achievable ceiling must be measured before step 7 compares against it.
+  ceiling was then measured (M17): about 145 to 150 GB/s for CPU and
+  GPU reading together, 116 to 119 GB/s for the GPU alone; the kernel at
+  one row reads 98.7 GB/s.
 - Model folder (never commit, never copy): `~/models/qwen38-speed/`.
   Contains `qwen38_27b_speed.yskn` (10,311,344,128 bytes), `bdraft2_k8.yskn`,
   `bdraft2_k8.shead`, `kvq_u5.bin`, `tokenizer.json`, `chat_template.jinja`,
@@ -316,13 +321,15 @@ measured cost model, pick the K and sources that minimise ms per token.
 
 ## Decisions
 
-D1 to D18 and D20 are in [DECISIONS.md](DECISIONS.md): D10 mapped CPU kernel,
+D1 to D21 are in [DECISIONS.md](DECISIONS.md): D10 mapped CPU kernel,
 D11 layer-major engine model, D12 Metal backend, D13 KV cache modes and
 codec, D14 engine on Metal with parallel recurrent heads, D15 draft model
 math and tie rule, D16 sessions, provisional passes, commit, snapshots
 and the lossless speculation loop, D17 residual capture and the draft
-proposer, D18 fast draft, D20 CPU stage fast paths. D19 (product engine)
-arrives with PR #26, D21 (kernel round two) with brief `07d`. Owner-decided gaps:
+proposer, D18 fast draft, D19 product engine, D20 CPU stage fast paths
+(both rounds and grouped attention), D21 fast draft in the product and
+adaptive draft depth. D22 (kernel round two) arrives with PR #31.
+Owner-decided gaps:
 
 - **D7** exp2(t) = portable exp of the binary32 product t × ln 2
   (bits 0x3f317218). Reason: upstream calls `exp2f(x * log2e)` and has no
@@ -409,7 +416,7 @@ Orchestrator decisions:
   oracle for real tensors. A CPU/GPU split of one matrix's output rows
   could add at most 15% at 1 row and 34% at 16 by rate addition, and the
   CPU is needed for the recurrent and attention layers, so it is deferred
-  to step 7. To record in DECISIONS.md when the Metal crate merges.
+  to step 7 (done there: D22). Recorded in DECISIONS.md as D12.
 - **O7 (2026-11-14)** The Metal engine integration (brief `04c`: backend
   selection in `Model`, grouped dispatch, recurrent heads in parallel) and
   the KV codec (brief `05a`) proceed while the plain-int8 score runs.
@@ -451,22 +458,17 @@ Orchestrator decisions:
 |---|---|---|---|
 | 2026-11-14 | 0 | PR #2 found already merged; CI green on main at d161397 | `gh pr list --state all`, `gh run list` |
 | 2026-11-14 | 1 | D7 to D9 implemented by Sol (75271d6). Opus review: code correct, tests could not detect a wrong tile schedule. Sol fix round (8ee8520): `prefix_schedule()` tested against hand-written schedules, pinned bits. 61 tests pass, none ignored. | `cargo test --workspace --release`; `! grep -rnE 'todo!\|unimplemented!\|#\[ignore\|SpecGap' crates/` |
-
 | 2026-11-14 | 2 | Astra built `yskn-engine` (mmap, pool, portable/NEON/dotprod kernels). Sol review: approve, one test nit. Orchestrator ran all checks. | `cargo run --release -p yskn-engine --example verify_linear -- MODEL.yskn` (12 of 12 PASS) |
-
 | 2026-11-14 | 3 | PR #6: layer-major engine `Model`, shared scoring, `verify_model` (Sol; Opus review approve with 6 nits, carried into brief `04c`). | `cargo run --release -p yskn-engine --example verify_model -- MODEL_FOLDER tools/quality/windows_own_thinking.json` (PASS) |
 | 2026-11-14 | 4 | PR #8: `crates/yskn-metal` (Opus; Sol review found a table-cache key bug and a racy duplicate table write, both fixed and re-approved). Metal tests also run on CI's paravirtual GPU (448 threads per threadgroup limit; default 128 works). | `cargo test -p yskn-metal --release`; M2 below |
-
 | 2026-11-14 | 5 B/C | PR #11: KV profile reader and row codec (Sol). Astra compared it with the CUDA source statement by statement: approve. Real profile: 128 groups, all 5-bit mode 0, 9 multipliers, 16 key and 13 value sides packable. | `cargo run --release -p yskn-ref --example kv_profile_info -- MODEL_FOLDER/kvq_u5.bin` |
 | 2026-11-14 | 3/4 | PR #13: engine `Model` on Metal with grouped dispatch, recurrent heads in parallel, review nits (Opus; Sol review approve). | M5, M6 below |
 | 2026-11-14 | 6 | PR #12: `crates/yskn-text` (Sol; two Opus reviews; final goldens by Luna). | `YSKN_MODEL_DIR=MODEL_FOLDER cargo test -p yskn-text --release` (127 model-backed and 26 model-free goldens pass); regenerating goldens with upstream's Python is byte-identical |
 | 2026-11-14 | 5 D | PR #14: KV cache modes in reference and engine (Sol; Astra and Opus reviews; fixes for result-file identification and test strength). | `cargo test --workspace --release` (Metal cases ran) |
 | 2026-11-14 | 5 I | PR #15: draft model reference and reduced head (Sol; Astra review against the source: approve, two test gaps carried forward). | `YSKN_MODEL_DIR=MODEL_FOLDER cargo test -p yskn-ref --release draft`; one scalar `propose` on the real files takes about 90 s |
 | 2026-11-14 | 3 | Plain int8 perplexity 2.075440 (M4): main model validated. | M4 below |
-
 | 2026-11-14 | 5 G/H | PR #17: provisional passes, commit, snapshots in the engine; generic lossless speculation loop (Sol; Opus review approve). | `cargo test --workspace --release` (randomized partial commits equal the reference in every KV mode and backend; generation identical with and without speculation) |
 | 2026-11-14 | 3 | Gate 1 passed: profile-int8 perplexity 2.075597 (M8). | M8 below |
-
 | 2026-11-14 | 5 F | PR #19: residual capture, draft proposer, joint snapshots (Sol; Opus reviews). Teacher test: 7 of 7 guesses accepted with correct wiring, 0 of 7 with a one-row lag or swapped slots. | `cargo test --workspace --release` (209 tests, Metal cases ran) |
 | 2026-11-14 | 5 D | PR #21: packed KV5 rows decoded once, stored as bfloat16 bits (Sol; Opus review: no changed bit). Kv5 cache: 736 bytes per packed row, 2.73 GiB at 32,768 tokens, 21.9 GiB at 262,144 (does not fit 24 GB). | frozen digests from 0b7bd5d unchanged |
 | 2026-11-14 | 6 | PR #18: `crates/yskn-cli` (binary `yskn`): chat logic, hyper server, terminal chat against an engine trait (Sol; socket and security fixes by Opus; four Astra reviews). | `cargo test -p yskn --release` (109 tests, repeated 5 times) |
@@ -538,12 +540,14 @@ orchestrator (PR #22) was reviewed by Sol before merging.
   source-derived expectations for the correction chain.
 - The KV codec's tie-path equality with the source is argued from the code,
   not proven by a test with source-derived expected values (none exist).
-- The bandwidth ceiling for this chip is not measured yet (see Environment).
+- The bandwidth ceiling for this chip: measured, M17; closed.
 - D12 in DECISIONS.md and M2 below were measured before two review fixes to
   the Metal shader; re-measure on a quiet machine during step 7.
 
 - `MappedModel::open` is an `unsafe fn` (file must not change while mapped).
-  The product binary needs a safe wrapper that documents this.
+  The product maps the model and the draft at one documented point
+  (`RealEngine` loading, PR #26 and PR #29) and prints "Model files must
+  not change while yskn is running"; closed.
 
 
 ## Measurements
@@ -841,7 +845,7 @@ shared machine (PR #30, D20):
 
 Attention stage alone with the real model's shapes (16 attention layers,
 24 query heads, 4 key/value heads, real header and profile, synthetic
-rows), ten workers, minimum of 5, load 5 to 12:
+rows), ten workers, load 5 to 12; minimum of 5 samples except the first column's 32,768-token figure, which is the minimum of 3:
 `YSKN_MODEL_DIR=~/models/qwen38-speed YSKN_BENCH_CONTEXT=C YSKN_BENCH_ROWS=M YSKN_BENCH_PASSES=5 cargo test --release -p yskn-engine --lib bench_real_attention_shapes -- --ignored --nocapture`
 
 | Context, rows | Before PR #30 | Round two | Grouped |
@@ -851,9 +855,12 @@ rows), ten workers, minimum of 5, load 5 to 12:
 | 32,768 tokens, 4 rows | | 2.22 s | 0.41 s |
 
 The targets (0.06 s and 0.10 s) are not met. At 32,768 tokens the
-grouped path reads the 2.06 GB of cache operands at about 10.8 GB/s, far
-below the measured bandwidth (M17), so the stage is not memory-bound
-yet: candidate for another round.
+grouped path's logical cache operands (2.06 GB per row) divided by its
+time give about 10.8 GB/s. That is a computed figure, not a measured
+memory traffic, so it does not by itself show what bounds the stage;
+D20 names cache traversal and widening at long context and arithmetic
+at short context. Candidate for another round, starting with a
+measurement of what bounds it.
 
 Correctness on the real model with the binaries of PR #30 (a47359a):
 `yskn selfcheck` PASS; `verify_model ~/models/qwen38-speed
