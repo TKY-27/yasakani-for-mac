@@ -6,6 +6,7 @@ mod template;
 mod tools;
 
 pub use stream::{OutputStream, StreamDecoder};
+pub use template::json_dumps;
 pub use tools::{ToolCallFilter, convert_parameter, parse_tool_call, tool_schemas};
 
 use serde_json::Value;
@@ -33,6 +34,7 @@ fn error(e: impl fmt::Display) -> Error {
 /// Special tokens are retained on decode; encode never adds special tokens.
 /// `options` is an object of template variables, including `add_generation_prompt`
 /// (default true), `enable_thinking`, and `preserve_thinking`.
+#[derive(Clone)]
 pub struct ChatFormatter {
     tokenizer: Tokenizer,
     environment: minijinja::Environment<'static>,
@@ -84,6 +86,20 @@ impl ChatFormatter {
                 folder.display()
             )));
         }
+        Self::from_tokenizer(tokenizer, &cfg, template)
+    }
+
+    /// Construct from embedded tokenizer/configuration text (no model files or weights).
+    pub fn from_json(tokenizer: &str, config: &str, template: &str) -> Result<Self> {
+        let tokenizer = Tokenizer::from_bytes(tokenizer.as_bytes()).map_err(error)?;
+        let cfg: Value = serde_json::from_str(config).map_err(error)?;
+        if !cfg.is_object() {
+            return Err(error("tokenizer_config.json must be an object"));
+        }
+        Self::from_tokenizer(tokenizer, &cfg, template.to_owned())
+    }
+
+    fn from_tokenizer(tokenizer: Tokenizer, cfg: &Value, template: String) -> Result<Self> {
         let mut environment = template::environment();
         environment
             .add_template_owned("chat", template)

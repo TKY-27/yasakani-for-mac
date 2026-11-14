@@ -67,6 +67,18 @@ pub(crate) fn environment() -> Environment<'static> {
     env
 }
 
+/// Python-compatible JSON spelling for protocol-embedded argument strings.
+pub fn json_dumps(value: &Value, ensure_ascii: bool) -> String {
+    JsonFormat {
+        ensure_ascii,
+        indent: None,
+        item_sep: ", ".into(),
+        key_sep: ": ".into(),
+        sort_keys: false,
+    }
+    .render(value, 0)
+}
+
 fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidOperation, message.into())
 }
