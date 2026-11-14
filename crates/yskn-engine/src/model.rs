@@ -1197,15 +1197,8 @@ fn attention_pass(
         attention.append_prepared(state, position + i, p)?;
     }
     let heads = attention.query_heads();
-    let outputs = engine.map_range(0..q.len() * heads, |i| {
-        crate::cpu_stages::attention::output_head(
-            attention,
-            state,
-            position + i / heads,
-            &prepared[i / heads],
-            i % heads,
-        )
-    })?;
+    let outputs =
+        crate::cpu_stages::attention::output_rows(engine, attention, state, position, &prepared)?;
     let gated: Vec<_> = outputs
         .chunks(heads)
         .map(|heads| heads.iter().flatten().copied().collect())

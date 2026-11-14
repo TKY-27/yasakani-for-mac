@@ -9,26 +9,6 @@ use yskn_ref::{
 const LOG2_E: f32 = std::f32::consts::LOG2_E;
 const EMPTY_MAXIMUM: f32 = -1.0e30;
 
-pub(crate) fn output_head(
-    layer: &Attention,
-    state: &AttentionState,
-    position: usize,
-    prepared: &PreparedRow,
-    head: usize,
-) -> Result<Vec<f32>> {
-    if super::enabled() {
-        layer.output_head_with_math::<super::math::FastMath>(
-            state,
-            position,
-            prepared,
-            head,
-            attend_head,
-        )
-    } else {
-        layer.output_head(state, position, prepared, head)
-    }
-}
-
 struct AttentionSplit {
     maximum: f32,
     denominator: f32,
@@ -36,6 +16,7 @@ struct AttentionSplit {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 struct SplitPlan {
     tiles: Vec<(usize, std::ops::Range<usize>)>,
     include_self: bool,
@@ -43,6 +24,7 @@ struct SplitPlan {
 
 /// Chapter 04's 31/42 splits with D9's absolute, per-row prefix tiles.
 /// `length` includes self and is therefore positive.
+#[cfg(test)]
 fn prefix_schedule(length: usize) -> Vec<SplitPlan> {
     let split_count = if length < 4096 { 31 } else { 42 };
     let per_split = length.div_ceil(split_count);
@@ -70,6 +52,7 @@ fn prefix_schedule(length: usize) -> Vec<SplitPlan> {
         .collect()
 }
 
+#[cfg(test)]
 fn attend_head(operands: AttentionOperands<'_>) -> Result<Vec<f32>> {
     let AttentionOperands {
         query,
@@ -123,12 +106,16 @@ fn attend_head(operands: AttentionOperands<'_>) -> Result<Vec<f32>> {
         denominator: 0.0,
         numerator: vec![0.0; 256],
     });
+    combine_splits(&splits)
+}
+
+fn combine_splits(splits: &[AttentionSplit]) -> Result<Vec<f32>> {
     let largest_maximum = splits
         .iter()
         .map(|split| split.maximum)
         .fold(EMPTY_MAXIMUM, f32::max);
     let mut scales = Vec::with_capacity(splits.len());
-    for split in &splits {
+    for split in splits {
         if split.maximum > -1.0e29 {
             let difference = split.maximum - largest_maximum;
             finite(&[difference], "attention split maximum difference")?;
@@ -139,7 +126,7 @@ fn attend_head(operands: AttentionOperands<'_>) -> Result<Vec<f32>> {
     }
     let mut denominator = 0.0;
     // Splits, including zero padding, combine in ascending order with separate products.
-    for (scale, split) in scales.iter().zip(&splits) {
+    for (scale, split) in scales.iter().zip(splits) {
         denominator += *scale * split.denominator;
     }
     finite(&[denominator], "attention combined denominator")?;
@@ -149,7 +136,7 @@ fn attend_head(operands: AttentionOperands<'_>) -> Result<Vec<f32>> {
         ));
     }
     let mut attended = vec![0.0; 256];
-    for (scale, split) in scales.iter().zip(&splits) {
+    for (scale, split) in scales.iter().zip(splits) {
         add_scaled(&mut attended, &split.numerator, *scale);
     }
     for value in &mut attended {
@@ -159,6 +146,7 @@ fn attend_head(operands: AttentionOperands<'_>) -> Result<Vec<f32>> {
     Ok(attended)
 }
 
+#[cfg(test)]
 fn prefix_tile(
     split: &mut AttentionSplit,
     query: &[f32],
@@ -180,6 +168,20 @@ fn prefix_tile(
         finite(&[score], "attention prefix score")?;
         scores[visible.start + lane - tile_start] = score;
     }
+    let probabilities = prefix_probabilities(split, &scores)?;
+    // Only visible rows are read. Each channel still consumes ascending tile keys.
+    for position in visible {
+        add_value(
+            position,
+            &mut split.numerator,
+            probabilities[position - tile_start],
+        );
+    }
+    finite(&[split.denominator], "attention prefix denominator")?;
+    finite(&split.numerator, "attention prefix numerator")
+}
+
+fn prefix_probabilities(split: &mut AttentionSplit, scores: &[f32; 32]) -> Result<[f32; 32]> {
     let new_maximum = scores.iter().copied().fold(split.maximum, f32::max);
     let rescale_argument = (split.maximum - new_maximum) * LOG2_E;
     let scaled_maximum = new_maximum * LOG2_E;
@@ -219,16 +221,7 @@ fn prefix_tile(
     for value in &mut split.numerator {
         *value *= rescale;
     }
-    // Only visible rows are read. Each channel still consumes ascending tile keys.
-    for position in visible {
-        add_value(
-            position,
-            &mut split.numerator,
-            probabilities[position - tile_start],
-        );
-    }
-    finite(&[split.denominator], "attention prefix denominator")?;
-    finite(&split.numerator, "attention prefix numerator")
+    Ok(probabilities)
 }
 
 fn add_self(
@@ -304,11 +297,12 @@ fn finite(values: &[f32], context: &'static str) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 fn dots32(query: &[f32], bases: &[[f32; 256]; 32], _count: usize) -> [f32; 32] {
     assert_eq!(query.len(), 256);
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: the production caller requires enabled(), tests require NEON;
+        // SAFETY: this retained baseline kernel is test-only and tests require NEON;
         // query and every cache row contain exactly 256 elements.
         unsafe {
             match _count {
@@ -331,6 +325,7 @@ fn dots32(query: &[f32], bases: &[[f32; 256]; 32], _count: usize) -> [f32; 32] {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[cfg(test)]
 unsafe fn dots32_neon<const GROUPS: usize>(query: &[f32], bases: &[[f32; 256]; 32]) -> [f32; 32] {
     use std::arch::aarch64::*;
     let mut sums = [vdupq_n_f32(0.0); GROUPS];
@@ -369,11 +364,12 @@ unsafe fn dots32_neon<const GROUPS: usize>(query: &[f32], bases: &[[f32; 256]; 3
     out
 }
 
+#[cfg(test)]
 fn add_cache_value(output: &mut [f32], row: &CacheRow, weight: f32) {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: output is a validated 256-channel split, cache rows own 256 bases;
-        // output_head requires runtime NEON. Widen directly in registers.
+        // direct baseline tests require runtime NEON. Widen directly in registers.
         unsafe {
             add_cache_value_neon(output, row, weight);
         }
@@ -384,6 +380,7 @@ fn add_cache_value(output: &mut [f32], row: &CacheRow, weight: f32) {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[cfg(test)]
 unsafe fn add_cache_value_neon(output: &mut [f32], row: &CacheRow, weight: f32) {
     use std::arch::aarch64::*;
     use yskn_ref::kv_codec::BaseView;
@@ -426,7 +423,7 @@ fn add_scaled(output: &mut [f32], bases: &[f32], weight: f32) {
     assert_eq!(bases.len(), 256);
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: output_head checks enabled() (runtime NEON detection); direct kernel
+        // SAFETY: output_rows checks enabled() (runtime NEON detection); direct kernel
         // tests check neon_available(). Both checked slices have 256 elements.
         unsafe {
             add_scaled_neon(output, bases, weight);
@@ -513,6 +510,61 @@ mod tests {
                     ]
                     .contains(&position)
                     {
+                        // Four causal rows share the cache, including passes crossing
+                        // tile edges and the 31 -> 42 split-schedule threshold.
+                        let mut pass_state = state.clone();
+                        let mut prepared = Vec::new();
+                        for offset in 0..4 {
+                            let q: Vec<_> = (0..2048).map(|_| sample()).collect();
+                            let k: Vec<_> = (0..512).map(|_| sample()).collect();
+                            let v: Vec<_> = (0..512).map(|_| sample()).collect();
+                            let p = layer.prepare_row(position + offset, &q, &k, &v).unwrap();
+                            layer
+                                .append_prepared(&mut pass_state, position + offset, &p)
+                                .unwrap();
+                            prepared.push(p);
+                        }
+                        let operands = prepared
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(i, p)| {
+                                let layer = &layer;
+                                let pass_state = &pass_state;
+                                (0..4).map(move |head| {
+                                    layer
+                                        .head_operands(pass_state, position + i, p, head)
+                                        .unwrap()
+                                })
+                            })
+                            .collect();
+                        let batch = grouped::Batch::new(operands, 2);
+                        // Reverse task completion order must not change split combination.
+                        let parts = (0..batch.tasks())
+                            .rev()
+                            .map(|task| batch.run(task).unwrap())
+                            .collect();
+                        let actual = batch.finish(parts).unwrap();
+                        for (i, attended) in actual.into_iter().enumerate() {
+                            let expected = layer
+                                .output_head(&pass_state, position + i / 4, &prepared[i / 4], i % 4)
+                                .unwrap();
+                            let actual = layer
+                                .output_head_with(
+                                    &pass_state,
+                                    position + i / 4,
+                                    &prepared[i / 4],
+                                    i % 4,
+                                    |_| Ok(attended),
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                bits(&actual),
+                                bits(&expected),
+                                "grouped {mode:?} ordinal={ordinal} position={} head={}",
+                                position + i / 4,
+                                i % 4
+                            );
+                        }
                         for head in 0..4 {
                             let expected = layer.output_head(&state, position, &row, head).unwrap();
                             let actual = layer
@@ -626,3 +678,7 @@ mod tests {
 #[cfg(test)]
 #[path = "attention_bench.rs"]
 mod bench;
+
+#[path = "attention_grouped.rs"]
+mod grouped;
+pub(crate) use grouped::output_rows;

@@ -109,7 +109,11 @@ fn bench_real_attention_shapes() {
             means,
         });
     }
-    let mut engine = crate::Engine::from_env().unwrap();
+    let threads = std::env::var("YSKN_BENCH_THREADS")
+        .ok()
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(crate::Engine::default_threads());
+    let mut engine = crate::Engine::new(crate::Kernel::fastest(), threads).unwrap();
     println!(
         "stage-only real header/norm/profile; synthetic projected bank; layers={} heads={} kv_heads={} context={context} rows={rows} threads={}",
         inputs.len(),
@@ -120,27 +124,46 @@ fn bench_real_attention_shapes() {
     let mut times = Vec::new();
     for pass in 0..=passes {
         let start = std::time::Instant::now();
+        let mut setup = 0.0;
+        let mut work = 0.0;
+        let mut combine = 0.0;
         for input in &inputs {
-            let outputs = engine
-                .map_range(0..rows * dims.query_heads, |i| {
+            let phase = std::time::Instant::now();
+            let operands = (0..rows * dims.query_heads)
+                .map(|i| {
                     let row = i / dims.query_heads;
                     let head = i % dims.query_heads;
-                    attend_head(AttentionOperands {
+                    AttentionOperands {
                         query: &input.queries[row][head],
                         kv_head: head / (dims.query_heads / dims.kv_heads),
                         prefix: &input.prefix[..context + row],
                         current: &input.prefix[context + row],
                         value_mean: input.means[head].as_ref(),
-                    })
+                    }
                 })
+                .collect();
+            let batch = grouped::Batch::new(operands, dims.kv_heads);
+            setup += phase.elapsed().as_secs_f64();
+            let phase = std::time::Instant::now();
+            let partials = engine
+                .map_range(0..batch.tasks(), |task| batch.run(task))
                 .unwrap();
+            work += phase.elapsed().as_secs_f64();
+            let phase = std::time::Instant::now();
+            let splits = batch.collect(partials);
+            let outputs = engine
+                .map_range(0..splits.len(), |i| combine_splits(&splits[i]))
+                .unwrap();
+            combine += phase.elapsed().as_secs_f64();
             std::hint::black_box(outputs);
         }
         let elapsed = start.elapsed().as_secs_f64();
         if pass > 0 {
             times.push(elapsed);
         }
-        println!("pass={pass} attention_s={elapsed:.9}");
+        println!(
+            "pass={pass} attention_s={elapsed:.9} setup_s={setup:.9} work_s={work:.9} combine_s={combine:.9}"
+        );
     }
     times.sort_by(f64::total_cmp);
     println!(

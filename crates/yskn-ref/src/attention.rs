@@ -492,27 +492,11 @@ impl Attention {
         query_head: usize,
         attend: impl FnOnce(AttentionOperands<'_>) -> Result<Vec<f32>>,
     ) -> Result<Vec<f32>> {
-        if state.dimensions != self.dimensions
-            || position > state.rows.len()
-            || query_head >= self.dimensions.query_heads
-            || prepared.dimensions != self.dimensions
-            || prepared.position != position
-        {
-            return Err(Error::InvalidInput(
-                "invalid attention prefix or head".into(),
-            ));
-        }
+        let operands = self.head_operands(state, position, prepared, query_head)?;
         let mut output = Vec::with_capacity(self.dimensions.head_dim);
         {
             let start = query_head * self.dimensions.head_dim;
-            let kv_head = query_head / (self.dimensions.query_heads / self.dimensions.kv_heads);
-            let attended = attend(AttentionOperands {
-                query: &prepared.queries[start..start + self.dimensions.head_dim],
-                kv_head,
-                prefix: &state.rows[..position],
-                current: &prepared.cache,
-                value_mean: self.value_mean(kv_head, &prepared.cache.values[kv_head])?,
-            })?;
+            let attended = attend(operands)?;
             if attended.len() != self.dimensions.head_dim {
                 return Err(Error::InvalidInput(
                     "invalid attention head output width".into(),
@@ -532,6 +516,36 @@ impl Attention {
         }
         M::finite(&output, "attention gated output")?;
         Ok(output)
+    }
+
+    /// Borrow validated causal operands for engines that share KV tiles across queries.
+    /// The scalar output hook uses this same validation and operand selection body.
+    pub fn head_operands<'a>(
+        &'a self,
+        state: &'a AttentionState,
+        position: usize,
+        prepared: &'a PreparedRow,
+        query_head: usize,
+    ) -> Result<AttentionOperands<'a>> {
+        if state.dimensions != self.dimensions
+            || position > state.rows.len()
+            || query_head >= self.dimensions.query_heads
+            || prepared.dimensions != self.dimensions
+            || prepared.position != position
+        {
+            return Err(Error::InvalidInput(
+                "invalid attention prefix or head".into(),
+            ));
+        }
+        let start = query_head * self.dimensions.head_dim;
+        let kv_head = query_head / (self.dimensions.query_heads / self.dimensions.kv_heads);
+        Ok(AttentionOperands {
+            query: &prepared.queries[start..start + self.dimensions.head_dim],
+            kv_head,
+            prefix: &state.rows[..position],
+            current: &prepared.cache,
+            value_mean: self.value_mean(kv_head, &prepared.cache.values[kv_head])?,
+        })
     }
 
     fn validate_projected_rows(

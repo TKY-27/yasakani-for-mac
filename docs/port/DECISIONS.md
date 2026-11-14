@@ -1985,3 +1985,203 @@ stage-only real-shape benchmark, not real-token prefill. The earlier apparent
 2.02x ratio includes host-load variation and must not be presented as a stable
 algorithmic speedup. All raw logs and pre-change benchmark executables are
 retained under this worktree's ignored `.work/07c-evidence/` directory.
+
+### D20 round three: grouped long-context attention (brief 07e)
+
+The fast attention pass groups every row/query head by KV head. Each absolute
+32-key tile is widened once for that group: keys become a temporary
+`[channel][key]` FP32 tile, values a `[key][channel]` FP32 tile. All queries
+consume that tile before its storage is dropped. The ordinary scalar
+`output_head` remains the `YSKN_CPU_STAGES=reference` implementation. The
+additive scalar `head_operands` hook shares validation and operand selection
+with the existing scalar output hook; the reference remains safe, scalar,
+and single-threaded.
+
+Each row retains its own 31/42 split count, ceil-divided split width, absolute
+32-slot tile boundaries, and self position. Eight consecutive split ranges
+per KV head give 32 tasks at the real shape, including a one-row pass. A tile
+inside one task's range is loaded by that worker alone. Tiles intersecting
+multiple task ranges (including differences between rows' split schedules)
+are widened once before dispatch and borrowed immutably by their owners.
+No two workers stream the same cache operands. Only these boundary tiles
+survive between tasks; there is no persistent second cache copy.
+
+Each score lane visits channels 0..255 in order with separate multiply and
+add, exactly the sixteen ordered D3 groups. Complete groups of four visible
+keys use NEON; partial groups use scalar edge chains, so masked keys do no
+arithmetic. Each query/split visits its own intersecting tiles in ascending
+order. The shared probability helper retains the original online maximum,
+rescale, exp2, paired four-lane denominator fold and BF16 probability/scale
+boundary. Value channels consume only their visible keys in ascending order;
+masked scales and value products are skipped, including with a negative-zero
+numerator. Thirty-two value-channel accumulators stay in registers for the
+complete key chain, avoiding a numerator load/store for every key. Self
+keeps its distinct score and FP32 weight. Means follow self, and padded
+splits combine in original index order regardless of task finish order.
+Combination and final output run as independent query tasks on the existing
+pool; final inverse rotation and gating still use the scalar-owned hook.
+On a parallel error, read-only scalar row/head replay selects the original
+first error; transaction ownership and rollback remain in the existing model.
+
+Cache layout is unchanged: 736 allocated bytes per five-bit packed side-row,
+288 per int8 side-row, and 89,600 bytes/token for the released profile's
+116 packed + 12 int8 rows across 16 layers (including token structs). Growth
+is zero. The scan touches a packed side's 512 BF16 operand bytes + four-byte
+scale, or an int8 side's 256 operand bytes + scale; it does not read packed
+words. K/V pairs therefore touch 1,032 bytes per key for packed/packed and
+776 for packed/int8 (520 for int8/int8). Positions ascend within a task;
+within a position the immutable cache bases ascend in channel order. The
+row/heap layout is not one contiguous per-head tile: pointer/cache-line
+traffic remains, but no allocation-format or snapshot/partial-commit change
+is needed. A temporary full tile is 65,792 bytes including both scale arrays.
+
+For the real packing mix, a single stream is 62,976 logical operand bytes
+per context token across all layers, about 2.064 GB at 32,768. This stream is
+shared by all six heads and all pass rows, instead of about 12.382 GB per
+row. Widened scratch writes, repeated L1 operand reads, output state traffic,
+metadata and actual cache-line transfers are additional; logical GB/s must
+not be described as measured DRAM bandwidth. Score and value chains together
+perform approximately `4 * 256 * 24 * 16 * context * rows` scalar FP32
+operations: 12.885 GFLOP at 32768/1 and 12.583 GFLOP at 2000/16, before
+softmax, checks, self and split combination.
+
+The scalar-oracle attention test now also runs four grouped rows at every
+listed boundary (0, 1, 30..33, 61..64, 2000, 4094..4096, 4106), with multiple
+queries per KV head, all three modes, both mixed packed/int8 directions and
+reverse task completion. It crosses the 31/42 transition within one pass.
+New direct grouped score tests cover signed zero, subnormals, BF16 ties and
+extreme int8 values; masked-tile tests poison invisible scales with NaN and
+require exact negative-zero numerators. The model failure test places a bad
+row between good rows and compares the exact error and committed state in
+all three modes, then checks successful continuation. A second failure test
+uses six queries per KV head and finite prepared operands that overflow in
+the attention prefix score of the middle row (not during preparation); it
+checks the scalar error and unchanged state with 1/4/10 workers. Existing model,
+snapshot, partial-commit and frozen-digest tests remain independent proofs.
+
+
+The four required proof commands are run from this worktree with
+`CARGO_NET_OFFLINE=true` (no network or new dependencies):
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p yskn-ref -p yskn-format -p yskn-engine --release
+YSKN_CPU_STAGES=reference cargo test -p yskn-engine --release
+```
+
+The stage harness additionally accepts `YSKN_BENCH_THREADS` to compare four
+and ten CPU workers. It reports setup (partition-boundary tiles), worker
+execution and split combination separately; all three remain included in
+the total. It retains the same real header/norm/profile and deterministic
+synthetic projected-row bank, and excludes preparation, final inverse
+rotation/gating and projections just as the before harness does. Neither
+real-token inference nor Metal execution is established by these timings.
+
+
+All four proof commands above **passed**. GPU cases report no available
+Metal device in this sandbox, so a passing suite is not Metal execution
+proof. No real-token 32,768-context inference, hardware-counter bandwidth,
+physical P/E-core affinity or trained-model scalar logit comparison was run.
+
+Measurement commands (2026-11-14 UTC; five samples after one excluded warmup):
+
+```sh
+export CARGO_NET_OFFLINE=true
+cargo test --release -p yskn-engine --lib --no-run
+# Retain each built executable as .work/07e-evidence/{before,after}.
+# before is unmodified 92c7277791f461d35a4cc5cf4b69941c3b0e4dc8.
+run_stage() (
+  lock=/Users/anag2bgod/Projects/yasakani-for-mac/.work/model.lock
+  acquired=0
+  trap '[ "$acquired" = 0 ] || rmdir "$lock"' EXIT
+  until mkdir "$lock" 2>/dev/null; do sleep 2; done
+  acquired=1
+  date -u
+  uptime
+  YSKN_MODEL_DIR="$HOME/models/qwen38-speed" \
+    YSKN_BENCH_CONTEXT="$2" YSKN_BENCH_ROWS="$3" \
+    YSKN_BENCH_PASSES=5 YSKN_BENCH_THREADS="${4:-10}" \
+    ".work/07e-evidence/$1" bench_real_attention_shapes --ignored --nocapture
+  result=$?
+  uptime
+  exit "$result"
+)
+# Twice, in this order, each invocation acquiring/releasing its own lock:
+run_stage before 2000 16
+run_stage after 2000 16
+run_stage before 32768 1
+run_stage after 32768 1
+run_stage before 32768 4
+run_stage after 32768 4
+# In repetition one, immediately after the matching ten-worker after run:
+run_stage after 2000 16 4
+run_stage after 32768 1 4
+```
+
+The actual runner is `.work/07e-evidence/run.py`, which uses atomic `mkdir`,
+wait/retry on an existing lock and `finally: rmdir` on successful or failed
+subprocess exit. It never removes a lock it did not acquire. The real model
+folder is read-only and was never copied. Each `final*.txt` log contains UTC,
+both full `uptime` triples and every sample. Final pairs ran after all proof
+commands, without this task's builds/tests in parallel. Other workers still
+caused substantial load variation. Seconds below are minimum / median;
+load columns are the one-minute load at start -> finish, not core utilization.
+
+| Repeat | Context / rows | Before min / median (s) | After min / median (s) | Before load | After load |
+|---|---|---:|---:|---|---|
+| 1 | 2000 / 16 | 0.227841 / 0.232880 | 0.086395 / 0.087310 | 5.05 -> 5.61 | 5.61 -> 5.61 |
+| 1 | 32768 / 1 | 0.451866 / 0.551876 | 0.191839 / 0.196624 | 5.61 -> 6.04 | 6.04 -> 7.00 |
+| 1 | 32768 / 4 | 2.224248 / 2.794284 | 0.407230 / 0.424792 | 7.00 -> 11.85 | 11.85 -> 12.26 |
+| 2 | 2000 / 16 | 0.320551 / 0.335975 | 0.112140 / 0.116632 | 12.26 -> 12.26 | 12.26 -> 11.76 |
+| 2 | 32768 / 1 | 1.592318 / 1.726584 | 0.442352 / 0.514554 | 11.76 -> 14.41 | 14.41 -> 16.66 |
+| 2 | 32768 / 4 | 3.399618 / 4.662573 | 1.097581 / 1.171935 | 16.66 -> 23.57 | 23.57 -> 24.90 |
+
+Use the lower-load first pair as the least-contended observation, retaining
+both pairs rather than hiding the second. Its minima improve 2.64x at
+2000/16, 2.36x at 32768/1 and 5.46x at 32768/4. The last ratio is especially
+load-sensitive (before pass times grew from 2.22 to 6.88 seconds). It is not
+a stable hardware speedup claim. Both targets remain **unmet**: best observed
+86.395 ms exceeds 60 ms at 2000/16, and 191.839 ms exceeds 100 ms at 32768/1.
+At 32768/4 the best amortized minimum/median is 101.808 / 106.198 ms per row.
+
+Four-worker after runs, following their ten-worker counterparts, measured:
+2000/16 126.442 / 132.425 ms (load 5.61 -> 5.61), and 32768/1
+282.218 / 282.965 ms (load 7.00 -> 7.00). Ten workers are retained: their
+medians were 87.310 and 196.624 ms. This supports using all ten workers on
+this host, but without affinity/counters it does not isolate efficiency-core
+execution from scheduler placement.
+
+The remaining limitation is mixed. At 2000/16 only 0.126897 GB of logical
+cache operands are fetched, 1.47 GB/s at the 86.395 ms minimum, while ordered
+score/value work is 12.630 GFLOP (including the rows' increasing prefixes),
+146.2 GFLOP/s. Worker time is 73.479 ms, setup 4.494 ms and combination
+3.161 ms in that same pass; allocation/drop/dispatch account for the rest.
+This is primarily arithmetic, softmax/checks and temporary-state traffic,
+not repeated full-cache streaming. At 32768/1, 2.063598 GB / 191.839 ms is
+10.76 logical GB/s, with 12.885 GFLOP / 191.839 ms = 67.2 GFLOP/s. Comparable
+arithmetic costs 2.22x as much as the short-context pass, indicating that
+cache traversal/widening and memory latency remain material. Its worker time
+is 186.791 ms; setup 3.134 ms and combination 1.208 ms. At 32768/4, the cache
+stream stays 2.063786 GB, while work grows to 51.542 GFLOP; the minimum
+corresponds to 5.07 logical GB/s and 126.6 GFLOP/s. These counts characterize
+the remaining memory/arithmetic pressure; they are neither DRAM counters nor
+a proof of a hard hardware ceiling. D3 still prohibits replacing each ordered
+score chain with a reassociated reduction or FMA. No operation-order rule
+prevented the implemented cache sharing, and target attainment is not claimed.
+
+A final rejected experiment added eight-row software prefetch and a NEON
+4x4 key-tile transpose with an extra temporary 32 KiB row-major key tile.
+It passed the focused bit tests. Two reversed-order comparisons at high
+load (one-minute load 29..33) gave about 6% lower long-context medians
+(.451099 -> .422695 and .329878 -> .310331 s), but inconsistent short-context
+results (.276660 -> .272356 and .163963 -> .174650 s). That did not justify
+additional unsafe assembly/scratch and the short-context regression. The
+experiment was removed; the final source is the previously fully verified
+version. The trial binaries/logs are retained only in ignored local evidence.
+
+The implementation and evidence are confined to the allowed files in 07e.
+`git add -A` failed with `Operation not permitted` creating
+`.git/worktrees/07e/index.lock`; staging and commits could not be created in
+this sandbox. No push was attempted. The unchanged starting HEAD is
+`92c7277791f461d35a4cc5cf4b69941c3b0e4dc8`.
