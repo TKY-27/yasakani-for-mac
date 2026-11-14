@@ -46,6 +46,9 @@ pub struct Generation {
     pub cached_tokens: usize,
     pub snap_mode: u8,
     pub passes: usize,
+    pub rows_verified: usize,
+    pub guesses_offered: usize,
+    pub guesses_accepted: usize,
     pub prefill_ms: f64,
     pub gen_ms: f64,
 }
@@ -55,6 +58,7 @@ pub struct Generation {
 /// The callback sees the growing committed array, including the final ids.
 /// `false` stops at the next commit boundary; errors stop and propagate after
 /// generation has quiesced. Call it even for chunks that decode to no text.
+/// An empty slice is also a cancellation poll before/between prefill passes.
 /// `max_new` includes the first predicted token and any EOS; reserve the
 /// context margin, clamp to available room and reject an empty/oversize prompt.
 pub trait Engine {

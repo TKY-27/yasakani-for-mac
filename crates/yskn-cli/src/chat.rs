@@ -479,6 +479,9 @@ fn stage(
             cached_tokens: 0,
             snap_mode: 0,
             passes: 0,
+            rows_verified: 0,
+            guesses_offered: 0,
+            guesses_accepted: 0,
             prefill_ms: 0.0,
             gen_ms: 0.0,
         };

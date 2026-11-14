@@ -1,10 +1,15 @@
+#[path = "product_commands.rs"]
+mod product_commands;
 use crate::{
     Error, Result,
     chat::{ChatParams, ChatRunner, Event},
+    engine::Engine,
+    real_engine::{DraftMode, RealEngine, RealEngineConfig},
     request::{RequestDefaults, parse_chat_request},
     server::{Config, Server},
     stub::{self, StubEngine},
 };
+use product_commands::{bench, selfcheck};
 use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
@@ -16,11 +21,41 @@ use std::{
 };
 
 pub const CHAT_HELP: &str = "commands:  /exit  quit      /reset  forget the conversation      /think on|off  thinking on or off (default on)\n           /effort low|medium|xhigh  how long the model thinks      /help  this text      Ctrl+C while it writes: stop the answer";
-const HELP: &str = "yskn - local Rust chat product (real engine not connected yet)\ncommands: serve, chat, info, bench, selfcheck\n  --engine stub       deterministic demo engine; required until integration\n  --model-dir FOLDER  optional real tokenizer/template, read only\n  --max-ctx N         context capacity (default 262144)\n  --seed0 N           first automatic request seed (default 1)\nserve:\n  --host HOST         default 127.0.0.1\n  --port PORT         default 8765; 0 chooses an ephemeral port\n  --api-key KEY       or YASAKANI_API_KEY; required for remote binds\n  --default-max-tokens N  default 32768\n  --max-tokens-cap N  request upper limit\n  --no-warmup\nchat:\n  --system TEXT --max-tokens N --temperature N --top-p N --top-k N\n  --seed N --no-think --effort low|medium|xhigh --hide-thinking --no-loop-guard\n  --raw  print control characters in model text and errors unescaped\n  /help shows terminal commands\nYASAKANI_THINKING_BUDGET sets the server default (0 = unlimited).\nbench and selfcheck: not available yet\n  --help, -h, --version";
+const HELP: &str = "yskn - local Rust chat and OpenAI-compatible server
+commands: serve, chat, info, bench, selfcheck
+  --model-dir FOLDER  published model folder (or YASAKANI_MODEL_DIR)
+  --engine real|stub  real is the default; stub is a deterministic demo
+  --kv int8|int8-profile|kv5  default kv5
+  --backend metal|cpu  default follows Model::load
+  --draft none|ngram|neural|both  default ngram
+  --k N              guesses per pass, default 3
+  --ctx N            context capacity, default 32768; --max-ctx is an alias
+  --threads N        CPU worker count
+  --prefill-width N  cancellable prefill pass width, default 16
+  --seed0 N          first automatic request seed, default 1
+serve:
+  --host HOST --port PORT  default 127.0.0.1:8765
+  --api-key KEY       or YASAKANI_API_KEY; required for remote binds
+  --default-max-tokens N --max-tokens-cap N --no-warmup
+chat:
+  --system TEXT --max-tokens N --temperature N --top-p N --top-k N --min-p N
+  --seed N --no-think --effort low|medium|xhigh --hide-thinking --no-loop-guard
+  --raw  print control characters in model text and errors unescaped
+  /help shows terminal commands; stdin/stdout also support pipes
+bench:
+  --n N              tokens per task, default 512 (greedy, ignores EOS)
+  --json OUT         save metrics and configuration; --draft and --k repeatable
+selfcheck:
+  --reference FILE   default MODEL_DIR/selfcheck.json
+YASAKANI_THINKING_BUDGET sets the server default (0 = unlimited).
+Model files must remain unchanged while the program runs.
+  --help, -h, --version";
+#[derive(Clone)]
 struct Args {
     command: String,
     values: HashMap<String, String>,
     flags: HashSet<String>,
+    comparisons: HashMap<String, Vec<String>>,
 }
 impl Args {
     fn value(&self, key: &str) -> Option<&str> {
@@ -36,23 +71,85 @@ impl Args {
         })
     }
     fn capacity(&self) -> Result<usize> {
-        let n = self.parse("max-ctx", 262144_usize)?;
+        if self.value("ctx").is_some() && self.value("max-ctx").is_some() {
+            return Err(Error::request("use only one of --ctx and --max-ctx"));
+        }
+        let n = self.parse("ctx", self.parse("max-ctx", 32768_usize)?)?;
         if n <= 65 {
-            return Err(Error::request("--max-ctx must be greater than 65"));
+            return Err(Error::request("--ctx/--max-ctx must be greater than 65"));
         }
         Ok(n)
     }
-    fn runner(&self) -> Result<ChatRunner> {
-        let fmt = if let Some(path) = self.value("model-dir") {
-            yskn_text::ChatFormatter::load(path)?
-        } else {
-            stub::formatter()?
+    fn is_stub(&self) -> bool {
+        self.value("engine") == Some("stub")
+    }
+    fn model_dir(&self) -> Result<std::path::PathBuf> {
+        self.value("model-dir")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("YASAKANI_MODEL_DIR").map(Into::into))
+            .ok_or_else(|| {
+                Error::request(
+                    "--model-dir is required for the real engine (or set YASAKANI_MODEL_DIR)",
+                )
+            })
+    }
+    fn real_config(&self) -> Result<RealEngineConfig> {
+        let draft = match self.value("draft").unwrap_or("ngram") {
+            "none" => DraftMode::None,
+            "ngram" => DraftMode::Ngram,
+            "neural" => DraftMode::Neural,
+            "both" => DraftMode::Both,
+            _ => {
+                return Err(Error::request(
+                    "--draft must be none, ngram, neural or both",
+                ));
+            }
         };
-        ChatRunner::new(
-            Box::new(StubEngine::new(self.capacity()?).using_formatter(fmt.clone())),
-            fmt,
-            self.parse("seed0", 1)?,
-        )
+        Ok(RealEngineConfig {
+            model_dir: self.model_dir()?,
+            kv: yskn_ref::quality::parse_kv_mode(std::ffi::OsStr::new(
+                self.value("kv").unwrap_or("kv5"),
+            ))
+            .map_err(Error::engine)?,
+            backend: self
+                .value("backend")
+                .map(str::parse::<yskn_engine::Backend>)
+                .transpose()
+                .map_err(Error::engine)?,
+            draft,
+            k: self.parse("k", 3)?,
+            context: self.capacity()?,
+            threads: self
+                .value("threads")
+                .map(|_| self.parse("threads", 1))
+                .transpose()?,
+            prefill_width: self.parse("prefill-width", 16)?,
+        })
+    }
+    fn defaults(&self) -> Result<RequestDefaults> {
+        let mut defaults = RequestDefaults::default();
+        if !self.is_stub() {
+            defaults.sampling = self.real_config()?.sampling_defaults()?;
+        }
+        Ok(defaults)
+    }
+    fn runner(&self) -> Result<ChatRunner> {
+        let (engine, fmt): (Box<dyn Engine>, _) = if self.is_stub() {
+            let fmt = if let Some(path) = self.value("model-dir") {
+                yskn_text::ChatFormatter::load(path)?
+            } else {
+                stub::formatter()?
+            };
+            (
+                Box::new(StubEngine::new(self.capacity()?).using_formatter(fmt.clone())),
+                fmt,
+            )
+        } else {
+            let config = self.real_config()?;
+            let fmt = yskn_text::ChatFormatter::load(&config.model_dir)?;
+            (Box::new(RealEngine::load(config)?), fmt)
+        };
+        ChatRunner::new(engine, fmt, self.parse("seed0", 1)?)
     }
 }
 fn parse_args(argv: Vec<String>) -> Result<Args> {
@@ -66,7 +163,19 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
             "unknown command: {command}\n{HELP}"
         )));
     }
-    let common = ["engine", "model-dir", "max-ctx", "seed0"];
+    let common = [
+        "engine",
+        "model-dir",
+        "max-ctx",
+        "ctx",
+        "seed0",
+        "kv",
+        "backend",
+        "draft",
+        "k",
+        "threads",
+        "prefill-width",
+    ];
     let serve = [
         "host",
         "port",
@@ -80,11 +189,13 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         "temperature",
         "top-p",
         "top-k",
+        "min-p",
         "seed",
         "effort",
     ];
     let mut values = HashMap::new();
     let mut flags = HashSet::new();
+    let mut comparisons: HashMap<String, Vec<String>> = HashMap::new();
     while let Some(arg) = it.next() {
         let Some(arg) = arg.strip_prefix("--") else {
             return Err(Error::request(format!("unexpected argument: {arg}")));
@@ -102,6 +213,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         if !common.contains(&key)
             && !(command == "serve" && serve.contains(&key))
             && !(command == "chat" && chat.contains(&key))
+            && !(command == "bench" && matches!(key, "n" | "json"))
+            && !(command == "selfcheck" && key == "reference")
         {
             return Err(Error::request(format!("unknown option: --{key}")));
         }
@@ -111,12 +224,19 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         if value.starts_with("--") {
             return Err(Error::request(format!("--{key} requires a value")));
         }
+        if command == "bench" && matches!(key, "draft" | "k") {
+            comparisons
+                .entry(key.into())
+                .or_default()
+                .push(value.clone());
+        }
         values.insert(key.into(), value);
     }
     Ok(Args {
         command,
         values,
         flags,
+        comparisons,
     })
 }
 pub async fn main(argv: Vec<String>) -> Result<()> {
@@ -128,36 +248,33 @@ pub async fn main(argv: Vec<String>) -> Result<()> {
         println!("yskn {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    if let Some(cmd) = argv
-        .first()
-        .filter(|s| matches!(s.as_str(), "bench" | "selfcheck"))
-    {
-        return Err(Error::request(format!("{cmd}: not available yet")));
-    }
     let args = parse_args(argv)?;
-    if matches!(args.command.as_str(), "bench" | "selfcheck") {
-        return Err(Error::request(format!(
-            "{}: not available yet",
-            args.command
-        )));
-    }
-    if args.value("engine") != Some("stub") {
-        return Err(Error::request(
-            "the real engine is not connected yet; select --engine stub for deterministic demo output",
-        ));
+    if !matches!(args.value("engine"), None | Some("real" | "stub")) {
+        return Err(Error::request("--engine must be real or stub"));
     }
     match args.command.as_str() {
         "info" => {
-            let runner = args.runner()?;
-            println!(
-                "yskn {}\nengine   stub (deterministic demo, no inference)\nplatform {} {}\ncontext  {} tokens\ntokenizer  ok\nreal engine: not available yet",
-                env!("CARGO_PKG_VERSION"),
-                std::env::consts::OS,
-                std::env::consts::ARCH,
-                runner.engine.context_capacity()
-            );
+            if args.is_stub() {
+                let runner = args.runner()?;
+                println!(
+                    "yskn {}\nengine   stub (deterministic demo, no inference)\nplatform {} {}\ncontext  {} tokens\ntokenizer  ok",
+                    env!("CARGO_PKG_VERSION"),
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    runner.engine.context_capacity()
+                );
+            } else {
+                let info = args.real_config()?.inspect()?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&info.to_json()).map_err(Error::engine)?
+                );
+                println!("Model files must remain unchanged while the program runs.");
+            }
             Ok(())
         }
+        "bench" => bench(&args),
+        "selfcheck" => selfcheck(&args),
         "serve" => {
             let mut cfg = Config {
                 host: args.value("host").unwrap_or("127.0.0.1").into(),
@@ -168,6 +285,7 @@ pub async fn main(argv: Vec<String>) -> Result<()> {
                     .or_else(|| std::env::var("YASAKANI_API_KEY").ok()),
                 ..Config::default()
             };
+            cfg.defaults = args.defaults()?;
             cfg.defaults.max_tokens = args.parse("default-max-tokens", 32768)?;
             cfg.defaults.max_tokens_cap = args
                 .value("max-tokens-cap")
@@ -178,7 +296,15 @@ pub async fn main(argv: Vec<String>) -> Result<()> {
                 .transpose()?;
             cfg.validate()?;
             args.capacity()?;
+            let engine_name = if args.is_stub() {
+                "stub (deterministic demo)"
+            } else {
+                "real; model files must remain unchanged while running"
+            };
             let keyed = cfg.api_key.as_ref().is_some_and(|s| !s.is_empty());
+            if !args.is_stub() {
+                eprintln!("{}", crate::real_engine::MODEL_FILE_STABILITY);
+            }
             let server = Server::bind(cfg, move || {
                 let mut r = args.runner()?;
                 if !args.flag("no-warmup") {
@@ -189,7 +315,7 @@ pub async fn main(argv: Vec<String>) -> Result<()> {
             .await?;
             let addr = server.local_addr()?;
             eprintln!(
-                "listening on http://{addr} (answers /health while the model loads)\nOpenAI-compatible API at http://{addr}/v1{}\nengine: stub (deterministic demo); stop with Ctrl+C",
+                "listening on http://{addr} (answers /health while the model loads)\nOpenAI-compatible API at http://{addr}/v1{}\nengine: {engine_name}; stop with Ctrl+C",
                 if keyed { ", API key required" } else { "" }
             );
             server
@@ -201,6 +327,9 @@ pub async fn main(argv: Vec<String>) -> Result<()> {
         }
         "chat" => {
             let p = chat_params(&args)?;
+            if !args.is_stub() {
+                eprintln!("Model files must remain unchanged while the program runs.");
+            }
             let hide = args.flag("hide-thinking");
             let raw = args.flag("raw");
             let writing = Arc::new(AtomicBool::new(false));
@@ -254,7 +383,14 @@ async fn termination() -> io::Result<()> {
 }
 fn chat_params(args: &Args) -> Result<ChatParams> {
     let mut body = json!({"messages":[{"role":"user","content":""}],"enable_thinking":!args.flag("no-think"),"loop_guard":!args.flag("no-loop-guard")});
-    for key in ["max-tokens", "temperature", "top-p", "top-k", "seed"] {
+    for key in [
+        "max-tokens",
+        "temperature",
+        "top-p",
+        "top-k",
+        "min-p",
+        "seed",
+    ] {
         if let Some(v) = args.value(key) {
             body[key.replace('-', "_")] = json!(v);
         }
@@ -265,7 +401,7 @@ fn chat_params(args: &Args) -> Result<ChatParams> {
         }
         body["reasoning_effort"] = json!(e);
     }
-    let mut p = parse_chat_request(&body, &RequestDefaults::default())?;
+    let mut p = parse_chat_request(&body, &args.defaults()?)?;
     p.messages = if let Some(system) = args.value("system") {
         json!([{"role":"system","content":system}])
     } else {
