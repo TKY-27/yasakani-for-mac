@@ -1,4 +1,6 @@
 //! Generated model artifacts and a separate scalar oracle; never published weights.
+pub mod allocation;
+
 #[allow(dead_code)]
 #[path = "../../../yskn-ref/tests/support/mod.rs"]
 pub mod model;

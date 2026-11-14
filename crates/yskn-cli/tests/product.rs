@@ -1,5 +1,8 @@
 mod product_support;
 
+#[global_allocator]
+static ALLOCATOR: product_support::allocation::Counting = product_support::allocation::Counting;
+
 use product_support::{Folder, greedy, sampled, scalar};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -93,35 +96,75 @@ fn committed_prefix_snapshot_and_reset_reuse_preserve_scalar_tokens_and_cache_co
 }
 
 #[test]
-fn fifty_requests_keep_one_bounded_session_and_snapshot_for_every_draft_mode() {
+fn repeated_snapshot_replacement_retains_bounded_live_allocations_for_every_draft_mode() {
+    const CHILD: &str = "YSKN_SNAPSHOT_ALLOCATION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Isolate process-wide allocation levels from parallel tests and their
+        // worker threads. The allocator is installed in this test binary only.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "repeated_snapshot_replacement_retains_bounded_live_allocations_for_every_draft_mode",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let folder = Folder::new();
-    let prompt = [1, 2, 3, 4];
-    let expected = scalar(&folder, &prompt, 2, &greedy());
+    // Extend, branch after the saved prefix, then switch to an unrelated
+    // prefix. Each request has new prefill rows and replaces the checkpoint.
+    let prompts = [
+        vec![1; 4],
+        vec![1; 8],
+        [vec![1; 7], vec![2, 3]].concat(),
+        vec![5; 12],
+        vec![5; 16],
+        [vec![5; 15], vec![6, 7]].concat(),
+    ];
+    let expected: Vec<_> = prompts
+        .iter()
+        .map(|p| scalar(&folder, p, 2, &greedy()))
+        .collect();
     for mode in modes() {
         let mut engine = folder.engine(mode);
-        for _ in 0..3 {
-            run(&mut engine, &prompt, 2, &greedy());
-        }
-        let session = engine.session_memory();
-        let snapshot = engine.snapshot_bytes();
-        assert!(snapshot > 0);
-        for request in 0..50 {
-            let result = run(&mut engine, &prompt, 2, &greedy());
-            assert_eq!(result.ids, expected, "{mode:?}, request {request}");
-            assert_eq!(
-                (result.cached_tokens, result.snap_mode),
-                (prompt.len() - 1, 2)
-            );
-            assert_eq!(
-                engine.session_memory(),
-                session,
-                "{mode:?}, request {request}"
-            );
-            assert_eq!(
-                engine.snapshot_bytes(),
-                snapshot,
-                "{mode:?}, request {request}"
-            );
+        let mut warmed_max = 0;
+        for cycle in 0..11 {
+            for (index, prompt) in prompts.iter().enumerate() {
+                let result = run(&mut engine, prompt, 2, &greedy());
+                assert_eq!(
+                    result.ids, expected[index],
+                    "{mode:?}, cycle {cycle}, prompt {index}"
+                );
+                if index % 3 == 0 {
+                    assert_eq!((result.cached_tokens, result.snap_mode), (0, 0));
+                } else {
+                    assert_eq!(
+                        (result.cached_tokens, result.snap_mode),
+                        (prompts[index - 1].len() - 1, 2)
+                    );
+                }
+                drop(result);
+                let live = product_support::allocation::live_bytes();
+                if cycle < 2 {
+                    warmed_max = warmed_max.max(live);
+                } else {
+                    // Small allocator/runtime bookkeeping is tolerated; even
+                    // one retained recurrent checkpoint exceeds this allowance.
+                    assert!(
+                        live <= warmed_max + 16 * 1024,
+                        "{mode:?}, cycle {cycle}, prompt {index}: live {live}, warmed maximum {warmed_max}"
+                    );
+                }
+            }
         }
     }
 }
