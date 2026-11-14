@@ -192,20 +192,23 @@ pub struct FastDraft {
 }
 
 impl FastDraft {
-    /// Engine and backend from `YSKN_KERNEL`/`YSKN_BACKEND` (as `Model::load`),
+    /// Engine and backend from `YSKN_KERNEL`/`YSKN_BACKEND`, and the Metal
+    /// options from `YSKN_METAL_MAC`/`YSKN_METAL_CPU_SHARE` (as `Model::load`),
     /// default options.
     /// # Safety
     /// Both draft files must remain unmodified and untruncated until this draft is dropped.
     pub unsafe fn load(folder: impl AsRef<Path>) -> Result<Self> {
         // SAFETY: forwarded file-stability contract.
-        unsafe {
+        let mut draft = unsafe {
             Self::with_options(
                 folder,
                 Engine::from_env()?,
                 Backend::from_env()?,
                 DraftOptions::default(),
-            )
-        }
+            )?
+        };
+        draft.compute.configure_metal_from_env()?;
+        Ok(draft)
     }
 
     /// Explicit pool, projection backend and options. Never reads the environment.

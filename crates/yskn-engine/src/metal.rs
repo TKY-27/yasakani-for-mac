@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Error, Matrix, Result};
+use crate::{Engine, Error, Matrix, Result};
 use objc2::{rc::Retained, rc::autoreleasepool, runtime::ProtocolObject};
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
@@ -26,6 +26,21 @@ unsafe extern "C" {
 }
 
 const SOURCE: &str = include_str!("linear.metal");
+
+/// Upload encodings of every i8 value, indexed by its byte: i16 bits, and binary16
+/// bits for the float kernel (|value| <= 128 is exact in binary16).
+static WIDE: [u16; 256] = {
+    let mut codes = [0; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        codes[byte] = byte as u8 as i8 as i16 as u16;
+        byte += 1;
+    }
+    codes
+};
+static HALF: std::sync::LazyLock<[u16; 256]> = std::sync::LazyLock::new(|| {
+    std::array::from_fn(|byte| yskn_format::f32_to_f16(f32::from(byte as u8 as i8)))
+});
 
 /// FORMAT.md §4.2 for one 32-step block of a `bits`-bit code. 32 steps use exactly
 /// `bits` words, so all four blocks of a sequence share these constant shifts.
@@ -65,6 +80,74 @@ const MAX_GROUPS: usize = 512;
 type Device = ProtocolObject<dyn MTLDevice>;
 type Buffer = ProtocolObject<dyn MTLBuffer>;
 type Pipeline = ProtocolObject<dyn MTLComputePipelineState>;
+type CommandBuffer = ProtocolObject<dyn MTLCommandBuffer>;
+
+/// Largest accepted CPU share of a matrix's rows.
+const MAX_CPU_SHARE: f64 = 0.9;
+
+#[derive(Clone, Copy)]
+enum CpuShare {
+    Off,
+    Fixed(f64),
+    Calibrated,
+}
+
+fn parse_share(share: f64) -> Result<CpuShare> {
+    if share == 0.0 {
+        Ok(CpuShare::Off)
+    } else if (0.0..=MAX_CPU_SHARE).contains(&share) {
+        Ok(CpuShare::Fixed(share))
+    } else {
+        Err(invalid("the CPU share must be within 0..=0.9"))
+    }
+}
+
+/// CPU fraction of each matrix's rows at M = 1, 2, 4, 8 and 16 (linear in between,
+/// constant above 16), from `bench_metal --shares` on the real model on the
+/// 4P+6E M5 with 10 CPU workers (D22). Each value is somewhat below the measured
+/// optimum: a CPU that is slower than calibrated (other load) costs far more
+/// than one that is faster.
+const CPU_SHARE: [(usize, f64); 5] = [(1, 0.08), (2, 0.08), (4, 0.09), (8, 0.12), (16, 0.15)];
+
+fn calibrated_cpu_share(m: usize) -> f64 {
+    let m = m.clamp(1, 16);
+    let upper = CPU_SHARE
+        .iter()
+        .position(|&(rows, _)| rows >= m)
+        .unwrap_or(CPU_SHARE.len() - 1);
+    let (m1, s1) = CPU_SHARE[upper];
+    if m1 == m || upper == 0 {
+        return s1;
+    }
+    let (m0, s0) = CPU_SHARE[upper - 1];
+    s0 + (s1 - s0) * (m - m0) as f64 / (m1 - m0) as f64
+}
+
+/// CPU rows of an `n`-row matrix at `share`: a multiple of the 32-row tile,
+/// leaving the GPU at least one tile (so 0 when n < 64).
+fn cpu_rows(share: f64, n: usize) -> usize {
+    let rows = (share * n as f64) as usize / ROW_TILE * ROW_TILE;
+    rows.min(n.saturating_sub(ROW_TILE) / ROW_TILE * ROW_TILE)
+}
+
+/// The CPU part of a split call: row-major M×len sums of each (matrix, row
+/// range) for the call's input, as `Engine::weighted_sums_rows`.
+type CpuRows<'a> = dyn FnMut(&[(&Matrix, std::ops::Range<usize>)]) -> Result<Vec<Vec<i64>>> + 'a;
+
+/// `YSKN_METAL_CPU_SHARE`: unset or `auto` = calibrated table, `off` = GPU only,
+/// or a fixed fraction in 0..=0.9 for every M.
+fn cpu_share_from_env() -> Result<CpuShare> {
+    match std::env::var("YSKN_METAL_CPU_SHARE").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("auto") => Ok(CpuShare::Calibrated),
+        Ok("off") => Ok(CpuShare::Off),
+        Ok(value) => value
+            .parse::<f64>()
+            .ok()
+            .and_then(|share| parse_share(share).ok())
+            .ok_or_else(|| invalid("YSKN_METAL_CPU_SHARE must be auto, off or 0..=0.9")),
+        Err(_) => Err(invalid("YSKN_METAL_CPU_SHARE must be auto, off or 0..=0.9")),
+    }
+}
 
 fn metal_error(context: &str, detail: impl std::fmt::Display) -> Error {
     Error::Io(std::io::Error::other(format!("Metal {context}: {detail}")))
@@ -101,6 +184,7 @@ struct PipelineKey {
     rows_per_dispatch: u32,
     warp: bool,
     aligned: bool,
+    float_mac: bool,
 }
 
 struct Dispatch {
@@ -118,10 +202,12 @@ struct Plan {
     groups: usize,
     code_bytes: u64,
     splits: usize,
+    float_mac: bool,
     dispatches: Vec<Dispatch>,
 }
 
-/// Widen the activation rows to i16 and copy the integer scales into shared buffers.
+/// Widen the activation rows to i16 (binary16 for the float kernel) and copy the
+/// integer scales into shared buffers.
 ///
 /// # Safety
 /// No GPU work and no other CPU reference may access either buffer's contents
@@ -131,6 +217,7 @@ unsafe fn upload(
     scales_buffer: &Buffer,
     activation: &[i8],
     scales: &[i32],
+    float_mac: bool,
 ) -> Result<()> {
     if activation_buffer.length() < activation.len() * 2
         || scales_buffer.length() < scales.len() * 4
@@ -142,11 +229,12 @@ unsafe fn upload(
     // access, so the mutable slice is not aliased.
     unsafe {
         let wide = std::slice::from_raw_parts_mut(
-            activation_buffer.contents().as_ptr().cast::<i16>(),
+            activation_buffer.contents().as_ptr().cast::<u16>(),
             activation.len(),
         );
+        let codes: &[u16; 256] = if float_mac { &HALF } else { &WIDE };
         for (wide, &value) in wide.iter_mut().zip(activation) {
-            *wide = i16::from(value);
+            *wide = codes[value as u8 as usize];
         }
         std::ptr::copy_nonoverlapping(
             scales.as_ptr(),
@@ -157,23 +245,24 @@ unsafe fn upload(
     Ok(())
 }
 
-/// Copy `len` i64 sums out of a shared output buffer.
+/// Row-major M×(g + c) sums: each activation row's `g` GPU sums from the shared
+/// output buffer (M×g), followed by its `c` CPU sums from `cpu` (M×c, may be empty).
 ///
 /// # Safety
 /// No GPU work may be writing the buffer during the call.
-unsafe fn download(output: &Buffer, len: usize) -> Result<Vec<i64>> {
-    if output.length() < len * 8 {
+unsafe fn download(output: &Buffer, inputs: usize, g: usize, cpu: &[i64]) -> Result<Vec<i64>> {
+    if inputs == 0 || output.length() < inputs * g * 8 || !cpu.len().is_multiple_of(inputs) {
         return Err(metal_error("readback", "output buffer too small"));
     }
-    let mut values = vec![0_i64; len];
-    // SAFETY: the buffer holds at least `len` i64 values (checked above; shared
+    let c = cpu.len() / inputs;
+    // SAFETY: the buffer holds at least M×g i64 values (checked above; shared
     // contents are page-aligned), and the caller guarantees no concurrent GPU write.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            output.contents().as_ptr().cast::<i64>(),
-            values.as_mut_ptr(),
-            len,
-        );
+    let gpu =
+        unsafe { std::slice::from_raw_parts(output.contents().as_ptr().cast::<i64>(), inputs * g) };
+    let mut values = Vec::with_capacity(inputs * (g + c));
+    for row in 0..inputs {
+        values.extend_from_slice(&gpu[row * g..(row + 1) * g]);
+        values.extend_from_slice(&cpu[row * c..(row + 1) * c]);
     }
     Ok(values)
 }
@@ -194,6 +283,36 @@ fn reserve(
     Ok(buffer)
 }
 
+/// A committed command buffer that is waited for when dropped, so no exit path
+/// (normal return, error or unwind) leaves GPU work reading or writing buffers
+/// the engine may reuse.
+struct InFlight(Retained<CommandBuffer>);
+
+impl InFlight {
+    /// Wait for completion; the GPU execution time reported by the command buffer.
+    fn wait(self) -> Result<Duration> {
+        let command = &self.0;
+        command.waitUntilCompleted();
+        if command.status() != MTLCommandBufferStatus::Completed {
+            let detail = command.error().map_or_else(
+                || "unknown".into(),
+                |e| e.localizedDescription().to_string(),
+            );
+            return Err(metal_error("execution", detail));
+        }
+        Ok(Duration::from_secs_f64(
+            (command.GPUEndTime() - command.GPUStartTime()).max(0.0),
+        ))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        // Returns at once when `wait` has already run.
+        self.0.waitUntilCompleted();
+    }
+}
+
 /// One matrix call with its own input and output buffers, ready to encode.
 pub struct Job {
     plan: Plan,
@@ -207,9 +326,16 @@ impl Job {
     pub fn output(&self) -> Vec<i64> {
         // SAFETY: `run` waits for completion and takes jobs mutably, so no GPU work
         // writes this job's buffer while it is borrowed here.
-        unsafe { download(&self.output, self.plan.output_len()) }
-            // The buffer was allocated for exactly this length in `MetalEngine::job`.
-            .expect("job output buffer")
+        unsafe {
+            download(
+                &self.output,
+                self.plan.inputs,
+                self.plan.params.rows as usize,
+                &[],
+            )
+        }
+        // The buffer was allocated for exactly this length in `MetalEngine::job`.
+        .expect("job output buffer")
     }
 
     /// Replace this job's activation rows and integer scales (same M) before a rerun.
@@ -221,7 +347,15 @@ impl Job {
         }
         // SAFETY: the job's private buffers are borrowed exclusively here, and `run`
         // waits for completion, so no GPU work reads them now.
-        unsafe { upload(&self.activation, &self.scales, activation, scales) }
+        unsafe {
+            upload(
+                &self.activation,
+                &self.scales,
+                activation,
+                scales,
+                self.plan.float_mac,
+            )
+        }
     }
 
     /// Bytes of compressed code this job reads (once per pass, independent of M).
@@ -289,7 +423,16 @@ impl Plan {
     }
 }
 
-/// Integer compressed-linear kernel on the system default Metal device.
+/// `YSKN_METAL_MAC`: `float` (default) or `integer` multiply-accumulate.
+fn float_mac_from_env() -> Result<bool> {
+    match std::env::var("YSKN_METAL_MAC").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("float") => Ok(true),
+        Ok("integer") => Ok(false),
+        _ => Err(invalid("YSKN_METAL_MAC must be float or integer")),
+    }
+}
+
+/// Exact compressed-linear kernel on the system default Metal device.
 ///
 /// Every file mapping wrapped for the GPU stays mapped until the engine is dropped.
 pub struct MetalEngine {
@@ -306,15 +449,18 @@ pub struct MetalEngine {
     /// may share a code stream but not a table.
     tables: HashMap<(usize, u64), Retained<Buffer>>,
     splits: usize,
-    /// Reusable input and per-matrix output buffers of `weighted_sums_shared`,
-    /// grown on demand and never shrunk.
+    float_mac: bool,
+    cpu_share: CpuShare,
+    /// Reusable input and per-matrix output buffers of `weighted_sums_shared` and
+    /// `weighted_sums_split`, grown on demand and never shrunk.
     scratch_activation: Option<Retained<Buffer>>,
     scratch_scales: Option<Retained<Buffer>>,
     scratch_outputs: Vec<Option<Retained<Buffer>>>,
 }
 
 impl MetalEngine {
-    /// `Ok(None)` when this process has no Metal device.
+    /// `Ok(None)` when this process has no Metal device. Binary32 arithmetic and
+    /// the calibrated CPU share; reads no environment variable (D14).
     pub fn new() -> Result<Option<Self>> {
         let Some(device) = MTLCreateSystemDefaultDevice() else {
             return Ok(None);
@@ -323,7 +469,8 @@ impl MetalEngine {
             .newCommandQueue()
             .ok_or_else(|| metal_error("queue", "newCommandQueue returned nil"))?;
         let options = MTLCompileOptions::new();
-        // Integer-only kernel; safe math anyway, so no float relaxation can creep in.
+        // Safe math, so no float relaxation can creep in (the binary32 mode is exact
+        // under any evaluation order or fusion anyway, METAL.md).
         options.setMathMode(MTLMathMode::Safe);
         let library = device
             .newLibraryWithSource_options_error(
@@ -348,6 +495,8 @@ impl MetalEngine {
             // Measured on the M5 (DESIGN.md): 4 beats 8 by 3-4% for M <= 8 and ties
             // at 16; 1-2 and 16-32 are slower.
             splits: 4,
+            float_mac: true,
+            cpu_share: CpuShare::Calibrated,
             scratch_activation: None,
             scratch_scales: None,
             scratch_outputs: Vec::new(),
@@ -383,6 +532,26 @@ impl MetalEngine {
         Ok(())
     }
 
+    /// Apply `YSKN_METAL_MAC` and `YSKN_METAL_CPU_SHARE` (unset = the defaults of
+    /// [`Self::new`]); unknown values are errors. Only the loading paths
+    /// (`Model::load`, `FastDraft::load`) and benchmarks call this.
+    pub fn configure_from_env(&mut self) -> Result<()> {
+        let (float_mac, cpu_share) = (float_mac_from_env()?, cpu_share_from_env()?);
+        self.float_mac = float_mac;
+        self.cpu_share = cpu_share;
+        Ok(())
+    }
+
+    /// Whether jobs created afterwards multiply in binary32 (exact, METAL.md) rather
+    /// than in 16/32-bit integers (default binary32).
+    pub fn float_mac(&self) -> bool {
+        self.float_mac
+    }
+
+    pub fn set_float_mac(&mut self, float_mac: bool) {
+        self.float_mac = float_mac;
+    }
+
     pub fn threads_per_threadgroup(&self) -> usize {
         ROW_TILE * self.splits
     }
@@ -392,7 +561,7 @@ impl MetalEngine {
             return Ok(pipeline.clone());
         }
         let values = MTLFunctionConstantValues::new();
-        let constants: [(NonNull<c_void>, MTLDataType); 4] = [
+        let constants: [(NonNull<c_void>, MTLDataType); 5] = [
             (NonNull::from(&key.bits).cast(), MTLDataType::UInt),
             (
                 NonNull::from(&key.rows_per_dispatch).cast(),
@@ -400,6 +569,7 @@ impl MetalEngine {
             ),
             (NonNull::from(&key.warp).cast(), MTLDataType::Bool),
             (NonNull::from(&key.aligned).cast(), MTLDataType::Bool),
+            (NonNull::from(&key.float_mac).cast(), MTLDataType::Bool),
         ];
         for (index, (value, kind)) in constants.into_iter().enumerate() {
             // SAFETY: each pointer refers to a live u32 (UInt) or bool (Bool, one
@@ -581,6 +751,7 @@ impl MetalEngine {
                 rows_per_dispatch: rows as u32,
                 warp: d.layout == Layout::Warp,
                 aligned,
+                float_mac: self.float_mac,
             })?;
             if pipeline.maxTotalThreadsPerThreadgroup() < self.threads_per_threadgroup() {
                 return Err(metal_error(
@@ -617,6 +788,7 @@ impl MetalEngine {
             code_bytes: (n * sequences * bits * 16) as u64,
             // Idle SIMD groups would only add barrier work for short rows.
             splits: self.splits.min(sequences),
+            float_mac: self.float_mac,
             dispatches,
         })
     }
@@ -640,15 +812,75 @@ impl MetalEngine {
         activation: &[i8],
         scales: &[i32],
     ) -> Result<Vec<Vec<i64>>> {
+        self.shared(None, matrices, activation, scales)
+    }
+
+    /// As [`Self::weighted_sums_shared`], but the CPU kernel on `cpu` computes
+    /// the last rows of each matrix while the GPU computes the others. The row
+    /// split comes only from the matrix size, M and [`Self::cpu_share`], so a run
+    /// is repeatable; the sums are exact whatever the split. A matrix with fewer
+    /// than 64 physical rows runs on the GPU alone. Every call covers all physical
+    /// rows: there is no prefix (head slice) variant of the split, and no
+    /// projection call site computes a prefix on Metal.
+    pub fn weighted_sums_split(
+        &mut self,
+        cpu: &mut Engine,
+        matrices: &[&Matrix],
+        activation: &[i8],
+        scales: &[i32],
+    ) -> Result<Vec<Vec<i64>>> {
+        self.shared(
+            Some(&mut |parts| cpu.weighted_sums_rows(parts, activation, scales)),
+            matrices,
+            activation,
+            scales,
+        )
+    }
+
+    /// The CPU's fraction of each matrix's rows for M activation rows (0 = GPU only).
+    pub fn cpu_share(&self, m: usize) -> f64 {
+        match self.cpu_share {
+            CpuShare::Off => 0.0,
+            CpuShare::Fixed(share) => share,
+            CpuShare::Calibrated => calibrated_cpu_share(m),
+        }
+    }
+
+    /// Override the CPU share for all M (`None` restores the calibrated table).
+    pub fn set_cpu_share(&mut self, share: Option<f64>) -> Result<()> {
+        self.cpu_share = match share {
+            None => CpuShare::Calibrated,
+            Some(share) => parse_share(share)?,
+        };
+        Ok(())
+    }
+
+    fn shared(
+        &mut self,
+        cpu: Option<&mut CpuRows>,
+        matrices: &[&Matrix],
+        activation: &[i8],
+        scales: &[i32],
+    ) -> Result<Vec<Vec<i64>>> {
+        let split: Vec<(usize, usize)> = matrices
+            .iter()
+            .map(|matrix| {
+                let d = matrix.descriptor();
+                let n = d.physical_rows;
+                let m = activation.len() / d.cols.max(1);
+                let cpu_rows = if cpu.is_some() {
+                    cpu_rows(self.cpu_share(m), n)
+                } else {
+                    0
+                };
+                (n - cpu_rows, n)
+            })
+            .collect();
         let plans = matrices
             .iter()
-            .map(|m| {
-                self.plan(
-                    m,
-                    activation.len(),
-                    scales.len(),
-                    m.descriptor().physical_rows,
-                )
+            .zip(&split)
+            .map(|(matrix, &(gpu_rows, _))| {
+                self.plan(matrix, activation.len(), scales.len(), gpu_rows)
             })
             .collect::<Result<Vec<_>>>()?;
         let activation_buffer = reserve(
@@ -666,30 +898,65 @@ impl MetalEngine {
             .map(|(plan, slot)| reserve(&self.device, slot, plan.output_len() * 8))
             .collect::<Result<Vec<_>>>()?;
         // SAFETY: the scratch buffers are distinct objects owned by this engine,
-        // which is borrowed mutably here, and every submission waits for
-        // completion, so no GPU work or other reference touches them meanwhile.
-        unsafe { upload(&activation_buffer, &scales_buffer, activation, scales) }?;
-        self.submit(|encoder| {
+        // which is borrowed mutably here. Every earlier command buffer of this
+        // engine was waited for by its `InFlight` guard before its call returned
+        // or unwound, and this call has not committed yet, so no GPU work or
+        // other reference touches them.
+        unsafe {
+            upload(
+                &activation_buffer,
+                &scales_buffer,
+                activation,
+                scales,
+                self.float_mac,
+            )
+        }?;
+        let in_flight = self.commit(|encoder| {
             for (plan, output) in plans.iter().zip(&outputs) {
                 plan.encode(encoder, &activation_buffer, &scales_buffer, output);
             }
         })?;
+        // The CPU rows run while the GPU works; wait for the GPU even if they fail.
+        let cpu_sums = match cpu {
+            Some(cpu) if split.iter().any(|&(gpu_rows, n)| gpu_rows < n) => {
+                let parts: Vec<_> = matrices
+                    .iter()
+                    .zip(&split)
+                    .map(|(matrix, &(gpu_rows, n))| (*matrix, gpu_rows..n))
+                    .collect();
+                cpu(&parts)
+            }
+            _ => Ok(vec![Vec::new(); matrices.len()]),
+        };
+        in_flight.wait()?;
+        let cpu_sums = cpu_sums?;
         plans
             .iter()
             .zip(&outputs)
-            .map(|(plan, output)| {
-                // SAFETY: `submit` returned, so the command buffer has completed and
+            .zip(&cpu_sums)
+            .map(|((plan, output), cpu)| {
+                // SAFETY: `wait` returned Ok, so the command buffer has completed and
                 // nothing writes these engine-owned buffers any more.
-                unsafe { download(output, plan.output_len()) }
+                unsafe { download(output, plan.inputs, plan.params.rows as usize, cpu) }
             })
             .collect()
     }
 
     /// Encode with `encode` into one command buffer, commit, and wait for completion.
+    /// Returns the GPU execution time reported by the command buffer.
     fn submit(
         &self,
         encode: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
     ) -> Result<Duration> {
+        self.commit(encode)?.wait()
+    }
+
+    /// Encode with `encode` into one command buffer and commit it; the returned
+    /// guard waits for completion when it is dropped.
+    fn commit(
+        &self,
+        encode: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
+    ) -> Result<InFlight> {
         autoreleasepool(|_| {
             let command = self
                 .queue
@@ -701,31 +968,14 @@ impl MetalEngine {
             encode(&encoder);
             encoder.endEncoding();
             command.commit();
-            command.waitUntilCompleted();
-            if command.status() != MTLCommandBufferStatus::Completed {
-                let detail = command.error().map_or_else(
-                    || "unknown".into(),
-                    |e| e.localizedDescription().to_string(),
-                );
-                return Err(metal_error("execution", detail));
-            }
-            Ok(Duration::from_secs_f64(
-                (command.GPUEndTime() - command.GPUStartTime()).max(0.0),
-            ))
+            Ok(InFlight(command))
         })
     }
 
     /// Wall time of committing and waiting for one trivial one-thread dispatch.
     pub fn round_trip(&self) -> Result<Duration> {
-        autoreleasepool(|_| {
-            let start = Instant::now();
-            let command = self
-                .queue
-                .commandBuffer()
-                .ok_or_else(|| metal_error("command buffer", "nil"))?;
-            let encoder = command
-                .computeCommandEncoder()
-                .ok_or_else(|| metal_error("encoder", "nil"))?;
+        let start = Instant::now();
+        self.submit(|encoder| {
             encoder.setComputePipelineState(&self.empty);
             let one = MTLSize {
                 width: 1,
@@ -733,14 +983,8 @@ impl MetalEngine {
                 depth: 1,
             };
             encoder.dispatchThreadgroups_threadsPerThreadgroup(one, one);
-            encoder.endEncoding();
-            command.commit();
-            command.waitUntilCompleted();
-            if command.status() != MTLCommandBufferStatus::Completed {
-                return Err(metal_error("execution", "empty dispatch failed"));
-            }
-            Ok(start.elapsed())
-        })
+        })?;
+        Ok(start.elapsed())
     }
 
     /// Row-major M×N sums including padded physical rows, as `yskn_engine::Engine`.
@@ -765,5 +1009,110 @@ impl MetalEngine {
         let mut job = [self.job(matrix, activation, scales, n)?];
         self.run(&mut job)?;
         Ok(job[0].output())
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/fixture/mod.rs"]
+mod fixture;
+
+#[cfg(test)]
+mod tests {
+    use super::fixture::{TempFile, assert_sums, random, synthetic};
+    use super::*;
+    use crate::{Kernel, MappedModel};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn cpu_rows_are_whole_tiles_and_leave_the_gpu_a_tile() {
+        // Below 64 rows the GPU's minimum tile leaves no whole tile for the CPU.
+        for n in [1, 11, 31, 32, 33, 40, 63] {
+            assert_eq!(cpu_rows(MAX_CPU_SHARE, n), 0, "n={n}");
+        }
+        assert_eq!(cpu_rows(MAX_CPU_SHARE, 64), 32);
+        assert_eq!(cpu_rows(MAX_CPU_SHARE, 75), 32);
+        assert_eq!(cpu_rows(MAX_CPU_SHARE, 104), 64);
+        assert_eq!(cpu_rows(0.3, 75), 0);
+        assert_eq!(cpu_rows(0.3, 320), 96);
+        assert_eq!(cpu_rows(0.0, 5120), 0);
+        assert_eq!(cpu_rows(0.08, 5120), 384);
+    }
+
+    /// A CPU part that panics or fails after the GPU part was committed: the call
+    /// returns only once the GPU work has completed (its rows are in the scratch
+    /// outputs), and the same engine then serves a normal call exactly.
+    #[test]
+    fn gpu_work_completes_before_a_failing_cpu_part_returns_and_the_engine_is_reused() {
+        let Some(mut engine) = MetalEngine::new().unwrap() else {
+            println!("skipped: no Metal device");
+            return;
+        };
+        let mut cpu = Engine::new(Kernel::fastest(), 4).unwrap();
+        // Enough GPU work (eight 4096-row matrices at M=16) to still be running
+        // when the panic has unwound, unless something waits for it.
+        let (n, k, m) = (4096, 5120, 16);
+        let file = TempFile::new(&synthetic(8, "warp", n, n, k, false));
+        // SAFETY: the private file is never modified and outlives all mapping owners.
+        let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+        let matrix = model.matrix("linear").unwrap();
+        let small_file = TempFile::new(&synthetic(4, "row", 9, 11, k, false));
+        // SAFETY: as above.
+        let small_model = unsafe { MappedModel::open(&small_file.0) }.unwrap();
+        let small = small_model.matrix("linear").unwrap();
+        let refs = [&matrix; 8];
+        let mut seed = 0x0dd5_eed0_0000_0007;
+        let mut input = || {
+            let activation: Vec<i8> = (0..m * k).map(|_| random(&mut seed) as i8).collect();
+            let scales: Vec<i32> = (0..m * k / 512).map(|_| random(&mut seed) as i32).collect();
+            (activation, scales)
+        };
+        engine.set_cpu_share(Some(0.5)).unwrap();
+        let gpu_rows = n - cpu_rows(0.5, n);
+        for panics in [true, false] {
+            engine.scratch_outputs.clear();
+            let (activation, scales) = input();
+            let expected = cpu.weighted_sums(&matrix, &activation, &scales).unwrap();
+            let mut failing = |_: &[(&Matrix, std::ops::Range<usize>)]| -> Result<Vec<Vec<i64>>> {
+                if panics {
+                    panic!("expected CPU part panic");
+                }
+                Err(invalid("expected CPU part error"))
+            };
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                engine.shared(Some(&mut failing), &refs, &activation, &scales)
+            }));
+            match result {
+                Err(_) => assert!(panics),
+                Ok(result) => assert!(!panics && result.is_err()),
+            }
+            let gpu_part: Vec<i64> = (0..m)
+                .flat_map(|row| expected[row * n..row * n + gpu_rows].iter().copied())
+                .collect();
+            for (index, output) in engine.scratch_outputs.iter().enumerate() {
+                // SAFETY: `shared` has returned or unwound, and its `InFlight`
+                // guard waited for the command buffer, so no GPU work writes it.
+                let sums = unsafe { download(output.as_ref().unwrap(), m, gpu_rows, &[]) };
+                assert_sums(
+                    &sums.unwrap(),
+                    &gpu_part,
+                    &format!("GPU rows of matrix {index} after panics={panics}"),
+                );
+            }
+            // The engine is reusable: new inputs overwrite the scratch buffers.
+            let (activation, scales) = input();
+            let expected = cpu.weighted_sums(&matrix, &activation, &scales).unwrap();
+            let sums = engine
+                .weighted_sums_split(&mut cpu, &refs, &activation, &scales)
+                .unwrap();
+            for (index, sums) in sums.iter().enumerate() {
+                assert_sums(sums, &expected, &format!("reuse {index} panics={panics}"));
+            }
+            // Fewer than 64 rows leave the CPU nothing, so a CPU part is never called.
+            let expected = cpu.weighted_sums(&small, &activation, &scales).unwrap();
+            let sums = engine
+                .shared(Some(&mut failing), &[&small], &activation, &scales)
+                .unwrap();
+            assert_sums(&sums[0], &expected, "small matrix without CPU rows");
+        }
     }
 }

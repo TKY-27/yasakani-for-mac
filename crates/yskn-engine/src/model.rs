@@ -130,7 +130,8 @@ pub struct Model {
 impl Model {
     /// Default kernel and pool (`YSKN_KERNEL`), backend from `YSKN_BACKEND`
     /// (default Metal when a device exists, CPU otherwise), `YSKN_KV`
-    /// (`int8`, `int8-profile`, `kv5`; default `int8`), 16 rows per pass.
+    /// (`int8`, `int8-profile`, `kv5`; default `int8`), 16 rows per pass, and on
+    /// Metal `YSKN_METAL_MAC` and `YSKN_METAL_CPU_SHARE` ([`Self::configure_metal_from_env`]).
     /// # Safety
     /// All weights files must remain unmodified and untruncated until this model is dropped.
     pub unsafe fn load(path: impl AsRef<Path>) -> Result<Self> {
@@ -143,7 +144,19 @@ impl Model {
             .transpose()?
             .unwrap_or_default();
         // SAFETY: forwarded file-stability contract is required of this method's caller.
-        unsafe { Self::with_options(path, Engine::from_env()?, Backend::from_env()?, 16, mode) }
+        let mut model = unsafe {
+            Self::with_options(path, Engine::from_env()?, Backend::from_env()?, 16, mode)?
+        };
+        model.configure_metal_from_env()?;
+        Ok(model)
+    }
+
+    /// Apply `YSKN_METAL_MAC` (`float` | `integer`) and `YSKN_METAL_CPU_SHARE`
+    /// (`auto` | `off` | 0..=0.9) to the Metal projector, as [`Self::load`] does;
+    /// unknown values are errors. Nothing is read on the CPU backend. Explicit
+    /// constructors use binary32 and the calibrated share (D22).
+    pub fn configure_metal_from_env(&mut self) -> Result<()> {
+        self.engine.configure_metal_from_env()
     }
 
     /// The CPU backend with an explicit kernel/pool and pass width (positive, with
@@ -896,6 +909,14 @@ impl Compute {
             engine,
         })
     }
+    /// `MetalEngine::configure_from_env` on the Metal backend; nothing on the CPU.
+    pub(crate) fn configure_metal_from_env(&mut self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = &mut self.metal {
+            return metal.configure_from_env();
+        }
+        Ok(())
+    }
     pub(crate) fn backend(&self) -> Backend {
         #[cfg(target_os = "macos")]
         if self.metal.is_some() {
@@ -921,8 +942,9 @@ impl Compute {
     ) -> Result<Vec<T>> {
         self.engine.map_range(range, function)
     }
-    /// Each matrix's M×N sums for one shared input: one Metal command buffer,
-    /// or one CPU kernel call per matrix.
+    /// Each matrix's M×N sums for one shared input: one Metal command buffer
+    /// (with the CPU kernel computing its calibrated share of the rows meanwhile,
+    /// D22), or one CPU kernel call per matrix.
     pub(crate) fn weighted_sums(
         &mut self,
         matrices: &[&Matrix],
@@ -931,7 +953,7 @@ impl Compute {
     ) -> Result<Vec<Vec<i64>>> {
         #[cfg(target_os = "macos")]
         if let Some(metal) = &mut self.metal {
-            return metal.weighted_sums_shared(matrices, activation, scales);
+            return metal.weighted_sums_split(&mut self.engine, matrices, activation, scales);
         }
         matrices
             .iter()

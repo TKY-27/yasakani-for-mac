@@ -337,3 +337,50 @@ fn worker_tasks_cover_large_matrices_and_the_final_partial_task() {
         }
     }
 }
+
+#[test]
+fn row_ranges_of_several_matrices_match_whole_matrix_sums() {
+    let a_bytes = synthetic(6, "warp", 300, 320, 1024, false);
+    let b_bytes = synthetic(5, "row", 70, 75, 1024, false);
+    let (a_file, b_file) = (TempFile::new(&a_bytes), TempFile::new(&b_bytes));
+    // SAFETY: the private files are never modified and outlive all mapping owners.
+    let (a_model, b_model) = unsafe {
+        (
+            MappedModel::open(&a_file.0).unwrap(),
+            MappedModel::open(&b_file.0).unwrap(),
+        )
+    };
+    let (a, b) = (
+        a_model.matrix("linear").unwrap(),
+        b_model.matrix("linear").unwrap(),
+    );
+    let mut seed = 0x5eed_4a11_0b0e_0001;
+    let m = 3;
+    let activation: Vec<i8> = (0..m * 1024).map(|_| random(&mut seed) as i8).collect();
+    let scales: Vec<i32> = (0..m * 2).map(|_| random(&mut seed) as i32).collect();
+    for threads in [1, 4] {
+        let mut engine = Engine::new(Kernel::Portable, threads).unwrap();
+        let whole_a = engine.weighted_sums(&a, &activation, &scales).unwrap();
+        let whole_b = engine.weighted_sums(&b, &activation, &scales).unwrap();
+        let parts = engine
+            .weighted_sums_rows(
+                &[(&a, 17..320), (&b, 75..75), (&b, 0..40)],
+                &activation,
+                &scales,
+            )
+            .unwrap();
+        let slice = |whole: &[i64], n: usize, rows: std::ops::Range<usize>| -> Vec<i64> {
+            (0..m)
+                .flat_map(|i| whole[i * n + rows.start..i * n + rows.end].to_vec())
+                .collect()
+        };
+        assert_sums(&parts[0], &slice(&whole_a, 320, 17..320), "a 17..320");
+        assert!(parts[1].is_empty());
+        assert_sums(&parts[2], &slice(&whole_b, 75, 0..40), "b 0..40");
+        assert!(
+            engine
+                .weighted_sums_rows(&[(&b, 10..76)], &activation, &scales)
+                .is_err()
+        );
+    }
+}
