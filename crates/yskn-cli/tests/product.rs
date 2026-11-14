@@ -219,6 +219,194 @@ fn cancellation_and_callback_errors_quiesce_prefill_and_generation_then_allow_ne
 }
 
 #[test]
+fn interrupted_prefill_reuses_shared_prefix_after_cancellation_or_callback_error() {
+    let folder = Folder::new();
+    let prompt = [1; 12];
+    let resumed = [vec![1; 8], vec![2, 3]].concat();
+    let expected = scalar(&folder, &resumed, 4, &greedy());
+    for mode in modes() {
+        for callback_error in [false, true] {
+            let mut engine = folder.engine(mode);
+            let mut polls = 0;
+            let interrupted = engine.generate(&prompt, 4, &greedy(), None, &mut |ids| {
+                assert!(ids.is_empty());
+                polls += 1;
+                if polls < 2 {
+                    Ok(true)
+                } else if callback_error {
+                    Err(yskn::Error::engine("prefill-callback-sentinel"))
+                } else {
+                    Ok(false)
+                }
+            });
+            if callback_error {
+                assert!(
+                    interrupted
+                        .unwrap_err()
+                        .to_string()
+                        .contains("prefill-callback-sentinel")
+                );
+            } else {
+                let result = interrupted.unwrap();
+                assert_eq!(result.finish, Finish::Cancelled);
+                assert!(result.ids.is_empty());
+                assert_eq!(result.passes, 0);
+            }
+            assert_eq!(polls, 2);
+            let result = run(&mut engine, &resumed, 4, &greedy());
+            // Width two committed exactly two rows before the interruption.
+            // Require live reuse, so an unrelated/reset path cannot mask damage.
+            assert_eq!(
+                (result.cached_tokens, result.snap_mode),
+                (2, 1),
+                "{mode:?}, error={callback_error}"
+            );
+            assert_eq!(result.ids, expected, "{mode:?}, error={callback_error}");
+        }
+    }
+}
+
+#[test]
+fn callback_error_during_generation_preserves_shared_prefix_for_next_request() {
+    let folder = Folder::new();
+    let resumed = [1, 2, 3, 4];
+    let expected = scalar(&folder, &resumed, 4, &greedy());
+    for mode in modes() {
+        let mut engine = folder.engine(mode);
+        let error = engine
+            .generate(&[1, 2], 8, &greedy(), None, &mut |ids| {
+                if ids.is_empty() {
+                    Ok(true)
+                } else {
+                    Err(yskn::Error::engine("generation-callback-sentinel"))
+                }
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("generation-callback-sentinel"));
+        let result = run(&mut engine, &resumed, 4, &greedy());
+        assert_eq!((result.cached_tokens, result.snap_mode), (2, 1), "{mode:?}");
+        assert_eq!(result.ids, expected, "{mode:?}");
+    }
+}
+
+#[test]
+fn prefix_and_snapshot_reuse_apply_each_requests_seed_and_sampling_settings() {
+    let folder = Folder::new();
+    let first = [1, 2, 3, 4];
+    let settings = [
+        sampled(),
+        Sampling {
+            temperature: 1.2345,
+            top_p: 0.8724,
+            top_k: 7,
+            min_p: 0.0314,
+            seed: 19,
+        },
+        Sampling {
+            temperature: 0.4174,
+            top_p: 0.7734,
+            top_k: 3,
+            min_p: 0.1424,
+            seed: 1234,
+        },
+    ];
+    for mode in modes() {
+        let mut engine = folder.engine(mode);
+        let initial = run(&mut engine, &first, 4, &settings[0]);
+        assert_eq!(initial.ids, scalar(&folder, &first, 4, &settings[0]));
+        let continued = [first.to_vec(), initial.ids.clone(), vec![5]].concat();
+        let result = run(&mut engine, &continued, 4, &settings[1]);
+        assert_eq!(
+            (result.cached_tokens, result.snap_mode),
+            (first.len() + initial.ids.len() - 1, 1),
+            "{mode:?}"
+        );
+        assert_eq!(
+            result.ids,
+            scalar(&folder, &continued, 4, &settings[1]),
+            "{mode:?}"
+        );
+        let mut branch = continued[..continued.len() - 1].to_vec();
+        branch.push(6);
+        // Alternate settings repeatedly on the same saved prefix, including
+        // returning to the original seed after different sampled requests.
+        for sampling in [&settings[2], &settings[0], &settings[1]] {
+            let result = run(&mut engine, &branch, 4, sampling);
+            assert_eq!(
+                (result.cached_tokens, result.snap_mode),
+                (branch.len() - 1, 2),
+                "{mode:?}, {sampling:?}"
+            );
+            assert_eq!(
+                result.ids,
+                scalar(&folder, &branch, 4, sampling),
+                "{mode:?}, {sampling:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn context_boundary_reserves_margin_clamps_output_and_rejects_prompts_without_room() {
+    let folder = Folder::new();
+    const CONTEXT: usize = 80;
+    // Engine's documented 64-row margin and the unconsumed final prediction
+    // (D19 / spec 08): at most 16 committed rows plus one pending output.
+    const SEQUENCE_LIMIT: usize = CONTEXT - 64 + 1;
+    let prompt = [1, 2, 3, 4, 1, 2, 3, 4];
+    for mode in modes() {
+        let mut engine = folder.engine_with_context(mode, CONTEXT);
+        assert_eq!(engine.context_capacity(), CONTEXT);
+        // Check both the usable sequence boundary and the raw configured
+        // context. Raw-context requests must clamp to preserve the margin.
+        for requested_total in [
+            SEQUENCE_LIMIT - 1,
+            SEQUENCE_LIMIT,
+            SEQUENCE_LIMIT + 1,
+            CONTEXT - 1,
+            CONTEXT,
+            CONTEXT + 1,
+        ] {
+            let requested = requested_total - prompt.len();
+            let count = requested.min(SEQUENCE_LIMIT - prompt.len());
+            let expected = scalar(&folder, &prompt, count, &greedy());
+            let result = run(&mut engine, &prompt, requested, &greedy());
+            assert_eq!(
+                result.ids.len(),
+                count,
+                "{mode:?}, requested total {requested_total}"
+            );
+            assert_eq!(
+                result.ids, expected,
+                "{mode:?}, requested total {requested_total}"
+            );
+            assert_eq!(result.finish, Finish::Length);
+        }
+        let last_valid = vec![1; CONTEXT - 64 - 1];
+        let result = run(&mut engine, &last_valid, 3, &greedy());
+        assert_eq!(
+            result.ids,
+            scalar(&folder, &last_valid, 2, &greedy()),
+            "{mode:?}"
+        );
+        for len in [CONTEXT - 64, CONTEXT - 64 + 1, CONTEXT, CONTEXT + 1] {
+            let mut called = false;
+            let error = engine
+                .generate(&vec![1; len], 1, &greedy(), None, &mut |_| {
+                    called = true;
+                    Ok(true)
+                })
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("prompt leaves no room"),
+                "{mode:?}, len={len}: {error}"
+            );
+            assert!(!called, "oversize prompt reached engine callback");
+        }
+    }
+}
+
+#[test]
 fn stop_id_is_included_and_stops_at_the_first_matching_prediction() {
     let folder = Folder::new();
     let expected = scalar(&folder, &[1, 2], 3, &greedy());
