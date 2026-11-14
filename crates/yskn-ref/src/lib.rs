@@ -15,6 +15,10 @@ pub mod quality;
 pub mod residual_norm_mlp;
 pub mod speculation;
 
+// The shared test support names this crate as `yskn_ref`, as integration tests do.
+#[cfg(test)]
+extern crate self as yskn_ref;
+
 #[cfg(test)]
 #[allow(dead_code)]
 #[path = "../tests/support/mod.rs"]
