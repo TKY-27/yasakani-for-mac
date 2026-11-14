@@ -129,3 +129,51 @@ took 54.9 / 59.2 / 64.1 / 76.3 / 100.7 ms for M = 1 / 2 / 4 / 8 / 16.
   the kernel, so this was not tried.
 - Larger M (prefill) would reuse each decoded block across more rows. One
   thread per row × 32-row tiles caps reuse at MC = 16 per dispatch.
+
+## Round 2 (brief 07d, D21): real model, M5
+
+Real model (`$HOME/models/qwen38-speed/qwen38_27b_speed.yskn`: 401 matrices,
+9,758,310,400 code bytes per pass), shared machine, `uptime` load given
+with each run. Commands and full tables are in D21.
+
+### Kept
+
+- **Exact binary32 multiply-accumulate** (`YSKN_METAL_MAC=float`, default;
+  proof under Design / Arithmetic). Kernel alone, ms per pass, minimum of
+  five, integer → float: M=1 100.7 → 98.9, M=4 181.3 → 153.8, M=16
+  638.2 → 492.0. The cost per added row falls from 35.8 to 26.2 ms.
+- **CPU share of the rows** (`YSKN_METAL_CPU_SHARE`, `weighted_sums_split`):
+  the ten CPU workers compute the last share(M)·N rows of each matrix of a
+  group while the GPU computes the rest. Engine-like grouping (257 calls),
+  GPU only → calibrated share: M=1 144.5 → about 136, M=4 194 → about 181,
+  M=16 554 → about 490 ms.
+
+### Memory bandwidth ceiling (`bench_bandwidth`)
+
+`cargo run --release -p yskn-engine --example bench_bandwidth -- --gb 4 --reps 5`
+(4 GiB shared buffer, read-only, minimum of five, GB/s = 10^9 B/s), two
+runs at load 6.0–6.7:
+
+| Reader | Run 1 | Run 2 |
+|---|---:|---:|
+| CPU, 1 thread | 73.6 | 74.2 |
+| CPU, 4 threads | 109.5 | 109.9 |
+| CPU, 10 threads | 133.8 | 119.6 |
+| GPU, kernel-like 512-byte SIMD loads | 116.6 | 119.0 |
+| concurrent: GPU on one half | 71.8 | 73.0 |
+| concurrent: CPU 10 threads on the other half | 77.0 | 78.2 |
+| concurrent sum (each side over its own time) | 148.8 | 151.2 |
+| concurrent, all bytes over the longer side's time | 143.5 | 146.1 |
+
+A first run a minute earlier (load 6.5) gave 72.5 / 101.7 / 107.3 CPU,
+112.2 GPU and a concurrent sum of 161.0. So the measured ceiling of this
+machine is about 145–150 GB/s for CPU and GPU together, about 115–119
+GB/s for the GPU alone and 107–134 GB/s for the CPU alone (the nominal
+153 GB/s was not reached by a single reader). The kernel at one row reads
+the 9.76 GB of code in 98.9 ms in one command buffer, 98.7 GB/s: 83–85 %
+of the GPU's own streaming rate and about two thirds of the combined
+ceiling. Inside the engine (257 command buffers) the GPU-only kernel takes
+about 144 ms (68 GB/s); the difference is the per-buffer round trip, not
+bandwidth. The CPU kernel alone reads 13.3 GB/s at one row, about a tenth
+of the CPU's streaming rate: it is limited by decode work, not memory, so
+the CPU share is bounded by CPU speed and by contention, not by DRAM.

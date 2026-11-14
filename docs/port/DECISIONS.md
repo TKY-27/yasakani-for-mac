@@ -1775,3 +1775,13 @@ the table sits below the measured optima (0.12 at M = 1, 0.15 at 2 and 4,
 at least 0.18 at 8 and 16). On a quiet machine the optimum should be
 higher; the orchestrator can repeat the sweep and change `CPU_SHARE` in
 `src/metal.rs`.
+
+### 3. Memory bandwidth ceiling (`bench_bandwidth`)
+
+A new example measures read-only streaming without a model file: CPU 1, 4
+and 10 threads, a GPU kernel with the compressed kernel's 512-byte SIMD-group
+loads, and both at once on disjoint halves. Measured ceiling (METAL.md,
+"Memory bandwidth ceiling"): about 145–150 GB/s for CPU and GPU together,
+115–119 GB/s GPU alone, 107–134 GB/s CPU alone. The kernel at one row reads
+98.7 GB/s in one command buffer (83–85 % of the GPU streaming rate); the
+CPU kernel reads 13.3 GB/s and is decode-bound.
