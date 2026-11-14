@@ -54,6 +54,17 @@ pub enum KvMode {
     Kv5,
 }
 
+impl KvMode {
+    /// Stable spelling used by command-line options and result files.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Int8 => "int8",
+            Self::Int8Profile => "int8-profile",
+            Self::Kv5 => "kv5",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttentionDimensions {
     pub query_heads: usize,

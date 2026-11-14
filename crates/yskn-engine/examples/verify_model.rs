@@ -31,9 +31,28 @@ fn first_difference(actual: &[Vec<f32>], expected: &[Vec<f32>]) -> Result<Option
 }
 
 /// Tokens and logit bit rows written by `dump_logits`.
-fn load_reference(path: &str) -> Result<(Vec<u32>, Vec<Vec<f32>>)> {
+fn load_reference(path: &str, mode: KvMode) -> Result<(Vec<u32>, Vec<Vec<f32>>)> {
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    parse_reference(&value, path, mode)
+}
+
+fn parse_reference(
+    value: &serde_json::Value,
+    path: &str,
+    mode: KvMode,
+) -> Result<(Vec<u32>, Vec<Vec<f32>>)> {
     let invalid = || Error::InvalidInput(format!("{path} is not a dump_logits file"));
+    let reference_mode = match value.get("kv_mode") {
+        None => KvMode::Int8,
+        Some(value) => parse_kv_mode(value.as_str().ok_or_else(invalid)?.as_ref())?,
+    };
+    if reference_mode != mode {
+        return Err(Error::InvalidInput(format!(
+            "reference kv_mode={} differs from --kv {}",
+            reference_mode.name(),
+            mode.name()
+        )));
+    }
     let tokens = value["tokens"]
         .as_array()
         .ok_or_else(invalid)?
@@ -81,10 +100,13 @@ fn main() -> Result<()> {
         let value = options.next().ok_or_else(usage)?;
         match option.as_str() {
             "--kv" => mode = parse_kv_mode(value.as_ref())?,
-            "--reference" => reference = Some(load_reference(value)?),
+            "--reference" => reference = Some(value),
             _ => return Err(usage()),
         }
     }
+    let reference = reference
+        .map(|path| load_reference(path, mode))
+        .transpose()?;
     let windows = TokenWindows::load(&arguments[1])?;
     let tokens = &windows.windows[0].ids[..ROWS];
     let threads = Engine::default_threads();
@@ -150,4 +172,38 @@ fn main() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reference_mode_is_checked_before_logits_and_legacy_means_int8() {
+        for mode in [KvMode::Int8, KvMode::Int8Profile, KvMode::Kv5] {
+            let dump =
+                serde_json::json!({"kv_mode": mode.name(), "tokens": [7], "logits_bits": [[0]]});
+            assert!(parse_reference(&dump, "dump", mode).is_ok());
+            for selected in [KvMode::Int8, KvMode::Int8Profile, KvMode::Kv5] {
+                if selected != mode {
+                    // No logits: a mismatch must fail before logit parsing/comparison.
+                    let dump = serde_json::json!({"kv_mode": mode.name()});
+                    let error = parse_reference(&dump, "dump", selected)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(error.contains(&format!("reference kv_mode={}", mode.name())));
+                    assert!(error.contains(&format!("--kv {}", selected.name())));
+                }
+            }
+        }
+        let legacy = serde_json::json!({"tokens": [7], "logits_bits": [[0]]});
+        assert!(parse_reference(&legacy, "dump", KvMode::Int8).is_ok());
+        for mode in [KvMode::Int8Profile, KvMode::Kv5] {
+            let error = parse_reference(&legacy, "dump", mode)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("reference kv_mode=int8"));
+            assert!(error.contains(&format!("--kv {}", mode.name())));
+        }
+    }
 }

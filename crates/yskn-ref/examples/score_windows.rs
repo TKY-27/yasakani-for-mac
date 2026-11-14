@@ -18,7 +18,7 @@ fn run() -> Result<()> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     if arguments.len() == 1 && (arguments[0] == "--help" || arguments[0] == "-h") {
         println!(
-            "Usage: score_windows MODEL_FOLDER TOKEN_WINDOWS.json [--kv int8|int8-profile|kv5]"
+            "Usage: score_windows MODEL_FOLDER TOKEN_WINDOWS.json [--kv int8|int8-profile|kv5] [--json OUT]"
         );
         println!(
             "Scores input/logit rows 1024..=2046 against tokens 1025..=2047 in each 2048-token window."
@@ -27,6 +27,7 @@ fn run() -> Result<()> {
     }
     let mut mode = KvMode::Int8;
     let mut paths = Vec::new();
+    let mut json = None;
     let mut args = arguments.iter();
     while let Some(argument) = args.next() {
         if argument == "--kv" {
@@ -34,6 +35,11 @@ fn run() -> Result<()> {
                 args.next()
                     .ok_or_else(|| Error::InvalidInput("--kv needs a mode".into()))?,
             )?;
+        } else if argument == "--json" {
+            json = Some(
+                args.next()
+                    .ok_or_else(|| Error::InvalidInput("--json needs a path".into()))?,
+            );
         } else if argument.to_string_lossy().starts_with('-') {
             return Err(Error::InvalidInput(
                 "unknown option; use --help for usage".into(),
@@ -48,14 +54,18 @@ fn run() -> Result<()> {
         ));
     }
     let windows = TokenWindows::load(paths[1])?;
-    score_with_kv(
+    let result = score_with_kv(
         mode,
         |mode| Model::load_folder_with(paths[0], mode),
         &windows,
         0..windows.windows.len(),
         1,
         |_| {},
-    )?
-    .print();
+    )?;
+    result.print();
+    if let Some(path) = json {
+        let output = serde_json::json!({"kv_mode": mode.name(), "score": result});
+        std::fs::write(path, serde_json::to_vec_pretty(&output)?)?;
+    }
     Ok(())
 }

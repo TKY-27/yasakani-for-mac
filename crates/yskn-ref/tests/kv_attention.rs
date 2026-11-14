@@ -1,5 +1,4 @@
-#[path = "support/sha256.rs"]
-mod digest;
+use sha2::{Digest, Sha256};
 mod support;
 
 use std::{
@@ -31,12 +30,14 @@ fn bits(rows: &[Vec<f32>]) -> Vec<Vec<u32>> {
         .collect()
 }
 fn hash(rows: &[Vec<u32>]) -> String {
-    digest::sha256(
-        &rows
-            .iter()
-            .flatten()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<_>>(),
+    format!(
+        "{:x}",
+        Sha256::digest(
+            rows.iter()
+                .flatten()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
     )
 }
 

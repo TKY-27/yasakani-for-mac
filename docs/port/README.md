@@ -148,14 +148,49 @@ done
 ```
 
 `--windows A..B` selects zero-based window indices, end excluded. Each window
-starts at reset. JSON contains per-window NLL sums/counts, elapsed seconds,
-and aggregate metrics; sum counts and NLLs to combine disjoint partial runs
+starts at reset. The engine's `--json OUT` writes this object (the range end
+is excluded; the model file name contains no directory path):
+
+```json
+{
+  "kv_mode": "kv5",
+  "backend": "metal",
+  "device": "Apple M4",
+  "kernel": "dotprod",
+  "threads": 4,
+  "rows_per_pass": 16,
+  "window_range": { "start": 0, "end": 1 },
+  "model_file": { "name": "qwen38_27b_e3x.yskn", "size_bytes": 123456789 },
+  "crate_version": "0.1.0",
+  "score": {
+    "windows": [
+      { "window": 0, "scored_positions": 1023,
+        "negative_log_likelihood_sum": 508.7, "elapsed_seconds": 100.0 }
+    ],
+    "scored_positions": 1023,
+    "negative_log_likelihood_sum": 508.7,
+    "mean_negative_log_likelihood": 0.49726295210166177,
+    "perplexity": 1.644214850338663,
+    "elapsed_seconds": 100.0
+  }
+}
+```
+
+Values above illustrate the layout, not a measured run; `windows` has one entry
+per selected window. `kernel` and `threads` describe the CPU pool, also used for
+non-projection work on Metal. The existing per-window NLL sums/counts, elapsed
+seconds and aggregate metrics are unchanged inside `score`. Sum counts and
+NLLs to combine disjoint partial runs
 in ascending window order, with possible last-bit binary64 rounding differences
 from the full per-position fold. Progress and timing lines go to stderr;
 stdout retains the three scalar-reference summary lines. `--backend` overrides
 `YSKN_BACKEND`. All three engine examples and reference `dump_logits` accept
 `--kv int8|int8-profile|kv5` (default `int8`, independent of `YSKN_KV`);
-`dump_logits` takes the option after its four positional arguments. Profile
+`dump_logits` takes the option after its four positional arguments. Its JSON is
+`{"kv_mode":"kv5","tokens":[...],"logits_bits":[[...],...]}` and stderr reports
+`kv_mode` too. `verify_model --reference` checks the dump's mode against `--kv`
+before loading the model or comparing logits; a legacy dump without `kv_mode`
+is accepted only with `--kv int8`. Profile
 modes require a model folder and use the same manifest/profile validation as
 the scalar loader. Direct `.yskn` paths support plain Int8.
 The `kv_encode` timing is the complete attention row preparation stage,
@@ -181,7 +216,9 @@ cargo run --release -p yskn-ref --example score_windows -- \
 `model::model_location_with_kv`/`load_weights_with_kv` are also used by the
 mapped engine to select the same mode without changing scalar arithmetic.
 The score example passes the selected mode to its loader through the shared
-scoring helper, preserving the ordered NLL fold.
+scoring helper, preserving the ordered NLL fold. Its optional `--json OUT` writes
+`{"kv_mode":"kv5","score":{...}}`, using the same mode spelling and unchanged
+`score` fields as the engine example above.
 
 The folder's optional `yasakani.json` supplies `files.weights`; otherwise
 the documented `qwen38_27b_e3x.yskn` default is used. `Model::load_folder` (and

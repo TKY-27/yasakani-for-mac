@@ -58,6 +58,11 @@ fn same(actual: &[Vec<f32>], expected: &[Vec<f32>], context: &str) {
         }
     }
 }
+fn logit_bits(rows: &[Vec<f32>]) -> Vec<Vec<u32>> {
+    rows.iter()
+        .map(|row| row.iter().map(|v| v.to_bits()).collect())
+        .collect()
+}
 fn digest(rows: &[Vec<f32>]) -> String {
     let mut hash = Sha256::new();
     for row in rows {
@@ -68,9 +73,9 @@ fn digest(rows: &[Vec<f32>]) -> String {
     format!("{:x}", hash.finalize())
 }
 fn compare(bytes: Vec<u8>, count: usize, baseline: &str) {
-    compare_mode(bytes, count, Some(baseline), KvMode::Int8);
+    compare_mode(bytes, count, baseline, KvMode::Int8);
 }
-fn compare_mode(bytes: Vec<u8>, count: usize, baseline: Option<&str>, mode: KvMode) {
+fn compare_mode(bytes: Vec<u8>, count: usize, baseline: &str, mode: KvMode) {
     let fixture = Fixture::new(&bytes);
     if mode != KvMode::Int8 {
         fs::write(
@@ -85,13 +90,28 @@ fn compare_mode(bytes: Vec<u8>, count: usize, baseline: Option<&str>, mode: KvMo
     let tokens: Vec<_> = (0..count).map(|i| ((i * 7 + 11) % 65) as u32).collect();
     reference.prefill(&tokens).unwrap();
     let expected = reference.row_logits().to_vec();
-    if let Some(baseline) = baseline {
-        assert_eq!(
-            digest(&expected),
-            baseline,
-            "reference bits changed from pre-change HEAD"
+    let int8_engine_logits = if mode != KvMode::Int8 {
+        let mut int8_reference =
+            yskn_ref::Model::load_folder_with(&fixture.0, KvMode::Int8).unwrap();
+        int8_reference.prefill(&[1, 2, 3]).unwrap();
+        int8_reference.prefill(&tokens).unwrap();
+        assert_ne!(
+            logit_bits(&expected),
+            logit_bits(int8_reference.row_logits()),
+            "reference ignored {mode:?}"
         );
-    }
+        let mut int8_engine = fixture.model(Kernel::Portable, 1, 5);
+        int8_engine.prefill(&[1, 2, 3]).unwrap();
+        int8_engine.prefill(&tokens).unwrap();
+        Some(logit_bits(int8_engine.row_logits()))
+    } else {
+        None
+    };
+    assert_eq!(
+        digest(&expected),
+        baseline,
+        "frozen reference logit bits changed"
+    );
     reference.prefill(&[17, 21]).unwrap();
     let continuation = reference.row_logits().to_vec();
     reference.reset().unwrap();
@@ -104,6 +124,13 @@ fn compare_mode(bytes: Vec<u8>, count: usize, baseline: Option<&str>, mode: KvMo
         same(model.row_logits(), &initial, context);
         model.prefill(&tokens).unwrap();
         same(model.row_logits(), &expected, context);
+        if let Some(int8_logits) = &int8_engine_logits {
+            assert_ne!(
+                &logit_bits(model.row_logits()),
+                int8_logits,
+                "engine ignored {mode:?}: {context}"
+            );
+        }
         assert_eq!(model.position(), 3 + count);
         assert_eq!(model.logits().unwrap().len(), expected[0].len());
         model.reset().unwrap();
@@ -223,7 +250,7 @@ fn int8_profile_mixed_model_matches_reference_across_passes_chunks_reset_and_con
             &["linear_attention", "full_attention", "full_attention"],
         ),
         73,
-        None,
+        "bd759b4b86ab911371bf726f34e0234c321c9d6292e31133e7f0d2f5c6d53b8c",
         KvMode::Int8Profile,
     );
 }
@@ -235,7 +262,7 @@ fn kv5_mixed_model_matches_reference_across_passes_chunks_reset_and_continuation
             &["linear_attention", "full_attention", "full_attention"],
         ),
         73,
-        None,
+        "af825f48eb7eb1a8337f52b31b7018ab568907e996724d81139c1594b0e5fc26",
         KvMode::Kv5,
     );
 }
@@ -406,7 +433,10 @@ fn load_selects_env_kv_and_explicit_constructors_keep_int8_default() {
         let loaded = unsafe { Model::load(&folder) };
         match expected {
             Ok(mode) => assert_eq!(loaded.unwrap().kv_mode(), mode.unwrap_or_default()),
-            Err(_) => assert!(matches!(loaded, Err(yskn_engine::Error::InvalidInput(_)))),
+            Err(_) => assert!(
+                matches!(loaded, Err(yskn_engine::Error::InvalidInput(message))
+                if message.contains("YSKN_KV") && !message.contains("--kv"))
+            ),
         }
         let fixture_engine = || Engine::new(Kernel::Portable, 1).unwrap();
         // SAFETY: the parent keeps this fixture immutable until this child exits.
@@ -448,6 +478,11 @@ fn load_selects_env_kv_and_explicit_constructors_keep_int8_default() {
             child.env("YSKN_KV", value);
         }
         let output = child.output().unwrap();
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child did not run the test: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
         assert!(
             output.status.success(),
             "kv={value:?}: {} {}",

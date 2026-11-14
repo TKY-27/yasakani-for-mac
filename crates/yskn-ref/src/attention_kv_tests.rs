@@ -306,3 +306,65 @@ fn codec_failure_after_a_successful_row_preserves_attention_state() {
         assert_eq!(state, before);
     }
 }
+
+#[test]
+fn prefix_rounds_nonunit_probability_times_scale_before_value_multiply() {
+    let mut profile = Profile::new(1, 2);
+    profile.codes.fill(256);
+    profile.gain = 1.0;
+    let layer = layer(profile);
+    let mut prefix = vec![token(&layer, 0, 257.0 / 256.0), token(&layer, 1, 1.0)];
+    // Query=1, key bases=-1/0, scale=1/16: scores -1 and 0 exactly.
+    for (row, integer) in prefix.iter_mut().zip([-1, 0]) {
+        row.keys[0] = CacheRow::Int8(Int8Row {
+            integers: vec![integer; 256],
+            scale: 1.0 / 16.0,
+        });
+    }
+    let mut s = split();
+    layer
+        .prefix_tile(&mut s, &[1.0; 256], 0, &prefix, 0, 0..2)
+        .unwrap();
+    // q35_atxpk3.cuh:402-406: p=exp2(-log2(e))=exp(-1), ~0.36787944.
+    // p*(257/256) ~0.36931646 rounds to BF16 189/512=0.369140625.
+    // Both value bases are 1: numerator=189/512+1=701/512 (0x3faf4000).
+    // Moving rounding onto scale instead gives p*1+1 ~1.36787944, different bits.
+    assert_eq!(s.maximum.to_bits(), 0);
+    assert_eq!(bits(&s.numerator), vec![0x3faf_4000; 256]);
+}
+
+#[test]
+fn value_guard_alone_disables_packing_and_preserves_initial_int8_until_guard() {
+    let mut synthetic = Profile::new(1, 2);
+    synthetic.codes.fill(0);
+    synthetic.gain = 1.0;
+    synthetic.groups[1].guard = 2;
+    let profile = Arc::new(KvProfile::parse(&synthetic.bytes()).unwrap());
+    assert!(profile.packable(0, 0));
+    assert!(!profile.packable(0, 1));
+    let layer = configured(profile, 0);
+    // Cache-domain values: max=127, initial scale=127/127=1.
+    // RN-even gives [-127,-64,0,32]. With no mean/basis and codebook=0,
+    // every post-guard reconstruction is 0: final int8 bytes=0, scale=0.
+    let row: [f32; 256] = std::array::from_fn(|i| [-127.0, -63.5, 0.0, 31.75][i % 4]);
+    let initial: Vec<i8> = (0..256).map(|i| [-127, -64, 0, 32][i % 4]).collect();
+    for position in [0, 1, 2, 3] {
+        for head in 0..2 {
+            let encoded = layer.encode_row(head, 1, position, &row).unwrap();
+            let CacheRow::Int8(encoded) = encoded else {
+                panic!("guard must disable packing for the entire value side")
+            };
+            if head == 0 && position < 2 {
+                assert_eq!(encoded.integers(), initial);
+                assert_eq!(encoded.scale().to_bits(), 1.0_f32.to_bits());
+            } else {
+                assert_eq!(encoded.integers(), &[0; 256]);
+                assert_eq!(encoded.scale().to_bits(), 0);
+            }
+            assert!(matches!(
+                layer.encode_row(head, 0, position, &row).unwrap(),
+                CacheRow::Packed(_)
+            ));
+        }
+    }
+}

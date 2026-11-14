@@ -113,6 +113,7 @@ fn shared_quality_mode_parser_and_loader_receive_each_explicit_mode() {
     ] {
         let mode = parse_kv_mode(std::ffi::OsStr::new(name)).unwrap();
         assert_eq!(mode, expected);
+        assert_eq!(mode.name(), name);
         let mut observed = None;
         let result = score_with_kv(
             mode,

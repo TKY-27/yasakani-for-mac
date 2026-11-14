@@ -69,12 +69,28 @@ fn main() -> Result<()> {
     };
     let mut totals = [Duration::ZERO; 6];
     let mut passes = 0;
+    let mut configuration = None;
     let result = score_with_kv(
         mode,
         |mode| {
+            let engine = Engine::from_env()?;
+            let kernel = engine.kernel().name();
+            let threads = engine.threads();
+            let (weights, _) = yskn_ref::model::model_location(std::path::Path::new(&folder))?;
+            let size_bytes = std::fs::metadata(&weights)?.len();
             // SAFETY: this read-only scoring command requires stable input weights until exit.
-            let model =
-                unsafe { Model::with_options(folder, Engine::from_env()?, backend, rows, mode)? };
+            let model = unsafe { Model::with_options(&folder, engine, backend, rows, mode)? };
+            configuration = Some(serde_json::json!({
+                "kv_mode": mode.name(),
+                "backend": model.backend().name(),
+                "device": model.device(),
+                "kernel": kernel,
+                "threads": threads,
+                "rows_per_pass": rows,
+                "window_range": {"start": range.start, "end": range.end},
+                "model_file": {"name": weights.file_name().unwrap().to_string_lossy(), "size_bytes": size_bytes},
+                "crate_version": env!("CARGO_PKG_VERSION"),
+            }));
             eprintln!(
                 "backend={} device={} rows_per_pass={rows} kv={mode:?}",
                 model.backend().name(),
@@ -83,7 +99,7 @@ fn main() -> Result<()> {
             Ok(model)
         },
         &windows,
-        range,
+        range.clone(),
         rows,
         |model| {
             for timing in model.pass_timings() {
@@ -122,7 +138,9 @@ fn main() -> Result<()> {
         result.elapsed_seconds
     );
     if let Some(path) = json {
-        result.write_json(path)?;
+        let mut output = configuration.expect("scoring loaded a model");
+        output["score"] = serde_json::to_value(&result)?;
+        std::fs::write(path, serde_json::to_vec_pretty(&output)?)?;
     }
     Ok(())
 }

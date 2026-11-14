@@ -27,6 +27,7 @@ impl Linear {
 
 /// Wall times cover nonoverlapping stages of a complete layer-major pass.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct PassTiming {
     pub position: usize,
     pub rows: usize,
@@ -63,7 +64,11 @@ impl Model {
     /// All weights files must remain unmodified and untruncated until this model is dropped.
     pub unsafe fn load(path: impl AsRef<Path>) -> Result<Self> {
         let mode = std::env::var_os("YSKN_KV")
-            .map(|value| yskn_ref::quality::parse_kv_mode(&value))
+            .map(|value| {
+                yskn_ref::quality::parse_kv_mode(&value).map_err(|_| {
+                    Error::InvalidInput("YSKN_KV expects int8|int8-profile|kv5".into())
+                })
+            })
             .transpose()?
             .unwrap_or_default();
         // SAFETY: forwarded file-stability contract is required of this method's caller.

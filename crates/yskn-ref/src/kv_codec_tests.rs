@@ -400,9 +400,7 @@ fn kv_guard_basis_mean_flat_fallback_and_row_independence() {
     );
 }
 
-#[path = "../tests/support/sha256.rs"]
-mod digest;
-use digest::sha256;
+use sha2::{Digest, Sha256};
 
 fn encoded_bytes(encoded: &CacheRow) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -425,11 +423,11 @@ fn encoded_bytes(encoded: &CacheRow) -> Vec<u8> {
 #[test]
 fn kv_frozen_sha256_synthetic_outputs() {
     assert_eq!(
-        sha256(b""),
+        format!("{:x}", Sha256::digest(b"")),
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     );
     assert_eq!(
-        sha256(b"abc"),
+        format!("{:x}", Sha256::digest(b"abc")),
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
     for (bits, expected) in [
@@ -461,7 +459,7 @@ fn kv_frozen_sha256_synthetic_outputs() {
                 }
             }
         }
-        let actual = sha256(&bytes);
+        let actual = format!("{:x}", Sha256::digest(&bytes));
         println!("frozen {bits} {actual}");
         assert_eq!(actual, expected);
     }

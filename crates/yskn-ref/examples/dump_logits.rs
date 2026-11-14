@@ -1,7 +1,7 @@
 //! `dump_logits MODEL_FOLDER WINDOWS.json ROWS OUT.json [--kv int8|int8-profile|kv5]`
 //!
 //! Runs the scalar reference on the first ROWS tokens of window 0 and writes
-//! `{"tokens": [...], "logits_bits": [[u32; vocabulary]; ROWS]}` for
+//! `{"kv_mode": "int8", "tokens": [...], "logits_bits": [[u32; vocabulary]; ROWS]}` for
 //! `yskn-engine`'s `verify_model --reference`. Loads all weights onto the heap.
 #![forbid(unsafe_code)]
 use std::{fs::File, io::BufWriter, process::ExitCode, time::Instant};
@@ -30,6 +30,7 @@ fn run() -> Result<()> {
             "usage: dump_logits MODEL_FOLDER WINDOWS.json ROWS OUT.json [--kv int8|int8-profile|kv5]".into(),
         )),
     };
+    eprintln!("kv_mode={}", mode.name());
     let windows = TokenWindows::load(windows)?;
     let rows: usize = rows
         .to_str()
@@ -49,7 +50,7 @@ fn run() -> Result<()> {
         .collect();
     serde_json::to_writer(
         BufWriter::new(File::create_new(out)?),
-        &serde_json::json!({ "tokens": tokens, "logits_bits": logits_bits }),
+        &serde_json::json!({ "kv_mode": mode.name(), "tokens": tokens, "logits_bits": logits_bits }),
     )?;
     Ok(())
 }
