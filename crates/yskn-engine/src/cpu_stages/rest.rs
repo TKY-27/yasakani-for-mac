@@ -2,21 +2,21 @@
 use crate::{Error, Result};
 use yskn_ref::{
     compressed_linear::{self, PreparedActivation},
-    portable_math::{bfloat, rsqrt, silu},
+    portable_math::{Elementwise, bfloat, rsqrt, silu},
     residual_norm_mlp::NormalizedInput,
 };
 
 fn require_finite(values: &[f32], context: &'static str) -> Result<()> {
-    if values.iter().all(|x| x.is_finite()) {
-        Ok(())
-    } else {
-        Err(Error::NonFinite(context))
-    }
+    super::math::FastMath::finite(values, context)
 }
 
 pub(crate) fn quantize_activation(input: &[f32], signs: &[i8]) -> Result<PreparedActivation> {
     if super::enabled() {
-        compressed_linear::quantize_activation_with_transform(input, signs, hadamard512)
+        compressed_linear::quantize_activation_with_math::<super::math::FastMath>(
+            input,
+            signs,
+            hadamard512,
+        )
     } else {
         compressed_linear::quantize_activation(input, signs)
     }
@@ -170,8 +170,9 @@ pub(crate) fn prepare_normalization(
         let w: [f32; 4] = normalization_weight[i..i + 4].try_into().unwrap();
         let adjusted = adjusted4(h, w);
         unnormalized[i..i + 4].copy_from_slice(&adjusted);
-        weighted_hidden_bf16[i..i + 4].copy_from_slice(&adjusted.map(bfloat));
+        weighted_hidden_bf16[i..i + 4].copy_from_slice(&adjusted);
     }
+    super::math::FastMath::bfloat(&mut weighted_hidden_bf16);
     require_finite(&weighted_hidden_bf16, "weighted hidden BF16")?;
     Ok(NormalizedInput {
         prepared: quantize_activation(&unnormalized, input_signs)?,
@@ -243,8 +244,10 @@ pub(crate) fn gated_product(gate_projection: &[f32], up_projection: &[f32]) -> R
     let mut output = vec![0.0; gate_projection.len()];
     let end = output.len() / 4 * 4;
     for i in (0..end).step_by(4) {
-        let activation =
-            std::array::from_fn(|lane| bfloat(silu(bfloat(gate_projection[i + lane]))));
+        let mut activation: [f32; 4] = gate_projection[i..i + 4].try_into().unwrap();
+        super::math::FastMath::bfloat(&mut activation);
+        super::math::FastMath::silu(&mut activation);
+        super::math::FastMath::bfloat(&mut activation);
         let up = up_projection[i..i + 4].try_into().unwrap();
         output[i..i + 4].copy_from_slice(&rounded_binary4(activation, up, true));
     }

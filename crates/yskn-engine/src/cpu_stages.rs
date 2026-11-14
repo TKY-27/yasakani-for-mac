@@ -37,3 +37,5 @@ pub(crate) mod recurrence;
 pub(crate) mod rest;
 
 pub(crate) mod kv_codec;
+
+pub(crate) mod math;

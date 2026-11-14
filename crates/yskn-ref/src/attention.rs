@@ -7,7 +7,7 @@ use crate::kv_codec::{
     CacheRow, Int8Row, encode_packed_with_search, requantize_int8_with_search, search_chain,
 };
 use crate::kv_profile::KvProfile;
-use crate::portable_math::{bfloat, exp, exp2, rsqrt, sigmoid, sincos};
+use crate::portable_math::{bfloat, exp, exp2, rsqrt, sincos};
 use crate::{Error, Result};
 
 const FREQUENCY_BITS: [u32; 32] = [
@@ -478,6 +478,20 @@ impl Attention {
         query_head: usize,
         attend: impl FnOnce(AttentionOperands<'_>) -> Result<Vec<f32>>,
     ) -> Result<Vec<f32>> {
+        self.output_head_with_math::<crate::portable_math::ScalarMath>(
+            state, position, prepared, query_head, attend,
+        )
+    }
+
+    /// Shared attention boundary with independent elementwise output kernels.
+    pub fn output_head_with_math<M: crate::portable_math::Elementwise>(
+        &self,
+        state: &AttentionState,
+        position: usize,
+        prepared: &PreparedRow,
+        query_head: usize,
+        attend: impl FnOnce(AttentionOperands<'_>) -> Result<Vec<f32>>,
+    ) -> Result<Vec<f32>> {
         if state.dimensions != self.dimensions
             || position > state.rows.len()
             || query_head >= self.dimensions.query_heads
@@ -505,15 +519,18 @@ impl Attention {
                 ));
             }
             let unrotated = inverse_rotate_cache(&attended);
-            finite(&unrotated, "attention inverse cache rotation")?;
+            M::finite(&unrotated, "attention inverse cache rotation")?;
+            let mut gates: [f32; 256] = std::array::from_fn(|i| prepared.gates[start + i]);
+            M::sigmoid(&mut gates);
+            M::bfloat(&mut gates);
             for (channel, value) in unrotated.into_iter().enumerate() {
                 // The inverse rotation, sigmoid, and product have separate BF16 boundaries.
                 let rounded_attended = bfloat(value);
-                let gate = bfloat(sigmoid(prepared.gates[start + channel]));
+                let gate = gates[channel];
                 output.push(bfloat(rounded_attended * gate));
             }
         }
-        finite(&output, "attention gated output")?;
+        M::finite(&output, "attention gated output")?;
         Ok(output)
     }
 

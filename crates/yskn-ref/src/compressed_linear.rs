@@ -64,13 +64,22 @@ pub fn quantize_activation_with_transform(
     input_signs: &[i8],
     transform: impl Fn(&mut [f32; ROTATION_BLOCK]),
 ) -> Result<PreparedActivation> {
+    quantize_activation_with_math::<crate::portable_math::ScalarMath>(input, input_signs, transform)
+}
+
+/// Shared quantizer with independent transform and elementwise conversion kernels.
+pub fn quantize_activation_with_math<M: crate::portable_math::Elementwise>(
+    input: &[f32],
+    input_signs: &[i8],
+    transform: impl Fn(&mut [f32; ROTATION_BLOCK]),
+) -> Result<PreparedActivation> {
     if input.is_empty() || input.len() % ROTATION_BLOCK != 0 || input_signs.len() != input.len() {
         return Err(Error::InvalidModel(
             "activation and input signs must have matching, nonzero multiples of 512 elements"
                 .into(),
         ));
     }
-    require_finite(input, "pre-rotation activation")?;
+    M::finite(input, "pre-rotation activation")?;
     if input_signs.iter().any(|&sign| sign != -1 && sign != 1) {
         return Err(Error::InvalidModel(
             "rotation signs must be -1 or +1".into(),
@@ -90,7 +99,7 @@ pub fn quantize_activation_with_transform(
             // FP16 rounding precedes the maximum and int8 quantization.
             *value = half(*value * HADAMARD_NORMALIZATION);
         }
-        require_finite(&rotated, "FP16-rounded rotated activation")?;
+        M::finite(&rotated, "FP16-rounded rotated activation")?;
         let maximum = rotated
             .iter()
             .fold(0.0_f32, |maximum, value| maximum.max(value.abs()));

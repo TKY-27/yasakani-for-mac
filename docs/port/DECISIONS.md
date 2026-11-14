@@ -1761,3 +1761,33 @@ Kernel variation again dominates total time. Preparation outside dense gates
 is about 3.7 ms; recurrence/update/output/checks about 8.8 ms. Task 3 therefore
 addresses wide elementwise math and checks in preparation and recurrent output,
 plus the still-large rest stage, rather than further changing ordered reductions.
+
+#### Task 3: portable elementwise kernels
+
+A small `Elementwise` hook supplies scalar default bodies shared by the
+reference preparation, quantizer and output routines. The engine selects
+NEON only when CPU stages are enabled. BF16 uses the existing integer
+nearest-even bias/NaN quieting rule. Binary16 uses integer exponent/significand
+rounding, including variable subnormal shifts, carry, signed zero, canonical
+NaN and exact widening; it does not depend on FP16 hardware modes.
+
+Portable exp runs the same range reduction, constants, separately rounded
+polynomial, divisions and exponent rescaling across four independent elements.
+Branch masks choose the original expressions. Rare range-limit/nonfinite
+lanes execute the scalar oracle, including its NaN payload behavior. SiLU and
+sigmoid retain their exact numerator and denominator expressions. Finite scans
+OR integer exponent masks across lanes, with a scalar tail. No reduced
+precision reciprocal or fused arithmetic is introduced.
+
+The hooks cover activation half rounding, normalization BF16, MLP SiLU,
+GDN convolution activation and recurrent output SiLU/state validation, and
+attention output sigmoid. Scalar single-value decay/softplus and ordered
+reductions stay scalar. The recurrence convolution multiply/add loop itself
+is unchanged; wide rounding/activation/check passes now run in SIMD.
+
+Tests compare exact bits for every finite half code and midpoint with adjacent
+binary32 values, all BF16 upper words/midpoints (including NaNs), exp branch
+boundaries, signed zero/subnormals and 100,003 random binary32 bit patterns.
+They also check direct exp, non-vector tails and every invalid-value lane.
+Focused tests and clippy pass. Real-model task-3 measurement was queued behind
+another owner's model lock; its result is recorded in the final table below.

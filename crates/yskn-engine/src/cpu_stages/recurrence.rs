@@ -11,14 +11,19 @@ pub(crate) fn recur_head(
 ) -> Result<Vec<f32>> {
     #[cfg(target_arch = "aarch64")]
     if super::enabled() {
-        return layer.recur_head_with(state, row, head, |state, query, key, value, decay, gate| {
-            if let Some(source) = source {
-                assert_eq!(source.len(), state.len());
-            }
-            // SAFETY: runtime NEON detection; the reference validates 128x128 state and
-            // 128-element operands. Source, if supplied, has the same extent and cannot alias state.
-            unsafe { core(state, source, query, key, value, decay, gate) }
-        });
+        return layer.recur_head_with_math::<super::math::FastMath>(
+            state,
+            row,
+            head,
+            |state, query, key, value, decay, gate| {
+                if let Some(source) = source {
+                    assert_eq!(source.len(), state.len());
+                }
+                // SAFETY: runtime NEON detection; the reference validates 128x128 state and
+                // 128-element operands. Source, if supplied, has the same extent and cannot alias state.
+                unsafe { core(state, source, query, key, value, decay, gate) }
+            },
+        );
     }
     if let Some(source) = source {
         state.copy_from_slice(source);

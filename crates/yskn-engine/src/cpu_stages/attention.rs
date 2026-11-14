@@ -17,7 +17,13 @@ pub(crate) fn output_head(
     head: usize,
 ) -> Result<Vec<f32>> {
     if super::enabled() {
-        layer.output_head_with(state, position, prepared, head, attend_head)
+        layer.output_head_with_math::<super::math::FastMath>(
+            state,
+            position,
+            prepared,
+            head,
+            attend_head,
+        )
     } else {
         layer.output_head(state, position, prepared, head)
     }

@@ -1,6 +1,6 @@
 //! Scalar recurrence from [chapter 03](../../../docs/spec/03_GATED_DELTANET.md).
 
-use crate::portable_math::{bfloat, exp, rsqrt, sigmoid, silu, softplus};
+use crate::portable_math::{bfloat, exp, rsqrt, sigmoid, softplus};
 use crate::{Error, Result};
 
 /// Dimensions read from the model and its tensor descriptors.
@@ -316,6 +316,26 @@ impl GatedDeltaNet {
         projected_z: &[f32],
         weighted_hidden_bf16: &[f32],
         inverse_rms: f32,
+        dense: impl FnMut(&[f32], &[f32], f32) -> Result<Vec<f32>>,
+    ) -> Result<GatedDeltaNetRow> {
+        self.prepare_with_math::<crate::portable_math::ScalarMath>(
+            history,
+            projected_qkv,
+            projected_z,
+            weighted_hidden_bf16,
+            inverse_rms,
+            dense,
+        )
+    }
+
+    /// Shared preparation with bit-identical elementwise kernels.
+    pub fn prepare_with_math<M: crate::portable_math::Elementwise>(
+        &self,
+        history: &[&[f32]],
+        projected_qkv: &[f32],
+        projected_z: &[f32],
+        weighted_hidden_bf16: &[f32],
+        inverse_rms: f32,
         mut dense: impl FnMut(&[f32], &[f32], f32) -> Result<Vec<f32>>,
     ) -> Result<GatedDeltaNetRow> {
         if history.len() != self.dimensions.convolution_width - 1
@@ -328,16 +348,18 @@ impl GatedDeltaNet {
         {
             return Err(dimension_mismatch());
         }
-        finite(projected_qkv, "DeltaNet QKV projection")?;
-        finite(projected_z, "DeltaNet Z projection")?;
-        finite(weighted_hidden_bf16, "DeltaNet dense gate input")?;
-        finite(&[inverse_rms], "DeltaNet inverse RMS")?;
+        M::finite(projected_qkv, "DeltaNet QKV projection")?;
+        M::finite(projected_z, "DeltaNet Z projection")?;
+        M::finite(weighted_hidden_bf16, "DeltaNet dense gate input")?;
+        M::finite(&[inverse_rms], "DeltaNet inverse RMS")?;
 
         // The projection boundary is BF16, including the history retained for later rows.
-        let projected = round_projection(projected_qkv);
-        let z: Vec<f32> = projected_z.iter().map(|&value| bfloat(value)).collect();
-        finite(&projected, "DeltaNet rounded QKV projection")?;
-        finite(&z, "DeltaNet rounded Z projection")?;
+        let mut projected = projected_qkv.to_vec();
+        M::bfloat(&mut projected);
+        let mut z = projected_z.to_vec();
+        M::bfloat(&mut z);
+        M::finite(&projected, "DeltaNet rounded QKV projection")?;
+        M::finite(&z, "DeltaNet rounded Z projection")?;
 
         let mut convolved = zeros(self.convolution_channels)?;
         for (channel, output) in convolved.iter_mut().enumerate() {
@@ -351,11 +373,14 @@ impl GatedDeltaNet {
             value += self.weights.convolution_weight
                 [weight_start + self.dimensions.convolution_width - 1]
                 * projected[channel];
-            finite(&[value], "DeltaNet convolution")?;
+            M::finite(&[value], "DeltaNet convolution")?;
             // Convolution is rounded before SiLU and again after SiLU.
-            *output = bfloat(silu(bfloat(value)));
+            *output = value;
         }
-        finite(&convolved, "DeltaNet convolved activation")?;
+        M::bfloat(&mut convolved);
+        M::silu(&mut convolved);
+        M::bfloat(&mut convolved);
+        M::finite(&convolved, "DeltaNet convolved activation")?;
 
         let mut query = zeros(self.query_key_width)?;
         let mut key = zeros(self.query_key_width)?;
@@ -366,7 +391,7 @@ impl GatedDeltaNet {
             let key_head = &convolved[self.query_key_width + start..self.query_key_width + end];
             let query_square_sum = squares128(query_head);
             let key_square_sum = squares128(key_head);
-            finite(
+            M::finite(
                 &[query_square_sum, key_square_sum],
                 "DeltaNet query/key norm",
             )?;
@@ -379,8 +404,8 @@ impl GatedDeltaNet {
                 key[start + channel] = key_head[channel] * key_inverse_length;
             }
         }
-        finite(&query, "DeltaNet query")?;
-        finite(&key, "DeltaNet key")?;
+        M::finite(&query, "DeltaNet query")?;
+        M::finite(&key, "DeltaNet key")?;
 
         let gates_a = dense(
             &self.weights.projection_a,
@@ -397,8 +422,8 @@ impl GatedDeltaNet {
         {
             return Err(dimension_mismatch());
         }
-        finite(&gates_a, "DeltaNet dense gates")?;
-        finite(&gates_b, "DeltaNet dense gates")?;
+        M::finite(&gates_a, "DeltaNet dense gates")?;
+        M::finite(&gates_b, "DeltaNet dense gates")?;
         Ok(GatedDeltaNetRow {
             projected,
             z,
@@ -468,6 +493,19 @@ impl GatedDeltaNet {
         value_head: usize,
         core_step: impl FnOnce(&mut [f32], &[f32], &[f32], &[f32], f32, f32) -> Result<Vec<f32>>,
     ) -> Result<Vec<f32>> {
+        self.recur_head_with_math::<crate::portable_math::ScalarMath>(
+            head_state, row, value_head, core_step,
+        )
+    }
+
+    /// Shared recurrent boundary checks and output gating with elementwise kernels.
+    pub fn recur_head_with_math<M: crate::portable_math::Elementwise>(
+        &self,
+        head_state: &mut [f32],
+        row: &GatedDeltaNetRow,
+        value_head: usize,
+        core_step: impl FnOnce(&mut [f32], &[f32], &[f32], &[f32], f32, f32) -> Result<Vec<f32>>,
+    ) -> Result<Vec<f32>> {
         let head_dim = self.dimensions.head_dim;
         if head_state.len() != head_dim * head_dim
             || value_head >= self.dimensions.value_heads
@@ -495,12 +533,12 @@ impl GatedDeltaNet {
         let decay_weight = exp(self.weights.log_decay_weight[value_head]);
         let biased_gate = gates_a[value_head] + self.weights.time_bias[value_head];
         let log_decay = -decay_weight * softplus(biased_gate);
-        finite(
+        M::finite(
             &[update_gate, decay_weight, biased_gate, log_decay],
             "DeltaNet decay",
         )?;
         let decay = exp(log_decay);
-        finite(&[decay], "DeltaNet decay factor")?;
+        M::finite(&[decay], "DeltaNet decay factor")?;
         let core = core_step(
             head_state,
             &query[key_start..key_start + head_dim],
@@ -513,12 +551,14 @@ impl GatedDeltaNet {
         if core.len() != head_dim {
             return Err(dimension_mismatch());
         }
-        finite(&core, "DeltaNet recurrent output")?;
+        M::finite(&core, "DeltaNet recurrent output")?;
         let square_sum = squares128(&core);
-        finite(&[square_sum], "DeltaNet output norm")?;
+        M::finite(&[square_sum], "DeltaNet output norm")?;
         let normalization_argument = square_sum / head_dim as f32 + self.epsilon;
-        finite(&[normalization_argument], "DeltaNet output norm argument")?;
+        M::finite(&[normalization_argument], "DeltaNet output norm argument")?;
         let output_inverse_rms = rsqrt(normalization_argument);
+        let mut activation: [f32; 128] = std::array::from_fn(|i| z[output_start + i]);
+        M::silu(&mut activation);
         let mut gated = zeros(head_dim)?;
         for (channel, output) in gated.iter_mut().enumerate() {
             // Chapter 03 requires a round after RMS, after gain, and after gating.
@@ -526,10 +566,10 @@ impl GatedDeltaNet {
                 self.weights.normalization_weight[channel]
                     * bfloat(core[channel] * output_inverse_rms),
             );
-            *output = bfloat(normalized * silu(z[output_start + channel]));
+            *output = bfloat(normalized * activation[channel]);
         }
-        finite(head_state, "DeltaNet recurrent state")?;
-        finite(&gated, "DeltaNet gated output")?;
+        M::finite(head_state, "DeltaNet recurrent state")?;
+        M::finite(&gated, "DeltaNet gated output")?;
         Ok(gated)
     }
 

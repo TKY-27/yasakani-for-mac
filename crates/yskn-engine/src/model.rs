@@ -1021,31 +1021,33 @@ fn recurrence(
             .collect();
         let width = taps.len() - rounded.len();
         if crate::cpu_stages::enabled() && qkv.len() == 1 {
-            vec![layer.prepare_with_gates(
-                &taps[..width],
-                &qkv[0],
-                &z[0],
-                &input[0].weighted_hidden_bf16,
-                input[0].inverse_rms,
-                |weights, hidden, rms| {
-                    let start = Instant::now();
-                    let gates = engine.map_range(0..weights.len() / hidden.len(), |head| {
-                        crate::cpu_stages::recurrence::dense_gate(
-                            &weights[head * hidden.len()..(head + 1) * hidden.len()],
-                            hidden,
-                            rms,
-                        )
-                    });
-                    gate_nanos.fetch_add(
-                        start.elapsed().as_nanos() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    gates
-                },
-            )?]
+            vec![
+                layer.prepare_with_math::<crate::cpu_stages::math::FastMath>(
+                    &taps[..width],
+                    &qkv[0],
+                    &z[0],
+                    &input[0].weighted_hidden_bf16,
+                    input[0].inverse_rms,
+                    |weights, hidden, rms| {
+                        let start = Instant::now();
+                        let gates = engine.map_range(0..weights.len() / hidden.len(), |head| {
+                            crate::cpu_stages::recurrence::dense_gate(
+                                &weights[head * hidden.len()..(head + 1) * hidden.len()],
+                                hidden,
+                                rms,
+                            )
+                        });
+                        gate_nanos.fetch_add(
+                            start.elapsed().as_nanos() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        gates
+                    },
+                )?,
+            ]
         } else {
             engine.map_range(0..qkv.len(), |i| {
-                layer.prepare_with_gates(
+                layer.prepare_with_math::<crate::cpu_stages::math::FastMath>(
                     &taps[i..i + width],
                     &qkv[i],
                     &z[i],
