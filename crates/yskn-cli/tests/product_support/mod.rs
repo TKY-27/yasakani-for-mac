@@ -1,4 +1,6 @@
 //! Generated model artifacts and a separate scalar oracle; never published weights.
+pub mod allocation;
+
 #[allow(dead_code)]
 #[path = "../../../yskn-ref/tests/support/mod.rs"]
 pub mod model;
@@ -124,9 +126,14 @@ impl Folder {
         }
     }
     pub fn engine(&self, draft: DraftMode) -> RealEngine {
+        self.engine_with_context(draft, CONTEXT)
+    }
+    pub fn engine_with_context(&self, draft: DraftMode, context: usize) -> RealEngine {
+        let mut config = self.config(draft);
+        config.context = context;
         let mut options = model::draft::options();
         options.capture_layers = vec![0];
-        RealEngine::load_with_draft_options(self.config(draft), options).unwrap()
+        RealEngine::load_with_draft_options(config, options).unwrap()
     }
 }
 impl Drop for Folder {

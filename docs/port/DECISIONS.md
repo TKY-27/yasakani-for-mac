@@ -1594,6 +1594,239 @@ Neither synthetic tests nor these accounting definitions establish released
 model throughput. The real-model selfcheck/bench/chat/server commands remain
 for the orchestrator; this brief never opens the in-use model.
 
+## D20 — Exact CPU stages around compressed projections (brief 07a)
+
+All new fast paths live in `yskn-engine`. `YSKN_CPU_STAGES=auto` (default)
+selects them when runtime NEON detection succeeds; `reference` disables them
+independently of `YSKN_KERNEL` and the projection backend. No new dependency,
+fast-math, fused multiply-add or cache payload growth is introduced. Additive
+reference APIs expose independent work; the original scalar oracle remains
+single-threaded, safe Rust and retains its frozen digests.
+
+### 1. KV row encoding
+
+The engine dispatches `(row, KV head, key/value side)` on the existing pool,
+then prepares query/gate rows and assembles cache entries in row/head order.
+Each side calls the original codec, preserving every trellis tie, checked
+integer operation, scale candidate order and FP16/BF16 boundary. Additive
+`Attention` stage methods preserve normalization and rotary arithmetic.
+The original `prepare_row` remains the oracle. If parallel preparation fails,
+the engine replays rows in scalar order before any cache append, returning the
+first scalar stage error. Successful preparation retains independent side tasks
+without replay. Query preparation shares its scalar body; the scalar path keeps
+its final query/gate checks after cache encoding. Randomized comparisons cover
+signed zeros, subnormals, BF16 midpoints, extreme values, guards, mixed packed
+and int8 sides, tile crossings and non-finite errors; cache digests and every
+output bit match. Existing model tests pass in all three modes.
+
+Synthetic CPU dotprod/10-worker measurement, 2026-11-14 05:18 UTC, two serial
+runs of nine samples after warmup (shared machine). Minimum / median seconds
+for `kv_encode`, before (`reference`) then after (`auto`):
+
+| Run | Before | After |
+|---|---:|---:|
+| 1 | .000231 / .000245 | .000062 / .000066 |
+| 2 | .000183 / .000197 | .000065 / .000068 |
+
+Commands (offline; `DIR` is a fresh temporary folder, deleted after all runs):
+
+```sh
+export CARGO_NET_OFFLINE=true
+cargo run --release -p yskn-engine --example synthetic_kv_model -- "$DIR/kv"
+# Twice, serially, for MODE=reference then auto:
+YSKN_CPU_STAGES=$MODE cargo run --release -p yskn-engine --example bench_model -- \
+  "$DIR/kv" --backend cpu --kv kv5 --rows-per-pass 1 --passes 9 --context 32
+```
+
+This small fixture has one attention layer/two KV heads and fewer scale
+candidates than the published profile. It cannot establish the real-model
+8 ms target. Integer trellis internals remain scalar: head/side concurrency
+is bounded by eight tasks per real-model layer at width one.
+
+### 2. Recurrence and transaction copies
+
+Four NEON lanes follow four independent value channels. Each lane decays the
+same matrix entries, forms the same four 32-term prediction folds, subtracts
+and scales the correction, then forms the same four 32-term readout folds.
+All products and additions are separate intrinsics. Scalar validation,
+portable nonlinear functions, output normalization and BF16 gates remain in
+the reference's additive `recur_head_with` hook; `recur_head` stays unchanged.
+
+On the first pass of a transaction, workers read committed matrix entries
+and write the decayed values directly into working storage. Only convolution
+history is copied at transaction start. Later prefill passes update working
+storage in place. Partial commit restarts from committed heads the same way;
+full commit swaps buffers. Failed computation/replay never modifies committed
+state; retries overwrite every matrix entry before reading it. No per-row
+state snapshots or extra persistent allocation are introduced. The disabled
+path retains the original full copy. Pass timing now includes transaction
+initialization in `recurrence` and `total` on the first pass (previously that
+copy was outside the reported pass). Fixed-context benchmark samples include
+that cost and print every stage with nanosecond precision.
+
+Random state/projection tests compare every output and matrix bit for both
+in-place and out-of-place updates, including zeros, negative zeros,
+subnormals, BF16 ties and non-finite rejection. Model and transactional tests
+pass, including multi-pass failure, partial/zero/full commits, failed partial
+replay followed by full retry, snapshots, captures and all cache modes.
+
+Synthetic eight-layer model, six GDN layers with only four value heads,
+CPU dotprod/10 workers, 2026-11-14 05:22 UTC. Two serial nine-sample runs,
+minimum / median `recurrence` seconds (including initialization):
+
+| Run | Before (`reference`) | After (`auto`) |
+|---|---:|---:|
+| 1 | .000892 / .000965 | .000734 / .000887 |
+| 2 | .000791 / .000963 | .000785 / .000880 |
+
+```sh
+cargo run --release -p yskn-engine --example synthetic_model -- "$DIR/large.yskn" 8
+# Twice, serially, MODE=reference then auto:
+YSKN_CPU_STAGES=$MODE cargo run --release -p yskn-engine --example bench_model -- \
+  "$DIR/large.yskn" --backend cpu --rows-per-pass 1 --passes 9 --context 3
+```
+
+The small synthetic recurrent matrix understates real copy traffic; scalar
+convolution, dense gates, normalization and pool dispatch now dominate it.
+The real-model 12 ms goal is unverified; scaling this fixture by layer/head
+counts is not a measurement of that goal.
+
+### 3. Attention
+
+The engine transposes four visible keys into transient channel-major scratch.
+NEON lanes follow different keys through all 256 separately rounded products
+and ascending additions. Value rows are widened one at a time and accumulated
+across four independent channels, visiting visible keys in their original
+order. Masked keys/values are never fetched; their denominator probabilities
+stay +0. Self keeps its separate four-part score, FP32 weight and original
+rescale expression. Prefix BF16 weights, portable exp/exp2, online maxima,
+31/42 splits, padding, value means and split combination all retain the
+reference orders. Final inverse rotation/gating and validation use an additive
+reference hook. There is no persistent transpose or increase in D13 bytes/token.
+
+Tests compare every output bit with the original `output_head`, including
+positions 0/1, 30/31/32/33, 61/62/63/64, 2000, 4094/4095/4096/4106, all three
+cache modes, grouped query heads, packed keys/int8 values and the reverse,
+guards, means/bases, signed zeros, subnormals and BF16 ties. A direct score
+test includes -128 and +127 base operands. Appended self/future entries remain
+invisible to prefix consumers. The existing frozen model digests also pass.
+
+CPU dotprod/10 workers, synthetic one-layer/two-head KV fixture, minimum /
+median attention seconds per 16-row pass, nine fixed-prefix samples:
+
+| UTC 2026-11-14 | Prefix | Before (`reference`) | After (`auto`) |
+|---|---:|---:|---:|
+| 05:26, run 1 | 2000 | .005391 / .006684 | .002174 / .002308 |
+| 05:26, run 2 | 2000 | .006610 / .006678 | .002232 / .002316 |
+| 05:27–05:29 | 32768 | .064403 / .074930 | .038130 / .042168 |
+
+```sh
+# Increase only the generated synthetic folder's yasakani.json max_ctx to 32784
+# before the long-context command. No trained files are opened.
+# Repeat the 2000-prefix comparison twice; run 32768 once per mode (9 samples).
+YSKN_CPU_STAGES=$MODE cargo run --release -p yskn-engine --example bench_model -- \
+  "$DIR/kv" --backend cpu --kv kv5 --rows-per-pass 16 --passes 9 --context 2000
+# Same command with --context 32768.
+```
+
+At 32768 tokens the synthetic attention cost per row is 2.383 / 2.636 ms
+(minimum / median, amortized over 16 rows), versus 4.025 / 4.683 ms disabled.
+A **dimension-only extrapolation**, multiplying by 16 layers * (24/2) query
+heads, is about 0.46 / 0.51 s per real-model row; this is not a real-model
+measurement. Similarly 2000-context extrapolation is about 0.44 s per 16-row
+pass, so the requested real-model 0.1 s target is not established.
+
+The enforced 256-term dependent score chains constrain arithmetic throughput;
+SIMD across more simultaneous key groups could hide their latency further.
+For real Kv5 at 32768, the bases/scales alone require at least 2.06 GB of
+cache reads per row, up to 12.38 GB without reuse between six queries sharing
+a KV head (excluding scratch/metadata). The 2.94 GB persistent cache exceeds
+on-chip cache. Thus long-context bandwidth is also material; these wall times
+without hardware counters cannot prove which dominates on the real model.
+No claimed bandwidth or arithmetic ceiling replaces real-device profiling.
+
+### 4. Normalization, quantization, restoration and elementwise steps
+
+The first two Hadamard distances operate within four-channel registers, then
+four independent butterflies execute together at each ascending distance
+4..256. Input signs, normalization, FP16 rounding, group maximum, nearest-even
+int8/24-bit scale conversion and output scale ordering remain scalar reference
+operations around additive transform hooks. Normalization uses NEON for each
+independent `hidden * (1 + gain)`; its four strided terms, XOR groups and block
+fold keep chapter 05's exact order. Residuals vectorize projection BF16, add,
+and BF16; gated products keep portable scalar SiLU and vectorize the rounded
+product. Vector BF16 uses the same integer ties-to-even rule, signed-zero bits
+and NaN quieting as `f32_to_bf16`. There is no FMA, reciprocal approximation,
+FP16-hardware rounding substitution or reduction reassociation.
+
+Tests compare Hadamard bits, all prepared int8/scales/row-quantum fields,
+normalization statistics/dense copies, restored projections (i64 extrema,
+rotated/unrotated, deferred RMS and padded truncation), residuals and gating.
+They include all-negative-zero and subnormal rows, random BF16 midpoints,
+non-vector tails, bad shapes/signs, overflow and non-finite errors. Every
+existing engine/reference model comparison passes with the optimized paths.
+
+Eight-layer synthetic CPU model, dotprod/10 workers, width one, prefix three,
+minimum / median `rest` seconds. Large variation reflects other jobs on this
+shared host; the anomalously slow first pair is retained, not discarded.
+
+| UTC 2026-11-14 | Samples | Before (`reference`) | After (`auto`) |
+|---|---:|---:|---:|
+| 05:32, run 1 | 9 | .009531 / .022426 | .006872 / .008857 |
+| 05:32, run 2 | 9 | .004438 / .006154 | .005850 / .006351 |
+| 05:33, run 3 | 15 | .004207 / .004354 | .003769 / .004140 |
+| 05:33, run 4 | 15 | .005256 / .006313 | .003772 / .005747 |
+
+```sh
+# Same generated large.yskn and fixed-context command as stage 2; two repetitions.
+YSKN_CPU_STAGES=$MODE cargo run --release -p yskn-engine --example bench_model -- \
+  "$DIR/large.yskn" --backend cpu --rows-per-pass 1 --passes 9 --context 3
+# Two additional comparisons in reversed (auto, reference) order, --passes 15.
+```
+
+The best observed rest minima improve from 4.207 to 3.769 ms, but medians are
+noisy and the gain is modest. Software FP16 conversion, portable nonlinear
+math, scalar reductions, allocations and dispatch remain. The real-model
+10 ms target has not been measured or claimed.
+
+### Real-model validation and remaining gains
+
+Run these **serially**, without another model/build/test job.
+`MODEL_FOLDER` below denotes the released model;
+CPU-stage choice is independent of Metal projection selection.
+
+```sh
+export CARGO_NET_OFFLINE=true
+# Both arithmetic paths, every KV mode, full vocabulary bits/configurations:
+for stages in reference auto; do
+  for kv in int8 int8-profile kv5; do
+    YSKN_CPU_STAGES=$stages cargo run --release -p yskn-engine --example verify_model -- \
+      "$MODEL_FOLDER" tools/quality/windows_own_thinking.json --kv "$kv"
+    for accept in 0 2 3; do
+      YSKN_CPU_STAGES=$stages cargo run --release -p yskn-engine --example verify_speculation -- \
+        "$MODEL_FOLDER" --tokens 1,2,3 --accept "$accept" --backend metal --kv "$kv"
+    done
+  done
+  # Repeat the following timing block at least twice on a quiet machine.
+  YSKN_CPU_STAGES=$stages cargo run --release -p yskn-engine --example bench_model -- \
+    "$MODEL_FOLDER" --backend metal --kv kv5 --rows-per-pass 1 --passes 9 --context 3
+  YSKN_CPU_STAGES=$stages cargo run --release -p yskn-engine --example bench_model -- \
+    "$MODEL_FOLDER" --backend metal --kv kv5 --rows-per-pass 16 --passes 9 --context 2000
+  # 32768 total context: leave room for the measured 16 rows.
+  YSKN_CPU_STAGES=$stages cargo run --release -p yskn-engine --example bench_model -- \
+    "$MODEL_FOLDER" --backend metal --kv kv5 --rows-per-pass 16 --passes 9 --context 32752
+done
+```
+
+Expected-gain order after measuring the real model: (1) interleave more
+independent attention score chains and share transient tile widening across
+queries without changing D3 or D13; (2) precompute/VIT2-vectorize integer
+emissions while preserving checked-overflow and exact tie rules; (3) parallelize
+or vectorize independent dense GDN gates/convolution channels, now that full
+matrix copies are gone; (4) profile software half conversion and residual/MLP
+allocation/dispatch. No SIMD-within-score reduction or additional persistent
+cache bytes are proposed as an unapproved shortcut.
+
 ## D21 — Fast draft in the product and an adaptive draft depth
 
 Decision (2026-11-14, brief 06k). The product runs the fast neural draft

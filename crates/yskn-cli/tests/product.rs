@@ -1,5 +1,8 @@
 mod product_support;
 
+#[global_allocator]
+static ALLOCATOR: product_support::allocation::Counting = product_support::allocation::Counting;
+
 use product_support::{Folder, greedy, sampled, scalar};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -93,34 +96,74 @@ fn committed_prefix_snapshot_and_reset_reuse_preserve_scalar_tokens_and_cache_co
 }
 
 #[test]
-fn fifty_requests_keep_one_bounded_session_and_snapshot_for_every_draft_mode() {
+fn repeated_snapshot_replacement_retains_bounded_live_allocations_for_every_draft_mode() {
+    const CHILD: &str = "YSKN_SNAPSHOT_ALLOCATION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Isolate process-wide allocation levels from parallel tests and their
+        // worker threads. The allocator is installed in this test binary only.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "repeated_snapshot_replacement_retains_bounded_live_allocations_for_every_draft_mode",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let folder = Folder::new();
-    let prompt = [1, 2, 3, 4];
-    let expected = scalar(&folder, &prompt, 2, &greedy());
+    // Two unrelated prefixes, each with 27 growing branches. Every shared
+    // request restores the previous prefix and then replaces its checkpoint;
+    // a leak cleared only by reset must also be caught before the next reset.
+    let prompts: Vec<Vec<u32>> = [1, 5]
+        .into_iter()
+        .flat_map(|prefix| {
+            (4..31).map(move |len| {
+                let mut prompt = vec![prefix; len];
+                prompt[len - 1] = prefix + 1 + (len % 2) as u32;
+                prompt
+            })
+        })
+        .collect();
+    let expected: Vec<_> = prompts
+        .iter()
+        .map(|p| scalar(&folder, p, 2, &greedy()))
+        .collect();
     for mode in modes() {
         let mut engine = folder.engine(mode);
+        // Warm scratch/KV/draft capacities beyond the largest measured prompt
+        // while retaining just one checkpoint, rather than warming a leak into
+        // the baseline by repeatedly replacing checkpoints first.
         for _ in 0..3 {
-            run(&mut engine, &prompt, 2, &greedy());
+            drop(run(&mut engine, &[9; 96], 2, &greedy()));
         }
-        let session = engine.session_memory();
-        let snapshot = engine.snapshot_bytes();
-        assert!(snapshot > 0);
-        for request in 0..50 {
-            let result = run(&mut engine, &prompt, 2, &greedy());
-            assert_eq!(result.ids, expected, "{mode:?}, request {request}");
-            assert_eq!(
-                (result.cached_tokens, result.snap_mode),
-                (prompt.len() - 1, 2)
-            );
-            assert_eq!(
-                engine.session_memory(),
-                session,
-                "{mode:?}, request {request}"
-            );
-            assert_eq!(
-                engine.snapshot_bytes(),
-                snapshot,
-                "{mode:?}, request {request}"
+        let warmed = product_support::allocation::live_bytes();
+        for (index, prompt) in prompts.iter().enumerate() {
+            let result = run(&mut engine, prompt, 2, &greedy());
+            assert_eq!(result.ids, expected[index], "{mode:?}, prompt {index}");
+            if index % 27 == 0 {
+                assert_eq!((result.cached_tokens, result.snap_mode), (0, 0));
+            } else {
+                assert_eq!(
+                    (result.cached_tokens, result.snap_mode),
+                    (prompts[index - 1].len() - 1, 2)
+                );
+            }
+            drop(result);
+            let live = product_support::allocation::live_bytes();
+            // Small allocator/runtime bookkeeping is tolerated; even one
+            // retained recurrent checkpoint exceeds this allowance.
+            assert!(
+                live <= warmed + 16 * 1024,
+                "{mode:?}, prompt {index}: live {live}, warmed {warmed}"
             );
         }
     }
@@ -172,6 +215,194 @@ fn cancellation_and_callback_errors_quiesce_prefill_and_generation_then_allow_ne
             run(&mut engine, &[2, 3], 2, &greedy()).ids,
             scalar(&folder, &[2, 3], 2, &greedy())
         );
+    }
+}
+
+#[test]
+fn interrupted_prefill_reuses_shared_prefix_after_cancellation_or_callback_error() {
+    let folder = Folder::new();
+    let prompt = [1; 12];
+    let resumed = [vec![1; 8], vec![2, 3]].concat();
+    let expected = scalar(&folder, &resumed, 4, &greedy());
+    for mode in modes() {
+        for callback_error in [false, true] {
+            let mut engine = folder.engine(mode);
+            let mut polls = 0;
+            let interrupted = engine.generate(&prompt, 4, &greedy(), None, &mut |ids| {
+                assert!(ids.is_empty());
+                polls += 1;
+                if polls < 2 {
+                    Ok(true)
+                } else if callback_error {
+                    Err(yskn::Error::engine("prefill-callback-sentinel"))
+                } else {
+                    Ok(false)
+                }
+            });
+            if callback_error {
+                assert!(
+                    interrupted
+                        .unwrap_err()
+                        .to_string()
+                        .contains("prefill-callback-sentinel")
+                );
+            } else {
+                let result = interrupted.unwrap();
+                assert_eq!(result.finish, Finish::Cancelled);
+                assert!(result.ids.is_empty());
+                assert_eq!(result.passes, 0);
+            }
+            assert_eq!(polls, 2);
+            let result = run(&mut engine, &resumed, 4, &greedy());
+            // Width two committed exactly two rows before the interruption.
+            // Require live reuse, so an unrelated/reset path cannot mask damage.
+            assert_eq!(
+                (result.cached_tokens, result.snap_mode),
+                (2, 1),
+                "{mode:?}, error={callback_error}"
+            );
+            assert_eq!(result.ids, expected, "{mode:?}, error={callback_error}");
+        }
+    }
+}
+
+#[test]
+fn callback_error_during_generation_preserves_shared_prefix_for_next_request() {
+    let folder = Folder::new();
+    let resumed = [1, 2, 3, 4];
+    let expected = scalar(&folder, &resumed, 4, &greedy());
+    for mode in modes() {
+        let mut engine = folder.engine(mode);
+        let error = engine
+            .generate(&[1, 2], 8, &greedy(), None, &mut |ids| {
+                if ids.is_empty() {
+                    Ok(true)
+                } else {
+                    Err(yskn::Error::engine("generation-callback-sentinel"))
+                }
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("generation-callback-sentinel"));
+        let result = run(&mut engine, &resumed, 4, &greedy());
+        assert_eq!((result.cached_tokens, result.snap_mode), (2, 1), "{mode:?}");
+        assert_eq!(result.ids, expected, "{mode:?}");
+    }
+}
+
+#[test]
+fn prefix_and_snapshot_reuse_apply_each_requests_seed_and_sampling_settings() {
+    let folder = Folder::new();
+    let first = [1, 2, 3, 4];
+    let settings = [
+        sampled(),
+        Sampling {
+            temperature: 1.2345,
+            top_p: 0.8724,
+            top_k: 7,
+            min_p: 0.0314,
+            seed: 19,
+        },
+        Sampling {
+            temperature: 0.4174,
+            top_p: 0.7734,
+            top_k: 3,
+            min_p: 0.1424,
+            seed: 1234,
+        },
+    ];
+    for mode in modes() {
+        let mut engine = folder.engine(mode);
+        let initial = run(&mut engine, &first, 4, &settings[0]);
+        assert_eq!(initial.ids, scalar(&folder, &first, 4, &settings[0]));
+        let continued = [first.to_vec(), initial.ids.clone(), vec![5]].concat();
+        let result = run(&mut engine, &continued, 4, &settings[1]);
+        assert_eq!(
+            (result.cached_tokens, result.snap_mode),
+            (first.len() + initial.ids.len() - 1, 1),
+            "{mode:?}"
+        );
+        assert_eq!(
+            result.ids,
+            scalar(&folder, &continued, 4, &settings[1]),
+            "{mode:?}"
+        );
+        let mut branch = continued[..continued.len() - 1].to_vec();
+        branch.push(6);
+        // Alternate settings repeatedly on the same saved prefix, including
+        // returning to the original seed after different sampled requests.
+        for sampling in [&settings[2], &settings[0], &settings[1]] {
+            let result = run(&mut engine, &branch, 4, sampling);
+            assert_eq!(
+                (result.cached_tokens, result.snap_mode),
+                (branch.len() - 1, 2),
+                "{mode:?}, {sampling:?}"
+            );
+            assert_eq!(
+                result.ids,
+                scalar(&folder, &branch, 4, sampling),
+                "{mode:?}, {sampling:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn context_boundary_reserves_margin_clamps_output_and_rejects_prompts_without_room() {
+    let folder = Folder::new();
+    const CONTEXT: usize = 80;
+    // Engine's documented 64-row margin and the unconsumed final prediction
+    // (D19 / spec 08): at most 16 committed rows plus one pending output.
+    const SEQUENCE_LIMIT: usize = CONTEXT - 64 + 1;
+    let prompt = [1, 2, 3, 4, 1, 2, 3, 4];
+    for mode in modes() {
+        let mut engine = folder.engine_with_context(mode, CONTEXT);
+        assert_eq!(engine.context_capacity(), CONTEXT);
+        // Check both the usable sequence boundary and the raw configured
+        // context. Raw-context requests must clamp to preserve the margin.
+        for requested_total in [
+            SEQUENCE_LIMIT - 1,
+            SEQUENCE_LIMIT,
+            SEQUENCE_LIMIT + 1,
+            CONTEXT - 1,
+            CONTEXT,
+            CONTEXT + 1,
+        ] {
+            let requested = requested_total - prompt.len();
+            let count = requested.min(SEQUENCE_LIMIT - prompt.len());
+            let expected = scalar(&folder, &prompt, count, &greedy());
+            let result = run(&mut engine, &prompt, requested, &greedy());
+            assert_eq!(
+                result.ids.len(),
+                count,
+                "{mode:?}, requested total {requested_total}"
+            );
+            assert_eq!(
+                result.ids, expected,
+                "{mode:?}, requested total {requested_total}"
+            );
+            assert_eq!(result.finish, Finish::Length);
+        }
+        let last_valid = vec![1; CONTEXT - 64 - 1];
+        let result = run(&mut engine, &last_valid, 3, &greedy());
+        assert_eq!(
+            result.ids,
+            scalar(&folder, &last_valid, 2, &greedy()),
+            "{mode:?}"
+        );
+        for len in [CONTEXT - 64, CONTEXT - 64 + 1, CONTEXT, CONTEXT + 1] {
+            let mut called = false;
+            let error = engine
+                .generate(&vec![1; len], 1, &greedy(), None, &mut |_| {
+                    called = true;
+                    Ok(true)
+                })
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("prompt leaves no room"),
+                "{mode:?}, len={len}: {error}"
+            );
+            assert!(!called, "oversize prompt reached engine callback");
+        }
     }
 }
 
@@ -591,11 +822,8 @@ mod sockets {
     use hyper_util::rt::TokioIo;
     use std::{
         net::SocketAddr,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
-        time::Duration,
+        sync::{Arc, Mutex, mpsc},
+        time::{Duration, Instant},
     };
     use tokio::{io::AsyncWriteExt, net::TcpStream, sync::oneshot};
     use yskn::{
@@ -614,8 +842,52 @@ mod sockets {
     }
     #[derive(Default)]
     struct Observation {
-        prefill: AtomicUsize,
+        gate: Mutex<Option<PrefillGate>>,
         cancelled: Mutex<Vec<Cancelled>>,
+    }
+    struct PrefillGate {
+        reached: oneshot::Sender<()>,
+        disconnected: mpsc::Receiver<()>,
+    }
+    impl Observation {
+        fn pausing_prefill() -> (Arc<Self>, oneshot::Receiver<()>, mpsc::SyncSender<()>) {
+            let (reached, boundary) = oneshot::channel();
+            let (disconnected, resume) = mpsc::sync_channel(1);
+            let observation = Arc::new(Self {
+                gate: Mutex::new(Some(PrefillGate {
+                    reached,
+                    disconnected: resume,
+                })),
+                ..Default::default()
+            });
+            (observation, boundary, disconnected)
+        }
+    }
+    impl PrefillGate {
+        fn wait_for_disconnect(
+            self,
+            ids: &[u32],
+            cb: &mut dyn FnMut(&[u32]) -> yskn::Result<bool>,
+        ) -> yskn::Result<bool> {
+            self.reached
+                .send(())
+                .expect("test left before prefill boundary");
+            self.disconnected
+                .recv_timeout(PATIENCE)
+                .expect("client was not disconnected");
+            // Closing the client and Hyper dropping its response body happen
+            // on different threads. Poll cancellation at this same boundary
+            // until the real callback observes it; never advance another row.
+            let deadline = Instant::now() + PATIENCE;
+            while cb(ids)? {
+                assert!(
+                    Instant::now() < deadline,
+                    "disconnect did not cancel prefill"
+                );
+                std::thread::yield_now();
+            }
+            Ok(false)
+        }
     }
     struct Observed {
         inner: RealEngine,
@@ -640,7 +912,12 @@ mod sockets {
             let result = self.inner.generate(p, n, s, stop, &mut |ids| {
                 if ids.is_empty() {
                     prefill_callbacks += 1;
-                    self.observation.prefill.fetch_add(1, Ordering::Release);
+                    if prefill_callbacks == 2 {
+                        let gate = self.observation.gate.lock().unwrap().take();
+                        if let Some(gate) = gate {
+                            return gate.wait_for_disconnect(ids, cb);
+                        }
+                    }
                 }
                 cb(ids)
             })?;
@@ -722,6 +999,46 @@ mod sockets {
         (addr, tx, task)
     }
     #[tokio::test]
+    async fn observed_prefill_gate_holds_real_engine_until_disconnect_then_cancels() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (observation, boundary, disconnected) = Observation::pausing_prefill();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let worker_observation = observation.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let folder = Folder::new();
+            let mut engine = Observed {
+                inner: folder.engine(DraftMode::None),
+                observation: worker_observation,
+            };
+            engine
+                .generate(&[1; 12], 2, &greedy(), None, &mut |_| {
+                    Ok(!signal.load(Ordering::Acquire))
+                })
+                .unwrap()
+        });
+        tokio::time::timeout(PATIENCE, boundary)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !worker.is_finished(),
+            "engine crossed the held prefill boundary"
+        );
+        assert!(observation.cancelled.lock().unwrap().is_empty());
+        cancelled.store(true, Ordering::Release);
+        disconnected.send(()).unwrap();
+        let result = tokio::time::timeout(PATIENCE, worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.finish, Finish::Cancelled);
+        assert!(result.ids.is_empty());
+        let calls = observation.cancelled.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].prefill_callbacks, 2);
+    }
+    #[tokio::test]
     async fn real_socket_streaming_and_nonstreaming_use_scalar_tokens_and_exact_usage() {
         let folder = Folder::new();
         let formatter = yskn_text::ChatFormatter::load(&folder.0).unwrap();
@@ -789,21 +1106,18 @@ mod sockets {
     #[tokio::test]
     async fn real_socket_disconnect_during_prefill_cancels_and_releases_engine_for_next_chat() {
         let folder = Folder::new();
-        let observation = Arc::new(Observation::default());
+        let (observation, boundary, disconnected) = Observation::pausing_prefill();
         let (addr, shutdown, task) = start(&folder, observation.clone()).await;
         let long_messages = json!([{"role":"user","content":"1 ".repeat(256)}]);
         let body=json!({"messages":long_messages,"stream":true,"max_tokens":4,"temperature":0,"enable_thinking":false}).to_string();
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(format!("POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
-        let deadline = tokio::time::Instant::now() + PATIENCE;
-        while observation.prefill.load(Ordering::Acquire) < 2 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "prefill did not start"
-            );
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        tokio::time::timeout(PATIENCE, boundary)
+            .await
+            .expect("prefill did not reach the held boundary")
+            .expect("engine left before prefill boundary");
         drop(client);
+        disconnected.send(()).unwrap();
         let messages = json!([{"role":"user","content":"2"}]);
         let (status, text) = request(
             addr,
@@ -823,10 +1137,7 @@ mod sockets {
         // Width-1 prefill calls back once before and once after each of the
         // prompt.len() - 1 rows; cancellation must land strictly inside.
         assert_eq!(cancelled.ids, 0, "cancelled after prefill: {cancelled:?}");
-        assert!(
-            (2..long_prompt.len()).contains(&cancelled.prefill_callbacks),
-            "disconnect was not observed between prefill passes: {cancelled:?}"
-        );
+        assert_eq!(cancelled.prefill_callbacks, 2, "{cancelled:?}");
         // The released engine answers the next chat exactly as a fresh one.
         let prompt = formatter
             .prompt(&messages, None, &json!({"enable_thinking":false}))

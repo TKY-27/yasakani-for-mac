@@ -87,9 +87,27 @@ pub struct Attention {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct CacheToken {
+pub struct CacheToken {
     keys: Vec<CacheRow>,
     values: Vec<CacheRow>,
+}
+
+impl CacheToken {
+    pub fn key(&self, head: usize) -> &CacheRow {
+        &self.keys[head]
+    }
+    pub fn value(&self, head: usize) -> &CacheRow {
+        &self.values[head]
+    }
+}
+
+/// Validated, immutable operands for an engine's independent head implementation.
+pub struct AttentionOperands<'a> {
+    pub query: &'a [f32],
+    pub kv_head: usize,
+    pub prefix: &'a [CacheToken],
+    pub current: &'a CacheToken,
+    pub value_mean: Option<&'a [f32; 256]>,
 }
 
 /// Causal cache rows. Engines may append provisionally and roll back by truncation.
@@ -428,6 +446,25 @@ impl Attention {
         prepared: &PreparedRow,
         query_head: usize,
     ) -> Result<Vec<f32>> {
+        self.output_head_with(state, position, prepared, query_head, |operands| {
+            self.attend_head(
+                operands.query,
+                query_head,
+                operands.prefix,
+                operands.current,
+            )
+        })
+    }
+
+    /// Engine head hook with the scalar validation, inverse rotation and output boundaries.
+    pub fn output_head_with(
+        &self,
+        state: &AttentionState,
+        position: usize,
+        prepared: &PreparedRow,
+        query_head: usize,
+        attend: impl FnOnce(AttentionOperands<'_>) -> Result<Vec<f32>>,
+    ) -> Result<Vec<f32>> {
         if state.dimensions != self.dimensions
             || position > state.rows.len()
             || query_head >= self.dimensions.query_heads
@@ -441,12 +478,19 @@ impl Attention {
         let mut output = Vec::with_capacity(self.dimensions.head_dim);
         {
             let start = query_head * self.dimensions.head_dim;
-            let attended = self.attend_head(
-                &prepared.queries[start..start + self.dimensions.head_dim],
-                query_head,
-                &state.rows[..position],
-                &prepared.cache,
-            )?;
+            let kv_head = query_head / (self.dimensions.query_heads / self.dimensions.kv_heads);
+            let attended = attend(AttentionOperands {
+                query: &prepared.queries[start..start + self.dimensions.head_dim],
+                kv_head,
+                prefix: &state.rows[..position],
+                current: &prepared.cache,
+                value_mean: self.value_mean(kv_head, &prepared.cache.values[kv_head])?,
+            })?;
+            if attended.len() != self.dimensions.head_dim {
+                return Err(Error::InvalidInput(
+                    "invalid attention head output width".into(),
+                ));
+            }
             let unrotated = inverse_rotate_cache(&attended);
             finite(&unrotated, "attention inverse cache rotation")?;
             for (channel, value) in unrotated.into_iter().enumerate() {
@@ -486,27 +530,12 @@ impl Attention {
         projected_key: &[f32],
         projected_value: &[f32],
     ) -> Result<PreparedRow> {
-        self.validate_projected_rows(projected_query_gate, projected_key, projected_value)?;
-        let mut queries = Vec::with_capacity(self.query_width);
-        let mut gates = Vec::with_capacity(self.query_width);
-        for head in 0..self.dimensions.query_heads {
-            let start = 2 * head * self.dimensions.head_dim;
-            // Each head stores its query followed immediately by that head's raw gate.
-            let query: Vec<f32> = projected_query_gate[start..start + self.dimensions.head_dim]
-                .iter()
-                .map(|&value| bfloat(value))
-                .collect();
-            let normalized = self.normalize_head(&query, &self.query_norm)?;
-            let rotated = rotate_cache(&self.rope(&normalized, position)?);
-            // Only queries have a BF16 boundary after the cache rotation.
-            queries.extend(rotated.into_iter().map(bfloat));
-            gates.extend(
-                projected_query_gate
-                    [start + self.dimensions.head_dim..start + 2 * self.dimensions.head_dim]
-                    .iter()
-                    .map(|&value| bfloat(value)),
-            );
-        }
+        let mut prepared = self.prepare_query_heads(
+            position,
+            projected_query_gate,
+            projected_key,
+            projected_value,
+        )?;
         let mut keys = Vec::with_capacity(self.dimensions.kv_heads);
         let mut values = Vec::with_capacity(self.dimensions.kv_heads);
         for head in 0..self.dimensions.kv_heads {
@@ -527,15 +556,121 @@ impl Attention {
             // Values receive neither head normalization nor RoPE.
             values.push(self.encode_row(head, 1, position, &rotate_cache(&value))?);
         }
-        finite(&queries, "attention rounded rotated query")?;
-        finite(&gates, "attention rounded gate")?;
+        finite(&prepared.queries, "attention rounded rotated query")?;
+        finite(&prepared.gates, "attention rounded gate")?;
+        prepared.cache = CacheToken { keys, values };
+        Ok(prepared)
+    }
+
+    /// Independent query/gate preparation for engines that schedule KV sides separately.
+    pub fn prepare_queries(
+        &self,
+        position: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+    ) -> Result<PreparedRow> {
+        let prepared = self.prepare_query_heads(position, q, k, v)?;
+        finite(&prepared.queries, "attention rounded rotated query")?;
+        finite(&prepared.gates, "attention rounded gate")?;
+        Ok(prepared)
+    }
+
+    fn prepare_query_heads(
+        &self,
+        position: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+    ) -> Result<PreparedRow> {
+        self.validate_projected_rows(q, k, v)?;
+        let mut queries = Vec::with_capacity(self.query_width);
+        let mut gates = Vec::with_capacity(self.query_width);
+        for head in 0..self.dimensions.query_heads {
+            let start = 2 * head * self.dimensions.head_dim;
+            // Each head stores its query followed immediately by that head's raw gate.
+            let query: Vec<f32> = q[start..start + self.dimensions.head_dim]
+                .iter()
+                .map(|&value| bfloat(value))
+                .collect();
+            let normalized = self.normalize_head(&query, &self.query_norm)?;
+            let rotated = rotate_cache(&self.rope(&normalized, position)?);
+            // Only queries have a BF16 boundary after the cache rotation.
+            queries.extend(rotated.into_iter().map(bfloat));
+            gates.extend(
+                q[start + self.dimensions.head_dim..start + 2 * self.dimensions.head_dim]
+                    .iter()
+                    .map(|&value| bfloat(value)),
+            );
+        }
         Ok(PreparedRow {
             dimensions: self.dimensions,
             position,
             queries,
             gates,
-            cache: CacheToken { keys, values },
+            cache: CacheToken {
+                keys: Vec::new(),
+                values: Vec::new(),
+            },
         })
+    }
+
+    pub fn kv_heads(&self) -> usize {
+        self.dimensions.kv_heads
+    }
+
+    /// A single independent head/side, preserving the scalar projection boundaries.
+    pub fn prepare_cache_side(
+        &self,
+        position: usize,
+        head: usize,
+        side: usize,
+        projected: &[f32],
+    ) -> Result<CacheRow> {
+        if head >= self.dimensions.kv_heads || side > 1 || projected.len() != self.kv_width {
+            return Err(Error::InvalidInput("invalid attention cache side".into()));
+        }
+        finite(
+            projected,
+            if side == 0 {
+                "attention key projection"
+            } else {
+                "attention value projection"
+            },
+        )?;
+        let start = head * self.dimensions.head_dim;
+        let row: Vec<_> = projected[start..start + self.dimensions.head_dim]
+            .iter()
+            .copied()
+            .map(bfloat)
+            .collect();
+        let rotated = if side == 0 {
+            rotate_cache(&self.rope(&self.normalize_head(&row, &self.key_norm)?, position)?)
+        } else {
+            rotate_cache(&row)
+        };
+        self.encode_row(head, side, position, &rotated)
+    }
+
+    /// Finish an engine-prepared row; sides are interleaved key/value in head order.
+    pub fn finish_prepared(
+        &self,
+        mut queries: PreparedRow,
+        sides: Vec<CacheRow>,
+    ) -> Result<PreparedRow> {
+        if queries.dimensions != self.dimensions || sides.len() != self.dimensions.kv_heads * 2 {
+            return Err(Error::InvalidInput(
+                "invalid attention prepared sides".into(),
+            ));
+        }
+        for (i, side) in sides.into_iter().enumerate() {
+            if i % 2 == 0 {
+                queries.cache.keys.push(side);
+            } else {
+                queries.cache.values.push(side);
+            }
+        }
+        Ok(queries)
     }
 
     fn normalize_head(&self, values: &[f32], weight: &[f32]) -> Result<Vec<f32>> {
