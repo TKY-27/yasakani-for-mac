@@ -123,12 +123,7 @@ pub struct ChatRunner {
     pub formatter: ChatFormatter,
     pub bridge: Vec<u32>,
     seed: i64,
-    // Longest vocabulary entry in UTF-8 bytes: no token stands for more text.
-    max_token_bytes: usize,
 }
-/// Normalization may shrink the rendered prompt before tokenization (NFC: at
-/// most 3x, Hangul jamo); the cheap context check allows up to this factor.
-const NORMALIZER_SHRINK: usize = 4;
 fn too_long(message: String) -> Error {
     let mut e = Error::request(message);
     e.code = Some("context_length_exceeded");
@@ -142,19 +137,11 @@ impl ChatRunner {
                 "tokenizer: </think> is not a single id in the loop-guard bridge",
             ));
         }
-        let max_token_bytes = formatter
-            .tokenizer()
-            .get_vocab(true)
-            .keys()
-            .map(String::len)
-            .max()
-            .unwrap_or(1);
         Ok(Self {
             engine,
             formatter,
             bridge,
             seed: seed0,
-            max_token_bytes,
         })
     }
     pub fn prepare_checked(&self, p: &ChatParams) -> Result<(Vec<u32>, bool)> {
@@ -167,8 +154,9 @@ impl ChatRunner {
             ))
         };
         let capacity = self.engine.context_capacity();
-        // Mirrors ChatFormatter::prompt, with a cheap size check between
-        // rendering and the far more expensive tokenization.
+        // Mirrors ChatFormatter::prompt. No size check before tokenization: a
+        // normalizer may delete any amount of text, so only the token count is
+        // a sound reason to refuse. The body and text limits bound the work.
         let mut options = p.template_kwargs.clone();
         if let Some(map) = options.as_object_mut() {
             map.insert("add_generation_prompt".into(), Value::Bool(true));
@@ -177,15 +165,6 @@ impl ChatRunner {
             .formatter
             .render(&p.messages, p.tools.as_ref(), &options)
             .map_err(rejected)?;
-        let most = capacity
-            .saturating_mul(self.max_token_bytes)
-            .saturating_mul(NORMALIZER_SHRINK);
-        if text.len() > most {
-            return Err(too_long(format!(
-                "the input is too long: {} bytes of prompt text cannot fit the model's maximum context length of {capacity} tokens (input, thinking and answer together)",
-                text.len()
-            )));
-        }
         let ids = self.formatter.encode(&text).map_err(rejected)?;
         if ids.len() >= capacity.saturating_sub(CONTEXT_MARGIN) {
             return Err(too_long(format!(

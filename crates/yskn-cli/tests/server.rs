@@ -1127,10 +1127,10 @@ async fn request_shape_limits_refuse_expanding_bodies() {
     assert_eq!(h.control.observation().calls, 2);
     h.stop().await;
 }
-// A prompt far beyond what the context could hold is refused between template
-// rendering and tokenization; the exact token check stays for the rest.
+// A prompt far beyond what the context could hold is refused by the exact
+// token check, before any stream starts and without reaching the engine.
 #[tokio::test]
-async fn far_too_long_input_is_refused_before_tokenization() {
+async fn far_too_long_input_is_refused_before_the_engine() {
     let h = Harness::start(Config::default()).await;
     let r = h
         .chat(json!({"messages":[{"role":"user","content":"a".repeat(2 << 20)}],"stream":true}))
@@ -1138,10 +1138,7 @@ async fn far_too_long_input_is_refused_before_tokenization() {
     assert_eq!(r.status, 400, "{}", r.text);
     assert_eq!(r.json()["error"]["code"], "context_length_exceeded");
     let message = error_message(&r);
-    assert!(
-        message.contains("bytes of prompt text cannot fit"),
-        "{message}"
-    );
+    assert!(message.contains("tokens exceeds"), "{message}");
     assert!(
         message.contains("maximum context length of 20000 tokens"),
         "{message}"

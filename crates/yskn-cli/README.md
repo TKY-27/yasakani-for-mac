@@ -143,13 +143,12 @@ context room), and it stops when the client disconnects or stops reading a
 stream (`stream_timeout`). A client that disconnects while its request waits
 in the queue is skipped by the engine thread.
 
-A prompt is also refused with `context_length_exceeded` between template
-rendering and tokenization when its rendered bytes exceed context capacity x
-the longest vocabulary entry in bytes x 4 (normalization such as NFC shrinks
-text at most 3x): no tokenization could then fit it. The exact token check
-after tokenization stays. With a real vocabulary whose longest entry is long,
-this early check triggers only well beyond the body limit at the full context,
-so it mainly helps small `--max-ctx` values; the body limit bounds the rest.
+A prompt is refused with `context_length_exceeded` only by the exact token
+check after tokenization, as upstream. There is no cheaper check on the
+rendered text before it: a tokenizer's normalizer may delete any amount of
+text (`StripAccents` turns 10,000 combining marks and "hi" into a 23-token
+prompt), so no byte count proves a prompt cannot fit. The cost of preparing a
+prompt is bounded by the body and text limits instead (see below).
 
 **What a request holds.** While a body is decoded its text exists at most
 twice at once: the raw body and the parsed JSON while parsing (the raw body is

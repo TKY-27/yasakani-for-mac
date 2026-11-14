@@ -855,3 +855,32 @@ fn error_messages_quote_a_short_excerpt_of_request_values() {
     }
     assert!(message(json!({"response_format":{"type":long}})).contains("…"));
 }
+// Review finding: an early context check assumed normalization shrinks text at
+// most four times, so a tokenizer whose normalizer deletes characters had a
+// prompt refused that fits. Only the exact check after tokenization remains.
+#[test]
+fn a_prompt_that_normalizes_to_fit_is_not_refused() {
+    let mut tok: Value = serde_json::from_str(include_str!("../data/stub-tokenizer.json")).unwrap();
+    tok["normalizer"] =
+        json!({"type":"Sequence","normalizers":[{"type":"NFD"},{"type":"StripAccents"}]});
+    let fmt = yskn_text::ChatFormatter::from_json(
+        &tok.to_string(),
+        "{}",
+        include_str!("../data/stub-template.jinja"),
+    )
+    .unwrap();
+    let engine = StubEngine::new(128).using_formatter(fmt.clone());
+    let r = ChatRunner::new(Box::new(engine), fmt, 1).unwrap();
+    let text = "\u{301}".repeat(10_000) + "hi";
+    let (ids, _) = r
+        .prepare_checked(&ChatParams::new(json!([{"role":"user","content":text}])))
+        .unwrap();
+    assert_eq!(ids.len(), 23);
+    // The exact check still refuses what does not fit.
+    let e = r
+        .prepare_checked(&ChatParams::new(
+            json!([{"role":"user","content":"a".repeat(64)}]),
+        ))
+        .unwrap_err();
+    assert_eq!(e.code, Some("context_length_exceeded"));
+}
