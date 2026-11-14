@@ -35,7 +35,7 @@ impl Fixture {
             path.join("weights.yskn"),
             support::synthetic_model_with_dimensions(
                 73,
-                &["linear_attention", "full_attention"],
+                &["linear_attention", "full_attention", "full_attention"],
                 512,
                 512,
                 32,
@@ -49,7 +49,7 @@ impl Fixture {
         .unwrap();
         fs::write(
             path.join("kvq_u5.bin"),
-            support::kv_profile::compact_mixed_profile(),
+            support::kv_profile::mixed_profile(),
         )
         .unwrap();
         Self(path)

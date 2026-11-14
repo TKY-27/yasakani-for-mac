@@ -59,7 +59,7 @@ fn draft_from(bytes: Vec<u8>, head: Vec<u8>) -> Draft {
 fn main_bytes() -> Vec<u8> {
     support::synthetic_model_with_dimensions(
         73,
-        &["linear_attention", "full_attention"],
+        &["linear_attention", "full_attention", "full_attention"],
         512,
         512,
         32,

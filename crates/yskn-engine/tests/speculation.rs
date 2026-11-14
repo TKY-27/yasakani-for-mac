@@ -85,23 +85,14 @@ fn random(state: &mut u64) -> usize {
     *state as usize
 }
 fn mixed() -> Fixture {
-    let fixture = Fixture::new(&support::synthetic_model(
+    Fixture::new(&support::synthetic_model(
         163,
-        &["linear_attention", "full_attention"],
-    ));
-    fs::write(
-        fixture.0.join("kvq_u5.bin"),
-        support::kv_profile::compact_mixed_profile(),
-    )
-    .unwrap();
-    fixture
+        &["linear_attention", "full_attention", "full_attention"],
+    ))
 }
 
 fn check_partial_commits(mode: KvMode) {
-    let fixture = Fixture::new(&support::synthetic_model(
-        163,
-        &["linear_attention", "full_attention", "full_attention"],
-    ));
+    let fixture = mixed();
     for backend in backends() {
         let mut engine = fixture.engine(backend, mode);
         let mut reference = fixture.reference(mode);
