@@ -89,7 +89,9 @@ impl Default for Limits {
             max_content_parts: 1024,
             max_tool_calls: 1024,
             max_tools: 1024,
-            max_text_bytes: MAX_BODY,
+            // Tokenizing costs time and memory in proportion to the text, and a full
+            // 262,144-token context of ordinary text is under 1 MiB.
+            max_text_bytes: 2 * 1024 * 1024,
             max_stop_bytes: 1024,
             queue_timeout: Duration::from_secs(600),
             max_connections: 64,

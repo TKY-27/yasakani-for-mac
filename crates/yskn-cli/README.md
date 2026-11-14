@@ -126,7 +126,7 @@ SHA-256 and reduces all 32 digest bytes without prefix-dependent branches.
 | Content parts per message (`max_content_parts`) | 1,024 | Clients send a handful of text parts per message |
 | Tool calls per assistant message (`max_tool_calls`) | 1,024 | Each call renders as at least about 10 tokens of tags; parallel calls come in single digits |
 | Tools (`max_tools`) | 1,024 | OpenAI documents at most 128 functions; 8 times that |
-| Text bytes of the cleaned messages and tools, keys included (`max_text_bytes`) | 8 MiB | Equal to the body limit, since unescaping only shrinks text; it bounds what Python-style `str()` of non-string text parts and parsed tool arguments can add |
+| Text bytes of the cleaned messages and tools, keys included (`max_text_bytes`) | 2 MiB | Bounds the one step that cannot be interrupted or charged to the budget, tokenizing the prompt on the engine thread (measured at about 230 bytes of memory per byte-level token). A full 262,144-token context of ordinary text is under 1 MiB, so a request beyond 2 MiB could not fit anyway; it also bounds what Python-style `str()` of non-string text parts and parsed tool arguments can add |
 | Wait for the engine, from queueing until generation starts (`queue_timeout`) | 600 s | The OpenAI Python SDK's default request timeout is 600 s, so a client would give up by then anyway. Exceeded: 503 with `Retry-After: 5`, and the request never reaches the engine |
 | Concurrent connections (`max_connections`, 1..1024) | 64; excess connections are closed unserved | One engine serves one request at a time |
 | Queued engine jobs | 64 (bounded by active HTTP connections) | One per connection |

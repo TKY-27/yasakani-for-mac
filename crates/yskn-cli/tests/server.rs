@@ -1133,7 +1133,7 @@ async fn request_shape_limits_refuse_expanding_bodies() {
 async fn far_too_long_input_is_refused_before_the_engine() {
     let h = Harness::start(Config::default()).await;
     let r = h
-        .chat(json!({"messages":[{"role":"user","content":"a".repeat(2 << 20)}],"stream":true}))
+        .chat(json!({"messages":[{"role":"user","content":"a".repeat(1 << 20)}],"stream":true}))
         .await;
     assert_eq!(r.status, 400, "{}", r.text);
     assert_eq!(r.json()["error"]["code"], "context_length_exceeded");
