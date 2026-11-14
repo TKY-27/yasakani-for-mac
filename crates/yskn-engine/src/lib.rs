@@ -2,6 +2,7 @@
 //! Metal compressed-linear kernel (macOS only) and layer-major main-model inference.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod cpu_stages;
 mod draft;
 mod draft_math;
 mod kernel;
