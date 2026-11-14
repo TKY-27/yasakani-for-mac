@@ -566,13 +566,6 @@ impl MetalEngine {
         share_table_applies(&self.name, cpu_threads)
     }
 
-    pub fn options(&self) -> MetalOptions {
-        MetalOptions {
-            float_mac: self.float_mac,
-            cpu_share: self.cpu_share,
-        }
-    }
-
     /// Arithmetic and CPU share for calls made afterwards; neither changes a bit.
     pub fn set_options(&mut self, options: MetalOptions) {
         self.float_mac = options.float_mac;

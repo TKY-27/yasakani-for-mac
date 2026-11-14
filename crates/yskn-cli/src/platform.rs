@@ -33,7 +33,8 @@ pub fn check_platform(arch: &str, os: &str, macos: Option<&str>) -> Result<()> {
                 "yskn requires macOS {MIN_MACOS} or later and cannot read the version {version:?}"
             ))
         })?;
-    // macOS 26 reports 16.x to programs built with an older SDK; there is no macOS 16.
+    // macOS 26 can report 16.x to programs built with an older SDK (as macOS 11
+    // reported 10.16); no macOS 16 exists, so 16 is read as 26.
     let major = if major == 16 { 26 } else { major };
     if major < MIN_MACOS {
         return Err(Error::engine(format!(

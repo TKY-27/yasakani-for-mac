@@ -1027,7 +1027,7 @@ fn platform_check_requires_apple_silicon_and_macos_26_and_names_the_value_found(
     for version in ["26.0", "26.4.1", "27.2.1", "30.1"] {
         check_platform("aarch64", "macos", Some(version)).unwrap();
     }
-    // macOS 26 reports 16.x to programs built with an older SDK.
+    // macOS 26 can report 16.x to programs built with an older SDK.
     check_platform("aarch64", "macos", Some("16.0")).unwrap();
     for (arch, os, version, expected) in [
         (
