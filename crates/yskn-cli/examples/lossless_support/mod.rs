@@ -5,7 +5,7 @@ use std::{cell::RefCell, collections::HashSet, path::Path, rc::Rc, time::Instant
 use yskn::{
     Error, Result,
     chat::{ChatParams, ChatRunner},
-    engine::{Engine, Generation, Sampling},
+    engine::{Engine, Finish, Generation, Sampling},
     real_engine::{DepthMode, DraftMode, RealEngineConfig},
     request::{RequestDefaults, parse_chat_request},
 };
@@ -140,6 +140,7 @@ struct Capture {
     snapshots: Vec<u8>,
     sampling: Vec<Value>,
     saw_tokens: bool,
+    cancelled: bool,
 }
 struct Recorder {
     inner: Box<dyn Engine>,
@@ -172,6 +173,7 @@ impl Engine for Recorder {
         let s = sampling.normalized();
         let fixed = |v: f64| (v * 1000.0).round_ties_even() / 1000.0;
         c.sampling.push(json!({"temperature":fixed(s.temperature),"top_p":fixed(s.top_p),"top_k":s.top_k,"min_p":fixed(s.min_p),"seed":s.seed as u32}));
+        c.cancelled |= g.finish == Finish::Cancelled;
         c.ids.extend_from_slice(&g.ids);
         c.stages.push(g.ids.len());
         c.passes += g.passes;
@@ -261,6 +263,11 @@ fn observe_controlled(
             "generation not exercised: no generation stage or empty token ids",
         ));
     }
+    if cancel && !c.cancelled {
+        return Err(Error::engine(
+            "cancellation not exercised: engine did not report cancelled",
+        ));
+    }
     let mut digest = Sha256::new();
     for id in &c.ids {
         digest.update(id.to_le_bytes());
@@ -272,7 +279,7 @@ fn observe_controlled(
     row["reasoning_tokens"] = json!(usage.reasoning_tokens);
     row["answer_stage_reached"] = json!(c.stages.len() > 1 || usage.reasoning_tokens < c.ids.len());
     row["loop_guard"] = json!(usage.loop_guard);
-    row["cancelled_after_commit"] = json!(cancel && c.saw_tokens);
+    row["cancelled_after_commit"] = json!(cancel && c.cancelled);
     row["effective_sampling_by_stage"] = json!(c.sampling);
     row["token_count"] = json!(c.ids.len());
     row["sha256_ids_le_u32"] = json!(format!("{:x}", digest.finalize()));
@@ -476,6 +483,29 @@ fn reuse_probes(
     Ok(())
 }
 
+fn reuse_exercised(name: &str, rows: &[Value], failures: &mut Vec<Value>) {
+    let modes: HashSet<u64> = rows
+        .iter()
+        .flat_map(|r| {
+            r["snapshot_modes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|m| {
+                    m.as_u64().filter(|&mode| {
+                        mode == 0 || r["cached_tokens"].as_u64().is_some_and(|n| n > 0)
+                    })
+                })
+        })
+        .collect();
+    for mode in 0..=2 {
+        if !modes.contains(&mode) {
+            failures
+                .push(json!({"kind":"reuse mode not exercised","configuration":name,"mode":mode}));
+        }
+    }
+}
+
 fn speculation_exercised(
     name: &str,
     samplers: &[usize],
@@ -628,18 +658,7 @@ pub fn check(
                 &mut rows,
                 &mut failures,
             )?;
-            let modes: HashSet<u64> = rows[config_start..]
-                .iter()
-                .flat_map(|r| r["snapshot_modes"].as_array().into_iter().flatten())
-                .filter_map(Value::as_u64)
-                .collect();
-            for mode in 0..=2 {
-                if !modes.contains(&mode) {
-                    failures.push(
-                        json!({"kind":"reuse mode not exercised","configuration":name,"mode":mode}),
-                    );
-                }
-            }
+            reuse_exercised(name, &rows[config_start..], &mut failures);
             sampling_exercised(name, samplers, &sampled_outputs, &mut failures);
             speculation_exercised(name, samplers, &rows[config_start..], &mut failures);
             drop(runner);
@@ -668,6 +687,24 @@ pub fn load_prompts(path: Option<&Path>) -> Result<Vec<Prompt>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reporting_reset_only_or_zero_cached_tokens_cannot_cover_reuse() {
+        let mut failures = vec![];
+        reuse_exercised(
+            "none",
+            &[json!({"snapshot_modes":[0,1,2],"cached_tokens":0})],
+            &mut failures,
+        );
+        assert_eq!(failures.len(), 2);
+        failures.clear();
+        reuse_exercised(
+            "none",
+            &[json!({"snapshot_modes":[0,1,2],"cached_tokens":32})],
+            &mut failures,
+        );
+        assert!(failures.is_empty());
+    }
 
     #[test]
     fn acceptance_under_greedy_and_probes_cannot_cover_inactive_seeded_runs() {
