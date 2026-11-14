@@ -1671,7 +1671,7 @@ allocation/dispatch. No SIMD-within-score reduction or additional persistent
 cache bytes are proposed as an unapproved shortcut.
 
 
-## D21 — Second round on the compressed-linear kernel (brief 07d)
+## D22 — Kernel round two (brief 07d)
 
 Every change keeps the kernel's result identical, as signed 64-bit integers,
 to the CPU kernel (D10) for every input. Each has a forced-off environment
@@ -1738,7 +1738,7 @@ is reused while the GPU reads it — and interleaves both parts row by row
 into the usual M×N result. The readback no longer zero-fills before
 copying. The split is a pure function of N, M and a constant table: CPU
 rows = share(M)·N rounded down to the 32-row tile, leaving the GPU at least
-one tile; share = 0.08, 0.10, 0.12, 0.14, 0.15 at M = 1, 2, 4, 8, 16,
+one tile; share = 0.08, 0.08, 0.09, 0.12, 0.15 at M = 1, 2, 4, 8, 16,
 linear in between and 0.15 above 16. Nothing is timed inside a pass, so a
 run is repeatable, and both devices return the same exact integers, so the
 split cannot change a bit. `YSKN_METAL_CPU_SHARE=off` restores GPU-only
@@ -1772,7 +1772,10 @@ alone took 735.7 / 1,311 ms at M = 1 / 16 at that time
 (`bench_linear --m 1,16`). Past the optimum the time rises steeply (the GPU
 waits for the CPU), and an external CPU load moves the optimum down, so
 the table sits below the measured optima (0.12 at M = 1, 0.15 at 2 and 4,
-at least 0.18 at 8 and 16). On a quiet machine the optimum should be
+at least 0.18 at 8 and 16). A first table (0.08, 0.10, 0.12, 0.14, 0.15)
+made the whole pass slower at four rows in one engine run at load 8–9
+(kernel 235–296 ms against 208–237 ms GPU-only), so M = 2, 4 and 8 were
+lowered. On a quiet machine the optimum should be
 higher; the orchestrator can repeat the sweep and change `CPU_SHARE` in
 `src/metal.rs`.
 
@@ -1785,3 +1788,87 @@ loads, and both at once on disjoint halves. Measured ceiling (METAL.md,
 115–119 GB/s GPU alone, 107–134 GB/s CPU alone. The kernel at one row reads
 98.7 GB/s in one command buffer (83–85 % of the GPU streaming rate); the
 CPU kernel reads 13.3 GB/s and is decode-bound.
+
+### 4. Submission overhead at one row: measured, nothing kept
+
+Instrumented runs (temporary timers around each phase of
+`weighted_sums_shared` and the command buffer's `GPUStartTime`/`GPUEndTime`
+on the host clock, not committed) gave, per command buffer:
+
+| Phase | Synthetic, 33 buffers per pass | Real model, 257 per pass |
+|---|---:|---:|
+| plan (validation, pipeline and table lookups) | 0.4 µs | 0.6–1.7 µs |
+| activation widening and upload | 0.2 µs | 0.2–0.9 µs |
+| encode (command buffer, encoder, bindings) | 3 µs | 3–10 µs |
+| commit → GPU start | 75 µs | 85 µs |
+| GPU end → `waitUntilCompleted` returns | 55 µs | 61 µs |
+| readback copy | 3 µs | 5–14 µs |
+
+So about 0.14 ms per round trip is scheduling and completion latency
+(36 ms per real pass), and 2–6 ms per pass is CPU-side work. The GPU's own
+execution time does not depend on the number of command buffers: on the
+synthetic file the GPU time per pass was 8.73–8.75 ms for one buffer per
+matrix (51) with CPU gaps of 0 to 0.5 ms between buffers, and 8.74 ms for
+one buffer per pass. (GPU time inside the engine varied from 11 to 30 ms
+per pass between runs; another process used the GPU at the same time,
+`ioreg` showed up to 60 % device utilization while none of these runs was
+active.)
+
+Tried and rejected (empty one-thread dispatch, 400 round trips each,
+median / minimum ms, two runs): `waitUntilCompleted` 0.147 / 0.110 and
+0.136 / 0.105; polling `status()` 0.146 / 0.113 and 0.126 / 0.104;
+`encodeSignalEvent` + polling the shared event 0.154 / 0.114 and
+0.111 / 0.089; a command buffer committed 0.3 ms in advance that waits
+on a CPU-signalled shared event, timed from the signal to the polled
+completion event (four samples) 0.170 / 0.113, 0.111 / 0.100,
+0.115 / 0.105 and 0.132 / 0.072; the same with unretained references
+0.109 / 0.067 and 0.206 / 0.104.
+None is consistently below about 0.11 ms: the latency is in the
+GPU scheduling and completion path, not in how the CPU waits. Polling
+(`status()`) in the engine was also measured on the real model, at one
+row, alternated three times with blocking: with the GPU alone 250 / 202 /
+144 ms polling against 144 / 146 / 145 ms blocking (load 22–24; the
+polling thread competes with other processes), so it was dropped.
+Fewer round trips: every one of the four groups per layer (input
+projections, output projection, gate+up, down) needs the CPU's
+floating-point result of the previous one (normalization, recurrence or
+attention, residual, gated product), and the head needs the final norm,
+so no two of the 257 command buffers can be merged without moving a
+floating-point stage to the GPU, which the brief excludes. The remaining
+CPU-side work (2–6 ms) is below the 2 % threshold except the readback
+copy, whose zero fill was removed with item 2.
+
+### 5. Whole pass on the real model
+
+`cargo run --release -p yskn-engine --example bench_model -- $HOME/models/qwen38-speed --backend metal --kv kv5 --rows-per-pass N --passes 9`
+with the switches below, minimum over nine passes, seconds, one value per
+round (rounds alternate the configurations; load in brackets). "Before"
+is this branch with both new modes switched off (`YSKN_METAL_MAC=integer
+YSKN_METAL_CPU_SHARE=off`), which is the previous kernel except that the
+readback no longer zero-fills.
+
+Run A (load 7.1–11.6; "after" used the first share table):
+
+| N | before kernel / total | float only kernel / total | float + share kernel / total |
+|---:|---|---|---|
+| 1 | .164, .160 / .252, .247 | .160, .174 / .254, .360 | .132, .143 / .220, .232 |
+| 4 | .221, .219 / .418, .422 | .208, .237 / .458, .516 | .235, .296 / .475, .594 |
+| 16 | .738, .767 / 1.332, 1.363 | .660, .710 / 1.254, 1.399 | .663, .628 / 1.266, 1.166 |
+
+Run B (load 5.8–7.2; final table; both float):
+
+| N | share off kernel / total | share auto kernel / total |
+|---:|---|---|
+| 1 | .152, .147 / .235, .228 | .136, .156 / .234, .243 |
+| 4 | .195, .213 / .387, .388 | .196, .179 / .396, .308 |
+| 16 | .694, .562 / 1.254, .980 | .588, .500 / 1.079, .939 |
+
+At 16 rows the share made the kernel faster than float alone in three of
+four comparisons (−11 to −15 %; equal in the fourth) and the whole pass in
+three (−4 to −17 %; +1 % in the fourth); both new modes together beat
+"before" in every 16-row comparison (kernel .500–.663 against .738–.767 s,
+total .939–1.266 against 1.332–1.363 s). At one and four rows
+the differences between rounds of the same configuration (up to 30 %) are
+larger than the effect, so no whole-pass gain is claimed there; the
+kernel-only measurements (items 1 and 2) are the evidence. These numbers
+need the quiet-machine repetition.

@@ -898,7 +898,7 @@ impl Compute {
     }
     /// Each matrix's M×N sums for one shared input: one Metal command buffer
     /// (with the CPU kernel computing its calibrated share of the rows meanwhile,
-    /// D21), or one CPU kernel call per matrix.
+    /// D22), or one CPU kernel call per matrix.
     pub(crate) fn weighted_sums(
         &mut self,
         matrices: &[&Matrix],

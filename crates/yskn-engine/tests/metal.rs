@@ -333,7 +333,7 @@ mod macos {
         let calibrated: Vec<_> = [1, 2, 3, 4, 8, 12, 16, 40]
             .map(|m| engine.cpu_share(m))
             .to_vec();
-        let table = [0.08, 0.10, 0.11, 0.12, 0.14, 0.145, 0.15, 0.15];
+        let table = [0.08, 0.08, 0.085, 0.09, 0.12, 0.135, 0.15, 0.15];
         assert!(
             calibrated
                 .iter()

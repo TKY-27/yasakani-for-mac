@@ -104,10 +104,10 @@ fn parse_share(share: f64) -> Result<CpuShare> {
 
 /// CPU fraction of each matrix's rows at M = 1, 2, 4, 8 and 16 (linear in between,
 /// constant above 16), from `bench_metal --shares` on the real model on the
-/// 4P+6E M5 with 10 CPU workers (D21). Each value is somewhat below the measured
+/// 4P+6E M5 with 10 CPU workers (D22). Each value is somewhat below the measured
 /// optimum: a CPU that is slower than calibrated (other load) costs far more
 /// than one that is faster.
-const CPU_SHARE: [(usize, f64); 5] = [(1, 0.08), (2, 0.10), (4, 0.12), (8, 0.14), (16, 0.15)];
+const CPU_SHARE: [(usize, f64); 5] = [(1, 0.08), (2, 0.08), (4, 0.09), (8, 0.12), (16, 0.15)];
 
 fn calibrated_cpu_share(m: usize) -> f64 {
     let m = m.clamp(1, 16);

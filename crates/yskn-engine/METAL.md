@@ -48,11 +48,11 @@ which includes uploading inputs and reading back outputs.
   `short2`/`half2` per column pair, row-major M×K) on upload. All lanes of a SIMD group read the same address
   (broadcast).
 - **Arithmetic.** Two exact multiply-accumulate modes (function constant
-  `FLOAT_MAC`, `YSKN_METAL_MAC=float|integer`, default float since D21), both
+  `FLOAT_MAC`, `YSKN_METAL_MAC=float|integer`, default float since D22), both
   compiled with `MTLMathMode::Safe`:
   - *integer*: per pair `short(w0*a0 + w1*a1)` is exact (|w| ≤ 127,
     |a| ≤ 128 → ≤ 32,512), accumulated to i32 per sequence (≤ 4.2 M);
-  - *float* (D21): the table is widened to `half2` and the activations are
+  - *float* (D22): the table is widened to `half2` and the activations are
     uploaded as binary16 (every integer of magnitude ≤ 2048 is exact in
     binary16, so both conversions are exact). Each pair runs two binary32
     `fma(float(w), float(a), part)`. Every operand is an integer with
@@ -103,6 +103,21 @@ which includes uploading inputs and reading back outputs.
 The CPU kernel (`bench_linear --kernel dotprod --threads 10`) on the same file
 took 54.9 / 59.2 / 64.1 / 76.3 / 100.7 ms for M = 1 / 2 / 4 / 8 / 16.
 
+### Round 2 (D22; synthetic file GPU time at M=16 unless noted)
+
+| Variant | Result | Note |
+|---|---|---|
+| float MAC, `half2` table and activations (kept) | 41.8–44.0 ms (integer 54.1–55.2) | exact, see Arithmetic |
+| float MAC with binary32 activations in memory | 63.7–65.8 | slower |
+| same, weights also converted to binary32 once per block | 62.2–65.8 | 32 more registers per lane |
+| float MAC with `half4` activation loads | 42.7–43.1 | no gain |
+| float MAC with two accumulators per row | 41.6–43.9 | no gain |
+| 32 activation rows per dispatch (one lane per output row) | M=16 51.2–51.6, M=32 102.0–104.4 | same session with 16: 46.0–46.9 / 94.0–94.6; register pressure |
+| `simdgroup_matrix` (8x8 binary16 x binary16 + binary32) | not built | the MSL specification states no accuracy for it, so exactness cannot be proven |
+| waiting by polling, shared events, pre-committed buffers, unretained references | about 0.11 ms per round trip each | D22 §4: latency is in the GPU path |
+| polling wait in the engine (real model, one row) | 144–250 ms vs 144–146 blocking | dropped |
+| CPU share above the optimum (real model) | M=1 0.18: 153–158 ms vs 134 at 0.12 | steep: the GPU waits for the CPU |
+
 ## What limits it
 
 - **M = 1–2** is close to memory streaming. The kernel takes 10.3 ms, of which
@@ -118,23 +133,48 @@ took 54.9 / 59.2 / 64.1 / 76.3 / 100.7 ms for M = 1 / 2 / 4 / 8 / 16.
   this file. One command buffer per layer (mode c) added about 0.17 ms per
   command buffer.
 
+### Round 2 (real model, D22)
+
+- **M = 1** in one command buffer: 98.9 ms, 98.7 GB/s of code, 83–85 % of
+  the GPU's measured streaming rate (116–119 GB/s, `bench_bandwidth`).
+  Inside the engine the 257 round trips add about 0.14 ms each (about
+  36 ms per pass: 85 µs from commit to GPU start, 61 µs from GPU end to
+  wake-up), which no waiting method reduced and which cannot be merged
+  because each group needs a CPU floating-point result. The CPU share hides
+  part of it; the CPU kernel itself is decode-bound (13 GB/s, a tenth of
+  the CPU's streaming rate).
+- **M ≥ 4** is binary32 multiply-add throughput: 26.2 ms per added row,
+  25.6 G multiply-adds in 26.2 ms ≈ 0.98 T/s.
+- **CPU share** is bounded by CPU speed and by other load on the CPU: a
+  slower CPU than calibrated makes the GPU wait (at load 22–24 the share
+  0.08 took 197 ms at one row against 145 ms GPU-only;
+  `YSKN_METAL_CPU_SHARE=off` turns it off).
+
 ## Not done / next
 
-- Not run on the real model (by instruction). It has not been checked
-  whether a 10 GB no-copy buffer is accepted, how wiring/residency behaves
-  under the default GPU wired limit, or whether page-ins from a cold cache
-  appear in the timing.
-- Exact FP32 arithmetic (every partial sum < 2^24) or `simdgroup_matrix`
-  could raise the M ≥ 4 throughput. The brief forbids floating point in
-  the kernel, so this was not tried.
+- The 10 GB no-copy buffer is accepted on the real model (D12, D14).
+  Residency under the default GPU wired limit and cold-cache page-ins
+  were not studied.
+- Exact binary32 is done (D22). `simdgroup_matrix` or the M5's Metal 4
+  tensor operations could raise the M ≥ 4 throughput; an integer tensor
+  operation (int8 inputs, int32 accumulation) would be exact by
+  construction, a binary16/binary32 one needs a documented accuracy.
+  Neither was tried.
 - Larger M (prefill) would reuse each decoded block across more rows. One
-  thread per row × 32-row tiles caps reuse at MC = 16 per dispatch.
+  thread per row caps it at MC = 16 (32 was slower, register pressure); a
+  tile that shares a decoded block between lanes through threadgroup
+  memory would be needed.
+- At M > 1 the CPU stages of one half of the rows could overlap the GPU
+  projections of the other half (rows only depend on earlier rows); not
+  tried, it restructures `Model::forward`.
+- `CPU_SHARE` was calibrated on a shared machine; a quiet machine should
+  allow larger shares (`bench_metal --shares`).
 
-## Round 2 (brief 07d, D21): real model, M5
+## Round 2 (brief 07d, D22): real model, M5
 
 Real model (`$HOME/models/qwen38-speed/qwen38_27b_speed.yskn`: 401 matrices,
 9,758,310,400 code bytes per pass), shared machine, `uptime` load given
-with each run. Commands and full tables are in D21.
+with each run. Commands and full tables are in D22.
 
 ### Kept
 
@@ -145,7 +185,7 @@ with each run. Commands and full tables are in D21.
 - **CPU share of the rows** (`YSKN_METAL_CPU_SHARE`, `weighted_sums_split`):
   the ten CPU workers compute the last share(M)·N rows of each matrix of a
   group while the GPU computes the rest. Engine-like grouping (257 calls),
-  GPU only → calibrated share: M=1 144.5 → about 136, M=4 194 → about 181,
+  GPU only → calibrated share: M=1 144.5 → about 136, M=4 194 → about 184,
   M=16 554 → about 490 ms.
 
 ### Memory bandwidth ceiling (`bench_bandwidth`)
