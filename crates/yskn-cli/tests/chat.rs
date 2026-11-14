@@ -957,3 +957,16 @@ fn template_kwargs_cannot_set_what_the_server_sets() {
     assert!(!thinking && !ids.is_empty());
     assert_eq!(c.observation().calls, 0);
 }
+// Review finding: bidirectional overrides and isolates could reorder what the
+// terminal shows. They are shown visibly too; the zero-width joiner and
+// variation selectors, which emoji need, are left alone.
+#[test]
+fn terminal_shows_bidirectional_controls_visibly() {
+    let text = "a\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}b";
+    assert_eq!(
+        yskn::cli::visible(text),
+        "a\\u202a\\u202b\\u202c\\u202d\\u202e\\u2066\\u2067\\u2068\\u2069b"
+    );
+    let emoji = "\u{1f469}\u{200d}\u{1f4bb} \u{2764}\u{fe0f}";
+    assert_eq!(yskn::cli::visible(emoji), emoji);
+}

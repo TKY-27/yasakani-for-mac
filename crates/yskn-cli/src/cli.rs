@@ -274,16 +274,21 @@ fn chat_params(args: &Args) -> Result<ChatParams> {
     Ok(p)
 }
 /// Shows C0 controls other than newline and tab, DEL and C1 controls as
-/// `\xNN`, so text written to a terminal cannot drive it.
+/// `\xNN`, and bidirectional overrides and isolates as `\uNNNN`, so text
+/// written to a terminal cannot drive it or reorder what it shows. Joiners and
+/// variation selectors stay: emoji need them.
 pub fn visible(text: &str) -> std::borrow::Cow<'_, str> {
     let control = |c: char| c.is_control() && c != '\n' && c != '\t';
-    if !text.contains(control) {
+    let bidi = |c: char| matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    if !text.contains(|c| control(c) || bidi(c)) {
         return text.into();
     }
     let mut out = String::with_capacity(text.len() + 8);
     for c in text.chars() {
         if control(c) {
             out.push_str(&format!("\\x{:02x}", c as u32));
+        } else if bidi(c) {
+            out.push_str(&format!("\\u{:04x}", c as u32));
         } else {
             out.push(c);
         }
