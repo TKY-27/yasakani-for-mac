@@ -6,6 +6,7 @@ mod template;
 mod tools;
 
 pub use stream::{OutputStream, StreamDecoder};
+pub use template::{json_dumps, write_json};
 pub use tools::{ToolCallFilter, convert_parameter, parse_tool_call, tool_schemas};
 
 use serde_json::Value;
@@ -14,6 +15,15 @@ use tokenizers::Tokenizer;
 
 pub const EOS_IDS: [u32; 2] = [248046, 248044];
 pub const IM_START: u32 = 248045;
+/// Template variables [`ChatFormatter::render`] sets itself, which its
+/// `options` may not contain. (`add_generation_prompt` is an option.)
+pub const RESERVED_VARIABLES: [&str; 5] = [
+    "messages",
+    "tools",
+    "bos_token",
+    "eos_token",
+    "raise_exception",
+];
 
 #[derive(Debug)]
 pub struct Error(String);
@@ -32,7 +42,9 @@ fn error(e: impl fmt::Display) -> Error {
 
 /// Special tokens are retained on decode; encode never adds special tokens.
 /// `options` is an object of template variables, including `add_generation_prompt`
-/// (default true), `enable_thinking`, and `preserve_thinking`.
+/// (default true), `enable_thinking`, and `preserve_thinking`, but none of
+/// [`RESERVED_VARIABLES`].
+#[derive(Clone)]
 pub struct ChatFormatter {
     tokenizer: Tokenizer,
     environment: minijinja::Environment<'static>,
@@ -84,6 +96,20 @@ impl ChatFormatter {
                 folder.display()
             )));
         }
+        Self::from_tokenizer(tokenizer, &cfg, template)
+    }
+
+    /// Construct from embedded tokenizer/configuration text (no model files or weights).
+    pub fn from_json(tokenizer: &str, config: &str, template: &str) -> Result<Self> {
+        let tokenizer = Tokenizer::from_bytes(tokenizer.as_bytes()).map_err(error)?;
+        let cfg: Value = serde_json::from_str(config).map_err(error)?;
+        if !cfg.is_object() {
+            return Err(error("tokenizer_config.json must be an object"));
+        }
+        Self::from_tokenizer(tokenizer, &cfg, template.to_owned())
+    }
+
+    fn from_tokenizer(tokenizer: Tokenizer, cfg: &Value, template: String) -> Result<Self> {
         let mut environment = template::environment();
         environment
             .add_template_owned("chat", template)
@@ -138,10 +164,20 @@ impl ChatFormatter {
         if !messages.is_array() {
             return Err(error("messages must be an array"));
         }
-        let mut context = options
+        let options = options
             .as_object()
-            .cloned()
             .ok_or_else(|| error("template options must be an object"))?;
+        // An option must not replace what the caller validated or the model
+        // folder supplies: `tools` would bypass `tools: None`.
+        if let Some(key) = options
+            .keys()
+            .find(|k| RESERVED_VARIABLES.contains(&k.as_str()))
+        {
+            return Err(error(format!(
+                "the template variable {key} cannot be set as an option"
+            )));
+        }
+        let mut context = options.clone();
         context.insert("messages".into(), messages.clone());
         context.insert("bos_token".into(), self.bos_token.clone());
         context.insert("eos_token".into(), self.eos_token.clone());

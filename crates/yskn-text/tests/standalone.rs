@@ -179,6 +179,16 @@ fn template_fallback_file_precedence_tokens_and_unknown_ids() {
     assert_eq!(stream.push(&[8]).unwrap(), "A");
     assert!(fmt.render(&json!({}), None, &json!({})).is_err());
     assert!(fmt.render(&json!([]), None, &json!(null)).is_err());
+    // Options cannot replace what the renderer sets: `tools` would replace
+    // the caller's validated (or absent) tools.
+    for key in yskn_text::RESERVED_VARIABLES {
+        let e = fmt
+            .render(&json!([]), None, &json!({(key): "x"}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(key), "{e}");
+        assert!(fmt.prompt(&json!([]), None, &json!({(key): "x"})).is_err());
+    }
     assert!(fmt.prompt(&json!([]), None, &json!(null)).is_err());
     let mut output = OutputStream::new(&fmt, false);
     output.feed(&[8], false).unwrap();
