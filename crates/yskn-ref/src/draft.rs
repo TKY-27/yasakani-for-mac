@@ -8,8 +8,7 @@ use serde_json::Value;
 use yskn_format::{Container, Header, VectorType};
 
 use crate::compressed_linear::{CompressedLinear, quantize_activation};
-use crate::draft_head::{Candidate, DraftChoice, ReducedHead, choose};
-use crate::gated_deltanet::xor_sum32;
+use crate::draft_head::{Candidate, DraftChoice, HeadLayout, ReducedHead, choose};
 use crate::portable_math::{bfloat, exp, exp2, rsqrt, sincos};
 use crate::{Error, Result, require_finite};
 
@@ -145,8 +144,40 @@ pub struct DraftSnapshot {
     values: Vec<Vec<u16>>,
 }
 impl DraftSnapshot {
+    /// A zeroed ring at position 0: `layers` arrays of [kv_head, slot, channel] BF16 bits.
+    pub fn empty(layers: usize, kv_heads: usize, window: usize) -> Self {
+        let n = kv_heads * window * HD;
+        Self {
+            dimensions: (layers, kv_heads, window),
+            position: 0,
+            keys: vec![vec![0; n]; layers],
+            values: vec![vec![0; n]; layers],
+        }
+    }
     pub fn position(&self) -> usize {
         self.position
+    }
+    /// Zero every slot and continue at `position` (reset, or reseeding a full ring suffix).
+    pub fn clear(&mut self, position: usize) {
+        self.position = position;
+        for row in self.keys.iter_mut().chain(&mut self.values) {
+            row.fill(0);
+        }
+    }
+    /// Publish one complete context row: each layer's [kv_head, channel] key and value
+    /// BF16 bits go to slot `position % window`, then the position advances.
+    pub fn push_row(&mut self, layers: &[(Vec<u16>, Vec<u16>)]) {
+        let (_, kv_heads, window) = self.dimensions;
+        for (layer, (key, value)) in layers.iter().enumerate() {
+            for head in 0..kv_heads {
+                let offset = (head * window + self.position % window) * HD;
+                self.keys[layer][offset..offset + HD]
+                    .copy_from_slice(&key[head * HD..(head + 1) * HD]);
+                self.values[layer][offset..offset + HD]
+                    .copy_from_slice(&value[head * HD..(head + 1) * HD]);
+            }
+        }
+        self.position += 1;
     }
     /// Head-major BF16 bits [kv_head,slot,channel] for each layer.
     pub fn keys(&self) -> &[Vec<u16>] {
@@ -194,6 +225,37 @@ pub struct DraftProposal {
     pub candidates: Vec<Vec<Candidate>>,
     /// Same IDs/order, with scores corrected using the selected predecessor.
     pub corrected: Vec<Vec<Candidate>>,
+}
+/// Options must match the container and head dimensions (shared with fast drafts).
+pub fn validate_options(
+    d: &DraftDimensions,
+    options: &DraftOptions,
+    head: &HeadLayout,
+) -> Result<()> {
+    if options.capture_layers.is_empty()
+        || product(options.capture_layers.len(), d.hidden)? != d.features
+        || options.capture_layers.windows(2).any(|w| w[0] >= w[1])
+        || options.mask_token as usize >= d.vocabulary
+        || options.shortlist < 16
+        || options.shortlist > 2048
+        || options.shortlist % 8 != 0
+        || options.shortlist > d.vocabulary
+        || head.hidden != d.hidden
+        || head.vocabulary != d.vocabulary
+    {
+        return Err(invalid("draft options/head incompatible with dimensions"));
+    }
+    Ok(())
+}
+/// Every projection uses a prefix of `bdraft2.fc`'s input signs.
+pub fn validate_signs(d: &DraftDimensions, signs: &[i8]) -> Result<()> {
+    if [d.hidden, d.feed_forward, product(d.query_heads, HD)?]
+        .iter()
+        .any(|&n| n > signs.len())
+    {
+        return Err(invalid("bdraft2.fc input signs too short"));
+    }
+    Ok(())
 }
 /// Manifest defaults and canonical containment check, including symlinks.
 /// Only draft files are resolved; files.weights is never opened.
@@ -251,27 +313,10 @@ impl Draft {
         options: DraftOptions,
     ) -> Result<Self> {
         let d = DraftDimensions::read(container.header())?;
-        if options.capture_layers.is_empty()
-            || product(options.capture_layers.len(), d.hidden)? != d.features
-            || options.capture_layers.windows(2).any(|w| w[0] >= w[1])
-            || options.mask_token as usize >= d.vocabulary
-            || options.shortlist < 16
-            || options.shortlist > 2048
-            || options.shortlist % 8 != 0
-            || options.shortlist > d.vocabulary
-            || head.layout().hidden != d.hidden
-            || head.layout().vocabulary != d.vocabulary
-        {
-            return Err(invalid("draft options/head incompatible with dimensions"));
-        }
+        validate_options(&d, &options, head.layout())?;
         let fc = matrix(container, "bdraft2.fc", d.hidden, d.features)?;
         let signs = fc.input_signs().to_vec();
-        if [d.hidden, d.feed_forward, product(d.query_heads, HD)?]
-            .iter()
-            .any(|&n| n > signs.len())
-        {
-            return Err(invalid("bdraft2.fc input signs too short"));
-        }
+        validate_signs(&d, &signs)?;
         let hidden_norm = vector(container, "bdraft2.hidden_norm", d.hidden)?;
         let final_norm = vector(container, "bdraft2.norm", d.hidden)?;
         let mut layers = Vec::new();
@@ -330,13 +375,8 @@ impl Draft {
             "bdraft2.sel.succ",
             product(d.vocabulary, d.correction_rank)?,
         )?;
-        let n = product(product(d.kv_heads, d.window)?, HD)?;
-        let ring = DraftSnapshot {
-            dimensions: (d.layers, d.kv_heads, d.window),
-            position: 0,
-            keys: vec![vec![0; n]; d.layers],
-            values: vec![vec![0; n]; d.layers],
-        };
+        product(product(d.kv_heads, d.window)?, HD)?;
+        let ring = DraftSnapshot::empty(d.layers, d.kv_heads, d.window);
         Ok(Self {
             dimensions: d,
             options,
@@ -372,15 +412,11 @@ impl Draft {
         Ok(())
     }
     pub fn reset(&mut self) {
-        self.ring.position = 0;
-        for row in self.ring.keys.iter_mut().chain(&mut self.ring.values) {
-            row.fill(0);
-        }
+        self.ring.clear(0);
     }
     // Used only when a long prefill retained a complete ring-capacity suffix.
     pub(crate) fn reset_at(&mut self, position: usize) {
-        self.reset();
-        self.ring.position = position;
+        self.ring.clear(position);
     }
     pub fn push_context(&mut self, position: usize, features: ContextFeatures<'_>) -> Result<()> {
         let d = &self.dimensions;
@@ -425,16 +461,7 @@ impl Draft {
             }
             pending.push((key, value));
         }
-        for (layer, (key, value)) in pending.into_iter().enumerate() {
-            for head in 0..d.kv_heads {
-                let offset = (head * d.window + position % d.window) * HD;
-                self.ring.keys[layer][offset..offset + HD]
-                    .copy_from_slice(&key[head * HD..(head + 1) * HD]);
-                self.ring.values[layer][offset..offset + HD]
-                    .copy_from_slice(&value[head * HD..(head + 1) * HD]);
-            }
-        }
-        self.ring.position += 1;
+        self.ring.push_row(&pending);
         Ok(())
     }
     /// Row-major [row,capture_slot,channel]; exactly the same per-row operations.
@@ -551,11 +578,7 @@ impl Draft {
             let filtered = dynamic_filter(&normalized, &dynamic, &l.mbase, d.hidden, 0);
             let gate = linear_rows(&l.gate, &filtered, &self.signs)?;
             let up = linear_rows(&l.up, &filtered, &self.signs)?;
-            let mut glu = Vec::with_capacity(gate.len());
-            for (g, u) in gate.into_iter().zip(up) {
-                glu.push((g / (1.0 + exp(-g))) * u);
-            }
-            let projected = linear_rows(&l.down, &glu, &self.signs)?;
+            let projected = linear_rows(&l.down, &glu(&gate, &up), &self.signs)?;
             add(
                 &mut hidden,
                 &dynamic_filter(&projected, &dynamic, &l.mbase, d.hidden, 1),
@@ -569,45 +592,127 @@ impl Draft {
         predecessor: u32,
         candidates: &[Candidate],
     ) -> Result<Vec<Candidate>> {
-        let d = &self.dimensions;
-        let mut hp = vec![0.0; d.correction_rank];
-        for (rank, value) in hp.iter_mut().enumerate() {
-            let mut partial = [0.0_f32; 32];
-            for (lane, acc) in partial.iter_mut().enumerate() {
-                for i in (lane..d.hidden).step_by(32) {
-                    // q35_bdraft.cu:303: dense BF16, NOT compressed.
-                    *acc = x[i].mul_add(self.hp[rank * d.hidden + i], *acc);
-                }
-            }
-            *value = xor_sum32(&partial);
-        }
-        require_finite(&hp, "draft correction feature")?;
-        let product: Vec<_> = hp
+        let r = self.dimensions.correction_rank;
+        let feature = correction_feature(x, &self.hp, r)?;
+        let pred = &self.pred[predecessor as usize * r..(predecessor as usize + 1) * r];
+        let succ: Vec<_> = candidates
             .iter()
-            .enumerate()
-            .map(|(r, &h)| self.pred[predecessor as usize * d.correction_rank + r] * h)
+            .map(|c| &self.succ[c.token as usize * r..(c.token as usize + 1) * r])
             .collect();
-        require_finite(&product, "draft predecessor product")?;
-        let mut output = Vec::with_capacity(16);
-        for c in candidates {
-            let mut partial = [0.0_f32; 32];
-            for (lane, acc) in partial.iter_mut().enumerate() {
-                for r in (lane..d.correction_rank).step_by(32) {
-                    // q35_bdraft.cu:409 (also legacy selector :334).
-                    *acc = product[r]
-                        .mul_add(self.succ[c.token as usize * d.correction_rank + r], *acc);
-                }
-            }
-            output.push(Candidate {
-                token: c.token,
-                score: c.score + xor_sum32(&partial),
-            });
-        }
-        if output.iter().any(|c| !c.score.is_finite()) {
-            return Err(Error::NonFinite("draft corrected score"));
-        }
-        Ok(output)
+        correct_candidates(&feature, pred, &succ, candidates)
     }
+}
+
+/// The block-draft operations used by `DraftProposer`. Implemented by this scalar
+/// reference and by fast drafts, which must reproduce it bit for bit.
+pub trait BlockDraft {
+    fn dimensions(&self) -> &DraftDimensions;
+    fn options(&self) -> &DraftOptions;
+    fn position(&self) -> usize;
+    fn snapshot(&self) -> DraftSnapshot;
+    fn restore(&mut self, snapshot: &DraftSnapshot) -> Result<()>;
+    fn reset(&mut self);
+    /// Zero the ring and continue at `position`; only for reseeding from a complete
+    /// ring-capacity suffix of committed rows.
+    fn reset_at(&mut self, position: usize);
+    /// `push_context` for consecutive rows starting at `position`; rows before a
+    /// failing row stay committed.
+    fn push_rows(&mut self, position: usize, rows: &[&[f32]]) -> Result<()>;
+    fn propose(
+        &mut self,
+        frontier: u32,
+        embedding: &mut dyn FnMut(u32) -> Result<Vec<f32>>,
+        choice: DraftChoice,
+    ) -> Result<DraftProposal>;
+}
+impl BlockDraft for Draft {
+    fn dimensions(&self) -> &DraftDimensions {
+        Draft::dimensions(self)
+    }
+    fn options(&self) -> &DraftOptions {
+        Draft::options(self)
+    }
+    fn position(&self) -> usize {
+        Draft::position(self)
+    }
+    fn snapshot(&self) -> DraftSnapshot {
+        Draft::snapshot(self)
+    }
+    fn restore(&mut self, snapshot: &DraftSnapshot) -> Result<()> {
+        Draft::restore(self, snapshot)
+    }
+    fn reset(&mut self) {
+        Draft::reset(self)
+    }
+    fn reset_at(&mut self, position: usize) {
+        Draft::reset_at(self, position)
+    }
+    fn push_rows(&mut self, position: usize, rows: &[&[f32]]) -> Result<()> {
+        for (i, &values) in rows.iter().enumerate() {
+            self.push_context(position + i, ContextFeatures { values })?;
+        }
+        Ok(())
+    }
+    fn propose(
+        &mut self,
+        frontier: u32,
+        embedding: &mut dyn FnMut(u32) -> Result<Vec<f32>>,
+        choice: DraftChoice,
+    ) -> Result<DraftProposal> {
+        Draft::propose(self, frontier, embedding, choice)
+    }
+}
+
+/// Dense BF16 hidden-to-correction projection `hp` ([rank, hidden], row-major).
+pub fn correction_feature(x: &[f32], hp: &[f32], rank: usize) -> Result<Vec<f32>> {
+    let hidden = x.len();
+    let mut feature = vec![0.0; rank];
+    for (rank, value) in feature.iter_mut().enumerate() {
+        let mut partial = [0.0_f32; 32];
+        for (lane, acc) in partial.iter_mut().enumerate() {
+            for i in (lane..hidden).step_by(32) {
+                // q35_bdraft.cu:303: dense BF16, NOT compressed.
+                *acc = x[i].mul_add(hp[rank * hidden + i], *acc);
+            }
+        }
+        *value = xor_sum32(&partial);
+    }
+    require_finite(&feature, "draft correction feature")?;
+    Ok(feature)
+}
+
+/// Predecessor correction: `pred` is the predecessor's row, `succ[i]` candidate i's row.
+pub fn correct_candidates(
+    feature: &[f32],
+    pred: &[f32],
+    succ: &[&[f32]],
+    candidates: &[Candidate],
+) -> Result<Vec<Candidate>> {
+    let rank = feature.len();
+    let product: Vec<_> = feature
+        .iter()
+        .enumerate()
+        .map(|(r, &h)| pred[r] * h)
+        .collect();
+    require_finite(&product, "draft predecessor product")?;
+    let mut output = Vec::with_capacity(16);
+    for (c, succ) in candidates.iter().zip(succ) {
+        let mut partial = [0.0_f32; 32];
+        for (lane, acc) in partial.iter_mut().enumerate() {
+            for r in (lane..rank).step_by(32) {
+                // q35_bdraft.cu:409 (also legacy selector :334).
+                *acc = product[r].mul_add(succ[r], *acc);
+            }
+        }
+        output.push(Candidate {
+            token: c.token,
+            score: c.score + xor_sum32(&partial),
+        });
+    }
+    if output.iter().any(|c| !c.score.is_finite()) {
+        return Err(Error::NonFinite("draft corrected score"));
+    }
+    Ok(output)
 }
 fn matrix<R: Read + Seek>(
     c: &mut Container<R>,
@@ -654,7 +759,7 @@ fn linear_rows(w: &CompressedLinear, x: &[f32], signs: &[i8]) -> Result<Vec<f32>
     }
     Ok(output)
 }
-fn norm(x: &[f32], weight: &[f32], epsilon: f32) -> Result<Vec<f32>> {
+pub fn norm(x: &[f32], weight: &[f32], epsilon: f32) -> Result<Vec<f32>> {
     let mut partial = [0.0_f32; 256];
     for (lane, acc) in partial.iter_mut().enumerate() {
         for i in (lane..x.len()).step_by(256) {
@@ -674,14 +779,14 @@ fn norm(x: &[f32], weight: &[f32], epsilon: f32) -> Result<Vec<f32>> {
     require_finite(&y, "draft norm output")?;
     Ok(y)
 }
-fn norm_rows(x: &[f32], w: &[f32], e: f32) -> Result<Vec<f32>> {
+pub fn norm_rows(x: &[f32], w: &[f32], e: f32) -> Result<Vec<f32>> {
     let mut out = Vec::new();
     for row in x.chunks_exact(w.len()) {
         out.extend(norm(row, w, e)?);
     }
     Ok(out)
 }
-fn rope(x: &mut [f32], w: &[f32], position: usize, epsilon: f32) -> Result<()> {
+pub fn rope(x: &mut [f32], w: &[f32], position: usize, epsilon: f32) -> Result<()> {
     for head in x.chunks_exact_mut(HD) {
         let squares: Vec<_> = head.iter().map(|&v| v * v).collect();
         let g: Vec<_> = squares.chunks_exact(32).map(xor_sum32).collect();
@@ -701,7 +806,7 @@ fn rope(x: &mut [f32], w: &[f32], position: usize, epsilon: f32) -> Result<()> {
     }
     require_finite(x, "draft RoPE")
 }
-fn dynamic_filter(
+pub fn dynamic_filter(
     x: &[f32],
     dynamic: &[f32],
     base: &[f32],
@@ -725,7 +830,18 @@ fn dynamic_filter(
     }
     y
 }
-fn add(x: &mut [f32], y: &[f32]) -> Result<()> {
+/// SiLU-gated product, elementwise: `(g / (1 + exp(-g))) * u`.
+pub fn glu(gate: &[f32], up: &[f32]) -> Vec<f32> {
+    gate.iter()
+        .zip(up)
+        .map(|(&g, &u)| (g / (1.0 + exp(-g))) * u)
+        .collect()
+}
+/// The reference's 32-lane XOR reduction tree, shared with fast drafts.
+pub fn xor_sum32(values: &[f32]) -> f32 {
+    crate::gated_deltanet::xor_sum32(values)
+}
+pub fn add(x: &mut [f32], y: &[f32]) -> Result<()> {
     for (x, &y) in x.iter_mut().zip(y) {
         *x += y;
     }
@@ -748,7 +864,7 @@ impl Partial {
     }
 }
 #[allow(clippy::too_many_arguments)]
-fn attention(
+pub fn attention(
     q: &[f32],
     k: &[f32],
     v: &[f32],
