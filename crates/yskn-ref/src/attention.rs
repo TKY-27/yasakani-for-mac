@@ -320,14 +320,16 @@ impl Attention {
         }
     }
 
-    fn value_mean<'a>(&'a self, head: usize, row: &CacheRow) -> Option<&'a [f32; 256]> {
+    fn value_mean<'a>(&'a self, head: usize, row: &CacheRow) -> Result<Option<&'a [f32; 256]>> {
         match row {
-            CacheRow::Int8(_) => None,
+            CacheRow::Int8(_) => Ok(None),
             CacheRow::Packed(_) => {
-                let profile = self.kv_profile.as_ref().expect("validated KV profile");
+                let profile = self.kv_profile.as_ref().ok_or_else(|| {
+                    Error::InvalidInput("packed attention row requires a profile".into())
+                })?;
                 let group = &profile.groups()[self.group_index(head, 1)];
                 // Missing packed means still add +0, preserving signed-zero operations.
-                Some(group.mean.as_ref().unwrap_or(&[0.0; 256]))
+                Ok(Some(group.mean.as_ref().unwrap_or(&[0.0; 256])))
             }
         }
     }
@@ -593,7 +595,7 @@ impl Attention {
             .checked_add(1)
             .ok_or_else(|| Error::InvalidModel("attention context length overflow".into()))?;
         let kv_head = query_head / (self.dimensions.query_heads / self.dimensions.kv_heads);
-        let mean = self.value_mean(kv_head, &current.values[kv_head]);
+        let mean = self.value_mean(kv_head, &current.values[kv_head])?;
         let schedule = prefix_schedule(length);
         let padded_count = schedule.len().next_power_of_two();
         let mut splits = Vec::with_capacity(padded_count);
@@ -668,13 +670,12 @@ impl Attention {
         tile_start: usize,
         visible: std::ops::Range<usize>,
     ) -> Result<()> {
-        let mut key_scratch = [0.0; 256];
         let mut scores = [f32::NEG_INFINITY; 32];
         for (tile_index, score) in scores.iter_mut().enumerate() {
             let position = tile_start + tile_index;
             if visible.contains(&position) {
                 let key = &prefix[position].keys[kv_head];
-                let bases = key.bases(&mut key_scratch);
+                let bases = key.bases();
                 let mut accumulator = 0.0;
                 for chunk in 0..self.dimensions.head_dim / 16 {
                     // D3: provisional mma16 order is ascending scalar multiply then add.
@@ -723,14 +724,14 @@ impl Attention {
         for value in &mut split.numerator {
             *value *= rescale;
         }
-        let mut value_scratch = [[0.0; 256]; 32];
-        let mut value_bases = [None; 32];
-        for (tile_index, scratch) in value_scratch.iter_mut().enumerate() {
+        // Widen each visible row once, before the channel/weight accumulation loops.
+        // Masked slots initialize only None, without zeroing an unread 256-value row.
+        let value_bases: [Option<[f32; 256]>; 32] = std::array::from_fn(|tile_index| {
             let position = tile_start + tile_index;
-            if visible.contains(&position) {
-                value_bases[tile_index] = Some(prefix[position].values[kv_head].bases(scratch));
-            }
-        }
+            visible
+                .contains(&position)
+                .then(|| prefix[position].values[kv_head].bases())
+        });
         let mut value_weights = [0.0; 32];
         for (tile_index, weight) in value_weights.iter_mut().enumerate() {
             let position = tile_start + tile_index;
@@ -748,7 +749,7 @@ impl Attention {
                     value_weights[half * 16..(half + 1) * 16].iter().enumerate()
                 {
                     // D9 skips masked operations entirely, including zero-valued products.
-                    if let Some(bases) = value_bases[half * 16 + offset] {
+                    if let Some(bases) = &value_bases[half * 16 + offset] {
                         *numerator += value_weight * bases[channel];
                     }
                 }
@@ -765,10 +766,8 @@ impl Attention {
         key: &CacheRow,
         value: &CacheRow,
     ) -> Result<()> {
-        let mut key_scratch = [0.0; 256];
-        let key_bases = key.bases(&mut key_scratch);
-        let mut value_scratch = [0.0; 256];
-        let value_bases = value.bases(&mut value_scratch);
+        let key_bases = key.bases();
+        let value_bases = value.bases();
         let mut partial = [0.0; 4];
         for (lane, sum) in partial.iter_mut().enumerate() {
             for chunk in 0..self.dimensions.head_dim / 16 {

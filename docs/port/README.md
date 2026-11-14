@@ -80,14 +80,74 @@ defaulting to `kvq_u5.bin`, and reject missing/malformed profiles or model
 attention-count/KV-head mismatches. Both weights and profile paths must stay
 inside the folder, including symlink targets. Plain Int8 needs no profile.
 `from_container_with_kv` accepts an explicit `Arc<KvProfile>` for in-memory
-or direct-file callers. Packed cache rows retain their words/scale and a 1 KiB
-array of decoded binary32 bases; validation and BF16 decoding happen at encoding,
-not per attention read. For 16 attention layers and four KV heads, fully packed
-five-bit K/V numeric payload is 148.5 KiB/token (including 128 KiB of derived
-bases); fallback rows remain int8. See D13 for memory accounting and packed
-score/mean/rounding rules. On a synthetic model the attention stage of a
-16-row pass at a 2,000-token context takes 0.0042 s in `kv5` and 0.0041 s in
-`int8-profile` (before this change `kv5` took 0.115 s).
+or direct-file callers. Packed cache rows retain their original words/scale
+and 256 derived BF16 bases as `u16` bits, decoded once at encoding and widened
+exactly once per visible row before attention accumulation. Bases live inline
+in a boxed packed row; the other heap holds the unchanged `Vec<u32>` words.
+Masked tile rows do not zero an unread 32 x 256 scratch array. Stored-code and
+scale digests and binary32 attention operations are unchanged.
+
+On this arm64 host, `size_of::<PackedRow>()` is 544 and
+`size_of::<CacheRow>()` is 32 bytes. Current reference memory accounting is:
+
+| Row representation | Numeric bytes/row | Enum slot + heaps/row | Numeric bytes/token (128 rows) | Allocated bytes/token including 16 token structs |
+|---|---:|---:|---:|---:|
+| Int8 / Int8Profile | 260 | 288 | 33,280 | 37,632 |
+| Five-bit packed | 676 | 736 | 86,528 | 94,976 |
+| Four-bit packed | 644 | 704 | 82,432 | 90,880 |
+| Real-profile Kv5 (116 five-bit packed + 12 int8) | mixed | mixed | 81,536 | 89,600 |
+
+Before 05l, a five-bit packed row occupied a 40-byte enum slot (containing the
+40-byte `PackedRow`), 160-byte words and a 1,024-byte decoded binary32 box:
+1,224 bytes total. It now uses a 32-byte enum slot, 544-byte packed-row box
+including its 512-byte BF16 bases, and 160-byte words: 736 bytes total.
+The real model has 16 attention layers, four KV heads, and key/value sides:
+128 rows/token, plus 16 x 48-byte token structs. Its cache sizes are:
+
+| Context tokens | Int8 cache bytes (GiB) | All five-bit packed reference bytes (GiB) | Real-profile Kv5 reference bytes (GiB) |
+|---|---:|---:|---:|
+| 2,048 | 77,070,336 (0.071777) | 194,510,848 (0.181152) | 183,500,800 (0.170898) |
+| 32,768 | 1,233,125,376 (1.148438) | 3,112,173,568 (2.898438) | 2,936,012,800 (2.734375) |
+| 262,144 | 9,865,003,008 (9.187500) | 24,897,388,544 (23.187500) | 23,488,102,400 (21.875000) |
+
+GiB is 2^30 bytes. Totals count requested row heaps and row/token structs at
+exact capacity, excluding allocator overhead, spare capacity, fixed
+state/profile objects and provisional copies. A retained full snapshot adds
+another full cache. **Kv5 at 2,048 and 32,768 tokens fits the 24 GB budget
+alongside the 10.3 GB model; 262,144 tokens does not.** Cache plus model alone
+is about 10.48, 13.24 and 33.79 GB with the real profile. These are reference
+representation estimates; the real model was not opened for this measurement.
+A later fast path might read packed words directly with only 164 numeric
+bytes per five-bit row (132 for four-bit), removing the derived bases. That
+would be 20,992 bytes/token if all rows pack, or 22,144 for the real profile;
+it is not the current reference representation. See D13 for the allocation
+formula and packed score/mean/rounding rules.
+
+The synthetic CPU benchmark below includes both attention and row preparation
+(`kv_encode`), since cached-base decoding moved to preparation. Values are
+stage medians in milliseconds for a 16-row pass after 2,000 prefix tokens,
+seven samples after one warm-up, restoring the same prefix before each sample.
+The model is `synthetic_kv_model`: one attention layer, two query/KV heads,
+seed `0x05_0a`, fully packable synthetic profile with value means. Both runs
+use `--backend cpu --rows-per-pass 16 --passes 7 --context 2000`, with dotprod
+and ten engine workers on this host. The scalar reference remains
+single-threaded. Baseline production sources are commit `0b7bd5d`; only the
+05j benchmark harness was copied into an isolated baseline source snapshot
+to add fixed-context sampling. No production baseline code was changed.
+
+| Version | KV mode | Attention ms | Row preparation ms | Sum of stage medians ms |
+|---|---|---:|---:|---:|
+| Before (`0b7bd5d`) | int8-profile | 13.431 | 1.041 | 14.472 |
+| Before (`0b7bd5d`) | kv5 | 115.849 | 0.860 | 116.709 |
+| After (05l, BF16 bits) | int8-profile | 6.988 | 1.142 | 8.130 |
+| After (05l, BF16 bits) | kv5 | 4.796 | 0.789 | 5.585 |
+
+The last column sums two stage medians; it is not a separately measured
+median of their sum. These are synthetic stage timings, not real-model
+throughput. Reproduce with `cargo run --release -p yskn-engine --example
+synthetic_kv_model -- OUT_DIR`, then `cargo run --release -p yskn-engine
+--example bench_model -- OUT_DIR --backend cpu --kv MODE --rows-per-pass 16
+--passes 7 --context 2000` (offline builds).
 
 ## Mapped engine API and commands
 

@@ -62,7 +62,7 @@ fn packed_zero_codebook_gives_exact_mean_in_prefix_and_self_splits() {
         .unwrap();
     assert_eq!(s.denominator.to_bits(), 3.0_f32.to_bits());
     assert_eq!(bits(&s.numerator), vec![0; 256]);
-    Attention::add_value_mean(&mut s, layer.value_mean(0, &current.values[0])).unwrap();
+    Attention::add_value_mean(&mut s, layer.value_mean(0, &current.values[0]).unwrap()).unwrap();
     assert_eq!(bits(&s.numerator), vec![0.75_f32.to_bits(); 256]);
     // 73 prefix entries also exercise distinct splits, including self and empty splits.
     let prefix = vec![prefix[0].clone(); 73];
@@ -367,4 +367,18 @@ fn value_guard_alone_disables_packing_and_preserves_initial_int8_until_guard() {
             ));
         }
     }
+}
+
+#[test]
+fn packed_prepared_row_used_by_plain_int8_output_head_returns_input_error() {
+    let packed = layer(Profile::new(1, 2));
+    let plain = Attention::new(packed.dimensions, vec![0.0; 256], vec![0.0; 256], 1.0e-6).unwrap();
+    let prepared = packed
+        .prepare_row(0, &[0.25; 1024], &[0.5; 512], &[0.75; 512])
+        .unwrap();
+    let state = plain.new_state().unwrap();
+    assert!(matches!(
+        plain.output_head(&state, 0, &prepared, 0),
+        Err(Error::InvalidInput(message)) if message == "packed attention row requires a profile"
+    ));
 }

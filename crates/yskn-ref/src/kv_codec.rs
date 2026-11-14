@@ -23,7 +23,7 @@ pub struct PackedRow {
     words: Vec<u32>,
     bits: u8,
     scale: f32,
-    bases: Box<[f32; 256]>,
+    bases: [u16; 256],
 }
 impl PackedRow {
     pub fn words(&self) -> &[u32] {
@@ -40,20 +40,15 @@ impl PackedRow {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CacheRow {
     Int8(Int8Row),
-    Packed(PackedRow),
+    Packed(Box<PackedRow>),
 }
 impl CacheRow {
     /// Attention reads only validated, immutable operands. Int8 conversion is
     /// exact; packed operands were BF16-rounded once when the row was encoded.
-    pub(crate) fn bases<'a>(&'a self, scratch: &'a mut [f32; 256]) -> &'a [f32; 256] {
+    pub(crate) fn bases(&self) -> [f32; 256] {
         match self {
-            Self::Int8(row) => {
-                for (base, &integer) in scratch.iter_mut().zip(&row.integers) {
-                    *base = f32::from(integer);
-                }
-                scratch
-            }
-            Self::Packed(row) => &row.bases,
+            Self::Int8(row) => std::array::from_fn(|i| f32::from(row.integers[i])),
+            Self::Packed(row) => row.bases.map(|bits| f32::from_bits(u32::from(bits) << 16)),
         }
     }
 
@@ -388,13 +383,14 @@ pub fn encode_packed(
     }
     let mask = (1 << g.bits) - 1;
     let fields = selected.states.map(|s| s & mask);
-    let mut packed = PackedRow {
+    let mut packed = Box::new(PackedRow {
         words: pack(&fields, g.bits),
         bits: g.bits,
         scale: selected.scale,
-        bases: Box::new([0.0; 256]),
-    };
-    *packed.bases = decode_packed(profile, group, &packed)?;
+        bases: [0; 256],
+    });
+    packed.bases =
+        decode_packed(profile, group, &packed)?.map(|base| (base.to_bits() >> 16) as u16);
     Ok(CacheRow::Packed(packed))
 }
 
