@@ -394,85 +394,43 @@ impl GatedDeltaNet {
         row: &GatedDeltaNetRow,
         value_head: usize,
     ) -> Result<Vec<f32>> {
-        let head_dim = self.dimensions.head_dim;
-        if head_state.len() != head_dim * head_dim
-            || value_head >= self.dimensions.value_heads
-            || row.convolved.len() != self.convolution_channels
-            || row.z.len() != self.output_width
-        {
-            return Err(dimension_mismatch());
-        }
-        let GatedDeltaNetRow {
-            z,
-            convolved,
-            query,
-            key,
-            gates_a,
-            gates_b,
-            ..
-        } = row;
-        let value_heads_per_key_head =
-            self.dimensions.value_heads / self.dimensions.query_key_heads;
-        let key_head = value_head / value_heads_per_key_head;
-        let key_start = key_head * head_dim;
-        let output_start = value_head * head_dim;
-        // Beta has a BF16 boundary; log_decay and its exponential remain FP32.
-        let update_gate = bfloat(sigmoid(gates_b[value_head]));
-        let decay_weight = exp(self.weights.log_decay_weight[value_head]);
-        let biased_gate = gates_a[value_head] + self.weights.time_bias[value_head];
-        let log_decay = -decay_weight * softplus(biased_gate);
-        finite(
-            &[update_gate, decay_weight, biased_gate, log_decay],
-            "DeltaNet decay",
-        )?;
-        let decay = exp(log_decay);
-        finite(&[decay], "DeltaNet decay factor")?;
-        let mut core = zeros(head_dim)?;
-        for (value_channel, core_value) in core.iter_mut().enumerate() {
-            let mut prediction_part = [0.0; 4];
-            for (group, partial) in prediction_part.iter_mut().enumerate() {
-                // Four ordered 32-term sums are distinct from XOR reduction.
-                for offset in 0..32 {
-                    let key_channel = group * 32 + offset;
-                    let index = key_channel * head_dim + value_channel;
-                    head_state[index] *= decay;
-                    *partial += head_state[index] * key[key_start + key_channel];
+        self.recur_head_with(
+            head_state,
+            row,
+            value_head,
+            |head_state, query, key, value, decay, update_gate| {
+                let head_dim = self.dimensions.head_dim;
+                let mut core = zeros(head_dim)?;
+                for (value_channel, core_value) in core.iter_mut().enumerate() {
+                    let mut prediction_part = [0.0; 4];
+                    for (group, partial) in prediction_part.iter_mut().enumerate() {
+                        // Four ordered 32-term sums are distinct from XOR reduction.
+                        for offset in 0..32 {
+                            let key_channel = group * 32 + offset;
+                            let index = key_channel * head_dim + value_channel;
+                            head_state[index] *= decay;
+                            *partial += head_state[index] * key[key_channel];
+                        }
+                    }
+                    let prediction = sum4(prediction_part);
+                    let value = value[value_channel];
+                    let correction = (value - prediction) * update_gate;
+                    finite(&[prediction, correction], "DeltaNet recurrent prediction")?;
+                    let mut output_part = [0.0; 4];
+                    for (group, partial) in output_part.iter_mut().enumerate() {
+                        for offset in 0..32 {
+                            let key_channel = group * 32 + offset;
+                            let index = key_channel * head_dim + value_channel;
+                            head_state[index] += key[key_channel] * correction;
+                            *partial += head_state[index] * query[key_channel];
+                        }
+                    }
+                    // The recurrent output is rounded before per-head normalization.
+                    *core_value = bfloat(sum4(output_part));
                 }
-            }
-            let prediction = sum4(prediction_part);
-            let value = convolved[2 * self.query_key_width + output_start + value_channel];
-            let correction = (value - prediction) * update_gate;
-            finite(&[prediction, correction], "DeltaNet recurrent prediction")?;
-            let mut output_part = [0.0; 4];
-            for (group, partial) in output_part.iter_mut().enumerate() {
-                for offset in 0..32 {
-                    let key_channel = group * 32 + offset;
-                    let index = key_channel * head_dim + value_channel;
-                    head_state[index] += key[key_start + key_channel] * correction;
-                    *partial += head_state[index] * query[key_start + key_channel];
-                }
-            }
-            // The recurrent output is rounded before per-head normalization.
-            *core_value = bfloat(sum4(output_part));
-        }
-        finite(&core, "DeltaNet recurrent output")?;
-        let square_sum = squares128(&core);
-        finite(&[square_sum], "DeltaNet output norm")?;
-        let normalization_argument = square_sum / head_dim as f32 + self.epsilon;
-        finite(&[normalization_argument], "DeltaNet output norm argument")?;
-        let output_inverse_rms = rsqrt(normalization_argument);
-        let mut gated = zeros(head_dim)?;
-        for (channel, output) in gated.iter_mut().enumerate() {
-            // Chapter 03 requires a round after RMS, after gain, and after gating.
-            let normalized = bfloat(
-                self.weights.normalization_weight[channel]
-                    * bfloat(core[channel] * output_inverse_rms),
-            );
-            *output = bfloat(normalized * silu(z[output_start + channel]));
-        }
-        finite(head_state, "DeltaNet recurrent state")?;
-        finite(&gated, "DeltaNet gated output")?;
-        Ok(gated)
+                Ok(core)
+            },
+        )
     }
 
     /// Engine core hook; validation, decay, normalization and BF16 gating retain the scalar contract.

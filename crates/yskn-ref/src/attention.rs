@@ -446,36 +446,14 @@ impl Attention {
         prepared: &PreparedRow,
         query_head: usize,
     ) -> Result<Vec<f32>> {
-        if state.dimensions != self.dimensions
-            || position > state.rows.len()
-            || query_head >= self.dimensions.query_heads
-            || prepared.dimensions != self.dimensions
-            || prepared.position != position
-        {
-            return Err(Error::InvalidInput(
-                "invalid attention prefix or head".into(),
-            ));
-        }
-        let mut output = Vec::with_capacity(self.dimensions.head_dim);
-        {
-            let start = query_head * self.dimensions.head_dim;
-            let attended = self.attend_head(
-                &prepared.queries[start..start + self.dimensions.head_dim],
+        self.output_head_with(state, position, prepared, query_head, |operands| {
+            self.attend_head(
+                operands.query,
                 query_head,
-                &state.rows[..position],
-                &prepared.cache,
-            )?;
-            let unrotated = inverse_rotate_cache(&attended);
-            finite(&unrotated, "attention inverse cache rotation")?;
-            for (channel, value) in unrotated.into_iter().enumerate() {
-                // The inverse rotation, sigmoid, and product have separate BF16 boundaries.
-                let rounded_attended = bfloat(value);
-                let gate = bfloat(sigmoid(prepared.gates[start + channel]));
-                output.push(bfloat(rounded_attended * gate));
-            }
-        }
-        finite(&output, "attention gated output")?;
-        Ok(output)
+                operands.prefix,
+                operands.current,
+            )
+        })
     }
 
     /// Engine head hook with the scalar validation, inverse rotation and output boundaries.
@@ -552,27 +530,12 @@ impl Attention {
         projected_key: &[f32],
         projected_value: &[f32],
     ) -> Result<PreparedRow> {
-        self.validate_projected_rows(projected_query_gate, projected_key, projected_value)?;
-        let mut queries = Vec::with_capacity(self.query_width);
-        let mut gates = Vec::with_capacity(self.query_width);
-        for head in 0..self.dimensions.query_heads {
-            let start = 2 * head * self.dimensions.head_dim;
-            // Each head stores its query followed immediately by that head's raw gate.
-            let query: Vec<f32> = projected_query_gate[start..start + self.dimensions.head_dim]
-                .iter()
-                .map(|&value| bfloat(value))
-                .collect();
-            let normalized = self.normalize_head(&query, &self.query_norm)?;
-            let rotated = rotate_cache(&self.rope(&normalized, position)?);
-            // Only queries have a BF16 boundary after the cache rotation.
-            queries.extend(rotated.into_iter().map(bfloat));
-            gates.extend(
-                projected_query_gate
-                    [start + self.dimensions.head_dim..start + 2 * self.dimensions.head_dim]
-                    .iter()
-                    .map(|&value| bfloat(value)),
-            );
-        }
+        let mut prepared = self.prepare_query_heads(
+            position,
+            projected_query_gate,
+            projected_key,
+            projected_value,
+        )?;
         let mut keys = Vec::with_capacity(self.dimensions.kv_heads);
         let mut values = Vec::with_capacity(self.dimensions.kv_heads);
         for head in 0..self.dimensions.kv_heads {
@@ -593,19 +556,27 @@ impl Attention {
             // Values receive neither head normalization nor RoPE.
             values.push(self.encode_row(head, 1, position, &rotate_cache(&value))?);
         }
-        finite(&queries, "attention rounded rotated query")?;
-        finite(&gates, "attention rounded gate")?;
-        Ok(PreparedRow {
-            dimensions: self.dimensions,
-            position,
-            queries,
-            gates,
-            cache: CacheToken { keys, values },
-        })
+        finite(&prepared.queries, "attention rounded rotated query")?;
+        finite(&prepared.gates, "attention rounded gate")?;
+        prepared.cache = CacheToken { keys, values };
+        Ok(prepared)
     }
 
     /// Independent query/gate preparation for engines that schedule KV sides separately.
     pub fn prepare_queries(
+        &self,
+        position: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+    ) -> Result<PreparedRow> {
+        let prepared = self.prepare_query_heads(position, q, k, v)?;
+        finite(&prepared.queries, "attention rounded rotated query")?;
+        finite(&prepared.gates, "attention rounded gate")?;
+        Ok(prepared)
+    }
+
+    fn prepare_query_heads(
         &self,
         position: usize,
         q: &[f32],
@@ -632,8 +603,6 @@ impl Attention {
                     .map(|&value| bfloat(value)),
             );
         }
-        finite(&queries, "attention rounded rotated query")?;
-        finite(&gates, "attention rounded gate")?;
         Ok(PreparedRow {
             dimensions: self.dimensions,
             position,
