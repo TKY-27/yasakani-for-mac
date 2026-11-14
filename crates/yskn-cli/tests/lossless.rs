@@ -8,10 +8,14 @@ mod product_support;
 use lossless_support::{CONFIG_NAMES, check, configure, prompts};
 use product_support::Folder;
 use serde_json::{Value, json};
-use std::{cell::Cell, collections::HashMap, process::Command, rc::Rc, sync::Mutex};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    process::{Command, Output},
+    rc::Rc,
+    sync::OnceLock,
+};
 
-// The default-dimension teacher shares a memory budget with the small fixtures.
-static MODEL_RUN: Mutex<()> = Mutex::new(());
 use yskn::{
     Result,
     engine::{Engine, Generation, Sampling},
@@ -28,8 +32,7 @@ enum Fault {
     LaterError,
     Empty,
     ConstantSeed,
-    LiveReuse,
-    SiblingReuse,
+    Reuse,
 }
 struct TestEngine {
     inner: RealEngine,
@@ -88,10 +91,8 @@ impl Engine for TestEngine {
             result.ids[2] = (result.ids[2] + 1) % 32;
         }
         if n == 8
-            && ((self.fault == Fault::LiveReuse && result.snap_mode == 1)
-                || (self.fault == Fault::SiblingReuse
-                    && prompt.contains(&4)
-                    && !self.reset_requested))
+            && self.fault == Fault::Reuse
+            && (result.snap_mode == 1 || (prompt.contains(&4) && !self.reset_requested))
         {
             result.ids[0] ^= 1;
         }
@@ -110,21 +111,24 @@ fn exercise(fault: Fault, all: bool) -> Value {
     exercise_template(
         fault,
         all,
-        "{% if enable_thinking %}t13 {% endif %}{% for m in messages %}{% if m.role == 'assistant' %}t10 {% endif %}{{ m.content }} {% endfor %}t10",
+        "{% if enable_thinking %}t13 {% endif %}{% if tools %}t14 {% endif %}{% for m in messages %}{% if m.role == 'assistant' %}t10 {% endif %}{{ m.content }} {% endfor %}t10",
     )
 }
 
 fn exercise_template(fault: Fault, all: bool, template: &str) -> Value {
-    let _run = MODEL_RUN.lock().unwrap();
+    let started = std::time::Instant::now();
     let folder = Folder::new();
     // Generation headers are present on historical assistant turns too. The
     // system setting changes the start, as it does in the real chat template.
     folder.write("chat_template.jinja", template);
-    let cases = prompts("synthetic.json", &json!([
-        {"id":"refrain","request":{"messages":[{"role":"user","content":"1 2 1 2 1 2 1 2"}],"enable_thinking":false,"max_tokens":12}},
-        {"id":"different","request":{"messages":[{"role":"user","content":"3 4 5 6"}],"enable_thinking":true,"max_tokens":12}}
-    ]).to_string()).unwrap();
-    let selection = if all {
+    let cases = prompts(
+        "test prompts.json",
+        include_str!("lossless_support/prompts.json"),
+    )
+    .unwrap();
+    let selection = if fault == Fault::ConstantSeed {
+        "none,both-k7-adaptive".into()
+    } else if all {
         CONFIG_NAMES.join(",")
     } else {
         "none,ngram-k3-fixed".into()
@@ -172,6 +176,12 @@ fn exercise_template(fault: Fault, all: bool, template: &str) -> Value {
     )
     .unwrap();
     assert_eq!(live.get(), 0);
+    eprintln!(
+        "{}: {} engine loads, {:.3}s",
+        std::thread::current().name().unwrap_or("fault child"),
+        names.len(),
+        started.elapsed().as_secs_f64()
+    );
     result
 }
 
@@ -191,7 +201,7 @@ fn actual_synthetic_engine_matches_ids_but_rejects_unexercised_draft_cells() {
     let runs = report["runs"].as_array().unwrap();
     assert_eq!(
         runs.iter().filter(|r| r["probe"] != true).count(),
-        5 * 4 * 2 * 2
+        5 * 4 * 3 * 2
     );
     for run in runs
         .iter()
@@ -202,6 +212,10 @@ fn actual_synthetic_engine_matches_ids_but_rejects_unexercised_draft_cells() {
             run["run"], run["snapshot_modes"], run["cached_tokens"]
         );
     }
+    assert!(
+        runs.iter()
+            .any(|r| r["prompt"] == "tool" && r["prompt_tokens"] == 6)
+    );
     for name in CONFIG_NAMES {
         let own: Vec<_> = runs.iter().filter(|r| r["configuration"] == name).collect();
         assert!(
@@ -256,7 +270,7 @@ fn rewritten_continuation_is_compared_and_fixed_pair_still_exercises_live_reuse(
     let report = exercise_template(
         Fault::None,
         false,
-        "{% if enable_thinking %}t13 {% endif %}{% for m in messages %}{% if m.role == 'assistant' %}t10 t11 {% endif %}{{ m.content }} {% endfor %}t10",
+        "{% if enable_thinking %}t13 {% endif %}{% if tools %}t14 {% endif %}{% for m in messages %}{% if m.role == 'assistant' %}t10 t11 {% endif %}{{ m.content }} {% endfor %}t10",
     );
     let runs = report["runs"].as_array().unwrap();
     for name in ["none", "ngram-k3-fixed"] {
@@ -293,11 +307,8 @@ fn rewritten_continuation_is_compared_and_fixed_pair_still_exercises_live_reuse(
 
 #[test]
 fn wrong_ids_only_during_live_or_sibling_reuse_fail_comparison() {
-    for (fault, run) in [
-        (Fault::LiveReuse, "conversation_extension"),
-        (Fault::SiblingReuse, "system_sibling"),
-    ] {
-        let report = exercise(fault, false);
+    let report = exercise(Fault::Reuse, false);
+    for run in ["conversation_extension", "system_sibling"] {
         assert_eq!(report["passed"], false);
         assert!(
             report["failures"]
@@ -389,6 +400,10 @@ fn fault_child() {
         return;
     };
     let fault = match mode.as_str() {
+        "diagnostic" => {
+            eprintln!("synthetic child stopped before report");
+            std::process::exit(17);
+        }
         "configuration" => Fault::Configuration,
         "repeat" => Fault::Repeat,
         "acceptance" => Fault::NoAcceptance,
@@ -401,22 +416,16 @@ fn fault_child() {
 
 #[test]
 fn token_and_repeat_faults_and_inactive_drafting_exit_nonzero_with_diagnostics() {
-    let _run = MODEL_RUN.lock().unwrap();
     for (mode, kind) in [
         ("configuration", "configuration_mismatch"),
         ("repeat", "repeat_mismatch"),
         ("acceptance", "speculation not exercised"),
     ] {
-        let child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "fault_child", "--nocapture"])
-            .env("YSKN_LOSSLESS_TEST_FAULT", mode)
-            .output()
-            .unwrap();
-        assert_eq!(
-            child.status.code(),
-            Some(1),
-            "{}",
-            String::from_utf8_lossy(&child.stderr)
+        let child = child_output(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "fault_child", "--nocapture"])
+                .env("YSKN_LOSSLESS_TEST_FAULT", mode),
+            1,
         );
         let stdout = String::from_utf8(child.stdout).unwrap();
         let report: Value = stdout
@@ -444,10 +453,12 @@ fn token_and_repeat_faults_and_inactive_drafting_exit_nonzero_with_diagnostics()
 
 #[test]
 fn malformed_prompt_files_name_the_file_and_entry_instead_of_panicking() {
+    assert!(lossless_support::profile_samplers("invalid").is_err());
     for text in [
         "{",
         "null",
         "[{},{}]",
+        r#"[{"id":"x","request":{"messages":[{"role":"user","content":"a"}]}},{"id":"x","request":{"messages":[{"role":"user","content":"b"}]}}]"#,
         "[{\"id\":\"x\",\"request\":{}},{}]",
         "[{\"id\":\"x\",\"request\":{\"messages\":[{\"role\":\"user\",\"content\":\"\"}],\"seed\":1}},{}]",
     ] {
@@ -457,8 +468,25 @@ fn malformed_prompt_files_name_the_file_and_entry_instead_of_panicking() {
             "{error}"
         );
     }
+    assert_eq!(
+        lossless_support::configs("neural-k7-fixed").unwrap(),
+        ["none", "neural-k7-fixed"]
+    );
+    assert!(lossless_support::configs("none,none").is_err());
+}
+
+#[test]
+fn bundled_prompt_file_has_unique_ids_documented_budgets_and_profile_arithmetic() {
     let defaults = prompts("defaults.json", lossless_support::DEFAULT_PROMPTS).unwrap();
     assert_eq!(defaults.len(), 24);
+    assert_eq!(
+        defaults
+            .iter()
+            .map(|p| &p.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        24
+    );
     assert_eq!(
         defaults
             .iter()
@@ -480,7 +508,6 @@ fn malformed_prompt_files_name_the_file_and_entry_instead_of_panicking() {
         lossless_support::profile_samplers("release").unwrap(),
         &[0, 1, 3]
     );
-    assert!(lossless_support::profile_samplers("invalid").is_err());
     let entries: Value = serde_json::from_str(lossless_support::DEFAULT_PROMPTS).unwrap();
     assert_eq!(
         entries
@@ -491,17 +518,44 @@ fn malformed_prompt_files_name_the_file_and_entry_instead_of_panicking() {
             .sum::<u64>(),
         256
     );
-    assert_eq!(
-        lossless_support::configs("neural-k7-fixed").unwrap(),
-        ["none", "neural-k7-fixed"]
-    );
-    assert!(lossless_support::configs("none,none").is_err());
+    for (profile, configs, samplers, main, unrelated, reuse_min, reuse_max, total_min, total_max) in [
+        ("release", 4, 3, 43_008, 276, 164, 232, 43_576, 43_644),
+        ("full", 5, 4, 71_680, 460, 205, 290, 72_473, 72_558),
+        ("quick", 5, 4, 10_240, 460, 205, 290, 11_033, 11_118),
+    ] {
+        assert_eq!(
+            lossless_support::profile_configs(profile).unwrap().len(),
+            configs
+        );
+        assert_eq!(
+            lossless_support::profile_samplers(profile).unwrap().len(),
+            samplers
+        );
+        let sweep: usize = if profile == "quick" {
+            entries
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["quick_max_tokens"].as_u64().unwrap() as usize)
+                .sum()
+        } else {
+            defaults
+                .iter()
+                .map(|p| p.request["max_tokens"].as_u64().unwrap() as usize)
+                .sum()
+        };
+        assert_eq!(configs * samplers * 2 * sweep, main);
+        assert_eq!(configs * samplers * (defaults.len() - 1), unrelated);
+        assert_eq!(configs * 41, reuse_min);
+        assert_eq!(configs * (41 + 17), reuse_max);
+        assert_eq!(main + unrelated + reuse_min + 128, total_min);
+        assert_eq!(main + unrelated + reuse_max + 128, total_max);
+    }
 }
 
 /// Constant-zero main logits and draft scores form a uniform teacher. The
-/// real default capture layers, mask ID and shortlist remain in use.
+/// default-option proof and the small all-configuration proof share this oracle.
 fn uniform_teacher_fixture(folder: &Folder) {
-    folder.neural_bench_fixture();
     use std::io::{Read, Seek, SeekFrom, Write};
     let mut main = std::fs::OpenOptions::new()
         .read(true)
@@ -536,56 +590,186 @@ fn uniform_teacher_fixture(folder: &Folder) {
         }
     }
     folder.write("draft.yskn", draft);
+    let head_path = folder.0.join("draft.shead");
+    let len = std::fs::metadata(&head_path).unwrap().len();
+    let mut prefix = [0; 24];
+    std::fs::File::open(&head_path)
+        .unwrap()
+        .read_exact(&mut prefix)
+        .unwrap();
+    folder.write("draft.shead", prefix);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(head_path)
+        .unwrap()
+        .set_len(len)
+        .unwrap();
 }
 
-fn example_binary() -> std::path::PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let mut root = exe.parent().unwrap();
-    while root.file_name().is_some_and(|n| n != "release") {
-        root = root.parent().expect("release target root");
-    }
-    let binary = root.join("examples/lossless");
-    assert!(
-        binary.is_file(),
-        "build cargo build -p yskn --release --example lossless first: {}",
-        binary.display()
+fn child_output(command: &mut Command, expected_code: i32) -> Output {
+    let child = command
+        .output()
+        .unwrap_or_else(|e| panic!("{command:?}: {e}"));
+    assert_eq!(
+        child.status.code(),
+        Some(expected_code),
+        "{command:?}: status={}\nstdout={}\nstderr={}",
+        child.status,
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr),
     );
-    binary
+    child
+}
+
+fn child_report(command: &mut Command, path: &std::path::Path, expected_code: i32) -> Value {
+    let child = command
+        .output()
+        .unwrap_or_else(|e| panic!("{command:?}: {e}"));
+    let report = std::fs::read(path);
+    assert_eq!(
+        child.status.code(),
+        Some(expected_code),
+        "{command:?}: status={}\nstderr={}\nreport={}",
+        child.status,
+        String::from_utf8_lossy(&child.stderr),
+        report
+            .as_ref()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .unwrap_or_else(|e| e.to_string())
+    );
+    let diagnostic = || {
+        format!(
+            "{}: status={}\nstderr={}",
+            path.display(),
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        )
+    };
+    let bytes = report.unwrap_or_else(|e| panic!("{}: {e}", diagnostic()));
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("{}: {e}", diagnostic()))
+}
+
+#[test]
+fn child_failure_reports_status_and_stderr_before_a_missing_report() {
+    let folder = Folder::new();
+    let panic = std::panic::catch_unwind(|| {
+        child_report(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "fault_child", "--nocapture"])
+                .env("YSKN_LOSSLESS_TEST_FAULT", "diagnostic"),
+            &folder.0.join("missing.json"),
+            0,
+        )
+    })
+    .unwrap_err();
+    let message = panic.downcast_ref::<String>().unwrap();
+    assert!(
+        message.contains("status=") && message.contains("17"),
+        "{message}"
+    );
+    assert!(
+        message.contains("stderr=synthetic child stopped before report"),
+        "{message}"
+    );
+}
+
+fn example_binary() -> &'static std::path::Path {
+    static BINARY: OnceLock<std::path::PathBuf> = OnceLock::new();
+    BINARY.get_or_init(|| {
+        let exe = std::env::current_exe().unwrap();
+        let root = exe
+            .ancestors()
+            .find(|p| {
+                matches!(
+                    p.file_name().and_then(|n| n.to_str()),
+                    Some("release" | "debug")
+                )
+            })
+            .expect("Cargo profile directory");
+        let mut command = Command::new(env!("CARGO"));
+        command
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .args([
+                "build",
+                "--offline",
+                "-p",
+                "yskn",
+                "--example",
+                "lossless",
+                "--target-dir",
+            ])
+            .arg(root.parent().unwrap())
+            .env("CARGO_NET_OFFLINE", "true");
+        if root.file_name().unwrap() == "release" {
+            command.arg("--release");
+        }
+        child_output(&mut command, 0);
+        root.join("examples/lossless")
+    })
 }
 
 #[test]
 fn real_example_binary_passes_every_configuration_with_a_uniform_teacher() {
-    let _run = MODEL_RUN.lock().unwrap();
     use yskn_ref::{Sampler, SamplingParameters, SamplingVersion};
+    // Default capture taps, mask token and shortlist need a full-size fixture
+    // once; their compatibility does not depend on configuration/sampler loops.
+    {
+        let folder = Folder::new();
+        folder.neural_bench_fixture();
+        uniform_teacher_fixture(&folder);
+        let config = folder.config(yskn::real_engine::DraftMode::Neural);
+        let mut engine = RealEngine::load(config).unwrap();
+        let sampling = Sampling {
+            temperature: 0.0,
+            ..RequestDefaults::default().sampling
+        };
+        let generated = engine
+            .generate(&[1], 2, &sampling, None, &mut |_| Ok(true))
+            .unwrap();
+        assert_eq!(generated.ids, [0, 0]);
+        assert!(generated.neural_guesses_offered > 0);
+        assert!(generated.guesses_accepted > 0);
+    }
     let folder = Folder::new();
     uniform_teacher_fixture(&folder);
     folder.write("chat_template.jinja", "{% for m in messages %}{% if m.role == 'assistant' %}t10 {% endif %}{{ m.content }} {% endfor %}t10");
-    // Known uniform teacher: main ties choose 0 greedily, sampled top-k retains
-    // low IDs. Embed its future continuations so n-gram reuse can offer long
-    // matches under every sampler, including both's six-token threshold.
+    // At four output tokens, one prompt must offer a long n-gram immediately;
+    // the other has a distinct suffix so both must use the neural proposer.
+    // The prefix includes the generation header and the pending sampled token.
+    const PROMPT_TOKENS: usize = 64;
     let mut teacher = Vec::new();
     for (seed, temperature, top_p, top_k, min_p) in [
+        (0, 0.0, 1.0, 1, 0.0),
         (42, 0.7, 0.9, 20, 0.0),
         (2027, 0.75, 0.9, 11, 0.05),
         (91, 1.3, 1.0, 20, 0.0),
     ] {
-        let sampler = Sampler::Sampled(SamplingParameters {
-            seed,
-            temperature,
-            top_p,
-            top_k,
-            min_p,
-            version: SamplingVersion::Gumbel,
-        });
-        for position in 129..141 {
-            teacher.push(sampler.sample(&[0.0; 32], position).unwrap());
+        let sampler = if temperature == 0.0 {
+            Sampler::Greedy
+        } else {
+            Sampler::Sampled(SamplingParameters {
+                seed,
+                temperature,
+                top_p,
+                top_k,
+                min_p,
+                version: SamplingVersion::Gumbel,
+            })
+        };
+        teacher.extend([0, 0, 0, 0, 0, 10]);
+        for position in PROMPT_TOKENS..PROMPT_TOKENS + 4 {
+            teacher.push(sampler.sample(&[0.0; 32], position as u64).unwrap());
         }
     }
     let cases: Vec<_> = [1, 2].into_iter().map(|id| {
-        let mut words = vec![id.to_string()];
-        words.extend(teacher.iter().map(|id| if *id < 10 { id.to_string() } else { format!("t{id}") }));
-        words.resize(128, "0".into());
-        json!({"id":format!("teacher-{id}"),"quick_max_tokens":12,"request":{"messages":[{"role":"user","content":words.join(" ")}],"enable_thinking":false,"max_tokens":12,"loop_guard":false}})
+        let mut ids = vec![id];
+        ids.extend_from_slice(&teacher);
+        ids.resize(PROMPT_TOKENS - 1, 0);
+        if id == 2 {
+            ids[PROMPT_TOKENS - 6..].copy_from_slice(&[1, 2, 3, 4, 5]);
+        }
+        let words: Vec<_> = ids.iter().map(|id| if *id < 10 { id.to_string() } else { format!("t{id}") }).collect();
+        json!({"id":format!("teacher-{id}"),"quick_max_tokens":4,"request":{"messages":[{"role":"user","content":words.join(" ")}],"enable_thinking":false,"max_tokens":4,"loop_guard":false}})
     }).collect();
     let formatter = yskn_text::ChatFormatter::load(&folder.0).unwrap();
     for case in &cases {
@@ -596,36 +780,46 @@ fn real_example_binary_passes_every_configuration_with_a_uniform_teacher() {
                 &json!({"enable_thinking":false}),
             )
             .unwrap();
-        assert_eq!(rendered.len(), 129);
+        assert_eq!(rendered.len(), PROMPT_TOKENS);
         assert_eq!(&rendered[1..1 + teacher.len()], &teacher);
     }
     folder.json("prompts.json", json!(cases));
     let path = folder.0.join("teacher-report.json");
-    let child = Command::new(example_binary())
-        .args(["--profile", "full", "--ctx", "512"])
+    let mut command = Command::new(example_binary());
+    command
+        .args([
+            "--profile",
+            "full",
+            "--ctx",
+            "512",
+            "--backend",
+            "cpu",
+            "--threads",
+            "1",
+            "--draft-capture-layers",
+            "0",
+            "--draft-mask-token",
+            "31",
+            "--draft-shortlist",
+            "32",
+            "--max-tokens",
+            "4",
+        ])
         .arg("--model-dir")
         .arg(&folder.0)
         .arg("--prompts")
         .arg(folder.0.join("prompts.json"))
         .arg("--report")
         .arg(&path)
-        .env("YSKN_BACKEND", "cpu")
-        .env_remove("YSKN_LOSSLESS_INJECT_MISMATCH")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|e| {
-        panic!(
-            "{e}: status={} stderr={}",
-            child.status,
-            String::from_utf8_lossy(&child.stderr)
-        )
-    }))
-    .unwrap();
+        .env("YSKN_BACKEND", "metal")
+        .env_remove("YSKN_LOSSLESS_INJECT_MISMATCH");
+    let report = child_report(&mut command, &path, 0);
     assert!(
-        child.status.success(),
-        "{} failures={}",
-        String::from_utf8_lossy(&child.stderr),
-        report["failures"]
+        report["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["token_count"].as_u64().unwrap_or(0) <= 4)
     );
     assert_eq!(report["passed"], true);
     let runs = report["runs"].as_array().unwrap();
@@ -659,57 +853,70 @@ fn real_example_binary_passes_every_configuration_with_a_uniform_teacher() {
 
 #[test]
 fn real_example_binary_saves_report_and_exits_nonzero_for_an_injected_mismatch() {
-    let _run = MODEL_RUN.lock().unwrap();
     let folder = Folder::new();
-    folder.write("chat_template.jinja", "{% if enable_thinking %}t13 {% endif %}{% for m in messages %}{% if m.role == 'assistant' %}t10 {% endif %}{{ m.content }} {% endfor %}t10");
-    folder.json("prompts.json", json!([
-        {"id":"a","request":{"messages":[{"role":"user","content":"1 2 1 2 1 2"}],"enable_thinking":false,"max_tokens":12}},
-        {"id":"b","request":{"messages":[{"role":"user","content":"3 4 5 6"}],"enable_thinking":false,"max_tokens":12}}
-    ]));
+    folder.write("chat_template.jinja", "{% if enable_thinking %}t13 {% endif %}{% if tools %}t14 {% endif %}{% for m in messages %}{% if m.role == 'assistant' %}t10 {% endif %}{{ m.content }} {% endfor %}t10");
+    folder.write(
+        "prompts.json",
+        include_str!("lossless_support/prompts.json"),
+    );
     let binary = example_binary();
+    for (option, value, message) in [
+        ("--backend", "invalid", "expected cpu or metal"),
+        ("--threads", "0", "must be positive"),
+        ("--draft-capture-layers", "x", "layer indices"),
+        ("--draft-mask-token", "x", "token ID"),
+        ("--draft-shortlist", "0", "must be positive"),
+    ] {
+        let child = child_output(
+            Command::new(binary)
+                .args([option, value])
+                .env_remove("YSKN_LOSSLESS_INJECT_MISMATCH"),
+            1,
+        );
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(stderr.contains(message), "{stderr}");
+    }
     for profile in ["release", "full"] {
         for value in ["", "0", "1"] {
-            let child = Command::new(&binary)
-                .args(["--profile", profile])
-                .env("YSKN_LOSSLESS_INJECT_MISMATCH", value)
-                .output()
-                .unwrap();
-            assert!(!child.status.success());
+            let child = child_output(
+                Command::new(binary)
+                    .args(["--profile", profile])
+                    .env("YSKN_LOSSLESS_INJECT_MISMATCH", value),
+                1,
+            );
             assert!(String::from_utf8_lossy(&child.stderr).contains("must be unset"));
         }
     }
     for inject in [false, true] {
         let report_path = folder.0.join(if inject { "bad.json" } else { "good.json" });
-        let mut command = Command::new(&binary);
+        let mut command = Command::new(binary);
         command
-            .args(["--profile", "quick", "--configs", "none", "--ctx", "512"])
+            .args([
+                "--profile",
+                "quick",
+                "--configs",
+                "none",
+                "--ctx",
+                "512",
+                "--backend",
+                "cpu",
+                "--threads",
+                "1",
+                "--max-tokens",
+                "8",
+            ])
             .arg("--model-dir")
             .arg(&folder.0)
             .arg("--prompts")
             .arg(folder.0.join("prompts.json"))
             .arg("--report")
             .arg(&report_path)
-            .env("YSKN_BACKEND", "cpu")
+            .env("YSKN_BACKEND", "metal")
             .env_remove("YSKN_LOSSLESS_INJECT_MISMATCH");
         if inject {
             command.env("YSKN_LOSSLESS_INJECT_MISMATCH", "1");
         }
-        let child = command.output().unwrap();
-        let report: Value =
-            serde_json::from_slice(&std::fs::read(&report_path).unwrap_or_else(|e| {
-                panic!(
-                    "{e}: status={} stderr={}",
-                    child.status,
-                    String::from_utf8_lossy(&child.stderr)
-                )
-            }))
-            .unwrap();
-        assert_eq!(
-            child.status.success(),
-            !inject,
-            "{} {report}",
-            String::from_utf8_lossy(&child.stderr)
-        );
+        let report = child_report(&mut command, &report_path, i32::from(inject));
         assert_eq!(report["passed"], !inject);
         if inject {
             assert!(

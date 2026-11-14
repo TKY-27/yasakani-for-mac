@@ -27,12 +27,22 @@ pub const CONTEXT: usize = 512;
 pub struct Folder(pub PathBuf);
 impl Folder {
     pub fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "yskn-product-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
+        let path = loop {
+            let path = std::env::temp_dir().join(format!(
+                "yskn-product-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => break path,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("{}: {e}", path.display()),
+            }
+        };
         let folder = Self(path);
         folder.write(
             "weights.yskn",

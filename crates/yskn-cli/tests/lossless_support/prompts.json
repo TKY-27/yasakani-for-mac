@@ -1,0 +1,80 @@
+[
+  {
+    "id": "refrain",
+    "quick_max_tokens": 8,
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "1 2 1 2 1 2 1 2"
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 12
+    }
+  },
+  {
+    "id": "different",
+    "quick_max_tokens": 4,
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "3 4 5 6"
+        }
+      ],
+      "enable_thinking": true,
+      "max_tokens": 4,
+      "thinking_budget": 1
+    }
+  },
+  {
+    "id": "tool",
+    "quick_max_tokens": 4,
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "5"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call-1",
+              "type": "function",
+              "function": {
+                "name": "read_sensor",
+                "arguments": "{}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call-1",
+          "content": "6"
+        },
+        {
+          "role": "user",
+          "content": "7"
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 4,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read_sensor",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            }
+          }
+        }
+      ]
+    }
+  }
+]

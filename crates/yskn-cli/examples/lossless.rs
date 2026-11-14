@@ -48,11 +48,14 @@ fn run() -> Result<bool> {
     let mut max_tokens = 256;
     let mut context = RealEngineConfig::default().context;
     let mut names = None;
+    let mut backend = None;
+    let mut threads = None;
+    let mut draft_options = yskn_ref::draft::DraftOptions::default();
     let mut profile = "release".to_string();
     while let Some(arg) = args.next() {
         if arg == "--help" {
             println!(
-                "lossless --model-dir MODEL_FOLDER [--profile release|full|quick] [--prompts FILE] [--max-tokens N] [--ctx N] [--configs LIST] [--report lossless.json]\nLIST: {} (none is always included first)",
+                "lossless --model-dir MODEL_FOLDER [--profile release|full|quick] [--prompts FILE] [--max-tokens N] [--ctx N] [--backend cpu|metal] [--threads N] [--draft-capture-layers LIST] [--draft-mask-token ID] [--draft-shortlist N] [--configs LIST] [--report lossless.json]\nLIST: {} (none is always included first)",
                 lossless_support::CONFIG_NAMES.join(",")
             );
             return Ok(true);
@@ -65,6 +68,11 @@ fn run() -> Result<bool> {
             "--configs",
             "--report",
             "--profile",
+            "--backend",
+            "--threads",
+            "--draft-capture-layers",
+            "--draft-mask-token",
+            "--draft-shortlist",
         ]
         .contains(&arg.as_str())
         {
@@ -77,12 +85,37 @@ fn run() -> Result<bool> {
             "--model-dir" => model = Some(PathBuf::from(value)),
             "--prompts" => prompts = Some(PathBuf::from(value)),
             "--report" => report = Some(PathBuf::from(value)),
+            "--draft-capture-layers" => {
+                draft_options.capture_layers = value
+                    .split(',')
+                    .map(|s| {
+                        s.parse::<usize>().map_err(|_| {
+                            Error::request(
+                                "--draft-capture-layers requires comma-separated layer indices",
+                            )
+                        })
+                    })
+                    .collect::<Result<_>>()?;
+            }
+            "--draft-mask-token" => {
+                draft_options.mask_token = value
+                    .parse()
+                    .map_err(|_| Error::request("--draft-mask-token requires a token ID"))?;
+            }
+            "--draft-shortlist" => {
+                draft_options.shortlist = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| Error::request("--draft-shortlist must be positive"))?;
+            }
+            "--backend" => backend = Some(value.parse().map_err(Error::engine)?),
             "--configs" => names = Some(lossless_support::configs(&value)?),
             "--profile" => {
                 lossless_support::profile_samplers(&value)?;
                 profile = value;
             }
-            "--max-tokens" | "--ctx" => {
+            "--max-tokens" | "--ctx" | "--threads" => {
                 let n = value
                     .parse::<usize>()
                     .ok()
@@ -90,6 +123,8 @@ fn run() -> Result<bool> {
                     .ok_or_else(|| Error::request(format!("{arg} must be positive")))?;
                 if arg == "--ctx" {
                     context = n;
+                } else if arg == "--threads" {
+                    threads = Some(n);
                 } else {
                     max_tokens = n;
                 }
@@ -108,6 +143,8 @@ fn run() -> Result<bool> {
     let base = RealEngineConfig {
         model_dir,
         context,
+        backend,
+        threads,
         ..RealEngineConfig::default()
     };
     let defaults = RequestDefaults {
@@ -124,7 +161,10 @@ fn run() -> Result<bool> {
         &profile,
         |name| {
             // RealEngine::load inspects AND enforces the physical-memory estimate.
-            let inner = RealEngine::load(lossless_support::configure(&base, name)?)?;
+            let inner = RealEngine::load_with_draft_options(
+                lossless_support::configure(&base, name)?,
+                draft_options.clone(),
+            )?;
             if std::env::var("YSKN_LOSSLESS_INJECT_MISMATCH").as_deref() == Ok("1") {
                 Ok(Box::new(InjectMismatch {
                     inner,

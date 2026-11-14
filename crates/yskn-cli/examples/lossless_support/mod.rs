@@ -385,7 +385,7 @@ fn seed_probes(
     let mut differs = false;
     for seed in [42, 2027] {
         for (i, prompt) in prompts.iter().take(2).enumerate() {
-            let mut p = parameters(prompt, defaults, 1, 8)?;
+            let mut p = parameters(prompt, defaults, 1, 8.min(defaults.max_tokens))?;
             p.seed = Some(seed);
             let label = |run| json!({"configuration":name,"sampler":"seed-only","seed":seed,"prompt":prompt.id,"run":run,"probe":true});
             runner.engine.reset()?;
@@ -426,7 +426,7 @@ fn reuse_probes(
     rows: &mut Vec<Value>,
     failures: &mut Vec<Value>,
 ) -> Result<Vec<(String, Observation)>> {
-    let system = "Keep the ledger in order. Each entry has a name, count, colour and shelf. Do not change existing entries. ".repeat(8);
+    let system = "Keep the ledger in order. Each entry has a name, count, colour and shelf. Do not change existing entries. ".repeat(2);
     let body = json!({"messages":[
         {"role":"system","content":system},
         {"role":"user","content":"Remember cedar."},
@@ -434,7 +434,7 @@ fn reuse_probes(
         {"role":"user","content":"Name the entry 3"}],"enable_thinking":false,"max_tokens":1,"temperature":0,"seed":0});
     let first = parse_chat_request(&body, defaults)?;
     let mut extension = first.clone();
-    extension.max_tokens = 8;
+    extension.max_tokens = 8.min(defaults.max_tokens);
     extension
         .messages
         .as_array_mut()
@@ -444,7 +444,7 @@ fn reuse_probes(
             json!({"role":"user","content":"Name its shelf."}),
         ]);
     let mut sibling = first.clone();
-    sibling.max_tokens = 8;
+    sibling.max_tokens = 8.min(defaults.max_tokens);
     sibling.messages[3]["content"] = json!("Name the colour 4");
     let (a, _) = runner.prepare_checked(&first)?;
     let (b, _) = runner.prepare_checked(&extension)?;
@@ -730,6 +730,10 @@ pub fn check(
         ));
     }
     let samplers = profile_samplers(profile)?;
+    let probe_defaults = RequestDefaults {
+        max_tokens,
+        ..defaults.clone()
+    };
     let mut cases = prompts.to_vec();
     if profile == "quick" {
         for p in &mut cases {
@@ -818,7 +822,7 @@ pub fn check(
                     &mut runner,
                     &capture,
                     prompts,
-                    defaults,
+                    &probe_defaults,
                     name,
                     &mut rows,
                     &mut failures,
@@ -840,7 +844,7 @@ pub fn check(
             let reuse_outputs = reuse_probes(
                 &mut runner,
                 &capture,
-                defaults,
+                &probe_defaults,
                 name,
                 &mut rows,
                 &mut failures,

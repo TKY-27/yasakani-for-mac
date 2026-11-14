@@ -401,7 +401,19 @@ No example code is linked into `yskn`. It never needs a server socket.
 
 Profiles select the following configurations and samplers. `--configs LIST`
 overrides configurations; `none` is always included first. `--max-tokens N`
-(default 256) caps each entry's requested output, including thinking.
+(default 256) caps each entry's requested output, including thinking, and also
+caps the seed-only and reuse probes (normally eight tokens each).
+`--backend cpu|metal` and `--threads N` map directly to `RealEngineConfig`;
+omitting them preserves the product defaults (environment/device detection
+and the available CPU count, capped at ten). For tiny synthetic models, use
+`--backend cpu --threads 1`: Metal dispatch and large worker pools can cost
+more than the computation. The explicit backend overrides `YSKN_BACKEND`.
+
+For development with differently shaped draft artifacts, the example also
+accepts `--draft-capture-layers 0,1,...`, `--draft-mask-token ID`, and
+`--draft-shortlist N`. These map to the existing `DraftOptions` API and retain
+its loader validation; omitted values keep the product's defaults. They are
+example arguments, not new product CLI switches.
 
 | Profile | Configurations | Samplers | Main sweeps | Tokens per sweep |
 | --- | --- | --- | --- | --- |
@@ -510,8 +522,10 @@ post-depth-truncation generation statistics, not its configured draft mode.
 An ID match without this activity fails. The small random synthetic fixture
 intentionally fails some of these coverage gates even though its IDs match.
 A second synthetic uniform-teacher fixture runs the actual example binary
-with every configuration, real proposals and real acceptance; it retains
-the default capture layers, mask ID and shortlist and adds no engine hooks.
+with every configuration, real proposals and real acceptance. A separate
+uniform-teacher generation verifies the default capture layers, mask ID and
+shortlist through `RealEngine::load`. The configuration/sampler matrix uses a
+small teacher and explicit draft options; neither proof adds engine hooks.
 
 `--prompts FILE` accepts an array of `{"id":"unique name","request":{...}}`
 entries (at least two). Sampling fields belong to the harness. Errors name
@@ -525,12 +539,89 @@ comparisons and exercise gates pass. Real-model duration, acceptance, long
 output lengths and real-template reuse must be verified on the host.
 
 For a synthetic fixture with a smaller context, `--ctx N` selects the engine
-context (the normal loader still enforces the model's maximum). To test the
-example's own failure exit and saved report, build it first with
-`CARGO_NET_OFFLINE=true cargo build --release -p yskn --example lossless`.
+context (the normal loader still enforces the model's maximum). The integration
+test builds the example offline once, in its own Cargo target/profile, before
+checking the example's failure exit and saved report. Both `cargo test -p yskn
+--test lossless` and its `--release` variant work without a separately built
+release example.
 `YSKN_LOSSLESS_INJECT_MISMATCH=1` flips the first returned token once per
 engine load, so the repeat comparison must fail. This diagnostic environment
 variable exists only in the example and is allowed only with `--profile quick`.
 Release and full refuse to start whenever it is set, even to an empty value.
 The integration test launches this binary on authored synthetic weights,
 checks a clean exit/report, then an injected nonzero exit/report.
+
+
+### Synthetic lossless regression budget
+
+The integration binary never runs the bundled 24-entry real-model corpus.
+Exactly one parser-only test validates its unique IDs, 1,792/256-token sweep
+budgets, and all three profiles' arithmetic above. Generation uses
+`tests/lossless_support/prompts.json`: a plain repetition (12 tokens), thinking
+(4, with a thinking budget), and an assistant tool call plus tool result (4).
+The example's quick report test caps the plain case at eight. Reuse pairs,
+cancellation, over-context recovery, and the seed-only probe still run through
+the real product chat/engine path. The ledger prefix was shortened from eight
+copies to two; the measured shared prefix must still reach 32 tokens.
+
+At `9afbce9`, the small in-process fixtures already selected CPU/one thread;
+example children selected CPU via `YSKN_BACKEND` but used the default worker
+count. An unconfigured standalone example detects Metal when a device is
+available. The tests now explicitly choose CPU/one thread, including children
+launched with `YSKN_BACKEND=metal` to check argument precedence.
+
+The principal cost was repeatedly prefilling and generating with the
+62-layer, 248,071-token teacher needed by default draft options. Its old main
+matrix alone budgeted 5 configurations × 4 samplers × 2 prompts × 2 sweeps ×
+12 tokens = 960 output tokens, plus 353–438 probe tokens, and 129-token input
+prefills. The new matrix uses a two-layer, 32-token teacher, two 64-token inputs,
+and four output tokens (320 main + 20 unrelated + 125–170 reuse + 64 seed-only
+= 529–574 tokens). An earlier prefix supplies the sampled continuations for
+n-gram offers; a distinct suffix forces neural offers. Every configuration and
+sampler must still offer guesses, greedy and seed 42 must accept guesses, and
+`both` must offer from both sources. One additional two-token greedy generation
+on the full-size teacher proves default capture/mask/shortlist compatibility
+and actual neural proposal/acceptance, rather than repeating that dimension
+proof across all matrix cells.
+
+The following names refer to tests in `tests/lossless.rs`. Each normal small
+check runs four samplers, three prompts twice (12/4/4-token caps), plus the
+unchanged comparisons and capped probes. Successful two-configuration checks
+budget at most 500 generated tokens; early-error checks stop sooner. The
+five-configuration check budgets at most 1,226. These are upper budgets, not
+claims that every generation reaches its cap.
+
+| Test | Engine loads before → after | Preserved proof and reduced work |
+| --- | ---: | --- |
+| `actual_synthetic_engine_matches_ids_but_rejects_unexercised_draft_cells` | 5 → 5 | All five configurations/four samplers, ID/repeat/stage comparisons, real acceptance, source accounting, modes 0/1/2, cancellation/failure recovery; 12/12 becomes 12/4/4 and adds the tool path. |
+| `rewritten_continuation_is_compared_and_fixed_pair_still_exercises_live_reuse` | 2 → 2 | Rewritten real continuation still compares; fixed fallback still reaches live reuse and equals reset; smaller main cases/prefix. |
+| `wrong_ids_only_during_live_or_sibling_reuse_fail_comparison` | 4 → 2 | Both live and sibling corruption must independently produce position-zero reuse mismatches; one shared engine sweep injects both. |
+| `a_constant_seed_fails_the_same_settings_probe` | 5 → 2 | Same settings except seed, four runs per seed, failure on `none` and shipping `both`; omit configurations without this probe. |
+| `an_empty_actual_engine_generation_fails_instead_of_comparing_equal` | 2 → 2 | Empty actual generation must fail, rather than compare equal; smaller baseline sweep. |
+| `later_error_preserves_the_mismatch_and_completed_rows` | 2 → 2 | Earlier mismatch and completed rows survive a later thinking-generation error; smaller baseline sweep. |
+| `fault_child` | 0 normally; 2 per child → same | Actual faulty-engine report drives exit 1; uses the small cases. |
+| `token_and_repeat_faults_and_inactive_drafting_exit_nonzero_with_diagnostics` | 6 → 6 | Three separate child exits, token/repeat positions and expected/actual IDs, inactive acceptance; smaller cases, explicit status/stderr diagnostics. |
+| `real_example_binary_passes_every_configuration_with_a_uniform_teacher` | 5 large → 1 large + 5 small | Default options get a real proposal/acceptance proof once; actual example retains every configuration/sampler and both proposal sources on the small teacher. |
+| `real_example_binary_saves_report_and_exits_nonzero_for_an_injected_mismatch` | 2 → 2 | Saved good/bad reports, real exits, position-zero repeat mismatch, release/full injection refusal; small prompt file, CPU/one thread, and argument validation. |
+| `malformed_prompt_files_name_the_file_and_entry_instead_of_panicking` | 0 → 0 | Bad syntax, invalid entries/owned sampling, duplicate IDs/configurations retain file/entry diagnostics; bundled validation moved below. |
+| `child_failure_reports_status_and_stderr_before_a_missing_report` | new, 0 | A child exits 17 without a report; the helper must retain exit status and stderr instead of masking it with the file error. |
+| `bundled_prompt_file_has_unique_ids_documented_budgets_and_profile_arithmetic` | new, 0 | The only bundled-corpus test; validates all 24 requests, uniqueness, budgets, and each profile's full token arithmetic without loading an engine. |
+
+The seven `lossless_support::tests` remain engine-free and unchanged: closing
+thinking-token/answer accounting; positive cached reuse; acceptance isolated
+from probes; both sources per sampler; empty generations; explicit sampling
+against greedy defaults; and sampler/seed diversity. The three
+`product_support::model` tests still verify reproducible mixed fixtures,
+released warp/bit layouts, and alternate dimensions/plain embeddings. They
+create synthetic artifacts and perform no generation.
+
+Temporary directories are atomically reserved using PID, timestamp and a
+process-local counter, with collision retry; each test owns its directory.
+There is no global model mutex to poison or serialize independent assertions.
+Child checks include command, exit status (including signals), stderr, and
+available report data before reporting a missing/invalid report. The example
+is rebuilt once per binary/profile, so stale or release-only artifacts cannot
+silently stand in for the dev child. Neither these tests nor the example/chat/
+engine path has a watchdog, deadline kill, process-group kill, or process-name
+lookup. No internal SIGTERM sender was found; an external sender cannot be
+identified from the reported failure alone.
