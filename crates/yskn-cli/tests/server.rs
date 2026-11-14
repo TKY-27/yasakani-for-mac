@@ -4,7 +4,13 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Request, body::Incoming, client::conn::http1};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
-use std::{io::ErrorKind, net::SocketAddr, rc::Rc, time::Duration};
+use std::{
+    io::ErrorKind,
+    net::SocketAddr,
+    rc::Rc,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -13,7 +19,7 @@ use tokio::{
 };
 use yskn::{
     chat::ChatRunner,
-    engine::{Engine, Generation, Sampling},
+    engine::{Engine, Finish, Generation, Sampling},
     server::{Config, Server},
     stub::{self, Control, Script, StubEngine},
 };
@@ -33,10 +39,38 @@ fn body() -> Value {
 fn ids(s: &str) -> Vec<u32> {
     stub::formatter().unwrap().encode(s).unwrap()
 }
+/// Engine silence a test sets: before the first output (a slow prefill, which
+/// polls for a cancel with an empty slice, as the real engine does between
+/// prefill passes) and before each later output (a slow decoding pass).
+#[derive(Clone, Default)]
+struct Silence(Arc<Mutex<Pauses>>);
+#[derive(Clone, Copy, Default)]
+struct Pauses {
+    prefill: Duration,
+    between: Duration,
+    /// Generations that began their silent prefill.
+    prefills: usize,
+    /// Generations that saw a cancel during the silent prefill.
+    cancelled: usize,
+}
+impl Silence {
+    fn get(&self) -> Pauses {
+        *self.0.lock().unwrap()
+    }
+    fn set(&self, prefill: Duration, between: Duration) {
+        let mut p = self.0.lock().unwrap();
+        p.prefill = prefill;
+        p.between = between;
+    }
+    fn count(&self, f: impl FnOnce(&mut Pauses)) {
+        f(&mut self.0.lock().unwrap());
+    }
+}
 // The integration fixture proves the engine need not be Send, and all methods
 // stay on the factory's owning thread. The real network/server code is used.
 struct Affine {
     inner: StubEngine,
+    silence: Silence,
     owner: std::thread::ThreadId,
     _not_send: Rc<()>,
 }
@@ -58,12 +92,44 @@ impl Engine for Affine {
         cb: &mut dyn FnMut(&[u32]) -> yskn::Result<bool>,
     ) -> yskn::Result<Generation> {
         assert_eq!(self.owner, std::thread::current().id());
-        self.inner.generate(p, n, s, stop, cb)
+        let Pauses {
+            prefill, between, ..
+        } = self.silence.get();
+        if !prefill.is_zero() {
+            self.silence.count(|p| p.prefills += 1);
+            let end = Instant::now() + prefill;
+            while Instant::now() < end {
+                if !cb(&[])? {
+                    self.silence.count(|p| p.cancelled += 1);
+                    return Ok(Generation {
+                        ids: vec![],
+                        finish: Finish::Cancelled,
+                        cached_tokens: 0,
+                        snap_mode: 0,
+                        passes: 0,
+                        rows_verified: 0,
+                        guesses_offered: 0,
+                        guesses_accepted: 0,
+                        prefill_ms: 0.0,
+                        gen_ms: 0.0,
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(1)); // simulated work
+            }
+        }
+        let mut first = true;
+        self.inner.generate(p, n, s, stop, &mut |ids| {
+            if !std::mem::take(&mut first) {
+                std::thread::sleep(between); // a slow decoding pass
+            }
+            cb(ids)
+        })
     }
 }
 struct Harness {
     addr: SocketAddr,
     control: Control,
+    silence: Silence,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<yskn::Result<()>>>,
 }
@@ -76,10 +142,13 @@ impl Harness {
         cfg.defaults.thinking_budget = 0;
         let c = Control::default();
         let control = c.clone();
+        let silence = Silence::default();
+        let quiet = silence.clone();
         let server = Server::bind(cfg, move || {
             ChatRunner::new(
                 Box::new(Affine {
                     inner: StubEngine::with_control(capacity, c),
+                    silence: quiet,
                     owner: std::thread::current().id(),
                     _not_send: Rc::new(()),
                 }),
@@ -100,6 +169,7 @@ impl Harness {
         Self {
             addr,
             control,
+            silence,
             shutdown: Some(tx),
             task: Some(task),
         }
@@ -274,6 +344,7 @@ async fn loading_state() {
     let h = Harness {
         addr,
         control: Control::default(),
+        silence: Silence::default(),
         shutdown: Some(tx),
         task: Some(task),
     };
@@ -1677,5 +1748,157 @@ async fn a_response_that_is_not_read_is_bounded_by_the_idle_deadline() {
     assert_eq!(r.json()["choices"][0]["message"]["content"], "next");
     assert_eq!(h.control.observation().stops, 1);
     drop(s);
+    h.stop().await;
+}
+// Soak finding: the idle deadline also fired while the engine worked on a
+// request and nothing was written, so a slow prefill or a slow decoding pass
+// cut the connection and cancelled the engine. The idle deadline is for
+// waiting on the client; these engines stay silent several times longer.
+fn quiet_config() -> Config {
+    let mut cfg = Config::default();
+    cfg.limits.idle_timeout = Duration::from_millis(200);
+    cfg
+}
+/// Splits an event stream into its comment frames and its JSON events. Every
+/// frame is one `:` comment line or one `data:` line; `[DONE]` comes last.
+fn sse_frames(text: &str) -> (usize, Vec<Value>) {
+    let frames: Vec<&str> = text
+        .strip_suffix("\n\n")
+        .expect("stream ends with a blank line")
+        .split("\n\n")
+        .collect();
+    assert_eq!(frames.last(), Some(&"data: [DONE]"), "{text}");
+    let mut comments = 0;
+    let mut events = vec![];
+    for f in &frames[..frames.len() - 1] {
+        assert!(!f.contains(['\n', '\r']), "frame spans lines: {f:?}");
+        if f.starts_with(':') {
+            comments += 1;
+        } else {
+            let data = f.strip_prefix("data: ").expect("data frame");
+            events.push(serde_json::from_str(data).unwrap());
+        }
+    }
+    (comments, events)
+}
+/// Sends one request on a kept-alive connection. The returned task ends when
+/// the server closes the connection; the sender keeps the client's side open.
+async fn kept_alive(
+    h: &Harness,
+    b: &Value,
+) -> (
+    Reply,
+    hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+    JoinHandle<()>,
+) {
+    let s = TcpStream::connect(h.addr).await.unwrap();
+    let (mut sender, conn) = http1::handshake(TokioIo::new(s)).await.unwrap();
+    let conn = tokio::spawn(async {
+        let _ = conn.await;
+    });
+    let b = b.to_string();
+    let r = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("host", h.addr.to_string())
+        .header("content-length", b.len())
+        .body(Full::new(Bytes::from(b)))
+        .unwrap();
+    let exchange = async {
+        let r = sender.send_request(r).await.expect("response");
+        let status = r.status().as_u16();
+        let headers = r.headers().clone();
+        let bytes = r.into_body().collect().await.unwrap().to_bytes();
+        Reply {
+            status,
+            headers,
+            text: String::from_utf8(bytes.to_vec()).unwrap(),
+        }
+    };
+    let reply = tokio::time::timeout(common::PATIENCE, exchange)
+        .await
+        .expect("request timed out");
+    (reply, sender, conn)
+}
+async fn closed_by_the_server(conn: JoinHandle<()>) {
+    tokio::time::timeout(common::PATIENCE, conn)
+        .await
+        .expect("the server never closed the idle connection")
+        .unwrap();
+}
+/// One non-streaming request on a kept-alive connection, then one streamed
+/// request, both answered in full despite the engine's silence.
+async fn survives_silence(h: &Harness, text: &str) {
+    h.script(&format!("</think>{text}"));
+    let (r, _sender, conn) = kept_alive(h, &body()).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.json()["choices"][0]["message"]["content"], text);
+    // Waiting for the next request is waiting for the client again.
+    closed_by_the_server(conn).await;
+    h.script(&format!("</think>{text}"));
+    let r = h
+        .chat(json!({"stream":true,"stream_options":{"include_usage":true}}))
+        .await;
+    assert_eq!(r.status, 200);
+    let (_, ev) = sse_frames(&r.text);
+    assert_eq!(ev[0]["choices"][0]["delta"], json!({"role":"assistant"}));
+    assert_eq!(pieces(&ev, "content"), text);
+    assert_eq!(ev[ev.len() - 2]["choices"][0]["finish_reason"], "stop");
+    assert!(
+        ev.last().unwrap()["usage"]["completion_tokens"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+}
+#[tokio::test]
+async fn a_silent_prefill_longer_than_the_idle_deadline_completes() {
+    let h = Harness::start(quiet_config()).await;
+    h.silence.set(Duration::from_millis(1000), Duration::ZERO);
+    survives_silence(&h, "after a long prefill").await;
+    assert_eq!(h.silence.get().cancelled, 0);
+    h.stop().await;
+}
+#[tokio::test]
+async fn pauses_between_tokens_longer_than_the_idle_deadline_complete() {
+    let h = Harness::start(quiet_config()).await;
+    h.silence.set(Duration::ZERO, Duration::from_millis(400));
+    // "</think>slow" and EOS take four engine passes: three pauses.
+    survives_silence(&h, "slow").await;
+    assert_eq!(h.control.observation().stops, 0);
+    h.stop().await;
+}
+// A request queued behind one that holds the engine gets the documented 503
+// after the queue wait, which is longer than the idle deadline, and its
+// connection is then closed by the idle deadline like any other.
+#[tokio::test]
+async fn a_request_queued_behind_a_long_one_gets_the_queue_timeout() {
+    let mut cfg = quiet_config();
+    cfg.limits.queue_timeout = Duration::from_millis(600);
+    let h = Harness::start(cfg).await;
+    h.silence.set(Duration::from_secs(3600), Duration::ZERO);
+    let mut first = TcpStream::connect(h.addr).await.unwrap();
+    first
+        .write_all(raw_post(&h, &body()).as_bytes())
+        .await
+        .unwrap();
+    let silence = h.silence.clone();
+    common::until("the long prefill to start", || silence.get().prefills == 1).await;
+    let (r, _sender, conn) = kept_alive(&h, &json!({"messages":user(),"max_tokens":20})).await;
+    assert_eq!(r.status, 503, "{}", r.text);
+    assert_eq!(r.headers["retry-after"], "5");
+    assert!(error_message(&r).contains("waited too long"), "{}", r.text);
+    closed_by_the_server(conn).await;
+    drop(first);
+    common::until("the engine to see the disconnect", || {
+        silence.get().cancelled == 1
+    })
+    .await;
+    h.silence.set(Duration::ZERO, Duration::ZERO);
+    h.script("</think>next");
+    let r = h.chat(json!({"max_tokens":20})).await;
+    assert_eq!(r.json()["choices"][0]["message"]["content"], "next");
+    // The queued request never reached the engine.
+    assert_eq!(h.control.observation().calls, 1);
     h.stop().await;
 }
