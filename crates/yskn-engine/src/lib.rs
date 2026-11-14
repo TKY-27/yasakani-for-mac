@@ -2,6 +2,8 @@
 //! Metal compressed-linear kernel (macOS only) and layer-major main-model inference.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod draft;
+mod draft_math;
 mod kernel;
 mod mapped;
 #[cfg(target_os = "macos")]
@@ -9,6 +11,7 @@ mod metal;
 mod model;
 mod pool;
 
+pub use draft::{DraftTiming, FastDraft};
 pub use kernel::Kernel;
 pub use mapped::{MappedModel, Matrix};
 #[cfg(target_os = "macos")]

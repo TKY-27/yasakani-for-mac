@@ -34,6 +34,11 @@ impl MappedModel {
         &self.header
     }
 
+    /// The shared read-only mapping, for in-place views of large vectors.
+    pub(crate) fn mapping(&self) -> &Arc<Mmap> {
+        &self.mapping
+    }
+
     /// A validated reader borrowing the same mapping; loading vectors never copies code streams.
     pub fn reader(&self) -> Result<Container<Cursor<&[u8]>>> {
         Ok(Container::new(Cursor::new(&self.mapping[..]))?)
@@ -114,7 +119,7 @@ impl MappedModel {
     }
 }
 
-fn region(bytes: &[u8], offset: u64, length: u64) -> Result<Range<usize>> {
+pub(crate) fn region(bytes: &[u8], offset: u64, length: u64) -> Result<Range<usize>> {
     let invalid = || Error::InvalidModel("mapped region exceeds address space or file".into());
     let start = usize::try_from(offset).map_err(|_| invalid())?;
     let length = usize::try_from(length).map_err(|_| invalid())?;

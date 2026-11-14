@@ -301,3 +301,103 @@ fn engine_handover_counts_memory_reseeds_long_suffix_and_detects_main_only_resto
     main.prefill(&[7; 5]).unwrap();
     assert!(neural.synchronize(&mut main).is_err());
 }
+
+/// One generation of 9 tokens after a 3-token prefill; returns tokens, accepted
+/// guesses and the main state digest.
+fn draft_run<D: yskn_ref::draft::BlockDraft>(
+    fixture: &Fixture,
+    backend: Backend,
+    proposer: &mut DraftProposer<D>,
+    sampler: &Sampler,
+    prompt: &[u32],
+    k: usize,
+) -> (Vec<u32>, usize, u64) {
+    let mut main = fixture.engine(backend, KvMode::Int8);
+    main.set_capture(proposer.capture_options()).unwrap();
+    main.prefill(&prompt[..3]).unwrap();
+    let mut limits = GenerationLimits::new(9, main.context_capacity());
+    limits.max_draft_tokens = k;
+    let result = generate(&mut main, proposer, &mut sampler.clone(), prompt, limits).unwrap();
+    assert!(result.statistics.guesses_offered > 0);
+    assert!(!main.has_provisional_pass());
+    let accepted = result.statistics.guesses_accepted;
+    (result.tokens, accepted, main.state_digest())
+}
+
+/// The fast draft drives the same lossless loop as the reference draft: equal
+/// tokens, main state, accepted guesses and final draft ring, and both equal no draft.
+fn check_fast_draft(backend: Backend) {
+    use yskn_engine::FastDraft;
+    let fixture = Fixture::new();
+    let artifact = draft_artifact();
+    let head = support::draft::shead(37);
+    fs::write(fixture.0.join("bdraft2_k8.yskn"), &artifact).unwrap();
+    fs::write(fixture.0.join("bdraft2_k8.shead"), &head).unwrap();
+    let prompt = [3, 7, 11, 9];
+    for seed in [None, Some(17), Some(0xabcdef)] {
+        let sampler = seed.map_or(Sampler::Greedy, |seed| {
+            Sampler::Sampled(SamplingParameters {
+                seed,
+                ..SamplingParameters::default()
+            })
+        });
+        let choice = seed.map_or(DraftChoice::Greedy, DraftChoice::sampled);
+        let mut main = fixture.engine(backend, KvMode::Int8);
+        main.prefill(&prompt[..3]).unwrap();
+        let limits = GenerationLimits::new(9, main.context_capacity());
+        let none = generate(
+            &mut main,
+            &mut NoProposer,
+            &mut sampler.clone(),
+            &prompt,
+            limits,
+        )
+        .unwrap()
+        .tokens;
+        let none_digest = main.state_digest();
+        for k in [1, 3, 7] {
+            let mut reference = proposer(&artifact, &head, k, choice);
+            let expected = draft_run(&fixture, backend, &mut reference, &sampler, &prompt, k);
+            assert_eq!(
+                (&expected.0, expected.2),
+                (&none, none_digest),
+                "reference K={k}"
+            );
+            // SAFETY: the fixture files are not modified while the draft is alive.
+            let draft = unsafe {
+                FastDraft::with_options(
+                    &fixture.0,
+                    Engine::new(Kernel::fastest(), 3).unwrap(),
+                    backend,
+                    DraftOptions {
+                        capture_layers: vec![0, 1],
+                        ..support::draft::options()
+                    },
+                )
+            }
+            .unwrap();
+            let mut fast = DraftProposer::new(draft, k, choice).unwrap();
+            let actual = draft_run(&fixture, backend, &mut fast, &sampler, &prompt, k);
+            assert_eq!(actual, expected, "{backend:?} seed={seed:?} K={k}");
+            assert_eq!(fast.draft().snapshot(), reference.draft().snapshot());
+        }
+    }
+    eprintln!(
+        "fast draft generation {backend:?}: greedy + 2 seeds, K=1/3/7 equal reference and no draft"
+    );
+}
+
+#[test]
+fn cpu_fast_draft_generation_equals_reference_draft_and_no_draft() {
+    check_fast_draft(Backend::Cpu);
+}
+
+#[test]
+fn metal_fast_draft_generation_equals_reference_draft_and_no_draft() {
+    #[cfg(target_os = "macos")]
+    if yskn_engine::MetalEngine::device_exists() {
+        check_fast_draft(Backend::Metal);
+        return;
+    }
+    println!("skipped: no Metal device");
+}

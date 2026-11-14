@@ -138,6 +138,13 @@ impl ReducedHead {
             return Err(Error::InvalidInput("draft head hidden width".into()));
         }
         require_finite(hidden, "draft head input")?;
+        let low = self.low_rank(hidden)?;
+        let scores = self.approximate_scores(&low);
+        let ids = shortlist(&scores, count)?;
+        top16(self.rescore(hidden, &ids))
+    }
+    /// Stage 1: the rank-512 projection of one hidden row, checked finite.
+    pub fn low_rank(&self, hidden: &[f32]) -> Result<Vec<f32>> {
         let mut low = vec![0.0; self.layout.rank];
         for (rank, value) in low.iter_mut().enumerate() {
             let mut partial = [0.0_f32; 32];
@@ -156,6 +163,10 @@ impl ReducedHead {
             *value = xor_sum32(&partial);
         }
         require_finite(&low, "draft low-rank projection")?;
+        Ok(low)
+    }
+    /// Stage 2: approximate scores of every token from the rank projection.
+    pub fn approximate_scores(&self, low: &[f32]) -> Vec<f32> {
         let mut scores = vec![0.0; self.layout.vocabulary];
         for (v, score) in scores.iter_mut().enumerate() {
             let mut partial = [0.0_f32; 32];
@@ -171,9 +182,12 @@ impl ReducedHead {
             }
             *score = xor_sum32(&partial) * self.approximate_scale[v];
         }
-        let ids = shortlist(&scores, count)?;
-        let mut candidates = Vec::with_capacity(count);
-        for v in ids {
+        scores
+    }
+    /// Stage 4: full-width int8 rescoring of shortlisted tokens, in shortlist order.
+    pub fn rescore(&self, hidden: &[f32], ids: &[u32]) -> Vec<Candidate> {
+        let mut candidates = Vec::with_capacity(ids.len());
+        for &v in ids {
             let mut partial = [0.0_f32; 32];
             for t in 0..hidden.len() / 128 {
                 for (lane, acc) in partial.iter_mut().enumerate() {
@@ -192,7 +206,7 @@ impl ReducedHead {
                 score: xor_sum32(&partial) * self.rescore_scale[v as usize],
             });
         }
-        top16(candidates)
+        candidates
     }
 }
 

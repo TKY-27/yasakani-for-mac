@@ -157,6 +157,10 @@ impl DraftSnapshot {
     pub fn position(&self) -> usize {
         self.position
     }
+    /// (layers, kv_heads, window); restore requires equal shapes.
+    pub fn shape(&self) -> (usize, usize, usize) {
+        self.dimensions
+    }
     /// Zero every slot and continue at `position` (reset, or reseeding a full ring suffix).
     pub fn clear(&mut self, position: usize) {
         self.position = position;
