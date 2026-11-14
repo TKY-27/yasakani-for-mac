@@ -209,10 +209,10 @@ fn compare_mode(bytes: Vec<u8>, count: usize, baseline: &str, mode: KvMode) {
                     };
                     assert_eq!(model.backend(), backend);
                     check(&context, model);
+                    println!("ran: {context}");
                 }
             }
         }
-        println!("ran: {mode:?} {backend:?} threads=1,4 rows_per_pass={widths:?}");
     }
 }
 /// A missing device is reported on stdout and is the only way to skip Metal cases.
