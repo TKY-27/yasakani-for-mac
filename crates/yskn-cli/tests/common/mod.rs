@@ -114,5 +114,7 @@ pub fn bad_requests() -> Vec<(Value, &'static str)> {
         ),
         (json!({"temperature":"NaN"}), "temperature must be a number"),
         (json!({"seed":1e100}), "seed must be a number"),
+        // Rust integer rules: Python's int() would accept the underscore.
+        (json!({"max_tokens":"1_000"}), "v must be a number"),
     ]
 }

@@ -68,7 +68,10 @@ struct Harness {
     task: Option<JoinHandle<yskn::Result<()>>>,
 }
 impl Harness {
-    async fn start(mut cfg: Config) -> Self {
+    async fn start(cfg: Config) -> Self {
+        Self::start_with_capacity(cfg, 20000).await
+    }
+    async fn start_with_capacity(mut cfg: Config, capacity: usize) -> Self {
         cfg.port = 0;
         cfg.defaults.thinking_budget = 0;
         let c = Control::default();
@@ -76,7 +79,7 @@ impl Harness {
         let server = Server::bind(cfg, move || {
             ChatRunner::new(
                 Box::new(Affine {
-                    inner: StubEngine::with_control(20000, c),
+                    inner: StubEngine::with_control(capacity, c),
                     owner: std::thread::current().id(),
                     _not_send: Rc::new(()),
                 }),
@@ -1354,5 +1357,181 @@ async fn absolute_form_target_authority_is_checked() {
     assert!(r.starts_with("HTTP/1.1 403"), "{r}");
     assert!(r.contains("forbidden: host"), "{r}");
     assert_eq!(h.control.observation().calls, 0);
+    h.stop().await;
+}
+fn raw_get(h: &Harness, extra: &str) -> String {
+    format!("GET /health HTTP/1.1\r\n{extra}Connection: close\r\n\r\n")
+        .replace("{own}", &h.addr.to_string())
+}
+#[tokio::test]
+async fn duplicate_security_headers_and_host_forms() {
+    let h = Harness::start(Config::default()).await;
+    let port = h.addr.port();
+    let b = body().to_string();
+    let post = |extra: &str| {
+        format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\n{extra}Content-Length: {}\r\n\r\n{b}",
+            h.addr,
+            b.len()
+        )
+    };
+    let origin = format!("Origin: http://{}\r\n", h.addr);
+    for (request, why) in [
+        (raw_get(&h, "Host: {own}\r\nHost: {own}\r\n"), "host"),
+        (post(&format!("{origin}{origin}")), "origin"),
+        (
+            post("Sec-Fetch-Site: same-origin\r\nSec-Fetch-Site: same-origin\r\n"),
+            "cross-site",
+        ),
+        // Python treats an empty value as absent.
+        (post("Sec-Fetch-Site: \r\n"), "cross-site"),
+    ] {
+        let r = raw(h.addr, &request).await;
+        assert!(r.starts_with("HTTP/1.1 403"), "{request}: {r}");
+        assert!(r.contains(&format!("forbidden: {why}")), "{request}: {r}");
+    }
+    for (host, status) in [
+        (format!("user@127.0.0.1:{port}"), 403),
+        (format!("localhost.:{port}"), 403),
+        (format!("127.0.0.1.:{port}"), 403),
+        (format!("[0:0:0:0:0:0:0:1]:{port}"), 403),
+        (format!("::1:{port}"), 403),
+        ("[::1]".to_owned(), 403),
+        (format!("[::1]:{}", port.wrapping_add(1)), 403),
+        (format!("[::1]:{port}"), 200),
+        (format!("LOCALHOST:{port}"), 200),
+    ] {
+        let r = raw(h.addr, &raw_get(&h, &format!("Host: {host}\r\n"))).await;
+        assert!(r.starts_with(&format!("HTTP/1.1 {status}")), "{host}: {r}");
+    }
+    assert_eq!(h.control.observation().calls, 0);
+    h.stop().await;
+
+    let h = Harness::start(Config {
+        api_key: Some("k".into()),
+        ..Config::default()
+    })
+    .await;
+    let r = raw(
+        h.addr,
+        &raw_get(&h, "Host: {own}\r\n")
+            .replace("GET /health", "GET /v1/models")
+            .replace(
+                "Connection:",
+                "Authorization: Bearer k\r\nAuthorization: Bearer k\r\nConnection:",
+            ),
+    )
+    .await;
+    assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+    h.stop().await;
+}
+#[tokio::test]
+async fn json_depth_and_lone_surrogates_are_invalid_json() {
+    let h = Harness::start(Config::default()).await;
+    let nested = |n: usize| {
+        format!(
+            r#"{{"messages":[{{"role":"user","content":"hi"}}],"max_tokens":4,"x":{}{}}}"#,
+            "[".repeat(n),
+            "]".repeat(n)
+        )
+    };
+    for (b, status) in [
+        (nested(100), 200),
+        (nested(200), 400),
+        (
+            r#"{"messages":[{"role":"user","content":"\ud800"}]}"#.to_owned(),
+            400,
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":"😀"}],"max_tokens":4}"#.to_owned(),
+            200,
+        ),
+    ] {
+        let r = h.raw_request("POST", "/v1/chat/completions", b, &[]).await;
+        assert_eq!(r.status, status, "{}", r.text);
+        if status == 400 {
+            assert_eq!(error_message(&r), "the request body is not valid JSON");
+        }
+    }
+    h.stop().await;
+}
+/// Every frame must be exactly one `data:` line; returns the JSON events.
+fn strict_events(text: &str) -> Vec<Value> {
+    let frames: Vec<&str> = text
+        .strip_suffix("\n\n")
+        .expect("stream ends with a blank line")
+        .split("\n\n")
+        .collect();
+    assert_eq!(frames.last(), Some(&"data: [DONE]"), "{text}");
+    frames[..frames.len() - 1]
+        .iter()
+        .map(|f| {
+            assert!(!f.contains(['\n', '\r']), "frame spans lines: {f:?}");
+            serde_json::from_str(f.strip_prefix("data: ").expect("data frame")).unwrap()
+        })
+        .collect()
+}
+// Model output and request content that look like SSE framing stay inside
+// their JSON strings: the client parses exactly the expected events.
+#[tokio::test]
+async fn sse_framing_cannot_be_injected() {
+    let h = Harness::start(Config::default()).await;
+    let evil = "a\r\n\r\ndata: [DONE]\n\nevent: x\ndata: {}\nid: 1\n\n";
+    h.script(&format!("{evil}</think>{evil}"));
+    let r = h
+        .chat(json!({"messages":[{"role":"user","content":evil}],"stream":true,"stream_options":{"include_usage":true}}))
+        .await;
+    assert_eq!(r.status, 200);
+    let ev = strict_events(&r.text);
+    assert_eq!(pieces(&ev, "reasoning_content"), evil);
+    assert_eq!(pieces(&ev, "content"), evil);
+    // Role, one chunk per token of each part, finish, usage.
+    assert_eq!(ev.len(), 1 + 2 * ids(evil).len() + 2);
+    assert!(ev.last().unwrap()["usage"].is_object());
+    h.stop().await;
+}
+#[tokio::test]
+async fn server_shutdown_during_generation_ends_the_stream_and_stops_the_engine() {
+    let h = Harness::start(Config::default()).await;
+    let (_sender, mut body, _task) = hold_engine(&h).await;
+    let control = h.control.clone();
+    h.stop().await; // returns only once the engine thread has been joined
+    assert_eq!(control.observation().stops, 1);
+    let rest = tokio::time::timeout(common::PATIENCE, async {
+        while let Some(Ok(_)) = body.frame().await {}
+    })
+    .await;
+    assert!(rest.is_ok(), "the stream did not end after shutdown");
+}
+// A streaming client that stops reading: the event channel stays bounded and
+// the engine is stopped by the backpressure deadline, freeing it.
+#[tokio::test]
+async fn a_stream_that_is_not_read_frees_the_engine() {
+    let mut cfg = Config::default();
+    cfg.limits.stream_timeout = Duration::from_millis(200);
+    // Room for far more output than socket buffers hold, so the job cannot
+    // end by itself first.
+    let h = Harness::start_with_capacity(cfg, 4_000_000).await;
+    h.control.push(Script {
+        ids: ids("unread "),
+        loop_from: Some(0),
+    });
+    let max = 2_000_000;
+    let b = json!({"messages":user(),"stream":true,"max_tokens":max,"enable_thinking":false,"loop_guard":false});
+    let mut s = TcpStream::connect(h.addr).await.unwrap();
+    s.write_all(raw_post(&h, &b).as_bytes()).await.unwrap();
+    let control = h.control.clone();
+    common::until("the engine to give up on the stalled stream", || {
+        control.observation().stops == 1
+    })
+    .await;
+    // Bounded by socket buffers and 8 queued events, far below max_tokens.
+    let generated = h.control.observation().generated;
+    assert!(generated < max / 4, "{generated}");
+    h.script("</think>next");
+    let r = h.chat(json!({"max_tokens":20})).await;
+    assert_eq!(r.json()["choices"][0]["message"]["content"], "next");
+    assert_eq!(h.control.observation().calls, 2);
+    drop(s);
     h.stop().await;
 }
