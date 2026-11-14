@@ -1675,12 +1675,9 @@ cache bytes are proposed as an unapproved shortcut.
 
 All measurements below use the CPU projection backend, dotprod/10 workers,
 `CARGO_NET_OFFLINE=true`, and the read-only `$HOME/models/qwen38-speed`.
-Every real-model invocation is enclosed by atomic `mkdir` of
-`/Users/anag2bgod/Projects/yasakani-for-mac/.work/model.lock` and an EXIT
-trap that `rmdir`s only that acquired lock after the process exits. A busy
-lock is waited for, never removed. No model is copied. macOS `sample PID 5 1`
-was attempted after task 1 but denied process inspection by the sandbox;
-stage timers are the available profile, not on-CPU sample counts.
+Model access is exclusive and read-only. macOS `sample PID 5 1` was denied
+process inspection by the sandbox; stage timers are the available profile,
+not on-CPU sample counts.
 
 #### Task 1: integer VIT2 selection
 
@@ -1742,6 +1739,9 @@ against `dense_gate`, in addition to the existing recurrent-state comparisons.
 `bench_model` now exposes `recurrence_prepare` (a subset of recurrence) and
 `dense_gate_work` (elapsed callback time summed across rows, hence overlapping
 for M>1). These are diagnostic subsets and are not subtracted twice from rest.
+Detailed subsets require `Model::set_detailed_timing(true)`, as requested by
+`bench_model`; ordinary passes retain only the coarse stage clocks and skip
+callback clock reads and atomic additions.
 
 The same real-model five-pass command gives, after task 2, minimum/median ms:
 
@@ -1789,8 +1789,7 @@ Tests compare exact bits for every finite half code and midpoint with adjacent
 binary32 values, all BF16 upper words/midpoints (including NaNs), exp branch
 boundaries, signed zero/subnormals and 100,003 random binary32 bit patterns.
 They also check direct exp, non-vector tails and every invalid-value lane.
-Focused tests and clippy pass. Real-model task-3 measurement was queued behind
-another owner's model lock; its result is recorded in the final table below.
+The task-3 measurement is recorded in the final table below.
 
 #### Task 4: long-context attention memory and independent score chains
 
@@ -1822,15 +1821,14 @@ boundary tests also cover the exp2 product before portable exp.
 Stage-only measurement reads the **real model header, actual attention norm
 vectors and profile**, constructs all 16 layers/24 query heads/4 KV heads,
 and uses a deterministic synthetic projected-row bank to fill distinct cache
-allocations. This avoids a minutes-long CPU prefill, respecting short model
-lock holds. It times the actual attention core on the ten-worker CPU pool,
+allocations. This excludes CPU prefill from the timed workload. It times the
+actual attention core on the ten-worker CPU pool,
 including 31/42 splits, self, means and final combination. It excludes query
 preparation, output inverse rotation/gating and compressed projections; it is
-**not a real-token end-to-end context benchmark**. Real header/profile reads
-are protected by the same model lock even though compressed weights are not
+**not a real-token end-to-end context benchmark**. Compressed weights are not
 loaded. Peak cache payload and repeated key reads have the real dimensions.
 
-Build once, then run each invocation under its own acquired model lock:
+Stage-only benchmark commands (exclusive model access):
 
 ```sh
 cargo test --release -p yskn-engine --lib --no-run
@@ -1841,9 +1839,8 @@ YSKN_MODEL_DIR="$HOME/models/qwen38-speed" YSKN_BENCH_CONTEXT=32768 \
   cargo test --release -p yskn-engine --lib bench_real_attention_shapes -- --ignored --nocapture
 ```
 
-The reported runs invoke the already-built test executable, avoiding builds
-under the lock. Before is the task-3 implementation plus this same harness,
-preserved before editing attention. One warmup is excluded in each run.
+The reported measurements exclude compilation and one warmup per run.
+The baseline is the task-3 implementation with the same harness.
 
 | Context / rows / samples | Before min / median (s) | After min / median (s) |
 |---|---:|---:|
@@ -1908,30 +1905,18 @@ codebook makes every candidate error equal and explicitly checks that the
 first candidate's scale bits survive. Integer target extrema also exercise
 the checked scalar fallback.
 
-The four required proof commands passed with `CARGO_NET_OFFLINE=true`:
-
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p yskn-ref -p yskn-format -p yskn-engine --release
-YSKN_CPU_STAGES=reference cargo test -p yskn-engine --release
-```
-
-After expanding the KV proof/benchmark fixture, its focused tests passed again
-in both modes, and fmt/workspace clippy passed again. No production code
-changed after the complete suites. The engine/reference integration coverage
-includes all three cache modes, frozen digests, varied workers/pass widths,
-commit/discard, snapshot/restore and failure atomicity. No tolerance or test
-expectation was weakened. GPU-dependent tests cannot establish Metal execution
-in this sandbox; real Metal and socket tests remain the orchestrator's work.
+Engine/reference integration coverage includes all three cache modes,
+frozen digests, varied workers/pass widths, commit/discard, snapshot/restore
+and failure atomicity, with exact comparisons in both CPU-stage modes.
+GPU-dependent tests cannot establish Metal execution in this sandbox;
+real Metal and socket execution are outside this validation boundary.
 
 Final real-model CPU profile, same five-pass one-row command as task 1.
 Values are minimum / median **milliseconds**. The task-3 serial run is kept
-below despite severe shared-host scheduling variation. Two other runs that
-started after a long lock wait overlapped this task's tests; their logs remain
-in `.work/07c-evidence/*contended*` / `task3.txt` and are excluded from this
-comparison. The final run occurred after all builds/tests and used its own
-model lock, released immediately at exit.
+below despite severe shared-host scheduling variation. Two additional runs
+with concurrent host load are excluded from this comparison. Their logs are
+`.work/07c-evidence/*contended*` / `task3.txt`. The final measurement had no
+concurrent build/test load.
 
 | Stage | After task 3, serial | Before task 5 | Final |
 |---|---:|---:|---:|
@@ -1967,11 +1952,10 @@ stable profile and preserving the mandated reduction orders. No Metal
 latency, real-token 2000/32768-context inference latency, full-model scalar
 logit comparison or full quality-score validation is claimed by this brief.
 
-After the final one-row run showed much lower scheduling variation, the same
-attention before/after binaries and commands were repeated serially, without
-builds/tests, acquiring/releasing the lock separately for each invocation.
-This confirmation resolves the large contention uncertainty in the earlier
-pair; it does not repeat or change any numerical proof.
+The lower-variation attention comparison uses the same before/after binaries
+and commands, measured serially with no concurrent build/test load and
+exclusive model access. It reduces the contention uncertainty in the earlier
+pair.
 
 | Context / rows / samples | Before min / median (s) | Final min / median (s) |
 |---|---:|---:|
