@@ -23,6 +23,7 @@ enum Fault {
     Repeat,
     NoAcceptance,
     LaterError,
+    Empty,
 }
 struct TestEngine {
     inner: RealEngine,
@@ -67,6 +68,9 @@ impl Engine for TestEngine {
                 || (self.fault == Fault::Repeat && *count == 2))
         {
             result.ids[2] = (result.ids[2] + 1) % 32;
+        }
+        if self.fault == Fault::Empty {
+            result.ids.clear();
         }
         if self.fault == Fault::NoAcceptance {
             result.guesses_accepted = 0;
@@ -204,6 +208,19 @@ fn actual_synthetic_engine_matches_ids_but_rejects_unexercised_draft_cells() {
             );
         }
     }
+}
+
+#[test]
+fn an_empty_actual_engine_generation_fails_instead_of_comparing_equal() {
+    let report = exercise(Fault::Empty, false);
+    assert_eq!(report["passed"], false);
+    assert!(report["failures"].as_array().unwrap().iter().any(|f| {
+        f["kind"] == "error"
+            && f["message"]
+                .as_str()
+                .unwrap()
+                .contains("generation not exercised")
+    }));
 }
 
 #[test]
