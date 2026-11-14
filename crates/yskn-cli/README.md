@@ -390,54 +390,94 @@ as blocked failures, never silently skip them or claim a pass.
 
 ```sh
 CARGO_NET_OFFLINE=true cargo run --release -p yskn --example lossless -- \
-  --model-dir MODEL_FOLDER --report lossless.json
+  --model-dir MODEL_FOLDER --profile release --report lossless.json
 ```
 
-This checks exact generated token IDs through the server's existing
-`parse_chat_request` and `ChatRunner` path, including the folder's tokenizer,
-chat template and generation defaults, EOS, tools, stop strings, thinking
-budget and loop guard. It loads one engine at a time using the normal loader
-and its physical-memory enforcement, then drops it before loading the next.
-Nothing from the example is linked into `yskn`.
+The example compares raw generated token IDs through `parse_chat_request`,
+`ChatRunner` and `RealEngine`, using the folder's tokenizer and chat template.
+It loads one engine at a time with the product's physical-memory enforcement.
+No example code is linked into `yskn`. It never needs a server socket.
 
-Default configurations: `none`, `ngram-k3-fixed`, `neural-k3-fixed`,
-`neural-k7-fixed`, `both-k7-adaptive`. `--configs` accepts a comma-separated
-subset of these names; `none` is always included first. Samplers are greedy,
-seeds 42 and 2027 at the model folder's default temperature/top-p/top-k/min-p,
-and seed 91 at temperature 1.3 (other settings remain the defaults).
+Profiles select the following configurations and samplers. `--configs LIST`
+overrides configurations; `none` is always included first. `--max-tokens N`
+(default 256) caps each entry's requested output, including thinking.
 
-For each configuration and sampler, all 24 prompts run once. Each then runs
-again after a one-token prefix probe: the same request with its template's
-`enable_thinking` toggled. Thus unrelated requests intervene, then a distinct
-request sharing the chat prefix primes a snapshot. The last repeat in each
-sweep follows an explicit reset. Templates that ignore the toggle are refused
-with a prompt-naming error, rather than claiming this coverage. The report
-records common prefix length, cached tokens and actual snapshot modes; it
-shows what paths were reached. Every repeat is compared to its first run,
-and both runs of every draft configuration are compared to `none`.
+| Profile | Configurations | Samplers | Main sweeps | Tokens per sweep |
+| --- | --- | --- | --- | --- |
+| `release` (default) | none, ngram K=3 fixed, neural K=7 fixed, both K=7 adaptive | greedy, seed 42, hot seed 91 | 4 × 3 × 2 = 24 | 1,792 |
+| `full` | release plus neural K=3 fixed | release plus seed 2027 | 5 × 4 × 2 = 40 | 1,792 |
+| `quick` | full | full | 40 | 256 |
 
-The JSON report includes each run's token count, SHA-256 (u32 IDs encoded
-little endian), finish reason, passes, offered/accepted guesses and elapsed
-time. IDs are the concatenated generated engine stages, including EOS and
-thinking tokens; loop-guard bridge *input* IDs are excluded and stage lengths
-are recorded. A mismatch prints the first zero-based position and both IDs
-(`null` means end of sequence). A draft configuration with zero accepted
-guesses over its compared runs fails even if all IDs match. Prefix probes
-are reported but do not satisfy this acceptance gate. Exit status is zero
-only when all comparisons and acceptance gates pass; input/load errors fail.
+Seed 42 uses temperature 0.7, top-p 0.9, top-k 20, min-p 0; hot seed 91
+uses 1.3, 1.0, 20, 0. Seed 2027 keeps the product defaults when temperature
+is positive and top-k is not 1; otherwise it uses the explicit moderate
+settings. Every generation stage records normalized settings, rounded to the
+engine's thousandths boundary, and the effective u32 seed. Each seeded
+sampler must differ from greedy on at least one prompt, and the seeds must
+differ from each other; otherwise the result is `sampling not exercised`.
+
+The 24 authored entries request 16 × 32 + 4 × 64 + 4 × 256 = 1,792 tokens.
+The 64-token cases request code or tool arguments; the four long cases ask
+for sustained repetition, varied nonrepetition, a whole code file, and a
+thinking response with a detailed answer. The long thinking case has a
+32-token thinking budget and room for the product's bridge and answer.
+The short reasoning-effort case uses natural thinking termination, without
+an artificial budget that would prevent an answer within its 32-token cap.
+Each row records the limit, early termination, reasoning tokens, loop-guard
+result and whether an answer stage was reached. Early termination remains
+visible; this checks ID losslessness, not task quality or a promise that the
+model follows the requested length. Quick uses the original per-entry 8/16
+limits (`quick_max_tokens`); custom entries without that field use 16.
+
+At 5–6 output tokens/s, release's main generation budget is
+24 × 1,792 = 43,008 tokens, or 119.5–143.4 minutes (about 2–2.4 hours).
+Full is 40 × 1,792 = 71,680 tokens, or 199.1–238.9 minutes.
+Quick is 40 × 256 = 10,240 tokens, or 28.4–34.1 minutes.
+Extra one-token unrelated probes add 276/460/460 tokens respectively;
+reuse/recovery probes add 44/55/55 tokens. Thus totals are
+43,328 / 72,195 / 10,755 tokens (120.4–144.4 / 200.5–240.7 /
+29.9–35.9 minutes). Loading, rendering, tokenization and prefill add time;
+EOS, stops and loop guard can shorten generation. These are arithmetic
+budgets, not measured real-model durations.
+
+Every prompt runs twice for every configuration/sampler; both draft runs
+are compared to `none`, and repeat IDs, finish reason and stage boundaries
+must match the first run. A repeat follows a one-token unrelated request;
+the last follows an explicit reset. Empty IDs or a missing generation stage
+fail, including when both sequences would otherwise compare equal. IDs
+include EOS and thinking, exclude bridge input IDs, and are hashed as u32
+little endian. Mismatches report the first differing position and IDs.
+
+Separate greedy probes run once per configuration, excluded from all
+speculation activity gates. They use a shared long ledger system prompt,
+a multi-turn conversation ending in “Name the entry 3”, its extension by
+an assistant answer and one user turn, and a sibling ending in “Name the
+colour 4”. Before execution, rendered IDs must prove that the extension
+strictly starts with the first request's entire generation prefix and that
+the distinct siblings share at least 32 tokens. The first conversation
+requests one output token: the engine retains the prompt up to its pending
+last token, so the extension reaches live reuse without guessing generated
+text or changing thinking. Run order is first, extension, first again;
+then sibling, first; unrelated, first; explicit reset, first; cancelled
+request, first; over-context request, first. Cancellation uses the product's
+callback after a committed token. The over-context failure is expected.
+All first-request repeats compare IDs; observed modes 0 (reset), 1 (live
+prefix), and 2 (snapshot restore) must each occur per configuration.
+Cached tokens and every stage's snapshot mode are recorded; shared system
+text alone does not guarantee restoration of a checkpoint saved later in
+the user message. No template toggle is used. An incompatible template
+fails with the measured prefix relation instead of silently skipping it.
+
+Every draft configuration **and sampler** must offer and accept positive
+numbers of guesses over its main runs. `both` must offer from both neural
+and n-gram sources for each sampler. Counts come from the product's actual
+post-depth-truncation generation statistics, not its configured draft mode.
+An ID match without this activity fails. The small random synthetic fixture
+intentionally fails some of these coverage gates even though its IDs match.
 
 `--prompts FILE` accepts an array of `{"id":"unique name","request":{...}}`
-entries (at least two). `request` is a normal supported OpenAI chat request;
-sampling fields are reserved for the harness. `--max-tokens N` (default 96)
-is a ceiling; each entry's `max_tokens`/`max_completion_tokens` can lower it.
-The authored default set uses 8 tokens for 16 entries and 16 for 8 entries:
-256 tokens per sweep. At 5 generated tokens/s, five configurations times
-four samplers times two sweeps is `5 × 4 × 2 × 256 / 5 = 2048 s` (34.1 min).
-The 480 one-token probes add 96 s, for 35.7 min plus loading and prefill;
-early EOS/stop can shorten this. A full 96 tokens for every entry would take
-307.2 min, so these intentionally short answers make the roughly 40-minute
-budget plausible, not a measured guarantee. Tool-call/code outputs may be
-truncated; this checks losslessness, not task quality. The long garden prompt
-is approximately 1,500 tokens (90 authored observations); the actual folder's
-`prompt_tokens` in the report is authoritative. Real-model duration, exact
-length and acceptance must be measured on the host with the real weights.
+entries (at least two). Sampling fields belong to the harness. Errors name
+the file and entry. Execution errors preserve completed rows and earlier
+failures in the report and exit nonzero. Exit status is zero only when all
+comparisons and exercise gates pass. Real-model duration, acceptance, long
+output lengths and real-template reuse must be verified on the host.

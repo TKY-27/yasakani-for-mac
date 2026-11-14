@@ -104,6 +104,7 @@ fn exercise(fault: Fault, all: bool) -> Value {
         &names,
         &defaults,
         12,
+        "full",
         |name| {
             assert_eq!(
                 live.get(),
@@ -306,6 +307,31 @@ fn malformed_prompt_files_name_the_file_and_entry_instead_of_panicking() {
         defaults
             .iter()
             .map(|p| p.request["max_tokens"].as_u64().unwrap())
+            .sum::<u64>(),
+        1792
+    );
+    let mut budgets: Vec<_> = defaults
+        .iter()
+        .map(|p| p.request["max_tokens"].as_u64().unwrap())
+        .collect();
+    budgets.sort();
+    assert_eq!(budgets, [vec![32; 16], vec![64; 4], vec![256; 4]].concat());
+    assert_eq!(
+        lossless_support::profile_configs("release").unwrap().len(),
+        4
+    );
+    assert_eq!(
+        lossless_support::profile_samplers("release").unwrap(),
+        &[0, 1, 3]
+    );
+    assert!(lossless_support::profile_samplers("invalid").is_err());
+    let entries: Value = serde_json::from_str(lossless_support::DEFAULT_PROMPTS).unwrap();
+    assert_eq!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["quick_max_tokens"].as_u64().unwrap())
             .sum::<u64>(),
         256
     );

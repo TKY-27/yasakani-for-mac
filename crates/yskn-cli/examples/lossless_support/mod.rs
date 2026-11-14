@@ -25,6 +25,7 @@ pub struct Prompt {
     pub id: String,
     pub request: Value,
     location: String,
+    quick_max_tokens: usize,
 }
 
 pub fn prompts(source: &str, text: &str) -> Result<Vec<Prompt>> {
@@ -60,13 +61,39 @@ pub fn prompts(source: &str, text: &str) -> Result<Vec<Prompt>> {
                     return Err(fail(&format!("{key} is selected by the harness")));
                 }
             }
+            let quick_max_tokens = match entry.get("quick_max_tokens") {
+                None => 16,
+                Some(v) => v
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| fail("quick_max_tokens must be a positive integer"))?,
+            };
             Ok(Prompt {
                 id: id.into(),
+                quick_max_tokens,
                 request: request.clone(),
                 location: format!("{source}: entry {i} ({id})"),
             })
         })
         .collect()
+}
+
+pub fn profile_samplers(profile: &str) -> Result<&'static [usize]> {
+    match profile {
+        "release" => Ok(&[0, 1, 3]),
+        "full" | "quick" => Ok(&[0, 1, 2, 3]),
+        _ => Err(Error::request("--profile must be release, full or quick")),
+    }
+}
+
+pub fn profile_configs(profile: &str) -> Result<Vec<String>> {
+    profile_samplers(profile)?;
+    if profile == "release" {
+        configs("none,ngram-k3-fixed,neural-k7-fixed,both-k7-adaptive")
+    } else {
+        configs(&CONFIG_NAMES.join(","))
+    }
 }
 
 pub fn configs(list: &str) -> Result<Vec<String>> {
@@ -239,6 +266,12 @@ fn observe_controlled(
         digest.update(id.to_le_bytes());
     }
     let mut row = label;
+    row["max_tokens"] = json!(p.max_tokens);
+    row["long_generation"] = json!(p.max_tokens >= 256);
+    row["ended_early"] = json!(usage.completion_tokens < p.max_tokens);
+    row["reasoning_tokens"] = json!(usage.reasoning_tokens);
+    row["answer_stage_reached"] = json!(c.stages.len() > 1 || usage.reasoning_tokens < c.ids.len());
+    row["loop_guard"] = json!(usage.loop_guard);
     row["cancelled_after_commit"] = json!(cancel && c.saw_tokens);
     row["effective_sampling_by_stage"] = json!(c.sampling);
     row["token_count"] = json!(c.ids.len());
@@ -443,11 +476,17 @@ fn reuse_probes(
     Ok(())
 }
 
-fn speculation_exercised(name: &str, rows: &[Value], failures: &mut Vec<Value>) {
+fn speculation_exercised(
+    name: &str,
+    samplers: &[usize],
+    rows: &[Value],
+    failures: &mut Vec<Value>,
+) {
     if name == "none" {
         return;
     }
-    for sampler in SAMPLERS {
+    for &sampler in samplers {
+        let sampler = SAMPLERS[sampler];
         let own: Vec<_> = rows
             .iter()
             .filter(|r| r["sampler"] == sampler && r["probe"] != true)
@@ -468,10 +507,17 @@ fn speculation_exercised(name: &str, rows: &[Value], failures: &mut Vec<Value>) 
     }
 }
 
-fn sampling_exercised(name: &str, outputs: &[Vec<Vec<u32>>], failures: &mut Vec<Value>) {
-    for (a, b) in [(0, 1), (0, 2), (0, 3), (1, 2)] {
-        if outputs[a] == outputs[b] {
-            failures.push(json!({"kind":"sampling not exercised","configuration":name,"samplers":[SAMPLERS[a],SAMPLERS[b]]}));
+fn sampling_exercised(
+    name: &str,
+    samplers: &[usize],
+    outputs: &[Vec<Vec<u32>>],
+    failures: &mut Vec<Value>,
+) {
+    for a in 0..outputs.len() {
+        for b in a + 1..outputs.len() {
+            if outputs[a] == outputs[b] {
+                failures.push(json!({"kind":"sampling not exercised","configuration":name,"samplers":[SAMPLERS[samplers[a]],SAMPLERS[samplers[b]]]}));
+            }
         }
     }
 }
@@ -483,6 +529,7 @@ pub fn check(
     names: &[String],
     defaults: &RequestDefaults,
     max_tokens: usize,
+    profile: &str,
     mut factory: impl FnMut(&str) -> Result<Box<dyn Engine>>,
     formatter: &yskn_text::ChatFormatter,
 ) -> Result<Value> {
@@ -491,6 +538,15 @@ pub fn check(
             "need two prompts, positive max-tokens, and none first",
         ));
     }
+    let samplers = profile_samplers(profile)?;
+    let mut cases = prompts.to_vec();
+    if profile == "quick" {
+        for p in &mut cases {
+            let parsed = parse_chat_request(&p.request, defaults)?;
+            p.request["max_completion_tokens"] = json!(parsed.max_tokens.min(p.quick_max_tokens));
+        }
+    }
+    let prompts = &cases;
     let mut rows = Vec::new();
     let mut failures = Vec::new();
     let mut baseline = Vec::new();
@@ -509,7 +565,8 @@ pub fn check(
             )?;
             let config_start = rows.len();
             let mut sampled_outputs: Vec<Vec<Vec<u32>>> = Vec::new();
-            for (sampler, sampler_name) in SAMPLERS.iter().enumerate() {
+            for (slot, &sampler) in samplers.iter().enumerate() {
+                let sampler_name = SAMPLERS[sampler];
                 let mut first = Vec::new();
                 // Full first sweep: each repeat has unrelated requests in between.
                 for prompt in prompts {
@@ -519,7 +576,7 @@ pub fn check(
                         .map_err(|e| Error::engine(format!("{}: {label}: {e}", prompt.location)))?;
                     if name != "none" {
                         compare(
-                            &baseline[sampler * prompts.len() + first.len()],
+                            &baseline[slot * prompts.len() + first.len()],
                             &result,
                             &label,
                             "configuration_mismatch",
@@ -550,7 +607,7 @@ pub fn check(
                     compare(&first[i], &result, &label, "repeat_mismatch", &mut failures);
                     if name != "none" {
                         compare(
-                            &baseline[sampler * prompts.len() + i],
+                            &baseline[slot * prompts.len() + i],
                             &result,
                             &label,
                             "configuration_mismatch",
@@ -583,8 +640,8 @@ pub fn check(
                     );
                 }
             }
-            sampling_exercised(name, &sampled_outputs, &mut failures);
-            speculation_exercised(name, &rows[config_start..], &mut failures);
+            sampling_exercised(name, samplers, &sampled_outputs, &mut failures);
+            speculation_exercised(name, samplers, &rows[config_start..], &mut failures);
             drop(runner);
         }
         Ok(())
@@ -593,7 +650,7 @@ pub fn check(
         failures.push(json!({"kind":"error","message":e.to_string()}));
     }
     Ok(
-        json!({"schema_version":2,"passed":failures.is_empty(),"max_tokens":max_tokens,"sampling_defaults":{"temperature":defaults.sampling.temperature,"top_p":defaults.sampling.top_p,"top_k":defaults.sampling.top_k,"min_p":defaults.sampling.min_p},"id_encoding":"concatenated engine stage ids, u32 little endian; stage boundaries recorded; bridge input ids excluded","runs":rows,"failures":failures}),
+        json!({"schema_version":2,"profile":profile,"passed":failures.is_empty(),"max_tokens":max_tokens,"sampling_defaults":{"temperature":defaults.sampling.temperature,"top_p":defaults.sampling.top_p,"top_k":defaults.sampling.top_k,"min_p":defaults.sampling.min_p},"id_encoding":"concatenated engine stage ids, u32 little endian; stage boundaries recorded; bridge input ids excluded","runs":rows,"failures":failures}),
     )
 }
 
@@ -620,7 +677,7 @@ mod tests {
             rows.push(json!({"sampler":sampler,"probe":true,"guesses_offered":10,"guesses_accepted":5,"neural_guesses_offered":5,"ngram_guesses_offered":5}));
         }
         let mut failures = vec![];
-        speculation_exercised("both-k7-adaptive", &rows, &mut failures);
+        speculation_exercised("both-k7-adaptive", &[0, 1, 2, 3], &rows, &mut failures);
         assert_eq!(
             failures
                 .iter()
@@ -670,8 +727,13 @@ mod tests {
     #[test]
     fn identical_samplers_and_identical_seeds_fail_the_diversity_gate() {
         let mut failures = vec![];
-        sampling_exercised("none", &vec![vec![vec![1]]; 4], &mut failures);
-        assert_eq!(failures.len(), 4);
+        sampling_exercised(
+            "none",
+            &[0, 1, 2, 3],
+            &vec![vec![vec![1]]; 4],
+            &mut failures,
+        );
+        assert_eq!(failures.len(), 6);
         assert!(
             failures
                 .iter()
@@ -680,6 +742,7 @@ mod tests {
         failures.clear();
         sampling_exercised(
             "none",
+            &[0, 1, 2, 3],
             &[vec![vec![0]], vec![vec![1]], vec![vec![1]], vec![vec![3]]],
             &mut failures,
         );
