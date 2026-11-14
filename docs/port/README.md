@@ -198,3 +198,67 @@ software square root independently matched a 100-digit decimal oracle on
 10,000 positive finite binary32 patterns. Representative source-derived bit
 vectors are permanent unit tests. This evidence checks the portable source
 port, not a CUDA binary or a released model.
+
+## Rust text I/O (`yskn-text`)
+
+`ChatFormatter::load(folder)` reads only the tokenizer, configuration and chat
+Jinja template. `render(&messages, tools.as_ref(), &options)` accepts JSON
+values; `prompt` returns `(Vec<u32>, starts_inside_thinking)` and always adds
+the generation prompt, as upstream does. `render` supports
+`add_generation_prompt: false`. `encode` adds no special tokens; `decode`
+keeps them and silently skips unmapped ids. Token ids, including the ten digit ids,
+are available to the future sampler and chat layers. This crate forbids unsafe
+code and has no Python runtime dependency.
+
+JSON numbers have limits relative to Python: JSON `-0` becomes a float and
+prints `-0.0`, while Python parses it as integer `0` and prints `0`. Integers
+beyond `u64` (or below `i64`) become floats and can lose precision, while Python
+keeps arbitrary-precision integers. `NaN` and `Infinity` are rejected as JSON
+input, while Python's `json.loads` accepts them and `json.dumps` emits `NaN`
+and `Infinity` by default.
+
+The environment preserves JSON key order. Its `trim` filter matches Python's
+whitespace set; `.strip()`, `.lstrip()` and `.rstrip()` come from
+`minijinja-contrib` and use Rust's whitespace set, which differs for U+001C to
+U+001F. The model's template uses only `|trim`. A Python-format `tojson` filter
+is also provided (including indentation, separators, ASCII escaping and
+sorted-key options). Floats joined with `~` or printed inside lists use Rust's
+float format; this only affects an error message if a caller passes a
+non-string `reasoning_effort`. Template errors expose the message passed
+to `raise_exception`. Nonempty string tool arguments are rejected by upstream's
+`ChatFormatter` template; request-level normalization belongs to the caller
+(upstream does that in `chat.py`). `strftime_now` is intentionally absent:
+Rust's standard library provides neither local calendar conversion nor
+`strftime`, and this model's template does not use it.
+
+`StreamDecoder` holds incomplete UTF-8 in a small re-decoding window and
+releases any final tail on `flush`, including a replacement character for a
+truncated final sequence, matching full decode. It retains only the window,
+not the entire generation. `OutputStream::feed` accepts the growing generation
+array, hides stop ids, splits reasoning at `</think>`, records its position,
+and strips initial answer newlines. `ToolCallFilter` incrementally separates
+content and tool calls, with schema-aware parameter conversion, JSON fallback,
+and lossless fallback for malformed or unfinished calls. These port all public
+text helpers in `python/yasakani/textio.py`; NumPy array types are replaced by
+Rust vectors and arrays. Request validation and generation remain outside this
+crate.
+
+Regenerate independent oracle vectors from the worktree root. Set `$PYTHON` to
+a Python with `tokenizers`, `jinja2` and `numpy`; these are needed only to
+regenerate goldens, never at run time:
+
+```sh
+PYTHONPATH=python "$PYTHON" \
+  tools/text/make_goldens.py "$HOME/models/qwen38-speed" \
+  crates/yskn-text/tests/data/goldens.json
+CARGO_NET_OFFLINE=true cargo test -p yskn-text
+CARGO_NET_OFFLINE=true YSKN_MODEL_DIR="$HOME/models/qwen38-speed" \
+  cargo test -p yskn-text --release -- --nocapture
+```
+
+The generator never loads weights or copies model files. It verifies the
+three published selfcheck prompt hashes and stores only test inputs and
+Python-produced text, ids, errors and stream events. With no `YSKN_MODEL_DIR`,
+the model-dependent suite prints `skipped: YSKN_MODEL_DIR is not set` and
+passes; an explicitly set unusable folder fails. Synthetic UTF-8, loading,
+JSON formatting and tool-processing tests always run without a model.

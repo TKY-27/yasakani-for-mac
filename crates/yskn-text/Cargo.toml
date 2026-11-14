@@ -1,0 +1,16 @@
+[package]
+name = "yskn-text"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+minijinja = { version = "3.1", default-features = false, features = ["builtins", "macros", "adjacent_loop_items", "loop_controls", "preserve_order", "serde"] }
+minijinja-contrib = { version = "3.1", features = ["pycompat"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+
+[dev-dependencies]
+sha2.workspace = true
