@@ -241,6 +241,17 @@ impl ChatRunner {
         emit: &mut dyn FnMut(Event) -> Result<()>,
     ) -> Result<Usage> {
         let (prompt, in_reasoning) = prepared;
+        // A request whose client left after preparation ends here, before the
+        // seed counter or the engine's state is touched.
+        if cancelled() {
+            let u = Usage {
+                prompt_tokens: prompt.len(),
+                finish: "length",
+                ..Usage::default()
+            };
+            emit(Event::Done(u.clone()))?;
+            return Ok(u);
+        }
         let max_new = p.max_tokens.max(1);
         let seed = if let Some(s) = p.seed {
             s
@@ -459,6 +470,20 @@ fn stage(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(Generation, Option<LoopHit>)> {
     let mut hit = None;
+    // Not even started for a client that is gone: `generate` may reset or
+    // reuse the engine's sequence.
+    if cancelled() {
+        let r = Generation {
+            ids: vec![],
+            finish: Finish::Cancelled,
+            cached_tokens: 0,
+            snap_mode: 0,
+            passes: 0,
+            prefill_ms: 0.0,
+            gen_ms: 0.0,
+        };
+        return Ok((r, hit));
+    }
     let r = engine.generate(prompt, max_new, sampling, stops, &mut |ids| {
         if cancelled() {
             return Ok(false);

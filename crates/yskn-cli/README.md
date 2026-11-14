@@ -102,7 +102,11 @@ pub trait Engine {
 
 A bounded channel serializes requests to the engine thread, with later requests
 waiting. `Api::call` is also usable as an embedded Hyper service. Consumer
-failure, body drop and shutdown cancel through the callback. Tests use a
+failure, body drop and shutdown cancel through the callback. `ChatRunner` also
+checks for a cancel before each `generate` call (the first, and the loop-guard
+bridge's second): a request cancelled after its prompt was prepared ends with
+the `length` finish without reaching the engine or advancing the seed counter,
+so the engine's cached sequence is left as the previous request left it. Tests use a
 scripted, loopable, delayed, failure-injectable stub with prompt-cache
 observations, matching the upstream fixture's responsibilities.
 

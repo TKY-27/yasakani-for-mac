@@ -997,6 +997,61 @@ fn a_rendered_prompt_over_the_limit_is_not_tokenized() {
     assert!(r.prepare_checked(&p).is_ok());
     assert_eq!(c.observation().calls, 0);
 }
+// Review finding (third round): a request cancelled after its prompt was
+// prepared still advanced the seed counter and reached `generate`, which may
+// reset or reuse the engine's state for a client that is gone. It now ends
+// with the cancelled finish before anything of the engine's is touched.
+#[test]
+fn a_request_cancelled_after_preparation_never_reaches_the_engine() {
+    let (mut r, c) = runner();
+    let p = params();
+    let prepared = r.prepare_checked(&p).unwrap();
+    let mut events = vec![];
+    let u = r
+        .run_prepared(&p, prepared, &|| true, &mut |e| {
+            events.push(e);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(c.observation().calls, 0);
+    assert_eq!((u.finish, u.completion_tokens), ("length", 0));
+    assert!(matches!(events.as_slice(), [Event::Done(_)]), "{events:?}");
+    // Neither the seed counter nor the engine's cached sequence moved.
+    script(&c, "</think>x");
+    let (_, _, _, u) = run(&mut r, params());
+    assert_eq!(c.observation().sampling.unwrap().seed, 100);
+    assert_eq!(u.cached_tokens, 0);
+    assert_eq!(c.observation().calls, 1);
+}
+// The loop-guard bridge makes a second `generate` call; a cancel that arrives
+// after the first one ended (here: while its notice is delivered) skips it.
+#[test]
+fn a_cancel_before_the_bridge_skips_its_generate_call() {
+    let (mut r, c) = runner();
+    let prefix = ids("I will think about this problem carefully. ");
+    let mut v = prefix.clone();
+    v.extend(ids("again"));
+    c.push(Script {
+        ids: v,
+        loop_from: Some(prefix.len()),
+    });
+    script(&c, "Final answer.");
+    let mut p = params();
+    p.max_tokens = 100000;
+    let gone = std::cell::Cell::new(false);
+    let prepared = r.prepare_checked(&p).unwrap();
+    let u = r
+        .run_prepared(&p, prepared, &|| gone.get(), &mut |e| {
+            if matches!(&e, Event::Reasoning(t) if t == loopguard::NOTICE) {
+                gone.set(true);
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(c.observation().calls, 1);
+    assert_eq!(u.finish, "length");
+    assert_eq!(u.loop_guard.unwrap()["answer_tokens"], 0);
+}
 // Review finding: `tools` in chat_template_kwargs reached the template instead
 // of the validated tools, bypassing the tool limit and tool_choice "none".
 // Names the renderer sets itself are refused, naming the key.
