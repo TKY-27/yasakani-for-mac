@@ -11,8 +11,8 @@ use yskn_ref::{
     model::CapturedRow,
     speculation::{
         self, AdaptiveDepth, CombinedProposer, DepthPolicy, DraftProposer, DraftWork,
-        GenerationLimits, NgramProposer, NoProposer, ProposalOrder, Proposer, SessionSnapshot,
-        StopReason, Verifier,
+        GenerationLimits, NgramProposer, NoProposer, ProposalOrder, ProposalSource, Proposer,
+        SessionSnapshot, StopReason, Verifier,
     },
 };
 
@@ -253,27 +253,27 @@ enum Drafts {
     None(NoProposer),
     Ngram(NgramProposer),
     Neural(Box<Neural>),
-    Both(Box<CombinedProposer<FastDraft>>),
+    Both(Box<CombinedProposer<FastDraft>>, ProposalSource),
 }
 impl Drafts {
     fn work(&self) -> DraftWork {
         match self {
             Self::Neural(p) => p.work(),
-            Self::Both(p) => p.draft().work(),
+            Self::Both(p, _) => p.draft().work(),
             _ => DraftWork::default(),
         }
     }
     fn reset(&mut self) {
         match self {
             Self::Neural(p) => p.reset(),
-            Self::Both(p) => p.reset(),
+            Self::Both(p, _) => p.reset(),
             _ => {}
         }
     }
     fn choice(&mut self, choice: DraftChoice) {
         match self {
             Self::Neural(p) => p.set_choice(choice),
-            Self::Both(p) => p.set_choice(choice),
+            Self::Both(p, _) => p.set_choice(choice),
             _ => {}
         }
     }
@@ -283,7 +283,7 @@ impl Drafts {
                 .snapshot_session(main)
                 .map(Checkpoint::Joint)
                 .map_err(Error::engine),
-            Self::Both(p) => p
+            Self::Both(p, _) => p
                 .snapshot_session(main)
                 .map(Checkpoint::Joint)
                 .map_err(Error::engine),
@@ -295,7 +295,7 @@ impl Drafts {
             (Self::Neural(p), Checkpoint::Joint(s)) => {
                 p.restore_session(main, s).map_err(Error::engine)
             }
-            (Self::Both(p), Checkpoint::Joint(s)) => {
+            (Self::Both(p, _), Checkpoint::Joint(s)) => {
                 p.restore_session(main, s).map_err(Error::engine)
             }
             (Self::None(_) | Self::Ngram(_), Checkpoint::Main(s)) => {
@@ -306,12 +306,23 @@ impl Drafts {
     }
 }
 impl Proposer for Drafts {
+    fn proposal_source(&self) -> ProposalSource {
+        match self {
+            Self::None(_) => ProposalSource::Unspecified,
+            Self::Ngram(_) => ProposalSource::Ngram,
+            Self::Neural(_) => ProposalSource::Neural,
+            Self::Both(_, source) => *source,
+        }
+    }
     fn propose(&mut self, h: &[u32], last: u32, max: usize) -> Vec<u32> {
         match self {
             Self::None(p) => p.propose(h, last, max),
             Self::Ngram(p) => p.propose(h, last, max),
             Self::Neural(p) => p.propose(h, last, max),
-            Self::Both(p) => p.propose(h, last, max),
+            Self::Both(p, source) => {
+                *source = ProposalSource::Ngram;
+                p.propose(h, last, max)
+            }
         }
     }
     fn free_guesses(&mut self, h: &[u32], last: u32, max: usize) -> Vec<u32> {
@@ -319,7 +330,10 @@ impl Proposer for Drafts {
             Self::None(p) => p.free_guesses(h, last, max),
             Self::Ngram(p) => p.free_guesses(h, last, max),
             Self::Neural(p) => p.free_guesses(h, last, max),
-            Self::Both(p) => p.free_guesses(h, last, max),
+            Self::Both(p, source) => {
+                *source = ProposalSource::Ngram;
+                p.free_guesses(h, last, max)
+            }
         }
     }
     fn synchronize<V: Verifier>(&mut self, v: &mut V) -> yskn_ref::Result<()> {
@@ -327,7 +341,7 @@ impl Proposer for Drafts {
             Self::None(p) => p.synchronize(v),
             Self::Ngram(p) => p.synchronize(v),
             Self::Neural(p) => p.synchronize(v),
-            Self::Both(p) => p.synchronize(v),
+            Self::Both(p, _) => p.synchronize(v),
         }
     }
     fn observe_committed(&mut self, rows: &[CapturedRow]) -> yskn_ref::Result<()> {
@@ -335,7 +349,7 @@ impl Proposer for Drafts {
             Self::None(p) => p.observe_committed(rows),
             Self::Ngram(p) => p.observe_committed(rows),
             Self::Neural(p) => p.observe_committed(rows),
-            Self::Both(p) => p.observe_committed(rows),
+            Self::Both(p, _) => p.observe_committed(rows),
         }
     }
     fn propose_with<V: Verifier>(
@@ -349,7 +363,18 @@ impl Proposer for Drafts {
             Self::None(p) => p.propose_with(v, h, last, max),
             Self::Ngram(p) => p.propose_with(v, h, last, max),
             Self::Neural(p) => p.propose_with(v, h, last, max),
-            Self::Both(p) => p.propose_with(v, h, last, max),
+            Self::Both(p, source) => {
+                // Combined proposals contain one source. Attribute the returned
+                // guesses by the neural call actually made, not the configured mode.
+                let before = p.draft().work().proposals;
+                let guesses = p.propose_with(v, h, last, max)?;
+                *source = if p.draft().work().proposals > before {
+                    ProposalSource::Neural
+                } else {
+                    ProposalSource::Ngram
+                };
+                Ok(guesses)
+            }
         }
     }
 }
@@ -438,11 +463,14 @@ impl RealEngine {
                     .set_capture(neural.capture_options())
                     .map_err(Error::engine)?;
                 if config.draft == DraftMode::Both {
-                    Drafts::Both(Box::new(CombinedProposer::new(
-                        NgramProposer::new(3, config.k).map_err(Error::engine)?,
-                        neural,
-                        ProposalOrder::LongNgramFirst(LONG_NGRAM_MATCH),
-                    )))
+                    Drafts::Both(
+                        Box::new(CombinedProposer::new(
+                            NgramProposer::new(3, config.k).map_err(Error::engine)?,
+                            neural,
+                            ProposalOrder::LongNgramFirst(LONG_NGRAM_MATCH),
+                        )),
+                        ProposalSource::Unspecified,
+                    )
                 } else {
                     Drafts::Neural(Box::new(neural))
                 }
@@ -490,6 +518,8 @@ impl RealEngine {
             passes: 0,
             rows_verified: 0,
             guesses_offered: 0,
+            neural_guesses_offered: 0,
+            ngram_guesses_offered: 0,
             guesses_accepted: 0,
             draft_proposals: 0,
             draft_updates: 0,
@@ -689,6 +719,8 @@ impl Engine for RealEngine {
             passes: result.statistics.passes,
             rows_verified: result.statistics.rows_verified,
             guesses_offered: result.statistics.guesses_offered,
+            neural_guesses_offered: result.statistics.neural_guesses_offered,
+            ngram_guesses_offered: result.statistics.ngram_guesses_offered,
             guesses_accepted: result.statistics.guesses_accepted,
             draft_proposals: after.proposals - work.proposals,
             draft_updates: after.updates - work.updates,

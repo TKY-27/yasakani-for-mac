@@ -125,9 +125,18 @@ fn exercise(fault: Fault, all: bool) -> Value {
 }
 
 #[test]
-fn actual_synthetic_engine_passes_every_configuration_and_sampler() {
+fn actual_synthetic_engine_matches_ids_but_rejects_unexercised_draft_cells() {
     let report = exercise(Fault::None, true);
-    assert_eq!(report["passed"], true, "{report}");
+    assert_eq!(report["passed"], false);
+    let failures = report["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 8, "{failures:?}");
+    assert!(
+        failures
+            .iter()
+            .all(|f| f["kind"] == "speculation not exercised"
+                || f["kind"] == "draft source not exercised"),
+        "{failures:?}"
+    );
     let runs = report["runs"].as_array().unwrap();
     assert_eq!(
         runs.iter().filter(|r| r["probe"] != true).count(),
@@ -172,6 +181,13 @@ fn actual_synthetic_engine_passes_every_configuration_and_sampler() {
                 "{report}"
             );
         }
+        for row in own.iter().filter(|r| r["expected_error"].is_null()) {
+            assert_eq!(
+                row["guesses_offered"].as_u64().unwrap(),
+                row["neural_guesses_offered"].as_u64().unwrap()
+                    + row["ngram_guesses_offered"].as_u64().unwrap()
+            );
+        }
         if name != "none" {
             assert!(
                 own.iter()
@@ -207,7 +223,7 @@ fn token_and_repeat_faults_and_inactive_drafting_exit_nonzero_with_diagnostics()
     for (mode, kind) in [
         ("configuration", "configuration_mismatch"),
         ("repeat", "repeat_mismatch"),
-        ("acceptance", "no_guess_accepted"),
+        ("acceptance", "speculation not exercised"),
     ] {
         let child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "fault_child", "--nocapture"])

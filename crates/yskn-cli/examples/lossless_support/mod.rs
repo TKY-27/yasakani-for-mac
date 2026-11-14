@@ -107,6 +107,8 @@ struct Capture {
     passes: usize,
     offered: usize,
     accepted: usize,
+    neural_offered: usize,
+    ngram_offered: usize,
     cached: usize,
     snapshots: Vec<u8>,
     sampling: Vec<Value>,
@@ -148,6 +150,8 @@ impl Engine for Recorder {
         c.passes += g.passes;
         c.offered += g.guesses_offered;
         c.accepted += g.guesses_accepted;
+        c.neural_offered += g.neural_guesses_offered;
+        c.ngram_offered += g.ngram_guesses_offered;
         c.cached += g.cached_tokens;
         c.snapshots.push(g.snap_mode);
         Ok(g)
@@ -231,6 +235,8 @@ fn observe_controlled(
     row["finish_reason"] = json!(usage.finish);
     row["passes"] = json!(c.passes);
     row["guesses_offered"] = json!(c.offered);
+    row["neural_guesses_offered"] = json!(c.neural_offered);
+    row["ngram_guesses_offered"] = json!(c.ngram_offered);
     row["guesses_accepted"] = json!(c.accepted);
     row["cached_tokens"] = json!(c.cached);
     row["snapshot_modes"] = json!(c.snapshots);
@@ -426,6 +432,31 @@ fn reuse_probes(
     Ok(())
 }
 
+fn speculation_exercised(name: &str, rows: &[Value], failures: &mut Vec<Value>) {
+    if name == "none" {
+        return;
+    }
+    for sampler in SAMPLERS {
+        let own: Vec<_> = rows
+            .iter()
+            .filter(|r| r["sampler"] == sampler && r["probe"] != true)
+            .collect();
+        let sum = |key: &str| own.iter().filter_map(|r| r[key].as_u64()).sum::<u64>();
+        if sum("guesses_offered") == 0 || sum("guesses_accepted") == 0 {
+            failures.push(
+                json!({"kind":"speculation not exercised","configuration":name,"sampler":sampler}),
+            );
+        }
+        if name == "both-k7-adaptive" {
+            for source in ["neural_guesses_offered", "ngram_guesses_offered"] {
+                if sum(source) == 0 {
+                    failures.push(json!({"kind":"draft source not exercised","configuration":name,"sampler":sampler,"source":source}));
+                }
+            }
+        }
+    }
+}
+
 fn sampling_exercised(name: &str, outputs: &[Vec<Vec<u32>>], failures: &mut Vec<Value>) {
     for (a, b) in [(0, 1), (0, 2), (0, 3), (1, 2)] {
         if outputs[a] == outputs[b] {
@@ -541,16 +572,7 @@ pub fn check(
             }
         }
         sampling_exercised(name, &sampled_outputs, &mut failures);
-        let accepted: u64 = rows[config_start..]
-            .iter()
-            .filter(|r| r["probe"] != true)
-            .filter_map(|r| r["guesses_accepted"].as_u64())
-            .sum();
-        if name != "none" && accepted == 0 {
-            let failure = json!({"kind":"no_guess_accepted","configuration":name});
-            eprintln!("{failure}");
-            failures.push(failure);
-        }
+        speculation_exercised(name, &rows[config_start..], &mut failures);
         drop(runner);
     }
     Ok(
@@ -572,6 +594,31 @@ pub fn load_prompts(path: Option<&Path>) -> Result<Vec<Prompt>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acceptance_under_greedy_and_probes_cannot_cover_inactive_seeded_runs() {
+        let mut rows = vec![json!({"sampler":"greedy","guesses_offered":10,"guesses_accepted":5})];
+        for sampler in &SAMPLERS[1..] {
+            rows.push(json!({"sampler":sampler,"guesses_offered":10,"guesses_accepted":0}));
+            rows.push(json!({"sampler":sampler,"probe":true,"guesses_offered":10,"guesses_accepted":5,"neural_guesses_offered":5,"ngram_guesses_offered":5}));
+        }
+        let mut failures = vec![];
+        speculation_exercised("both-k7-adaptive", &rows, &mut failures);
+        assert_eq!(
+            failures
+                .iter()
+                .filter(|f| f["kind"] == "speculation not exercised")
+                .count(),
+            3
+        );
+        assert_eq!(
+            failures
+                .iter()
+                .filter(|f| f["kind"] == "draft source not exercised")
+                .count(),
+            8
+        );
+    }
 
     #[test]
     fn two_empty_generations_are_not_a_lossless_pass() {
