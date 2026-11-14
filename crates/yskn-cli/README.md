@@ -175,14 +175,15 @@ SHA-256 and reduces all 32 digest bytes without prefix-dependent branches.
 | Rendered prompt (`max_prompt_bytes`) | 2 MiB | The same reasoning as the text limit, applied to the template's output, which adds tags and JSON punctuation to the counted text. Checked on the engine thread between rendering and tokenizing, because tokenizing costs time and memory in proportion to the prompt (measured below). Over it: 400 `context_length_exceeded`, naming the rendered size and the limit |
 | Wait for the engine, from queueing until generation starts (`queue_timeout`) | 600 s | The OpenAI Python SDK's default request timeout is 600 s, so a client would give up by then anyway. Exceeded: 503 with `Retry-After: 5`, and the request never reaches the engine |
 | Concurrent connections (`max_connections`, 1..1024) | 64; excess connections are closed unserved | One engine serves one request at a time |
-| Queued engine jobs | 64 (bounded by active HTTP connections) | One per connection |
+| Queued engine jobs | 64 in the engine channel (its capacity is `max_connections`); further requests wait to enter it, at most one per connection, so the connection limit bounds them | One per connection. Every queued or waiting request's data is charged to the shared `max_pending_bytes` budget. A request that gets the queue-timeout 503 while its job is in the channel leaves the job there, holding its budget share, until the engine thread reaches and skips it; one still waiting to enter the channel is dropped with its share at once |
+| Wall-clock limit on one request's hold of the engine | None | Bounded by the token limits instead: the prompt is at most the context minus the 64-token reserve, the output at most `max_tokens` and the context room left. Other requests get 503 after `queue_timeout`. At the default 32,768-token context this is up to about an hour on this hardware (see below); that figure is an estimate from the prefill rate reported for this machine, not a guarantee |
 | Buffered events per response | 8 | Backpressure reaches the engine quickly |
 | Header read buffer (`header_bytes`, at least 8192) | 32 KiB | Browser and SDK headers are a few KiB |
 | Header count (`max_headers`) | 100 | As Python's `http.client`, which upstream's server uses |
 | Complete header deadline (`header_timeout`) | 10 s | Slow-header clients cannot hold connections. Hyper 1.12 starts it whenever it waits for a request head, also for the next request on a kept-alive connection, so with the defaults this deadline, not `idle_timeout`, closes a connection left idle between requests |
 | Complete body deadline (`body_timeout`) | 30 s | 8 MiB at loopback speed takes milliseconds |
 | Wait for the client (`idle_timeout`): no request bytes arrive (head, body, next request), or a write to the client makes no progress. Not counted while a request is queued or the engine works on it | 300 s | Bounds a client that stops sending or stops reading; the engine's own silence (a long prefill) is not the client's |
-| Full event-channel backpressure deadline (`stream_timeout`) | 30 s | A stream that is not read stops the engine |
+| Full event-channel backpressure deadline (`stream_timeout`) | 30 s | A stream that is not read stops the engine and releases the request's budget share. The connection slot and the unsent response stay until the write deadline (`idle_timeout`) ends the connection |
 | SSE keep-alive comment after this long without output (`keepalive_interval`, 10 ms to 1 h) | 15 s | Well under the 60 s default read timeout of common reverse proxies (nginx `proxy_read_timeout`); 14 bytes (`: keep-alive`), ignored by SSE clients |
 | Bytes discarded while closing (`linger_bytes`) | 256 KiB | See closing below |
 | Closing deadline (`linger_timeout`) | 2 s | See closing below |
@@ -214,11 +215,18 @@ cancel flag. The engine thread checks that flag before rendering, after
 rendering and tokenizing, before each `generate`, between prefill passes (the
 real engine calls `on_tokens` with an empty slice after every
 `--prefill-width` rows) and at every commit, so a disconnect stops the engine
-within one prefill pass or decoding pass. A request whose client has pipelined
-further bytes is the exception Hyper has always had: it stops reading until
-the response is written, so a disconnect is then noticed only when something
-is written (a token or keep-alive comment of a stream, the whole non-streaming
-response at its end).
+within one prefill pass or decoding pass. Limits of this detection, both
+Hyper defaults that predate this server's idle rules:
+
+- A client that half-closes its write side (`shutdown(Write)`) after a
+  complete request is treated as gone: Hyper runs with `half_close(false)`,
+  so the end of its stream ends the connection and cancels the request, and
+  no complete response is sent (a stream may already have sent its headers
+  and role chunk). A test pins this.
+- With pipelined extra bytes after the request, Hyper stops reading until the
+  response is written, so a disconnect is noticed only at the next write (a
+  token or keep-alive comment of a stream, the whole non-streaming response at
+  its end).
 
 A stream sends an SSE comment line (`: keep-alive`) after `keepalive_interval`
 without other output, so clients and intermediaries with their own read
@@ -228,11 +236,21 @@ before them. A non-streaming response has no place for such bytes: it is
 written only when generation ends, so **a non-streaming client must set its
 own read timeout above the longest prefill plus generation it expects**
 (prompt length times the prefill rate above, plus the output). Keep-alive
-comments are produced only when Hyper asks the body for more, which it does
-only while its write buffer (`header_bytes`, 32 KiB) has room: a client that
-stops reading gets no more of them than of any other output. There is no
-separate response-byte budget; what a response holds is bounded by the 8
-buffered events, Hyper's write buffer and the socket buffers, as before.
+comments are produced only when Hyper asks the body for the next frame, which
+it does only while less than `header_bytes` (32 KiB) waits in its write
+buffer: a client that stops reading gets no more of them than of any other
+output. The 32 KiB is that threshold, not a strict bound: a single frame can
+be larger, and a non-streaming response is one frame holding the whole JSON
+body. There is no separate response-byte budget; what a stream holds is the 8
+buffered events, the frames Hyper took below its threshold and the socket
+buffers, as before. A stream whose only output is keep-alive comments to a
+client that never reads is released by the write deadline only once those
+comments fill the socket buffers: measured on macOS loopback at the 10 ms
+minimum interval with a 4 KiB client receive buffer, the connection was freed
+after 318 s (at 14 bytes per 10 ms, about 445 KB of comments) and the engine
+cancelled, with `idle_timeout` at 200 ms; at the 15 s default interval the
+same buffers would take days to fill. The engine is busy for that time
+only if it stays silent, which the token limits bound as below.
 
 **What can hold the engine, and for how long.** A request now holds the one
 engine for as long as its preparation, prefill and generation take, however
@@ -245,16 +263,23 @@ therefore one prefill of a full context (32,704 tokens at the default
 `--ctx 32768`: about 27 to 55 minutes at 50 to 100 ms per token) or a short
 prompt followed by nearly 32,704 decoded tokens, whichever the decode rate
 makes longer; a larger `--ctx` scales it. Only a disconnect, a stalled reader
-or shutdown ends it earlier. Every other request meanwhile waits in the queue
-and, past `queue_timeout`, gets 503 with `Retry-After: 5`; its connection then
-returns to waiting for the client and is closed by the deadlines above. A
-queued request whose wait ran out keeps its share of `max_pending_bytes`
-until the engine thread reaches and skips it, so the budget, not time,
-bounds those. A client that stops reading is cut off once output fills the
-socket and Hyper's buffer: by `stream_timeout` when the 8 events are full, or
-by `idle_timeout` when a write makes no progress, whichever comes first, and
-the engine is cancelled. Keep-alive comments cannot keep such a client
-attached past the output it refuses to read.
+or shutdown ends it earlier. The minute figures are estimates for this
+hardware's reported prefill rate, not guarantees. Every other request
+meanwhile waits: up to 64 jobs in the engine channel, more waiting to enter
+it (at most one per connection, so `max_connections` bounds them), all
+charged to `max_pending_bytes`. Past `queue_timeout` each gets 503 with
+`Retry-After: 5`; its connection then returns to waiting for the client and
+is closed by the deadlines above. A job already in the channel when its
+client got that 503 keeps its budget share until the engine thread reaches
+and skips it, so the budget, not time, bounds those; a request still waiting
+to enter the channel is dropped with its share at once.
+
+A client that stops reading a stream is released at two points. When the 8
+buffered events stay full for `stream_timeout`, the engine stops and the
+request's budget share is returned. The connection slot and the response
+Hyper still holds stay until a write has made no progress for
+`idle_timeout`, which then ends the connection. Keep-alive comments cannot
+keep such a client attached past the output it refuses to read.
 
 Generation itself has no deadline: it is bounded by `max_tokens` (and the
 context room), and it stops when the client disconnects or stops reading a
