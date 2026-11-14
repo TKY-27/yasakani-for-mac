@@ -1791,3 +1791,75 @@ boundaries, signed zero/subnormals and 100,003 random binary32 bit patterns.
 They also check direct exp, non-vector tails and every invalid-value lane.
 Focused tests and clippy pass. Real-model task-3 measurement was queued behind
 another owner's model lock; its result is recorded in the final table below.
+
+#### Task 4: long-context attention memory and independent score chains
+
+A tile now interleaves 1/2/4/8 four-key accumulators (according to visible
+width). Each key still visits all 256 channels in ascending order with a
+separate product and sum. Four-channel transposes occur in registers rather
+than a second channel-major scratch buffer. Prefix exp2 runs the portable
+vector algorithm; masked probabilities are restored to positive zero before
+the original denominator fold. Value accumulation widens immutable cached
+BF16/int8 operands directly into registers, eliminating the intermediate
+256-float value array. The scalar `bases()` API and fast view share one
+`base_view` body. The original scalar attention remains the forced-off path.
+
+Logical key operands touched are 512 BF16 bytes plus a four-byte scale for a
+packed row, or 256 signed bytes plus scale for int8 (excluding metadata/cache
+lines). Keys are visited in absolute tile order, channels ascending; values
+remain in ascending visible-key order for each channel. Register transpose
+removes 1024 bytes written and read back per key; direct value widening removes
+the same intermediate traffic per value. There is no persistent cache growth.
+Threads still span rows and query heads. Six query heads sharing a KV head
+still reread its operands; widening is not shared across rows/heads.
+
+The existing full attention oracle tests cover all three cache modes,
+31/42-split and tile boundaries, mixed packed/int8 sides, means and masked
+negative zero. The direct score test now covers 1/4/5/8/9/16/17/31/32 keys,
+checking every valid lane against its scalar 256-term chain. Elementwise
+boundary tests also cover the exp2 product before portable exp.
+
+Stage-only measurement reads the **real model header, actual attention norm
+vectors and profile**, constructs all 16 layers/24 query heads/4 KV heads,
+and uses a deterministic synthetic projected-row bank to fill distinct cache
+allocations. This avoids a minutes-long CPU prefill, respecting short model
+lock holds. It times the actual attention core on the ten-worker CPU pool,
+including 31/42 splits, self, means and final combination. It excludes query
+preparation, output inverse rotation/gating and compressed projections; it is
+**not a real-token end-to-end context benchmark**. Real header/profile reads
+are protected by the same model lock even though compressed weights are not
+loaded. Peak cache payload and repeated key reads have the real dimensions.
+
+Build once, then run each invocation under its own acquired model lock:
+
+```sh
+cargo test --release -p yskn-engine --lib --no-run
+YSKN_MODEL_DIR="$HOME/models/qwen38-speed" \
+  cargo test --release -p yskn-engine --lib bench_real_attention_shapes -- --ignored --nocapture
+YSKN_MODEL_DIR="$HOME/models/qwen38-speed" YSKN_BENCH_CONTEXT=32768 \
+  YSKN_BENCH_ROWS=1 YSKN_BENCH_PASSES=3 \
+  cargo test --release -p yskn-engine --lib bench_real_attention_shapes -- --ignored --nocapture
+```
+
+The reported runs invoke the already-built test executable, avoiding builds
+under the lock. Before is the task-3 implementation plus this same harness,
+preserved before editing attention. One warmup is excluded in each run.
+
+| Context / rows / samples | Before min / median (s) | After min / median (s) |
+|---|---:|---:|
+| 2000 / 16 / 5 | .953321 / 1.043144 | .472496 / .492316 |
+| 32768 / 1 / 3 | .882691 / .897571 | .724074 / .730233 |
+
+An intermediate score-only change (before direct value widening) measured
+.696305 / .760815 s at 2000/16. The final minimum improves 2.02x at 2000/16;
+the 0.1 s target is **not reached**. At 32768 the measured cost per row is
+724.074 / 730.233 ms (M=1), 1.22x minimum improvement. Shared-host scheduling
+varies materially; these are wall measurements, not hardware-counter claims.
+
+For the real packing mix, base operands and scales logically total about
+2.064 GB per 32768-token row with perfect KV-head reuse, or 12.382 GB without
+reuse across six grouped queries. Cache-line/pointer traffic is additional;
+repeated reads may hit caches. Sharing transient widening between queries,
+without changing each query's prefix/split arithmetic, is the principal
+remaining attention optimization. No unmeasured bandwidth ceiling establishes
+that the 0.1 s target can be reached on this host.

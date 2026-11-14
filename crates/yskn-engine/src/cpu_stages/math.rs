@@ -26,11 +26,16 @@ impl Elementwise for FastMath {
         ScalarMath::finite(values, context)
     }
 }
+pub(crate) fn exp2(values: &mut [f32]) {
+    map(values, Operation::Exp2);
+}
+
 #[derive(Clone, Copy)]
 enum Operation {
     Bfloat,
     Silu,
     Sigmoid,
+    Exp2,
     Half(f32),
 }
 fn map(values: &mut [f32], operation: Operation) {
@@ -47,6 +52,11 @@ fn scalar(values: &mut [f32], operation: Operation) {
         Operation::Bfloat => ScalarMath::bfloat(values),
         Operation::Silu => ScalarMath::silu(values),
         Operation::Sigmoid => ScalarMath::sigmoid(values),
+        Operation::Exp2 => {
+            for value in values {
+                *value = yskn_ref::portable_math::exp2(*value);
+            }
+        }
         Operation::Half(scale) => ScalarMath::scale_half(values, scale),
     }
 }
@@ -272,6 +282,7 @@ unsafe fn map_neon(values: &mut [f32], operation: Operation) {
             let result = match operation {
                 Operation::Bfloat => bfloat4(value),
                 Operation::Half(scale) => half4(vmulq_n_f32(value, scale)),
+                Operation::Exp2 => exp4(vmulq_n_f32(value, f32::from_bits(0x3f317218))),
                 Operation::Sigmoid => vdivq_f32(
                     vdupq_n_f32(1.0),
                     vaddq_f32(vdupq_n_f32(1.0), exp4(vnegq_f32(value))),
@@ -296,6 +307,7 @@ mod tests {
             Operation::Half(f32::from_bits(0x3d3504f3)),
             Operation::Silu,
             Operation::Sigmoid,
+            Operation::Exp2,
         ] {
             let mut expected = values.to_vec();
             let mut actual = values.to_vec();

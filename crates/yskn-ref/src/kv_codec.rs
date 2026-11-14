@@ -42,13 +42,26 @@ pub enum CacheRow {
     Int8(Int8Row),
     Packed(Box<PackedRow>),
 }
+/// Borrowed validated attention operands, before applying the row scale.
+pub enum BaseView<'a> {
+    Int8(&'a [i8]),
+    Bfloat16(&'a [u16; 256]),
+}
+
 impl CacheRow {
     /// Attention reads only validated, immutable operands. Int8 conversion is
     /// exact; packed operands were BF16-rounded once when the row was encoded.
-    pub fn bases(&self) -> [f32; 256] {
+    pub fn base_view(&self) -> BaseView<'_> {
         match self {
-            Self::Int8(row) => std::array::from_fn(|i| f32::from(row.integers[i])),
-            Self::Packed(row) => row.bases.map(|bits| f32::from_bits(u32::from(bits) << 16)),
+            Self::Int8(row) => BaseView::Int8(&row.integers),
+            Self::Packed(row) => BaseView::Bfloat16(&row.bases),
+        }
+    }
+
+    pub fn bases(&self) -> [f32; 256] {
+        match self.base_view() {
+            BaseView::Int8(integers) => std::array::from_fn(|i| f32::from(integers[i])),
+            BaseView::Bfloat16(bases) => bases.map(|bits| f32::from_bits(u32::from(bits) << 16)),
         }
     }
 
