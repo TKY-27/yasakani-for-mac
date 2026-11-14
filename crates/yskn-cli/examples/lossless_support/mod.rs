@@ -109,6 +109,7 @@ struct Capture {
     accepted: usize,
     cached: usize,
     snapshots: Vec<u8>,
+    sampling: Vec<Value>,
 }
 struct Recorder {
     inner: Box<dyn Engine>,
@@ -133,6 +134,9 @@ impl Engine for Recorder {
             .inner
             .generate(prompt, max_new, sampling, stops, emit)?;
         let mut c = self.capture.borrow_mut();
+        let s = sampling.normalized();
+        let fixed = |v: f64| (v * 1000.0).round_ties_even() / 1000.0;
+        c.sampling.push(json!({"temperature":fixed(s.temperature),"top_p":fixed(s.top_p),"top_k":s.top_k,"min_p":fixed(s.min_p),"seed":s.seed as u32}));
         c.ids.extend_from_slice(&g.ids);
         c.stages.push(g.ids.len());
         c.passes += g.passes;
@@ -161,8 +165,14 @@ fn parameters(
     if sampler == 0 {
         body["temperature"] = json!(0.0);
     }
-    if sampler == 3 {
-        body["temperature"] = json!(1.3);
+    if sampler == 1
+        || sampler == 3
+        || (sampler == 2 && (defaults.sampling.temperature <= 0.0 || defaults.sampling.top_k == 1))
+    {
+        body["temperature"] = json!(if sampler == 3 { 1.3 } else { 0.7 });
+        body["top_p"] = json!(if sampler == 3 { 1.0 } else { 0.9 });
+        body["top_k"] = json!(20);
+        body["min_p"] = json!(0.0);
     }
     let mut p = parse_chat_request(&body, defaults)
         .map_err(|e| Error::request(format!("{}: {e}", prompt.location)))?;
@@ -186,6 +196,7 @@ fn observe(
         digest.update(id.to_le_bytes());
     }
     let mut row = label;
+    row["effective_sampling_by_stage"] = json!(c.sampling);
     row["token_count"] = json!(c.ids.len());
     row["sha256_ids_le_u32"] = json!(format!("{:x}", digest.finalize()));
     row["finish_reason"] = json!(usage.finish);
@@ -238,6 +249,14 @@ fn compare(
     }
 }
 
+fn sampling_exercised(name: &str, outputs: &[Vec<Vec<u32>>], failures: &mut Vec<Value>) {
+    for (a, b) in [(0, 1), (0, 2), (0, 3), (1, 2)] {
+        if outputs[a] == outputs[b] {
+            failures.push(json!({"kind":"sampling not exercised","configuration":name,"samplers":[SAMPLERS[a],SAMPLERS[b]]}));
+        }
+    }
+}
+
 /// The factory is called only after the previous runner and its weights drop.
 /// Tests supply actual synthetic RealEngines, with faults confined to test wrappers.
 pub fn check(
@@ -269,6 +288,7 @@ pub fn check(
             0,
         )?;
         let config_start = rows.len();
+        let mut sampled_outputs: Vec<Vec<Vec<u32>>> = Vec::new();
         for (sampler, sampler_name) in SAMPLERS.iter().enumerate() {
             let mut first = Vec::new();
             // Full first sweep: each repeat has unrelated requests in between.
@@ -332,10 +352,12 @@ pub fn check(
                     );
                 }
             }
+            sampled_outputs.push(first.iter().map(|o| o.ids.clone()).collect());
             if name == "none" {
                 baseline.extend(first);
             }
         }
+        sampling_exercised(name, &sampled_outputs, &mut failures);
         let accepted: u64 = rows[config_start..]
             .iter()
             .filter(|r| r["run"] != "prefix_probe")
@@ -361,5 +383,46 @@ pub fn load_prompts(path: Option<&Path>) -> Result<Vec<Prompt>> {
                 .map_err(|e| Error::request(format!("{}: {e}", path.display())))?,
         ),
         None => prompts("embedded lossless_prompts.json", DEFAULT_PROMPTS),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_sampling_overrides_greedy_and_single_choice_defaults() {
+        let prompt = prompts("test", r#"[{"id":"a","request":{"messages":[{"role":"user","content":"x"}]}},{"id":"b","request":{"messages":[{"role":"user","content":"y"}]}}]"#).unwrap().remove(0);
+        let mut defaults = RequestDefaults::default();
+        defaults.sampling.temperature = 0.0;
+        defaults.sampling.top_k = 1;
+        for sampler in 1..4 {
+            let p = parameters(&prompt, &defaults, sampler, 32).unwrap();
+            assert!(p.temperature > 0.0 && p.top_k > 1 && p.top_p >= 0.9);
+        }
+        defaults.sampling.temperature = 0.8;
+        defaults.sampling.top_k = 11;
+        let p = parameters(&prompt, &defaults, 2, 32).unwrap();
+        assert_eq!((p.temperature, p.top_k), (0.8, 11));
+    }
+
+    #[test]
+    fn identical_samplers_and_identical_seeds_fail_the_diversity_gate() {
+        let mut failures = vec![];
+        sampling_exercised("none", &vec![vec![vec![1]]; 4], &mut failures);
+        assert_eq!(failures.len(), 4);
+        assert!(
+            failures
+                .iter()
+                .all(|f| f["kind"] == "sampling not exercised")
+        );
+        failures.clear();
+        sampling_exercised(
+            "none",
+            &[vec![vec![0]], vec![vec![1]], vec![vec![1]], vec![vec![3]]],
+            &mut failures,
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["samplers"], json!(["seed-42", "seed-2027"]));
     }
 }
