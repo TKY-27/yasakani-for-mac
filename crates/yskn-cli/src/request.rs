@@ -1,7 +1,7 @@
 //! Validation at the OpenAI request boundary, matching chat.py/server.py.
 use crate::{Error, Result, chat::ChatParams, server::Limits};
 use serde_json::{Map, Value, json};
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 /// Upper bound on the number of values a JSON text can hold, counted without
 /// parsing it: every value except the root follows `[`, `,` or `:` outside a
@@ -108,27 +108,47 @@ pub fn truthy(v: &Value) -> bool {
 pub const EXCERPT: usize = 64;
 /// `text` cut to [`EXCERPT`] characters, with an ellipsis if it was longer.
 pub fn excerpt(text: &str) -> String {
-    let mut out: String = text.chars().take(EXCERPT).collect();
-    if out.len() < text.len() {
+    excerpt_of(|out| out.write_str(text))
+}
+/// Keeps the first `left` characters written into it, then refuses more:
+/// its error stops the writer, so quoting a huge value costs no more than
+/// the excerpt, with no copy of the value.
+struct Prefix {
+    text: String,
+    left: usize,
+    cut: bool,
+}
+impl fmt::Write for Prefix {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for c in s.chars() {
+            if self.left == 0 {
+                self.cut = true;
+                return Err(fmt::Error);
+            }
+            self.text.push(c);
+            self.left -= 1;
+        }
+        Ok(())
+    }
+}
+/// The first `n` characters `write` produces, and whether it had more.
+fn prefix(n: usize, write: impl FnOnce(&mut Prefix) -> fmt::Result) -> (String, bool) {
+    let mut out = Prefix {
+        text: String::new(),
+        left: n,
+        cut: false,
+    };
+    // The writers used here fail only when `out` stops them, which `cut` records.
+    let _ = write(&mut out);
+    (out.text, out.cut)
+}
+/// [`EXCERPT`] characters of what `write` produces, with an ellipsis if it had more.
+fn excerpt_of(write: impl FnOnce(&mut Prefix) -> fmt::Result) -> String {
+    let (mut out, cut) = prefix(EXCERPT, write);
+    if cut {
         out.push('…');
     }
     out
-}
-/// `v` with every string and key cut to `n` characters and every list and
-/// object to `n` entries, so quoting a huge value costs no more than its
-/// excerpt. Its repr or JSON text is longer than `n` exactly when `v`'s is.
-fn shortened(v: &Value, n: usize) -> Value {
-    let cut = |s: &str| s.chars().take(n).collect::<String>();
-    match v {
-        Value::String(s) => Value::String(cut(s)),
-        Value::Array(a) => a.iter().take(n).map(|v| shortened(v, n)).collect(),
-        Value::Object(m) => m
-            .iter()
-            .take(n)
-            .map(|(k, v)| (cut(k), shortened(v, n)))
-            .collect(),
-        v => v.clone(),
-    }
 }
 fn py_string(v: &Value) -> String {
     if let Value::String(s) = v {
@@ -461,10 +481,12 @@ pub fn parse_chat_request(body: &Value, cfg: &RequestDefaults) -> Result<ChatPar
             return Err(Error::request(format!(
                 "tool_choice {} is not supported; use \"auto\" or \"none\"",
                 // As upstream: the first 80 characters of the JSON text.
-                yskn_text::json_dumps(&shortened(&body["tool_choice"], 80), true)
-                    .chars()
-                    .take(80)
-                    .collect::<String>()
+                prefix(80, |out| yskn_text::write_json(
+                    &body["tool_choice"],
+                    true,
+                    out
+                ))
+                .0
             )));
         }
     }
@@ -482,7 +504,7 @@ pub fn parse_chat_request(body: &Value, cfg: &RequestDefaults) -> Result<ChatPar
     if rf.is_object() && !rf["type"].is_null() && rf["type"] != "text" {
         return Err(Error::request(format!(
             "response_format {} is not supported",
-            excerpt(&py_repr(&shortened(&rf["type"], EXCERPT)))
+            excerpt_of(|out| write_repr(&rf["type"], out))
         )));
     }
     let messages = clean_messages(&body["messages"])?;

@@ -205,7 +205,12 @@ once; each is still charged before it is parsed.
 Error messages never quote more than a short excerpt of a request value: at
 most 64 characters of its Python repr followed by `…` (`response_format`, the
 method of a 501), or, as upstream, the first 80 characters of its JSON text
-(`tool_choice`); control characters appear escaped in both. Template and
+(`tool_choice`); control characters appear escaped in both. The repr or JSON
+text is written into a sink that stops the writer once it has the excerpt, so
+quoting a value costs no more than the excerpt, however large or nested the
+value is (measured: 434 bytes allocated for the 80-character excerpt of an
+8.3 MB `tool_choice` of 25,600 strings of 80 emoji, which allocated 151 MiB
+when the excerpt was cut from a shortened copy of the value). Template and
 tokenizer errors are cut to 500 characters. An error response is therefore a
 few hundred bytes whatever the request held, and a client that never reads a
 response is cut off by `idle_timeout`, which also bounds a write that makes no

@@ -855,6 +855,47 @@ fn error_messages_quote_a_short_excerpt_of_request_values() {
     }
     assert!(message(json!({"response_format":{"type":long}})).contains("…"));
 }
+// Review finding (third round): an excerpt was made by shortening every list to
+// 80 items and serializing the whole shortened copy, so a nested value within
+// every limit (the review's 8.3 MB `tool_choice` of 25,600 strings of 80 emoji)
+// made the server hold about 150 MiB to write an 80-character message. The
+// excerpt is now written into a sink that stops after it, so quoting the
+// value costs a tiny fraction of merely building it. (Work is compared by
+// time: counting allocations would need an `unsafe` allocator.)
+#[test]
+fn quoting_a_nested_value_costs_only_the_excerpt() {
+    let cfg = RequestDefaults::default();
+    let started = std::time::Instant::now();
+    let nested = json!(vec![vec![vec!["\u{1f600}".repeat(80); 80]; 80]; 4]);
+    let built = started.elapsed();
+    for key in ["tool_choice", "response_format"] {
+        let mut b = json!({"messages":user()});
+        b[key] = if key == "tool_choice" {
+            nested.clone()
+        } else {
+            json!({"type":nested.clone()})
+        };
+        // The best of a few tries, so a pause of this thread cannot fail it.
+        let quoted = (0..5)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let e = parse_chat_request(&b, &cfg).unwrap_err();
+                assert!(
+                    e.message.starts_with(&format!("{key} [[[")),
+                    "{}",
+                    e.message
+                );
+                assert!(e.message.chars().count() < 150, "{}", e.message);
+                started.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(
+            quoted * 10 < built,
+            "{key}: {quoted:?} to quote, {built:?} to build"
+        );
+    }
+}
 // Review finding: an early context check assumed normalization shrinks text at
 // most four times, so a tokenizer whose normalizer deletes characters had a
 // prompt refused that fits. Only the exact check after tokenization remains.

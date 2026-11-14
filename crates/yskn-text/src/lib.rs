@@ -6,7 +6,7 @@ mod template;
 mod tools;
 
 pub use stream::{OutputStream, StreamDecoder};
-pub use template::json_dumps;
+pub use template::{json_dumps, write_json};
 pub use tools::{ToolCallFilter, convert_parameter, parse_tool_call, tool_schemas};
 
 use serde_json::Value;
