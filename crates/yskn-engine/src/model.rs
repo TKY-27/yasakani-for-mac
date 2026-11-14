@@ -1090,11 +1090,12 @@ fn attention_pass(
             let sides = engine.map_range(0..q.len() * sides_per_row, |index| {
                 let row = index / sides_per_row;
                 let side = index % 2;
-                attention.prepare_cache_side(
+                attention.prepare_cache_side_with_search(
                     position + row,
                     index % sides_per_row / 2,
                     side,
                     if side == 0 { &k[row] } else { &v[row] },
+                    crate::cpu_stages::kv_codec::search_chain,
                 )
             })?;
             let queries = engine.map_range(0..q.len(), |i| {

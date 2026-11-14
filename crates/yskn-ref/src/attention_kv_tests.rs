@@ -1,3 +1,4 @@
+use crate::kv_codec::requantize_int8;
 use super::synthetic_kv_profile::{Profile, mixed_profile};
 use super::*;
 

@@ -1670,3 +1670,57 @@ matrix copies are gone; (4) profile software half conversion and residual/MLP
 allocation/dispatch. No SIMD-within-score reduction or additional persistent
 cache bytes are proposed as an unapproved shortcut.
 
+
+### D20 round two: real-shape CPU profiling (brief 07c)
+
+All measurements below use the CPU projection backend, dotprod/10 workers,
+`CARGO_NET_OFFLINE=true`, and the read-only `$HOME/models/qwen38-speed`.
+Every real-model invocation is enclosed by atomic `mkdir` of
+`/Users/anag2bgod/Projects/yasakani-for-mac/.work/model.lock` and an EXIT
+trap that `rmdir`s only that acquired lock after the process exits. A busy
+lock is waited for, never removed. No model is copied. macOS `sample PID 5 1`
+was attempted after task 1 but denied process inspection by the sandbox;
+stage timers are the available profile, not on-CPU sample counts.
+
+#### Task 1: integer VIT2 selection
+
+Only the engine replaces VIT2. Four lanes represent four independent reduced
+states `g`. The integer emissions, paired minimum **before** shared-cost
+addition for five bits, low predecessor bits, normalization and signed
+final `(cost,state)` minimum are unchanged. Stack arrays replace per-step
+allocation. The fast path checks 4/5 bits, target bounds +/-2048 and table
+bounds +/-1100; D13's reduced-cost bound keeps every intermediate in i32.
+Other inputs use the checked scalar oracle. There is no floating change:
+additive search hooks share the original scale-candidate fold, first strict
+minimum, reconstruction and packing. `YSKN_CPU_STAGES=reference` disables
+both this search and the previous side parallelism.
+
+`cargo test --release -p yskn-engine --lib cpu_stages::kv_codec` checks 360
+random/boundary/tied chain cases (including checked-overflow fallback), and
+complete packed/int8-profile encoding across random, constant, signed-zero,
+subnormal, guarded and mixed-side rows. It compares exact selected states,
+encoded representation and scale bits to the unchanged scalar search.
+
+One-core explicit benchmark, nine samples of 1000 synthetic five-bit chains:
+`cargo test --release -p yskn-engine --lib bench_search_chain -- --ignored --nocapture`.
+Reference minimum/median 9.719/9.889 us; fast 1.340/1.343 us (7.25x minimum).
+This benchmark does not load the model.
+
+Real-model command, before and after task 1, five passes after warmup:
+
+```sh
+target/release/examples/bench_model "$HOME/models/qwen38-speed" \
+  --backend cpu --kv kv5 --rows-per-pass 1 --passes 5
+```
+
+| Stage (ms, minimum / median) | Before 07c | After task 1 |
+|---|---:|---:|
+| total | 739.576 / 756.953 | 828.407 / 830.701 |
+| kernel | 656.200 / 669.637 | 752.224 / 754.442 |
+| recurrence | 40.413 / 40.805 | 41.204 / 41.639 |
+| attention | 1.225 / 1.251 | 1.185 / 1.330 |
+| kv_encode | 11.797 / 12.177 | 3.425 / 3.499 |
+| rest | 29.098 / 29.437 | 28.627 / 28.923 |
+
+Kernel timing varies on the shared host; total-time improvement is not claimed
+from this pair. KV preparation minimum improves 3.44x.

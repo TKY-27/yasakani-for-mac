@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use crate::gated_deltanet::xor_sum32;
-use crate::kv_codec::{CacheRow, Int8Row, encode_packed, requantize_int8};
+use crate::kv_codec::{
+    CacheRow, Int8Row, encode_packed_with_search, requantize_int8_with_search, search_chain,
+};
 use crate::kv_profile::KvProfile;
 use crate::portable_math::{bfloat, exp, exp2, rsqrt, sigmoid, sincos};
 use crate::{Error, Result};
@@ -322,6 +324,17 @@ impl Attention {
         position: usize,
         row: &[f32],
     ) -> Result<CacheRow> {
+        self.encode_row_with_search(head, side, position, row, search_chain)
+    }
+
+    fn encode_row_with_search(
+        &self,
+        head: usize,
+        side: usize,
+        position: usize,
+        row: &[f32],
+        search: impl Fn(&[i32; 64], &crate::kv_profile::CodeTable, u8, bool) -> Result<[u8; 64]>,
+    ) -> Result<CacheRow> {
         if self.kv_mode == KvMode::Int8 {
             return encode_int8(row);
         }
@@ -331,10 +344,10 @@ impl Attention {
         // src/kvq_fast.cuh:78,189,218-234: guard uses the absolute cache position.
         match self.kv_mode {
             KvMode::Int8 => unreachable!(),
-            KvMode::Int8Profile => Ok(CacheRow::Int8(requantize_int8(
-                profile, group, position, row,
+            KvMode::Int8Profile => Ok(CacheRow::Int8(requantize_int8_with_search(
+                profile, group, position, row, &search,
             )?)),
-            KvMode::Kv5 => encode_packed(profile, group, position, row),
+            KvMode::Kv5 => encode_packed_with_search(profile, group, position, row, &search),
         }
     }
 
@@ -627,6 +640,18 @@ impl Attention {
         side: usize,
         projected: &[f32],
     ) -> Result<CacheRow> {
+        self.prepare_cache_side_with_search(position, head, side, projected, search_chain)
+    }
+
+    /// Same projection boundaries with an independent integer trellis search.
+    pub fn prepare_cache_side_with_search(
+        &self,
+        position: usize,
+        head: usize,
+        side: usize,
+        projected: &[f32],
+        search: impl Fn(&[i32; 64], &crate::kv_profile::CodeTable, u8, bool) -> Result<[u8; 64]>,
+    ) -> Result<CacheRow> {
         if head >= self.dimensions.kv_heads || side > 1 || projected.len() != self.kv_width {
             return Err(Error::InvalidInput("invalid attention cache side".into()));
         }
@@ -649,7 +674,7 @@ impl Attention {
         } else {
             rotate_cache(&row)
         };
-        self.encode_row(head, side, position, &rotated)
+        self.encode_row_with_search(head, side, position, &rotated, search)
     }
 
     /// Finish an engine-prepared row; sides are interleaved key/value in head order.
