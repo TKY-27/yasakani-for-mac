@@ -4,7 +4,7 @@ This file is the single resumable record of the port. It is written so the
 orchestrator can continue from it alone. Update it at every merge, decision
 and measurement.
 
-Last updated: 2026-11-14 16:45 JST (steps 1 to 4 done; step 5 merged except the wide prefill kernel; step 6: the product binary runs the real model and reproduces upstream's self-check, in review as PR #26; step 7 under way: CPU stage fast paths, kernel round two, draft depth policy). **Read "Work in flight" first when resuming.**
+Last updated: 2026-11-14 16:45 JST (steps 1 to 4 done; step 5 merged except the wide prefill kernel and the prompt reuse and cancellable prefill that are part of PR #26; step 6: the product binary runs the real model and reproduces upstream's self-check, in review as PR #26; step 7 under way: CPU stage fast paths, kernel round two, draft depth policy). **Read "Work in flight" first when resuming.**
 
 ## Work in flight (2026-11-14 16:45 JST)
 
@@ -99,8 +99,10 @@ Release criteria (all must hold):
    **Done: D12, Metal** (PR #8). The engine's `Model` runs on it (PR #13,
    D14); the Metal code now lives in `crates/yskn-engine/src/metal.rs`.
 5. Draft model, speculation loop, prompt snapshots, long-prompt prefill, KV5.
-   **Merged**, except a wide kernel for long-prompt prefill (brief `07d`):
-   see the unit table under "Step 5 plan".
+   **Merged**, except a wide kernel for long-prompt prefill (brief `07d`)
+   and units K and L's product side (prompt reuse, cancellable prefill),
+   which are in PR #26, still in review: see the unit table under
+   "Step 5 plan".
 6. Product binary: terminal chat, OpenAI-compatible server, benchmark.
    **In progress.** `crates/yskn-text` merged (PR #12): tokenizer, chat
    template, stream decoding, tool helpers; 153 goldens generated from
@@ -445,10 +447,11 @@ orchestrator (PR #22) was reviewed by Sol before merging.
   workers compiling while the real model was loaded. The one-hour run
   must be measured with nothing else running and judged by swap-out
   counters over the run, not by the absolute figure.
-- Scalar attention time grows linearly with context: about 1 s per 16-row
-  pass at 2,000 tokens, so on the order of a second per token at 32,768
-  (extrapolated, not measured). A fast attention path is required for the
-  32,768-token release criterion; step 7.
+- Attention time grows linearly with context. The scalar code took about
+  1 s per 16-row pass at 2,000 tokens; the fast path of PR #25 takes
+  0.31 s (M13), which still extrapolates to about 0.3 s per row at
+  32,768 tokens (not measured). The target is under 0.1 s per 16-row pass
+  at 2,000 tokens; brief `07c`.
 - The format's maximum context (262,144 tokens) does not fit this machine
   in `Kv5` with the current cache representation; the product caps the
   context by memory (brief `06i`). A compact fast path reading packed
@@ -458,9 +461,10 @@ orchestrator (PR #22) was reviewed by Sol before merging.
 
 - `generate` copies the whole recurrent state (about 157 MB) at the start
   of every provisional pass and again on a partial commit (D16); step 7.
-- Row encoding (`kv_encode`, 45 ms at one row) runs the scalar codec for
-  128 side-rows sequentially within a row; it can run in parallel across
-  heads and sides without changing bits; step 7.
+- Row encoding (`kv_encode`) was 45 ms at one row with the scalar codec
+  run sequentially; PR #25 runs it in parallel across heads and sides
+  (13 ms, M13). The codec's candidate selection is now the hottest CPU
+  function; brief `07c`.
 
 - Draft tests (from Astra's review of PR #15): a rank-projection test with
   off-diagonal entries and rank different from hidden width; a synthetic
@@ -665,8 +669,11 @@ window 7 deep proposals lose. Hence decision O10.
 
 Binaries of the PR #24 branch, machine at low load.
 `./verify_draft ~/models/qwen38-speed` (example `verify_draft`): the fast
-draft's proposal and state equal the scalar reference at position 300,
-and the Metal, CPU and portable configurations equal each other: PASS.
+draft's state equals the scalar reference after 3 context rows (the
+example's default for the independent scalar comparison), its proposal
+equals the scalar draft's at position 300 with the fast draft's snapshot
+restored into the scalar draft, and the Metal, CPU and portable
+configurations equal each other: PASS.
 `./bench_draft ~/models/qwen38-speed` (example `bench_draft`): one
 proposal 47.2 ms median (kernel 26.8, attention 5.7, approximate scores
 4.1); pushing context rows 0.39 ms per row in batches of 256, 1.5 ms for
