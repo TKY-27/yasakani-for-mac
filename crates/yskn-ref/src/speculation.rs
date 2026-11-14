@@ -7,7 +7,12 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use crate::model::{CaptureOptions, CapturedRow, ModelDimensions};
 use crate::{Error, Model, Result, Sampler};
+
+pub use crate::draft_proposer::{
+    CombinedProposer, DraftProposer, DraftProposerSnapshot, ProposalOrder, SessionSnapshot,
+};
 
 /// A causal verifier. Failed passes are atomic; commit retains exactly its first
 /// `rows` input rows, and discard restores the committed prediction.
@@ -23,6 +28,23 @@ pub trait Verifier {
     fn logits(&self) -> Option<&[f32]>;
     fn commit(&mut self, rows: usize) -> std::result::Result<(), Self::Error>;
     fn discard(&mut self);
+    fn captured_rows(&self) -> &[CapturedRow] {
+        &[]
+    }
+    fn provisional_captures(&self) -> &[CapturedRow] {
+        &[]
+    }
+    fn capture_options(&self) -> Option<&CaptureOptions> {
+        None
+    }
+    fn dimensions(&self) -> Option<&ModelDimensions> {
+        None
+    }
+    fn embedding(&self, _token: u32) -> Result<Vec<f32>> {
+        Err(Error::InvalidInput(
+            "verifier does not expose embeddings".into(),
+        ))
+    }
 }
 
 impl Verifier for Model {
@@ -47,6 +69,37 @@ impl Verifier for Model {
     }
     fn discard(&mut self) {
         self.discard_provisional();
+    }
+    fn captured_rows(&self) -> &[CapturedRow] {
+        self.captured_rows()
+    }
+    fn provisional_captures(&self) -> &[CapturedRow] {
+        self.provisional_captures()
+    }
+    fn capture_options(&self) -> Option<&CaptureOptions> {
+        Some(self.capture_options())
+    }
+    fn dimensions(&self) -> Option<&ModelDimensions> {
+        Some(self.dimensions())
+    }
+    fn embedding(&self, token: u32) -> Result<Vec<f32>> {
+        self.embedding(token)
+    }
+}
+
+/// Verifiers whose owned checkpoints can be saved together with a draft ring.
+pub trait CheckpointVerifier: Verifier {
+    type Snapshot;
+    fn snapshot(&self) -> std::result::Result<Self::Snapshot, Self::Error>;
+    fn restore(&mut self, snapshot: &Self::Snapshot) -> std::result::Result<(), Self::Error>;
+}
+impl CheckpointVerifier for Model {
+    type Snapshot = crate::Snapshot;
+    fn snapshot(&self) -> Result<Self::Snapshot> {
+        self.snapshot()
+    }
+    fn restore(&mut self, snapshot: &Self::Snapshot) -> Result<()> {
+        self.restore(snapshot)
     }
 }
 
@@ -80,6 +133,25 @@ pub trait Proposer {
         last_selected: u32,
         max_guesses: usize,
     ) -> Vec<u32>;
+    /// Observe the retained prompt suffix before generation or a direct proposal.
+    fn synchronize<V: Verifier>(&mut self, _verifier: &V) -> Result<()> {
+        Ok(())
+    }
+    /// Called only after commit succeeds, with exactly the consumed input rows.
+    fn observe_committed(&mut self, _rows: &[CapturedRow]) -> Result<()> {
+        Ok(())
+    }
+    /// Fallible, verifier-aware entry point; token-only proposers keep their API.
+    fn propose_with<V: Verifier>(
+        &mut self,
+        verifier: &V,
+        history: &[u32],
+        last: u32,
+        max: usize,
+    ) -> Result<Vec<u32>> {
+        self.synchronize(verifier)?;
+        Ok(self.propose(history, last, max))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -199,6 +271,7 @@ pub struct GenerationResult {
 pub enum GenerationError<E> {
     Verifier(E),
     Selector(Error),
+    Proposer(Error),
     InvalidInput(&'static str),
 }
 impl<E: fmt::Display> fmt::Display for GenerationError<E> {
@@ -206,6 +279,7 @@ impl<E: fmt::Display> fmt::Display for GenerationError<E> {
         match self {
             Self::Verifier(error) => write!(f, "verifier: {error}"),
             Self::Selector(error) => write!(f, "selector: {error}"),
+            Self::Proposer(error) => write!(f, "proposer: {error}"),
             Self::InvalidInput(message) => write!(f, "generation: {message}"),
         }
     }
@@ -214,7 +288,7 @@ impl<E: std::error::Error + 'static> std::error::Error for GenerationError<E> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Verifier(error) => Some(error),
-            Self::Selector(error) => Some(error),
+            Self::Selector(error) | Self::Proposer(error) => Some(error),
             Self::InvalidInput(_) => None,
         }
     }
@@ -257,6 +331,9 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
         statistics: GenerationStatistics::default(),
         stop_reason: StopReason::MaxNewTokens,
     };
+    proposer
+        .synchronize(verifier)
+        .map_err(GenerationError::Proposer)?;
     while result.tokens.len() < limits.max_new_tokens {
         let position = verifier.position();
         let room = capacity.saturating_sub(position);
@@ -266,7 +343,14 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
         }
         let remaining = limits.max_new_tokens - result.tokens.len();
         let width = room.min(remaining).min(verifier.max_pass_width());
-        let guesses = proposer.propose(&history, pending, limits.max_draft_tokens.min(width - 1));
+        let guesses = proposer
+            .propose_with(
+                verifier,
+                &history,
+                pending,
+                limits.max_draft_tokens.min(width - 1),
+            )
+            .map_err(GenerationError::Proposer)?;
         if guesses.len() > limits.max_draft_tokens.min(width - 1) {
             return Err(GenerationError::InvalidInput(
                 "proposer exceeded the requested guess limit",
@@ -326,10 +410,21 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
             }
         }
         let confirmed = result.tokens.len() - before;
+        let captures = verifier.provisional_captures();
+        if !captures.is_empty() && captures.len() < confirmed {
+            verifier.discard();
+            return Err(GenerationError::InvalidInput(
+                "verifier omitted captured rows",
+            ));
+        }
+        let committed_captures = captures.iter().take(confirmed).cloned().collect::<Vec<_>>();
         if let Err(error) = verifier.commit(confirmed) {
             verifier.discard();
             return Err(GenerationError::Verifier(error));
         }
+        proposer
+            .observe_committed(&committed_captures)
+            .map_err(GenerationError::Proposer)?;
         result.statistics.tokens_confirmed_per_pass.push(confirmed);
         result.statistics.pass_durations.push(started.elapsed());
         history.push(pending);

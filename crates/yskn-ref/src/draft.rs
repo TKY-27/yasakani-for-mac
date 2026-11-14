@@ -377,6 +377,11 @@ impl Draft {
             row.fill(0);
         }
     }
+    // Used only when a long prefill retained a complete ring-capacity suffix.
+    pub(crate) fn reset_at(&mut self, position: usize) {
+        self.reset();
+        self.ring.position = position;
+    }
     pub fn push_context(&mut self, position: usize, features: ContextFeatures<'_>) -> Result<()> {
         let d = &self.dimensions;
         if position != self.position() || features.values.len() != d.features {
@@ -919,6 +924,84 @@ mod tests {
         let expected = 2.0 * rsqrt(1.0 + 1e-6);
         assert!(x.iter().all(|&v| v.to_bits() == expected.to_bits()));
     }
+    #[test]
+    fn draft_rope_nonzero_position_matches_hand_rotation_and_head_weights() {
+        let mut x = vec![1.0; HD];
+        let mut weights = vec![0.0; HD];
+        weights[0] = 2.0;
+        weights[64] = 3.0;
+        weights[32] = 4.0;
+        weights[96] = 5.0;
+        rope(&mut x, &weights, 1, 1e-6).unwrap();
+        // RMS(x)=1; r=1/sqrt(1+1e-6). For pair 0, angle=1:
+        // r*(2*cos(1)-3*sin(1), 3*cos(1)+2*sin(1)). Pair 32 has
+        // angle=10^(-7/2), with direct head weights (4,5). Constants are
+        // independently evaluated in binary64 from those two equations.
+        for (channel, expected) in [
+            (0, -1.443_807_620_783_779_8_f64),
+            (64, 3.303_847_235_297_007_4_f64),
+            (32, 3.998_416_661_988_438_5_f64),
+            (96, 5.001_262_160_412_533_f64),
+        ] {
+            assert!(
+                (f64::from(x[channel]) - expected).abs() < 3e-6,
+                "channel={channel} got={} expected={expected}",
+                x[channel]
+            );
+        }
+        assert!(
+            x.iter()
+                .enumerate()
+                .all(|(channel, &value)| { [0, 32, 64, 96].contains(&channel) || value == 0.0 })
+        );
+    }
+
+    #[test]
+    fn draft_grouped_attention_nonuniform_scores_use_inverse_sqrt_head_scaling() {
+        let mut d = dims();
+        d.query_heads = 8;
+        d.kv_heads = 2;
+        let mut q = vec![0.0; BLOCK_ROWS * d.query_heads * HD];
+        for row in 0..BLOCK_ROWS {
+            for head in 0..d.query_heads {
+                q[(row * d.query_heads + head) * HD] = (head + 1) as f32;
+            }
+        }
+        let mut k = vec![0.0; BLOCK_ROWS * d.kv_heads * HD];
+        let mut v = k.clone();
+        let mut rk = vec![0; d.kv_heads * d.window * HD];
+        let mut rv = rk.clone();
+        for kv in 0..d.kv_heads {
+            k[kv * HD] = (kv + 1) as f32;
+            v[kv * HD] = (16 + kv * 32) as f32;
+            rk[kv * d.window * HD] = yskn_format::f32_to_bf16(-((kv + 1) as f32));
+            rv[kv * d.window * HD] = yskn_format::f32_to_bf16((8 + kv * 32) as f32);
+        }
+        let out = attention(&q, &k, &v, &rk, &rv, 1, &d).unwrap();
+        for row in 0..BLOCK_ROWS {
+            for head in 0..d.query_heads {
+                // Eight query heads share two KV heads in contiguous groups of four.
+                // Among current rows only key 0 has score s=q*k/sqrt(128),
+                // the other seven scores are zero. History position 0 has -s
+                // and is in the sliding window until block row 7.
+                let kv = head / 4;
+                let score = ((head + 1) * (kv + 1)) as f64 / 128.0_f64.sqrt();
+                let current_weight = score.exp();
+                let history_weight = if row < 7 { (-score).exp() } else { 0.0 };
+                let expected = (current_weight * (16 + kv * 32) as f64
+                    + history_weight * (8 + kv * 32) as f64)
+                    / (current_weight + 7.0 + history_weight);
+                let offset = (row * d.query_heads + head) * HD;
+                assert!(
+                    (f64::from(out[offset]) - expected).abs() < 8e-6,
+                    "row={row} head={head}: {} != {expected}",
+                    out[offset]
+                );
+                assert!(out[offset + 1..offset + HD].iter().all(|&x| x == 0.0));
+            }
+        }
+    }
+
     #[test]
     fn draft_filter_uses_current_dynamic_previous_unmodified_row_and_branch_bases() {
         let x: Vec<_> = (0..3).flat_map(|r| vec![(r + 1) as f32; 512]).collect();

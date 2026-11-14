@@ -508,3 +508,85 @@ fn draft_uses_fc_sign_prefix_and_ignores_per_matrix_output_rotation() {
             .unwrap()
     );
 }
+
+#[test]
+fn draft_reduced_head_rectangular_off_diagonal_projection_and_scales_have_known_scores() {
+    let mut bytes = fixture::shead_with_hidden(7, 1024);
+    let layout = HeadLayout::read(&mut Cursor::new(&bytes)).unwrap();
+    assert_eq!((layout.rank, layout.hidden), (512, 1024));
+    for region in &layout.arrays {
+        bytes[region.start as usize..region.end as usize].fill(0);
+    }
+    let put = |bytes: &mut [u8], array: usize, index: usize, value: f32| {
+        let offset = layout.arrays[array].start as usize + 4 * index;
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    };
+    // Row-major R[rank,hidden]: low[3] = 2*.5 = 1; low[501] = -4*.25 = -1.
+    // Both entries are off diagonal, and channel 700 lies in the second hidden block.
+    put(&mut bytes, 0, 3 * 1024 + 700, 2.0);
+    put(&mut bytes, 0, 501 * 1024 + 17, -4.0);
+    for token in 0..32 {
+        let approximate = layout.arrays[1].start as usize + token * 512;
+        bytes[approximate + 3] = 1;
+        if token < 16 {
+            bytes[approximate + 501] = (-1_i8) as u8;
+        }
+        // Raw approximate scores are 2 for IDs 0..15 and 1 for IDs 16..31.
+        // Non-unit scales reverse that ordering: .5 versus 2. Removing scales
+        // therefore changes shortlist membership, not just an unobserved score.
+        put(&mut bytes, 2, token, if token < 16 { 0.25 } else { 2.0 });
+        let rescore = layout.arrays[3].start as usize + token * 1024;
+        bytes[rescore + 700] = (token as i8 - 20) as u8;
+        bytes[rescore + 17] = 4;
+        put(
+            &mut bytes,
+            4,
+            token,
+            if token % 2 == 0 { 0.25 } else { 0.5 },
+        );
+    }
+    let head = ReducedHead::read(&mut Cursor::new(bytes)).unwrap();
+    let mut hidden = vec![0.0; 1024];
+    hidden[700] = 0.5;
+    hidden[17] = 0.25;
+    let mut expected: Vec<_> = (16..32)
+        .map(|token| Candidate {
+            token,
+            // Full-width dot is .5*(token-20) + .25*4, before token scale.
+            score: (0.5 * token as f32 - 9.0) * if token % 2 == 0 { 0.25 } else { 0.5 },
+        })
+        .collect();
+    expected.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap()
+            .then(a.token.cmp(&b.token))
+    });
+    assert_eq!(head.candidates(&hidden, 16).unwrap(), expected);
+}
+
+#[test]
+fn draft_grouped_query_artifact_runs_with_four_query_heads_per_kv_head() {
+    let mut d = Draft::from_container(
+        &mut Container::from_bytes(fixture::container_with_heads(23, 8, 2)).unwrap(),
+        ReducedHead::read(&mut Cursor::new(fixture::shead(37))).unwrap(),
+        fixture::options(),
+    )
+    .unwrap();
+    assert_eq!(
+        (d.dimensions().query_heads, d.dimensions().kv_heads),
+        (8, 2)
+    );
+    let before = d
+        .propose(3, fixture::embedding, DraftChoice::Greedy)
+        .unwrap();
+    d.push_context_rows(0, &fixture::features(0)).unwrap();
+    let snapshot = d.snapshot();
+    assert!(snapshot.keys().iter().all(|keys| keys.len() == 2 * 8 * 128));
+    let after = d
+        .propose(3, fixture::embedding, DraftChoice::Greedy)
+        .unwrap();
+    assert_eq!(after.tokens.len(), 7);
+    assert_ne!(before.candidates, after.candidates);
+    assert_eq!(snapshot, d.snapshot());
+}
