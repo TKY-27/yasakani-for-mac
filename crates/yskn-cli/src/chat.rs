@@ -63,6 +63,17 @@ pub enum Event {
     Done(Usage),
 }
 
+/// Longest proper prefix of `stop` that `buf` ends with. As upstream, only
+/// prefixes no longer than the buffer are tried, longest first, so the work is
+/// bounded by the held-back text rather than by the stop string. Byte indices
+/// are used only at Unicode scalar boundaries.
+fn held(buf: &str, stop: &str) -> usize {
+    let mut k = (stop.len() - 1).min(buf.len());
+    while k > 0 && !(stop.is_char_boundary(k) && buf.ends_with(&stop[..k])) {
+        k -= 1;
+    }
+    k
+}
 pub struct StopFilter {
     stops: Vec<String>,
     buf: String,
@@ -84,21 +95,16 @@ impl StopFilter {
             return text.into();
         }
         self.buf.push_str(text);
-        if let Some(cut) = self.stops.iter().filter_map(|s| self.buf.find(s)).min() {
+        let buf = &self.buf;
+        // A stop longer than the buffer cannot be inside it.
+        let found = self.stops.iter().filter(|s| s.len() <= buf.len());
+        if let Some(cut) = found.filter_map(|s| buf.find(s.as_str())).min() {
             let out = self.buf[..cut].to_owned();
             self.buf.clear();
             self.hit = true;
             return out;
         }
-        // Byte indices are used only at Unicode scalar boundaries.
-        let keep = self
-            .stops
-            .iter()
-            .flat_map(|s| s.char_indices().skip(1).map(|(i, _)| &s[..i]))
-            .filter(|s| self.buf.ends_with(s))
-            .map(str::len)
-            .max()
-            .unwrap_or(0);
+        let keep = self.stops.iter().map(|s| held(buf, s)).max().unwrap_or(0);
         let tail = self.buf.split_off(self.buf.len() - keep);
         std::mem::replace(&mut self.buf, tail)
     }

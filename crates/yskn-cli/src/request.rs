@@ -58,6 +58,19 @@ pub fn check_size(body: &Value, limits: &Limits, mut values: usize) -> Result<us
     if body["tools"].as_array().map_or(0, Vec::len) > limits.max_tools {
         return Err(too_many("tools".into(), limits.max_tools));
     }
+    let stops = match &body["stop"] {
+        Value::Array(a) => a.as_slice(),
+        s => std::slice::from_ref(s),
+    };
+    if stops
+        .iter()
+        .any(|s| s.as_str().is_some_and(|s| s.len() > limits.max_stop_bytes))
+    {
+        return Err(Error::request(format!(
+            "stop strings must be at most {} bytes long",
+            limits.max_stop_bytes
+        )));
+    }
     check_values(values, limits)?;
     Ok(values)
 }

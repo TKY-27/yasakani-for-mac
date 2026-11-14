@@ -123,7 +123,8 @@ SHA-256 and reduces all 32 digest bytes without prefix-dependent branches.
 | Bytes discarded while closing (`linger_bytes`) | 256 KiB | See closing below |
 | Closing deadline (`linger_timeout`) | 2 s | See closing below |
 | Context reserve | 64 tokens | As upstream |
-| Stop strings per request | 4 | As upstream and OpenAI |
+| Stop strings per request | 4 | As upstream; OpenAI documents "up to 4 sequences" |
+| Bytes per stop string (`max_stop_bytes`) | 1,024 | OpenAI documents no length and upstream has none; stop markers are short. The stop filter's work per output piece is bounded by the text it holds back, as upstream's `StopFilter` is |
 | Loop guard: longest period, repeat run in thinking / answer, digit run in thinking | 16 tokens; 256 / 1024 tokens; 1000 tokens | As upstream |
 
 A prompt is also refused with `context_length_exceeded` between template

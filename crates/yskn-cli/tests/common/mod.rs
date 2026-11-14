@@ -87,6 +87,15 @@ pub fn bad_requests() -> Vec<(Value, &'static str)> {
         (json!({"stop":[5]}), "stop must be"),
         (json!({"stop":true}), "stop must be"),
         (
+            json!({"stop":"x".repeat(1025)}),
+            "stop strings must be at most 1024 bytes long",
+        ),
+        // Bytes, not characters: 513 two-byte characters.
+        (
+            json!({"stop":["a", "\u{e9}".repeat(513)]}),
+            "stop strings must be at most 1024 bytes long",
+        ),
+        (
             json!({"chat_template_kwargs":"bad"}),
             "chat_template_kwargs must be an object",
         ),

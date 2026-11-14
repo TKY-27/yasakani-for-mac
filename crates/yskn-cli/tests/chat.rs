@@ -656,3 +656,40 @@ fn integer_sampling_keeps_i64_precision_and_text_parts_match_python_conversion()
         json!([{"type":"text","text":"True"},{"type":"text","text":"None"},{"type":"text","text":"{'x': ['a', False]}"}])
     );
 }
+// Review finding: every prefix of every stop string was compared on every
+// push, so one huge stop string, or a long partial match, stalled the single
+// engine thread. The work per push is now bounded by the held-back text.
+fn within_patience(work: impl FnOnce() + Send + 'static) {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        work();
+        let _ = done.send(());
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the stop filter did not finish within 30 s");
+}
+#[test]
+fn stop_filter_work_is_bounded_by_the_held_back_text() {
+    within_patience(|| {
+        let mut f = StopFilter::new(&["x".repeat(16 << 20)]);
+        let reply = "a short reply. ".repeat(200);
+        let out: String = reply.chars().map(|c| f.push(&c.to_string())).collect();
+        assert_eq!(out + &f.flush(), reply);
+    });
+    within_patience(|| {
+        let n = 1 << 20;
+        let mut f = StopFilter::new(&["a".repeat(n) + "b"]);
+        let mut out = String::new();
+        for _ in 0..20000 {
+            out += &f.push("a");
+        }
+        assert_eq!(out, "", "a possible stop start is held back");
+        out += &f.push("c");
+        assert_eq!(out, "a".repeat(20000) + "c");
+        // First match wins, after a long partial one.
+        let mut f = StopFilter::new(&["a".repeat(n) + "b", "ac".into()]);
+        assert_eq!(f.push(&"a".repeat(5000)) + &f.push("c"), "a".repeat(4999));
+        assert!(f.hit);
+    });
+}

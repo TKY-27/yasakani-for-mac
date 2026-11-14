@@ -687,6 +687,12 @@ async fn thinking_off_stop_max_tokens_and_usage_over_socket() {
         ev.last().unwrap()["usage"]["completion_tokens_details"]["reasoning_tokens"],
         0
     );
+    // A stop string exactly at the length limit is accepted.
+    h.script("Hello STOP world");
+    let r = h
+        .chat(json!({"enable_thinking":false,"stop":["x".repeat(1024), "STOP"]}))
+        .await;
+    assert_eq!(r.json()["choices"][0]["message"]["content"], "Hello ");
     h.script("long output here");
     let d = h
         .chat(json!({"enable_thinking":false,"max_completion_tokens":5}))
