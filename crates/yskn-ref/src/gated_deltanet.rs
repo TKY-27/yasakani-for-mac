@@ -52,6 +52,17 @@ impl GatedDeltaNetState {
         self.history.copy_from_slice(&source.history);
     }
 
+    /// Copy only history when an engine writes the recurrent matrix out of place.
+    pub fn copy_history_from(&mut self, source: &Self) {
+        assert_eq!(self.dimensions, source.dimensions);
+        self.history.copy_from_slice(&source.history);
+    }
+
+    pub fn recurrent_heads(&self) -> std::slice::ChunksExact<'_, f32> {
+        self.recurrent_state
+            .chunks_exact(self.dimensions.head_dim * self.dimensions.head_dim)
+    }
+
     pub fn allocated_bytes(&self) -> usize {
         (self.recurrent_state.capacity() + self.history.capacity()) * std::mem::size_of::<f32>()
     }
@@ -383,6 +394,53 @@ impl GatedDeltaNet {
         row: &GatedDeltaNetRow,
         value_head: usize,
     ) -> Result<Vec<f32>> {
+        self.recur_head_with(
+            head_state,
+            row,
+            value_head,
+            |head_state, query, key, value, decay, update_gate| {
+                let head_dim = self.dimensions.head_dim;
+                let mut core = zeros(head_dim)?;
+                for (value_channel, core_value) in core.iter_mut().enumerate() {
+                    let mut prediction_part = [0.0; 4];
+                    for (group, partial) in prediction_part.iter_mut().enumerate() {
+                        // Four ordered 32-term sums are distinct from XOR reduction.
+                        for offset in 0..32 {
+                            let key_channel = group * 32 + offset;
+                            let index = key_channel * head_dim + value_channel;
+                            head_state[index] *= decay;
+                            *partial += head_state[index] * key[key_channel];
+                        }
+                    }
+                    let prediction = sum4(prediction_part);
+                    let value = value[value_channel];
+                    let correction = (value - prediction) * update_gate;
+                    finite(&[prediction, correction], "DeltaNet recurrent prediction")?;
+                    let mut output_part = [0.0; 4];
+                    for (group, partial) in output_part.iter_mut().enumerate() {
+                        for offset in 0..32 {
+                            let key_channel = group * 32 + offset;
+                            let index = key_channel * head_dim + value_channel;
+                            head_state[index] += key[key_channel] * correction;
+                            *partial += head_state[index] * query[key_channel];
+                        }
+                    }
+                    // The recurrent output is rounded before per-head normalization.
+                    *core_value = bfloat(sum4(output_part));
+                }
+                Ok(core)
+            },
+        )
+    }
+
+    /// Engine core hook; validation, decay, normalization and BF16 gating retain the scalar contract.
+    pub fn recur_head_with(
+        &self,
+        head_state: &mut [f32],
+        row: &GatedDeltaNetRow,
+        value_head: usize,
+        core_step: impl FnOnce(&mut [f32], &[f32], &[f32], &[f32], f32, f32) -> Result<Vec<f32>>,
+    ) -> Result<Vec<f32>> {
         let head_dim = self.dimensions.head_dim;
         if head_state.len() != head_dim * head_dim
             || value_head >= self.dimensions.value_heads
@@ -416,33 +474,17 @@ impl GatedDeltaNet {
         )?;
         let decay = exp(log_decay);
         finite(&[decay], "DeltaNet decay factor")?;
-        let mut core = zeros(head_dim)?;
-        for (value_channel, core_value) in core.iter_mut().enumerate() {
-            let mut prediction_part = [0.0; 4];
-            for (group, partial) in prediction_part.iter_mut().enumerate() {
-                // Four ordered 32-term sums are distinct from XOR reduction.
-                for offset in 0..32 {
-                    let key_channel = group * 32 + offset;
-                    let index = key_channel * head_dim + value_channel;
-                    head_state[index] *= decay;
-                    *partial += head_state[index] * key[key_start + key_channel];
-                }
-            }
-            let prediction = sum4(prediction_part);
-            let value = convolved[2 * self.query_key_width + output_start + value_channel];
-            let correction = (value - prediction) * update_gate;
-            finite(&[prediction, correction], "DeltaNet recurrent prediction")?;
-            let mut output_part = [0.0; 4];
-            for (group, partial) in output_part.iter_mut().enumerate() {
-                for offset in 0..32 {
-                    let key_channel = group * 32 + offset;
-                    let index = key_channel * head_dim + value_channel;
-                    head_state[index] += key[key_start + key_channel] * correction;
-                    *partial += head_state[index] * query[key_start + key_channel];
-                }
-            }
-            // The recurrent output is rounded before per-head normalization.
-            *core_value = bfloat(sum4(output_part));
+        let core = core_step(
+            head_state,
+            &query[key_start..key_start + head_dim],
+            &key[key_start..key_start + head_dim],
+            &convolved[2 * self.query_key_width + output_start
+                ..2 * self.query_key_width + output_start + head_dim],
+            decay,
+            update_gate,
+        )?;
+        if core.len() != head_dim {
+            return Err(dimension_mismatch());
         }
         finite(&core, "DeltaNet recurrent output")?;
         let square_sum = squares128(&core);
