@@ -98,32 +98,38 @@ fn mixed() -> Fixture {
 }
 
 fn check_partial_commits(mode: KvMode) {
-    let fixture = mixed();
+    let fixture = Fixture::new(&support::synthetic_model(
+        163,
+        &["linear_attention", "full_attention", "full_attention"],
+    ));
     for backend in backends() {
         let mut engine = fixture.engine(backend, mode);
         let mut reference = fixture.reference(mode);
         engine.prefill(&[8, 21, 5]).unwrap();
         reference.prefill(&[8, 21, 5]).unwrap();
         let mut seed = 0x4567_89ab_cdef_u64;
-        let mut widths = [false; 10];
-        let mut accepted_lengths = [false; 10];
-        for pass in 0..23 {
-            let width = if pass < 9 {
-                pass + 1
-            } else if pass < 19 {
-                9
-            } else {
-                1 + random(&mut seed) % 9
-            };
-            let accepted = if pass < 9 {
-                width
-            } else if pass < 19 {
-                pass - 9
-            } else {
-                random(&mut seed) % (width + 1)
-            };
-            widths[width] = true;
-            accepted_lengths[accepted] = true;
+        let mut pairs = [[false; 10]; 10];
+        let mut rolled_back = [false; 2];
+        let mut recrossed = [false; 2];
+        // Compute across each tile edge, reject back before it, then cross again.
+        let boundaries = [(29, 6, 1), (30, 6, 4), (61, 6, 1), (62, 6, 4)]
+            .into_iter()
+            .map(|(start, width, accepted)| (Some(start), width, accepted));
+        let sweep = (1..=9).flat_map(|width| (0..=width).map(move |k| (None, width, k)));
+        for (pass, (start, width, accepted)) in boundaries.chain(sweep).enumerate() {
+            if let Some(start) = start {
+                assert!(engine.position() <= start);
+                let padding: Vec<_> = (engine.position()..start)
+                    .map(|_| (random(&mut seed) % 128) as u32)
+                    .collect();
+                engine.prefill(&padding).unwrap();
+                reference.prefill(&padding).unwrap();
+                assert_eq!(engine.position(), start);
+                assert_eq!(engine.state_digest(), reference.state_digest());
+                assert_eq!(bits(engine.row_logits()), bits(reference.row_logits()));
+            }
+            let start = engine.position();
+            pairs[width][accepted] = true;
             let tokens: Vec<_> = (0..width)
                 .map(|_| (random(&mut seed) % 128) as u32)
                 .collect();
@@ -138,6 +144,13 @@ fn check_partial_commits(mode: KvMode) {
             assert!(engine.commit(width + 1).is_err());
             engine.commit(accepted).unwrap();
             reference.commit(accepted).unwrap();
+            for (i, boundary) in [32, 64].into_iter().enumerate() {
+                if start < boundary && start + width > boundary && engine.position() < boundary {
+                    rolled_back[i] = true;
+                } else if rolled_back[i] && start < boundary && engine.position() > boundary {
+                    recrossed[i] = true;
+                }
+            }
             assert_eq!(engine.position(), reference.position());
             assert_eq!(
                 engine.state_digest(),
@@ -158,11 +171,16 @@ fn check_partial_commits(mode: KvMode) {
             assert_eq!(bits(engine.row_logits()), logits);
             assert!(!engine.has_provisional_pass());
         }
-        assert!(widths[1..].iter().all(|&seen| seen));
-        assert!(accepted_lengths.iter().all(|&seen| seen));
+        for (width, accepted) in pairs.iter().enumerate().skip(1) {
+            assert!(accepted[..=width].iter().all(|&seen| seen), "width {width}");
+        }
         assert!(
-            engine.position() > 64,
-            "committed context crosses two attention tiles"
+            rolled_back.into_iter().all(|seen| seen),
+            "rollback before 32 and 64"
+        );
+        assert!(
+            recrossed.into_iter().all(|seen| seen),
+            "re-cross 32 and 64 after rollback"
         );
     }
 }
