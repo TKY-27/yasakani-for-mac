@@ -133,7 +133,17 @@ normalized/gain-adjusted copy made for the next projection.
 For a single row, gather `[slot,hidden_channel]`, shape `[5,5120]`,
 flattened to 25,600 values. Batch capture is `[slot,row,hidden_channel]`,
 not the row-major shape used by the draft input API.
-(`src/engine35.cpp:1650`; `src/engine35.cpp:830-833`)
+(`src/engine35.cpp:1650`; `src/engine35.cpp:830-833`;
+`src/q35_bdraft.cu:249-252,490-499`)
+
+Before a proposal at frontier position `F`, context covers committed input
+positions `[max(0,F-ring_capacity),F)`. Position `F` is the pending frontier
+input and is excluded. Prompt rows are inserted while prefill advances
+(`src/engine35.cpp:1248-1261`). Following verification, insert exactly the
+committed rows beginning at the old `F`, once each in ascending position;
+neither rejected rows nor the newly selected frontier are context. Pending
+committed rows are flushed even when generation stops.
+(`src/specx.cpp:435-437,464`; `src/engine35.cpp:1851`)
 
 For every newly committed context position `p`, including prompt positions:
 
@@ -480,8 +490,9 @@ When the main sampler is enabled with version 3, the draft uses its own
 `draft_temperature=mul64(float64(0.001),float64(850))` by default. Preserve
 this binary64 multiplication; unlike the main option setter it does not
 divide by `1000.0`, and it need not equal the binary64 literal `0.85`.
-Otherwise it
-selects greedily. It does not copy the main request's temperature, top-k,
+Only enabled main sampling **version 3** supplies the seed and absolute
+position for coupled selection; version 2 and disabled sampling select greedily.
+It does not copy the main request's temperature, top-k,
 top-p, or min-p. The draft has exactly 16 candidates and hardcoded top-p
 `0.95`, with no min-p filter.
 (`src/engine35.hpp:183`; `src/engine35.cpp:948,1845-1850`;
@@ -554,8 +565,16 @@ models keep those operation shapes; hidden/FFN widths are multiples of
 may be 2..2048. The same 32 history splits and one block split are retained.
 The source's 16-row option, inactive compressed/subset heads, second/third
 side-candidate policy and HCAP are outside this brief. Snapshot/reset and
-committed-row context updates are implemented; main-model capture and the
-verification/speculation loop are not wired yet.
+committed-row context updates are implemented. D17 connects the main-model
+capture to `DraftProposer`: capture layers come from `DraftOptions`, default
+capture is off, and committed features alone update the ring. `DraftChoice`
+is explicit at the API boundary; callers using main sampler version 2 must
+choose `Greedy`, while version 3 may use `DraftChoice::sampled(seed)` with
+that main seed. Draft temperature remains independent and top-p remains 0.95.
+The `generate` example uses version 3 for `--seed` and greedy choice otherwise.
+`snapshot_session` / `restore_session` save and restore both the main-model
+snapshot and proposer ring; the main-model snapshot alone does not own the
+separate draft ring. Reset both owners before reusing an empty session.
 
 Source review found no contradictory equation in §§1–8 or the SHEAD byte
 layout in chapter 10. The added dense-vector/tap/rounding details above

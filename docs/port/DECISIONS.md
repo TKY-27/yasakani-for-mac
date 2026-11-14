@@ -741,6 +741,65 @@ absolute position, including guard bypass. The existing public stage
 signatures are unchanged. The profile uses `Arc` so the mapped engine's
 parallel prepared-row/output stages can continue sharing attention.
 
+Brief 05j keeps the packed words, bit width and FP32 scale and decodes each
+packed row once at encoding. Brief 05l stores the 256 derived BF16 bases as
+512 bytes of `u16` bits inline in a boxed `PackedRow`. The packed words retain
+their original `Vec<u32>` representation. There are two heap blocks: the
+packed row (including bases) and the words; bases have no separate allocation.
+Boxing the packed variant keeps int8 cache slots small instead of making every
+fallback carry space for 512 unused bytes. Attention widens each visible row
+exactly once before its key dot or tile value accumulation, with no change to
+binary32 operation order. Masked value slots are `None`; no unread 32 x 256
+scratch array is zeroed per tile. Stored-code/scale digests omit derived bases.
+
+Measured with `std::mem::size_of` on this arm64 host: `Int8Row` is 32 bytes,
+`PackedRow` is 544, and `CacheRow` is 32. An int8 row costs 32 + 256 = 288
+bytes including its enum slot and integer heap. A five-bit packed row costs
+32 + 544 + 160 = 736 bytes including its enum slot and both heaps (704 for
+four-bit words). Before 05l, `PackedRow` and `CacheRow` were each 40 bytes;
+the packed row lived inside the enum slot and owned 160-byte words and a
+1,024-byte decoded-base box, totaling 40 + 160 + 1,024 = 1,224 bytes, not the
+sum of both overlapping struct sizes. Before 05j, the packed representation
+had no derived-base allocation: 40 + 160 = 200 bytes including its enum slot.
+These are requested allocation sizes, not allocator-rounded resident memory.
+
+The real architecture has 16 attention layers, four KV heads and two sides:
+128 rows/token. Each layer also stores one 48-byte `CacheToken` (two vectors)
+per token, adding 768 bytes/token. Current reference costs are:
+
+| Rows | Numeric bytes/row | Row slot + heaps | Numeric bytes/token | Allocated bytes/token including token structs |
+|---|---:|---:|---:|---:|
+| All int8 (`Int8` or `Int8Profile`) | 260 | 288 | 33,280 | 37,632 |
+| All five-bit packed | 676 | 736 | 86,528 | 94,976 |
+| All four-bit packed | 644 | 704 | 82,432 | 90,880 |
+| Real-profile `Kv5`: 116 five-bit packed + 12 int8 fallback | mixed | mixed | 81,536 | 89,600 |
+
+Numeric bytes include scale and, for packed rows, the derived BF16 bases.
+For `p` five-bit packed rows, numeric payload is `33,280 + 416*p` and the
+allocated total is `37,632 + 448*p` bytes/token. The real profile packs all
+16 key sides and 13 value sides, four rows per side: `p = 116`.
+
+| Context tokens | Int8 cache bytes (GiB) | All five-bit packed reference bytes (GiB) | Real-profile Kv5 reference bytes (GiB) |
+|---|---:|---:|---:|
+| 2,048 | 77,070,336 (0.071777) | 194,510,848 (0.181152) | 183,500,800 (0.170898) |
+| 32,768 | 1,233,125,376 (1.148438) | 3,112,173,568 (2.898438) | 2,936,012,800 (2.734375) |
+| 262,144 | 9,865,003,008 (9.187500) | 24,897,388,544 (23.187500) | 23,488,102,400 (21.875000) |
+
+GiB is 2^30 bytes. These totals include row/token structs and requested heap
+sizes at exact token capacity. They exclude allocator overhead, spare vector
+capacity, the fixed state/profile objects, snapshots and provisional prepared
+row copies. A retained full snapshot adds another cache of the same size.
+With the 10.3 GB model, 2,048 and 32,768 tokens fit the 24 GB machine's memory
+budget in `Kv5`: real-profile cache plus model is about 10.48 and 13.24 GB,
+respectively, leaving room for execution and the OS. At 262,144 tokens they
+do not fit: that cache plus model alone is about 33.79 GB (35.20 GB if all
+rows pack). This is reference-representation accounting, not a measured real
+model run. A later reader that consumes packed words directly could need only
+164 numeric bytes per five-bit row (128 + 4 = 132 for four-bit rows), with no
+derived bases. Its all-five-bit payload would be 20,992 bytes/token, or
+22,144 with the real profile's 12 int8 fallbacks; that compact reader is not
+implemented here.
+
 Reads are defined as follows:
 
 - `Int8` and `Int8Profile` consume exact signed-int8 base operands and the
@@ -914,3 +973,292 @@ attention/filter/sparse-head oracles, explicit shortlist/selection ties,
 common signs/ignored output rotations and frozen proposal/score digests.
 Digests freeze this port, not a CUDA golden capture. CUDA bit equality,
 acceptance quality and end-to-end text equality are not claimed.
+
+## D16 — Bounded transactional sessions and lossless speculation
+
+`yskn-engine::Model` now implements the reference's explicit sequence ABI:
+`run_provisional(tokens)`, `commit(k)` and `discard_provisional()`. k counts
+input rows including row zero; zero discards. There is no one-row precommit
+or implicit +1, and a pending pass rejects another pass/prefill/snapshot/restore.
+Provisional width is bounded by the constructor's positive `rows_per_pass`.
+Long prefill still chunks at that width, atomically across every chunk.
+
+### Ownership, copying and bounds
+
+Attention cache rows append directly to their existing layer cache. Discard,
+partial commit, failed provisional execution and failed prefill truncate the
+appended suffix. The engine never clones an attention cache. The reference
+keeps its existing scalar copy/recompute behavior as the independent oracle.
+
+Each recurrent layer has a committed state and one preallocated working state,
+both including convolution history. At transaction start `copy_from` copies
+only recurrence/history into the existing working allocation; the committed
+state stays unchanged until success. Successful prefill swaps these states.
+Provisional execution retains the prepared per-row recurrence inputs in fixed
+replay slots allocated once when the model loads: rounded projections, z,
+convolution outputs, normalized q/k and dense gates. Each slot copies into its
+existing vectors. Full commit swaps the already-computed working state;
+partial commit resets working recurrence from committed state and replays only
+accepted recurrence/history through the same `recur_head`/`advance_history`
+operations. No embedding, compressed projection, attention or MLP is replayed.
+Failure cannot publish working recurrence. Ordinary transient projection,
+attention and row-preparation allocations remain; fixed replay payload does
+not allocate or grow per pass. Context-dependent cache/history storage grows
+only with the retained context, not with the number of retries/checkpoints.
+
+The alternative, retaining a full recurrent snapshot per row, was rejected
+for memory. With chapter 03's 48 GDN layers, each state has
+`48 * (48*128*128 + 3*10240) * 4 = 156,893,184` payload bytes, including
+BF16-rounded convolution history represented in f32 by this reference.
+The two fixed committed/working states therefore hold 313,786,368 bytes.
+A prepared row costs
+`48 * (2*10240 + 6144 + 2*2048 + 2*48) * 4 = 5,916,672` bytes.
+For maximum pass width W, fixed recurrent/replay payload is
+`313,786,368 + W*5,916,672` bytes (408,453,120 bytes at default W=16),
+plus small Vec metadata, W token IDs and requested logits. A per-row-state
+design would instead add `W*156,893,184` bytes (2,510,290,944 at W=16).
+These are dimension-derived payload counts, not measured real-model RSS;
+weights, attention caches, operator scratch and output logits are additional.
+`session_memory()` reports actual state/replay payload and buffer capacities.
+
+`prefill_with_logits(tokens, LogitRows::{All,Last,None})` controls head work.
+All is the unchanged scoring default; Last runs only the final prompt row's
+head; None skips heads and clears predictions. Empty prefill remains a no-op.
+Failure preserves position, committed recurrence/cache, logits and timings.
+
+### Checkpoints and exactness
+
+Both models' owned `snapshot()` captures recurrence/history, position, the
+last committed prediction and exact prefix token IDs, with a session identity.
+Attention is retained in the owner, never copied. `restore` checks session/reset,
+position and prefix equality before truncating attention and copying recurrent
+values into existing allocations. A changed prefix, another session, pending
+pass or future checkpoint returns an error. Snapshot values are not accumulated
+inside the model; each dropped value releases its own payload. One checkpoint
+costs one recurrent state plus `4*position` prefix bytes and one vocabulary row.
+Repeated restore at a fixed maximum context extent preserves capacities.
+
+The one generic `yskn_ref::speculation::generate` loop is used by both models.
+The supplied prompt tail ends in a pending, unconsumed token. Each pass runs
+`[pending, guesses...]`. Guess j is accepted only if it equals the selector's
+choice from row j-1. The first mismatch yields the correction token and stops
+reading later rows. EOS/callback cancellation stop at their selected token.
+Committing exactly the consumed predecessors leaves the final selected token
+pending, identically for K=0 and K>0. Output and context limits bound drafting
+before the pass. No artificial EOS is introduced by a proposal.
+
+D1/D9 guarantee the same row logits for every straight-chain grouping. The
+existing sampler is keyed by seed, absolute prediction position and candidate
+ID, with no pass-local RNG consumption. Inductively the selector therefore
+chooses the same token at every depth and commits the same state for greedy
+and seeded runs, independent of proposer accuracy. Tests compare both token
+sequences and a digest over all committed numeric state (including KV codes,
+scales, convolution history and committed logits), plus explicit future rows.
+The diagnostic digest is FNV-1a, not a cryptographic proof; logit comparisons
+check every f32 bit independently. No frozen reference digest was changed.
+
+The upstream source confirms recurrence-only replay (`src/engine35.cpp:843-851`),
+its different +1 ABI/one-row shortcut (`1299-1329`) and retained-cache snapshots
+(`1550-1583`). Chapter 08 now distinguishes those upstream conventions from
+the Rust contract. No new discrepancy was found in those source ranges.
+HCAP, adaptive 8/16-row blocks, the next-token table and cost/source policy were
+not ported. No draft/draft_head files or D15 section were created.
+
+### D16 synthetic measurement (2026-11-14)
+
+Fresh temporary directory, generated exactly with
+`cargo run --release -p yskn-engine --example synthetic_model -- FILE 8`:
+856,300,800-byte model, hidden 5120, FFN 17408, vocabulary 4096, six GDN/two
+attention layers. No released model was opened. The process could not obtain
+a Metal device, so these are CPU dotprod/10-worker timings only. No task build,
+test or other model run overlapped the timed run. `bench_speculation FILE
+--backend cpu --passes 7` takes one warmup and seven measured samples per
+width. Values are medians in milliseconds, including real operator allocation
+and dispatch costs:
+
+| Width | Provisional | Partial accepted rows | Partial commit | Full commit | Snapshot-copy proxy |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 74.378042 | 1 (full) | 0.000750 | 0.000833 | 0.031750 |
+| 2 | 126.326667 | 1 | 0.331166 | 0.001000 | 0.059666 |
+| 4 | 134.122792 | 2 | 0.420208 | 0.001083 | 0.109417 |
+| 8 | 162.727500 | 4 | 0.696042 | 0.001000 | 0.266459 |
+
+The rejected design's proxy copies and retains W owned recurrent checkpoints
+at one position; it measures copy/allocation cost, not a second implementation
+of per-row snapshot execution. Copying is faster than recurrence replay on
+this small-state synthetic fixture, but needs 1,646,592 bytes per checkpoint
+versus 73,920 replay bytes per row. The chosen session at W=8 holds 3,293,184
+bytes of recurrent states and 591,360 replay bytes, fixed across passes.
+For the real dimensions the memory ratio is about 26.5x per retained row;
+that bound motivates replay despite its measured extra CPU work. Full
+acceptance avoids replay entirely. These timings do not predict real-model
+speed or the optimal draft width, and no Metal timing is claimed.
+
+
+## D17 — Captured main residuals feed the scalar draft proposer
+
+Capture is opt-in on both main-model implementations. The loaded draft supplies
+the ordered layer list and the maximum retained row count; shipping defaults
+are zero-based layers `[5,19,33,47,61]` and the draft ring capacity. Capture
+off preserves the existing path and digests. Capture only observes the main
+layer result and changes neither logits nor committed numeric state.
+
+The capture contract was checked directly against the unchanged upstream
+sources:
+
+| Contract | Verified source lines and result |
+|---|---|
+| Tap | `src/engine35.cpp:798-799` applies the MLP down residual projection; `830-833` copies `h_` immediately after each layer, and `1650` installs the five layers. Held: capture the post-MLP residual, not the normalized projection input. |
+| Rounding | `src/q35_kernels.cu:1437-1444` writes `rbf(old + rbf(down))` to the residual array. Held: BF16 rounding before the add and again afterwards, expanded to f32; reference `residual_add` already uses this formula. |
+| Slot order | `src/q35_bdraft.cu:249-252` gathers each capture slot into `[row,slot,channel]`; `490-499` reads the equivalent slot-major values directly for A8. Held: one row is `[slot,channel]`, five hidden-width vectors in capture-list order. |
+| Prompt | `src/engine35.cpp:1248-1261` runs committed prefill, feeds its captures, then advances position. Held: prompt rows enter the ring as context. |
+| Accepted rows | `src/specx.cpp:435-437` queues `n_commit+1` rows starting at the old frontier, reflecting upstream's +1 commit ABI. `src/engine35.cpp:1851` inserts context before proposing. Held: only committed input rows enter, once in ascending position. Rust's `commit(k)` already counts row zero, so it forwards k rows. |
+| Terminal flush | `src/specx.cpp:464` inserts pending context after the loop. Held: final committed rows must reach the ring even without a subsequent proposal. |
+
+Use half-open positions to avoid an off-by-one reading: before a proposal with
+frontier input at position F, the live ring covers
+`[max(0,F-ring_capacity),F)`. The token at F is selected but unconsumed. After
+verification, feed the old frontier and accepted consumed successors, but no
+rejected row and no new unconsumed frontier. Ring overwrite discards old
+positions; a long prefill therefore retains only its last ring-capacity rows.
+This also applies to a reused session or a restored prefix followed by a long
+new prompt: whenever the retained suffix starts beyond the draft position,
+a complete contiguous window ending at the main position reseeds the ring.
+All earlier slots would have been overwritten upstream, so projecting this
+suffix yields the same ring bits as inserting every prompt row.
+Committed captures and pending-pass captures are exposed separately. Successful
+commits hand over owned rows; failed/discarded passes never advance the ring.
+When a single commit is wider than the capture window, the reference hands over
+only its window-sized suffix while the engine hands over all committed rows.
+Both produce identical final rings. `DraftProposer` never configures a capture
+window smaller than a generation pass.
+Synchronization and direct proposals require a mutable verifier so delivered
+captures can be consumed, rather than retained in the model or its snapshots.
+
+`DraftProposer` proposes the first K tokens of the existing eight-row block,
+K=1..7. The block still computes all eight noncausal rows; this work does not
+optimize it. The main model remains the sole selector/acceptance authority.
+The separate proposer owns its draft ring. `snapshot_session(&model)` captures
+both owners and `restore_session(&mut model, &checkpoint)` validates ownership
+and restores the matching main state and ring. Reset invalidates that owner's
+checkpoints. Each main model also supplies a context identity, changed after
+every successful restore or reset. A bound proposer rejects an identity mismatch
+even if a new branch has advanced past its previous position. Joint restore
+rebinds the restored ring to the new identity; main-only restore/reset cannot
+silently mix contexts. A verifier without identity support is rejected.
+
+The owners remain separate because the shared generation API supports main-only,
+n-gram and combined use, and existing model callers already own the verifier.
+Forcing all of those through a new owning session would expand the public API
+change substantially. Identity validation detects misuse at the common boundary
+without hashing the full growing prefix or keeping delivered features alive.
+After a main reset callers must reset the proposer too; after a main-only
+restore they must use a matching joint checkpoint or rebuild the session.
+
+### Sampling and proposal policy boundary
+
+`src/engine35.cpp:1845-1850` enables draft coupling only when main sampling is
+on and version is 3; otherwise draft selection is greedy. The seed and
+absolute prediction position feed token-keyed Gumbel noise at
+`src/q35_bdraft.cu:401-404`. The draft uses its own temperature (850
+thousandths by default), 16 candidates and fixed top-p 0.95
+(`src/q35_bdraft.cu:404-430`), not the main request's temperature/top-p/top-k.
+`DraftChoice` makes this caller choice explicit. The generate example uses
+main version 3 and the same seed for `--seed`, otherwise greedy draft choice.
+
+`CombinedProposer` chooses a fixed order (`NgramFirst` or `DraftFirst`) and
+falls back only when the first proposal is empty. With a positive guess budget,
+`DraftFirst` never falls back: the neural draft always supplies guesses (errors
+propagate, rather than trying n-gram). Draft context still advances when n-gram wins. This does not port upstream's match-length gate, acceptance
+EMA comparison, periodic neural probes, next-token-table extensions, HCAP or
+8/16-row width adaptation (`src/specx.cpp:216-265,441-447`). Chapter 08 §5
+records those upstream rules separately from this deliberately fixed policy.
+
+`draft_acceptance` prints two separately labeled greedy measurements for neural,
+n-gram and fixed n-gram-first combination. `teacher_forced_agreement` compares
+with main choices conditioned on the window text. `verified_acceptance` instead
+runs a provisional `[frontier, guesses...]` pass for each source and counts only
+the matching leading prefix. Every probe is discarded; only the window frontier
+is committed before continuing teacher-forced. Missing guesses count as misses
+at later depths in both measurements. Defaults are one window and two
+positions because the real scalar draft may need about 90 seconds per proposal.
+No released-model acceptance or speed claim follows from the synthetic checks;
+real-model commands are documented in README for the orchestrator.
+
+
+### Synthetic connection evidence and session fixes
+
+The teacher is an actual two-layer main model with an all-zero output head
+(greedy token 0), and an actual one-layer draft with BF16 correction weights
+constructed to read its context-dependent hidden rows. Correct captures give
+an accepted prefix of 7/7; one-row-lagged features and swapped capture slots
+each give 0/7. The correct pair also accepts all seven guesses in one actual
+`generate` verification pass. This deliberately constructed task detects a
+wrong connection; it does not estimate released-model acceptance quality.
+An independent two-layer residual calculation checks both BF16 boundaries,
+and scripted acceptance counts check the exact ring contents before proposals
+and after the terminal flush. End-to-end cases compare K=1/3/7 with K=0 for
+greedy and two seeds, including joint restore and a reused prefix.
+
+The carried D16 review findings are fixed in the engine: failure after an
+attention layer truncates its appended suffix; partial-replay failure retains
+the pending pass, matching the reference, and a later full retry replays from
+committed recurrence. Restore validates every attention prefix before mutation.
+A checkpoint after partial commit is checked against a fresh reference.
+Temporarily deleting the provisional-failure truncation makes the new
+later-layer-failure test fail at its following probe; the truncation is restored.
+Metal cases explicitly skip when there is no device. No released model is
+opened by these synthetic tests.
+
+### Capture storage and draft failure (brief 05i)
+
+The main model retains a bounded queue of **undelivered** committed rows, plus
+pending provisional captures. After synchronization/commit observation the
+committed queue is moved out and released; joint snapshots synchronize first,
+so they contain no delivered main captures. A main-only snapshot taken before
+hand-over still owns its undelivered rows, as required for faithful restoration.
+Reference and engine deliver the same row positions and FP32 bits. Engine long
+prefill captures only the final window across all chunks, avoiding allocation
+of rows that would immediately be evicted. Existing undelivered rows are kept
+until atomic prefill succeeds; only then are overwritten rows dropped.
+`SessionMemory.capture_bytes` includes both committed and provisional allocated
+FP32 payloads and row descriptors; main `Snapshot::capture_bytes` and reference
+`Model::capture_bytes` expose the corresponding storage. Empty retained Vec
+capacity is counted too.
+
+For real dimensions, one feature row is `5*5120*4 = 102,400` bytes. Previously
+each populated session retained `2048*102,400 = 209,715,200` bytes (200 MiB), and
+each main or joint snapshot copied another 209,715,200 capture bytes. After
+hand-over each session and each snapshot retains **0 capture payload bytes**.
+Before hand-over the bounded queue can still hold 209,715,200 payload bytes;
+a W-row provisional pass holds at most `W*102,400` (1,638,400 at W=16).
+Row descriptors add `capacity*size_of::<CapturedRow>()` (32 bytes each on a
+64-bit host), as reported, rather than being hidden in payload estimates.
+Atomic prefill with an undelivered old queue can transiently retain both that
+queue and the new suffix; neither is a copy of an already delivered ring.
+
+The necessary draft KV ring is unchanged:
+`2*5*8*2048*128*2 = 41,943,040` bytes (40 MiB) per session and joint snapshot.
+Thus steady capture-plus-ring payload falls from 251,658,240 to 41,943,040
+bytes per session and per joint snapshot; other main state, weights, attention,
+logits and operator scratch are additional (D16). These are dimension-derived
+counts; no released model was opened or measured.
+
+If a proposer fails before the first successful generation commit, `generate`
+returns its error. Once outputs have been committed, an observation or subsequent
+proposal error disables drafting for the rest of that call and continues normal
+one-row verification. Returned tokens, callbacks, stop boundaries and main
+state therefore remain lossless, including tokens from earlier passes. A draft
+failure cannot undo the main commit, so returning only an error would lose
+output; the main model can instead finish the request independently. The failed
+proposer may no longer be synchronized: reuse returns a clear missing-capture
+error unless a complete prompt capture window can reseed it, or the caller
+rebuilds/restores it.
+
+New depth-dependent teacher targets are `6..=12` for frontier 5 with history
+tail 0. They distinguish every block successor row and the frontier embedding;
+the existing capture-lag/slot-swap teacher and K=0 losslessness checks remain.
+Sampled hook proposals are compared with direct `Draft::propose` at frontier
+position 5, two seeds and explicit prediction positions `6..=12`. Temporary
+reversal, permutation, history-tail frontier, greedy substitution, wrong-seed
+and wrong-position mutations each fail these tests and are removed afterwards.

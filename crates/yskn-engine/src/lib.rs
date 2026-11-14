@@ -13,6 +13,6 @@ pub use kernel::Kernel;
 pub use mapped::{MappedModel, Matrix};
 #[cfg(target_os = "macos")]
 pub use metal::{Job, MetalEngine};
-pub use model::{Backend, Model, PassTiming};
+pub use model::{Backend, LogitRows, Model, PassTiming, SessionMemory, Snapshot};
 pub use pool::Engine;
 pub use yskn_ref::{Error, KvMode, Result};

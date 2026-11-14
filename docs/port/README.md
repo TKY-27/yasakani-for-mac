@@ -80,7 +80,74 @@ defaulting to `kvq_u5.bin`, and reject missing/malformed profiles or model
 attention-count/KV-head mismatches. Both weights and profile paths must stay
 inside the folder, including symlink targets. Plain Int8 needs no profile.
 `from_container_with_kv` accepts an explicit `Arc<KvProfile>` for in-memory
-or direct-file callers. See D13 for packed score/mean/rounding rules.
+or direct-file callers. Packed cache rows retain their original words/scale
+and 256 derived BF16 bases as `u16` bits, decoded once at encoding and widened
+exactly once per visible row before attention accumulation. Bases live inline
+in a boxed packed row; the other heap holds the unchanged `Vec<u32>` words.
+Masked tile rows do not zero an unread 32 x 256 scratch array. Stored-code and
+scale digests and binary32 attention operations are unchanged.
+
+On this arm64 host, `size_of::<PackedRow>()` is 544 and
+`size_of::<CacheRow>()` is 32 bytes. Current reference memory accounting is:
+
+| Row representation | Numeric bytes/row | Enum slot + heaps/row | Numeric bytes/token (128 rows) | Allocated bytes/token including 16 token structs |
+|---|---:|---:|---:|---:|
+| Int8 / Int8Profile | 260 | 288 | 33,280 | 37,632 |
+| Five-bit packed | 676 | 736 | 86,528 | 94,976 |
+| Four-bit packed | 644 | 704 | 82,432 | 90,880 |
+| Real-profile Kv5 (116 five-bit packed + 12 int8) | mixed | mixed | 81,536 | 89,600 |
+
+Before 05l, a five-bit packed row occupied a 40-byte enum slot (containing the
+40-byte `PackedRow`), 160-byte words and a 1,024-byte decoded binary32 box:
+1,224 bytes total. It now uses a 32-byte enum slot, 544-byte packed-row box
+including its 512-byte BF16 bases, and 160-byte words: 736 bytes total.
+The real model has 16 attention layers, four KV heads, and key/value sides:
+128 rows/token, plus 16 x 48-byte token structs. Its cache sizes are:
+
+| Context tokens | Int8 cache bytes (GiB) | All five-bit packed reference bytes (GiB) | Real-profile Kv5 reference bytes (GiB) |
+|---|---:|---:|---:|
+| 2,048 | 77,070,336 (0.071777) | 194,510,848 (0.181152) | 183,500,800 (0.170898) |
+| 32,768 | 1,233,125,376 (1.148438) | 3,112,173,568 (2.898438) | 2,936,012,800 (2.734375) |
+| 262,144 | 9,865,003,008 (9.187500) | 24,897,388,544 (23.187500) | 23,488,102,400 (21.875000) |
+
+GiB is 2^30 bytes. Totals count requested row heaps and row/token structs at
+exact capacity, excluding allocator overhead, spare capacity, fixed
+state/profile objects and provisional copies. A retained full snapshot adds
+another full cache. **Kv5 at 2,048 and 32,768 tokens fits the 24 GB budget
+alongside the 10.3 GB model; 262,144 tokens does not.** Cache plus model alone
+is about 10.48, 13.24 and 33.79 GB with the real profile. These are reference
+representation estimates; the real model was not opened for this measurement.
+A later fast path might read packed words directly with only 164 numeric
+bytes per five-bit row (132 for four-bit), removing the derived bases. That
+would be 20,992 bytes/token if all rows pack, or 22,144 for the real profile;
+it is not the current reference representation. See D13 for the allocation
+formula and packed score/mean/rounding rules.
+
+The synthetic CPU benchmark below includes both attention and row preparation
+(`kv_encode`), since cached-base decoding moved to preparation. Values are
+stage medians in milliseconds for a 16-row pass after 2,000 prefix tokens,
+seven samples after one warm-up, restoring the same prefix before each sample.
+The model is `synthetic_kv_model`: one attention layer, two query/KV heads,
+seed `0x05_0a`, fully packable synthetic profile with value means. Both runs
+use `--backend cpu --rows-per-pass 16 --passes 7 --context 2000`, with dotprod
+and ten engine workers on this host. The scalar reference remains
+single-threaded. Baseline production sources are commit `0b7bd5d`; only the
+05j benchmark harness was copied into an isolated baseline source snapshot
+to add fixed-context sampling. No production baseline code was changed.
+
+| Version | KV mode | Attention ms | Row preparation ms | Sum of stage medians ms |
+|---|---|---:|---:|---:|
+| Before (`0b7bd5d`) | int8-profile | 13.431 | 1.041 | 14.472 |
+| Before (`0b7bd5d`) | kv5 | 115.849 | 0.860 | 116.709 |
+| After (05l, BF16 bits) | int8-profile | 6.988 | 1.142 | 8.130 |
+| After (05l, BF16 bits) | kv5 | 4.796 | 0.789 | 5.585 |
+
+The last column sums two stage medians; it is not a separately measured
+median of their sum. These are synthetic stage timings, not real-model
+throughput. Reproduce with `cargo run --release -p yskn-engine --example
+synthetic_kv_model -- OUT_DIR`, then `cargo run --release -p yskn-engine
+--example bench_model -- OUT_DIR --backend cpu --kv MODE --rows-per-pass 16
+--passes 7 --context 2000` (offline builds).
 
 ## Mapped engine API and commands
 
@@ -104,7 +171,8 @@ are unsafe solely because callers must keep the backing weights file
 unchanged and untruncated until model drop. The engine offers `prefill`,
 `row_logits`, `logits`, `position`, `reset`, `context_capacity`,
 `dimensions`, `rows_per_pass`, `kv_mode`, `backend`, `device` and measured
-`pass_timings`. It has no provisional, commit, draft or speculation API.
+`pass_timings`. D16 adds `run_provisional`, `commit`, `discard_provisional`,
+`snapshot`, `restore`, and the shared `yskn_ref::speculation::generate` loop.
 See D11 for the causal attention and parallelism contract and D14 for the
 backends and the parallel recurrent heads.
 
@@ -361,7 +429,7 @@ ContextFeatures { values })`, or row-major `[row,slot,channel]` through
 `push_context_rows`. The hook is precisely defined in
 [D15](DECISIONS.md#d15--scalar-block-draft-and-reduced-head): post-MLP residual
 BF16 expanded to FP32, five captures in layer order, no additional norm.
-The main model does not expose these captures yet.
+D17 exposes these captures and connects them through `DraftProposer`.
 
 `propose(frontier_token, embedding_provider, DraftChoice::Greedy)` returns
 seven token IDs plus each position's top16 with raw and corrected scores.
@@ -418,3 +486,143 @@ service tests do not establish transport verification. Full commands, security
 limits, the engine contract and deliberate Python/Windows differences are in
 [the CLI README](../../crates/yskn-cli/README.md); each ported test names its
 upstream case in a comment.
+
+The scalar reference intentionally remains slow. D17 adds main capture wiring
+and the shared speculation loop; 16-row blocks and HCAP side policy remain
+outside the port.
+
+
+## Lossless generation and prompt reuse (D16)
+
+Both models implement `speculation::Verifier`. `generate` accepts any `Proposer`
+and a `Sampler` (greedy or seeded), a nonempty known prompt tail and
+`GenerationLimits`. Prefill **except the last prompt token** first: that token
+is pending and becomes verification row zero. The result contains new token IDs
+only; its last ID remains pending. Thus `position` advances once per returned
+ID, including EOS or a callback cancellation token, identically with K=0.
+`max_new_tokens=0` runs no pass. Callbacks return false to cancel; EOS IDs are
+caller parameters. Both stop immediately after selecting a token and commit
+only its consumed predecessors. `max_draft_tokens`, remaining output room,
+context capacity and verifier pass width jointly bound every proposal.
+
+`NoProposer`, `ScriptProposer` and `NgramProposer::new(n,k)` are supplied.
+N-grams copy only known continuation from the most recent earlier exact match.
+D17 adds `DraftProposer` and `CombinedProposer` with fixed n-gram-first or
+neural-first fallback; upstream adaptive-width/source policy is not ported.
+Statistics report verified rows, passes, matching guesses, confirmed tokens per
+pass and elapsed time including commit/callbacks. A terminal matching guess
+counts as accepted even though the final selected token stays pending.
+
+Engine `run_provisional` accepts 1..=`rows_per_pass` rows, never advances
+position, and rejects an existing pending pass. `commit(k)` consumes exactly
+k rows including row zero; zero discards. `prefill_with_logits(tokens,
+LogitRows::{All,Last,None})` commits arbitrary-length prompts atomically;
+`prefill` preserves the scoring default All. Last computes the vocabulary head
+only once at the end, None skips it and clears predictions. Empty prefill is
+a no-op. `row_logits` includes only requested rows. Following continuation is
+identical in all three modes.
+
+`snapshot()?` returns an owned value containing recurrent matrices/history,
+position, token prefix and the committed prediction. Neither model copies
+attention in a snapshot. `restore(&snapshot)` truncates attention and reinstalls
+recurrence/prediction. It rejects pending passes, another session, a reset,
+a future position, or a changed prefix. Keep only checkpoints you need: each
+owned value costs another recurrent state, and is freed on drop. Restoring
+invalidates later checkpoints until their exact token prefix is present again.
+`session_memory()` reports persistent payload/capacities; `state_digest()`
+hashes committed numeric bits (all cache codes/scales, recurrence/history,
+position and last committed prediction) without allocation. This diagnostic
+FNV-1a value is not a cryptographic identity or a weight-file checksum.
+
+All commands below are offline and must run serially. The real-model commands
+are for the orchestrator; brief 05e never opens released weights.
+
+```sh
+export CARGO_NET_OFFLINE=true
+MODEL_FOLDER=/path/to/model-folder
+# Scalar oracle is dropped before loading the mapped engine. Exercise partial,
+# zero and full commit with --accept 2, 0 and 3 respectively in all modes.
+for kv in int8 int8-profile kv5; do
+  cargo run --release -p yskn-engine --example verify_speculation -- \
+    "$MODEL_FOLDER" --tokens 1,2,3 --accept 2 --backend metal --kv "$kv" || exit
+done
+
+# Compare stdout's first line (IDs); statistics/times may differ.
+cargo run --release -p yskn-engine --example generate -- \
+  "$MODEL_FOLDER" --tokens 1,2,3,1,2,3,1 --max-new 32 --draft none --greedy --backend metal --kv kv5
+cargo run --release -p yskn-engine --example generate -- \
+  "$MODEL_FOLDER" --tokens 1,2,3,1,2,3,1 --max-new 32 --draft ngram --k 7 --greedy --backend metal --kv kv5
+# Repeat both commands replacing --greedy with --seed 17, then --seed 11259375.
+# Optional --eos 248046,248044 selects the model's stopping IDs.
+
+# Synthetic timing only: create a fresh directory and delete its file afterwards.
+# Replace FILE with a path inside that directory.
+cargo run --release -p yskn-engine --example synthetic_model -- FILE 8
+cargo run --release -p yskn-engine --example bench_speculation -- FILE --backend cpu --passes 7
+```
+
+`verify_speculation` checks every vocabulary bit for provisional, committed and
+continuation rows plus the full committed-state digest against the scalar
+reference. It deliberately heap-loads the scalar weights first and releases
+them before mapping the engine. Use `--backend cpu` too. `bench_speculation`
+reports widths 1/2/4/8, full and half-prefix commit costs and a checkpoint-copy
+cost proxy for the rejected per-row snapshot design. See D16 for measured
+memory, timings and verification boundaries.
+
+
+## Main-model capture and neural proposals (D17)
+
+`CaptureOptions { layers, max_rows }` enables observational post-MLP residual
+capture on either model before prefill. Defaults capture nothing. Use
+`DraftProposer::capture_options()` for the loaded draft's layer order and
+ring capacity. `captured_rows()` exposes the retained committed tail, and
+`provisional_captures()` exposes pending rows separately. Each row stores its
+absolute position and slot-major features. Configure capture before consuming
+a prompt; features of already-consumed rows cannot be reconstructed from KV.
+Long prefills retain only the required tail. See D17 for the exact BF16 tap.
+
+`DraftProposer::new(draft, k, choice)` supports K=1..7 using the scalar draft.
+The shared `generate` loop synchronizes prompt context, observes committed
+rows after successful commits and leaves rejected/new-frontier rows out of
+the draft ring. `DraftChoice::sampled(seed)` uses independent temperature
+850 thousandths and top-p 0.95. Use the main seed only when main sampling is
+version 3; main version 2 uses greedy draft choice, as upstream does.
+`CombinedProposer::new(ngram, draft, ProposalOrder::NgramFirst)` falls back to
+neural when copying abstains; `DraftFirst` reverses that fixed order.
+
+Use `proposer.snapshot_session(&model)?` to checkpoint main state and its
+matching draft ring together, then
+`proposer.restore_session(&mut model, &checkpoint)?` before continuing.
+Reset both owners together (`model.reset()?; proposer.reset()`). A main snapshot
+alone does not capture the separately owned draft ring. Captured features remain
+an observation and do not contribute to the committed numerical-state digest.
+
+The following real-model commands are for the orchestrator and run serially.
+The scalar neural draft can take about 90 seconds **per proposal**; this
+integration provides correctness and acceptance diagnostics, not a fast path.
+No released model was opened for brief 05g.
+
+```sh
+export CARGO_NET_OFFLINE=true
+MODEL_FOLDER=/path/to/model-folder
+cargo run --release -p yskn-engine --example generate -- \
+  "$MODEL_FOLDER" --tokens 1,2,3,1,2,3,1 --max-new 8 --draft neural --k 3 --greedy --backend metal --kv kv5
+# Compare the first stdout line with --draft none, then --draft ngram and --draft both.
+# Repeat with --seed 17 and --seed 11259375 instead of --greedy; use K=1,3,7.
+cargo run --release -p yskn-engine --example draft_acceptance -- \
+  "$MODEL_FOLDER" tools/quality/windows_own_thinking.json \
+  --windows 0..1 --positions 2 --k 3 --kv kv5 --backend metal
+```
+
+`generate --draft neural|ngram|both|none` defaults to none. Both uses fixed
+n-gram-first fallback. `draft_acceptance` defaults to window 0, two positions
+per window and K=3; a position is an input row beginning at the window's first
+scored position (1024). It teacher-forces the known window tokens and compares
+proposals with the main model's greedy choices on the following positions.
+It counts the matching **leading prefix**, stopping at the first mismatch.
+Each depth reports the fraction of all tested positions reaching that depth;
+missing guesses count as unaccepted. The mean accepted prefix uses the same
+position denominator. Neural and n-gram candidates are evaluated at the same
+frontier; the fixed n-gram-first combined metric reuses those candidates to
+avoid computing the expensive neural block twice. These are teacher-forced
+acceptance diagnostics, not a free-running quality or throughput measurement.

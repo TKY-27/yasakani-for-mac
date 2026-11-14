@@ -3,15 +3,18 @@ use super::Writer;
 use serde_json::json;
 
 pub fn container(seed: u64) -> Vec<u8> {
+    container_with_heads(seed, 4, 4)
+}
+pub fn container_with_heads(seed: u64, query_heads: usize, kv_heads: usize) -> Vec<u8> {
     let mut w = Writer::new(seed, false);
     w.tensor("bdraft2.fc", "draft", 512, 2560, 0.015625);
     for i in 0..2 {
         let p = format!("bdraft2.layers.{i}.");
         for (name, rows, cols) in [
-            ("q", 512, 512),
-            ("k", 512, 512),
-            ("v", 512, 512),
-            ("o", 512, 512),
+            ("q", query_heads * 128, 512),
+            ("k", kv_heads * 128, 512),
+            ("v", kv_heads * 128, 512),
+            ("o", 512, query_heads * 128),
             ("gate", 512, 512),
             ("up", 512, 512),
             ("down", 512, 512),
@@ -38,15 +41,18 @@ pub fn container(seed: u64) -> Vec<u8> {
     // Source assumes all projections use the fc sign prefix; ensure that remains
     // observable even when a matrix's own descriptor has different signs.
     w.tensors[1]["rot_in"]["sign_seed"] = json!(99);
-    w.finish(json!({ "arch":"bdraft2","hidden":512,"ffn":512,"vocab":32,"layers":2,"heads":4,"kv_heads":4,"head_dim":128,"window":8,"rank":32,"eps":1e-6,"block":8,"top_k":16 }))
+    w.finish(json!({ "arch":"bdraft2","hidden":512,"ffn":512,"vocab":32,"layers":2,"heads":query_heads,"kv_heads":kv_heads,"head_dim":128,"window":8,"rank":32,"eps":1e-6,"block":8,"top_k":16 }))
 }
 pub fn shead(seed: u64) -> Vec<u8> {
+    shead_with_hidden(seed, 512)
+}
+pub fn shead_with_hidden(seed: u64, hidden: usize) -> Vec<u8> {
     let mut w = Writer::new(seed, false);
     let mut b = b"SHEAD001".to_vec();
-    for n in [32_i32, 512, 512, 12345] {
+    for n in [32_i32, hidden as i32, 512, 12345] {
         b.extend_from_slice(&n.to_le_bytes());
     }
-    for _ in 0..512 * 512 {
+    for _ in 0..512 * hidden {
         b.extend_from_slice(&(w.signed_unit() * 0.03125).to_le_bytes());
     }
     for _ in 0..32 * 512 {
@@ -55,7 +61,7 @@ pub fn shead(seed: u64) -> Vec<u8> {
     for _ in 0..32 {
         b.extend_from_slice(&0.03125_f32.to_le_bytes());
     }
-    for _ in 0..32 * 512 {
+    for _ in 0..32 * hidden {
         b.push((w.random() % 255) as u8);
     }
     for _ in 0..32 {

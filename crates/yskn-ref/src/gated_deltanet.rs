@@ -44,6 +44,30 @@ pub struct GatedDeltaNetState {
 }
 
 impl GatedDeltaNetState {
+    /// Copy into an already allocated state with the same dimensions.
+    pub fn copy_from(&mut self, source: &Self) {
+        assert_eq!(self.dimensions, source.dimensions);
+        self.recurrent_state
+            .copy_from_slice(&source.recurrent_state);
+        self.history.copy_from_slice(&source.history);
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        (self.recurrent_state.capacity() + self.history.capacity()) * std::mem::size_of::<f32>()
+    }
+
+    pub fn update_digest(&self, digest: &mut u64) {
+        for values in [&self.recurrent_state, &self.history] {
+            for byte in (values.len() as u64).to_le_bytes().into_iter().chain(
+                values
+                    .iter()
+                    .flat_map(|value| value.to_bits().to_le_bytes()),
+            ) {
+                *digest = (*digest ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+
     /// Rounded projections of the previous rows, oldest first.
     pub fn history_rows(&self) -> std::slice::ChunksExact<'_, f32> {
         let rows = self.dimensions.convolution_width - 1;
@@ -68,6 +92,35 @@ pub struct GatedDeltaNetRow {
     key: Vec<f32>,
     gates_a: Vec<f32>,
     gates_b: Vec<f32>,
+}
+
+impl GatedDeltaNetRow {
+    /// Retain a prepared row in a fixed-width replay slot without allocating.
+    pub fn copy_from(&mut self, source: &Self) {
+        self.projected.copy_from_slice(&source.projected);
+        self.z.copy_from_slice(&source.z);
+        self.convolved.copy_from_slice(&source.convolved);
+        self.query.copy_from_slice(&source.query);
+        self.key.copy_from_slice(&source.key);
+        self.gates_a.copy_from_slice(&source.gates_a);
+        self.gates_b.copy_from_slice(&source.gates_b);
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        [
+            &self.projected,
+            &self.z,
+            &self.convolved,
+            &self.query,
+            &self.key,
+            &self.gates_a,
+            &self.gates_b,
+        ]
+        .iter()
+        .map(|v| v.capacity())
+        .sum::<usize>()
+            * std::mem::size_of::<f32>()
+    }
 }
 
 /// The BF16 projection boundary; the result is also what the convolution history keeps.
@@ -153,6 +206,19 @@ impl GatedDeltaNet {
             output_width,
             convolution_channels,
             state_elements,
+        })
+    }
+
+    /// One preallocated slot for recurrence-only replay at commit.
+    pub fn new_row(&self) -> Result<GatedDeltaNetRow> {
+        Ok(GatedDeltaNetRow {
+            projected: zeros(self.convolution_channels)?,
+            z: zeros(self.output_width)?,
+            convolved: zeros(self.convolution_channels)?,
+            query: zeros(self.query_key_width)?,
+            key: zeros(self.query_key_width)?,
+            gates_a: zeros(self.dimensions.value_heads)?,
+            gates_b: zeros(self.dimensions.value_heads)?,
         })
     }
 

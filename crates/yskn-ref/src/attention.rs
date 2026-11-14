@@ -92,7 +92,7 @@ struct CacheToken {
     values: Vec<CacheRow>,
 }
 
-/// Only the visible causal prefix is retained; a model pass owns its provisional copy.
+/// Causal cache rows. Engines may append provisionally and roll back by truncation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AttentionState {
     dimensions: AttentionDimensions,
@@ -100,6 +100,59 @@ pub struct AttentionState {
 }
 
 impl AttentionState {
+    /// Remove a provisional suffix without copying or reallocating the prefix.
+    pub fn truncate(&mut self, len: usize) -> Result<()> {
+        if len > self.rows.len() {
+            return Err(Error::InvalidInput(
+                "cannot extend an attention cache by truncation".into(),
+            ));
+        }
+        self.rows.truncate(len);
+        Ok(())
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.rows.capacity()
+    }
+
+    /// Diagnostic FNV-1a over every stored code and scale, independent of allocation.
+    pub fn update_digest(&self, digest: &mut u64) {
+        self.update_prefix_digest(digest, self.rows.len());
+    }
+
+    /// Digest only the committed prefix while later rows are provisional.
+    pub fn update_prefix_digest(&self, digest: &mut u64, len: usize) {
+        assert!(len <= self.rows.len());
+        fn bytes(digest: &mut u64, values: &[u8]) {
+            for &byte in values {
+                *digest = (*digest ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            }
+        }
+        bytes(digest, &(len as u64).to_le_bytes());
+        for token in &self.rows[..len] {
+            for side in [&token.keys, &token.values] {
+                bytes(digest, &(side.len() as u64).to_le_bytes());
+                for row in side {
+                    bytes(digest, &row.scale().to_bits().to_le_bytes());
+                    match row {
+                        CacheRow::Int8(row) => {
+                            bytes(digest, &[0]);
+                            for &value in row.integers() {
+                                bytes(digest, &[value as u8]);
+                            }
+                        }
+                        CacheRow::Packed(row) => {
+                            bytes(digest, &[row.bits()]);
+                            for value in row.words() {
+                                bytes(digest, &value.to_le_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.rows.len()
     }
@@ -267,34 +320,23 @@ impl Attention {
         }
     }
 
-    fn base(&self, row: &CacheRow, head: usize, side: usize, channel: usize) -> Result<f32> {
+    fn value_mean<'a>(&'a self, head: usize, row: &CacheRow) -> Result<Option<&'a [f32; 256]>> {
         match row {
-            CacheRow::Int8(row) => Ok(f32::from(row.integers()[channel])),
+            CacheRow::Int8(_) => Ok(None),
             CacheRow::Packed(_) => {
                 let profile = self.kv_profile.as_ref().ok_or_else(|| {
                     Error::InvalidInput("packed attention row requires a profile".into())
                 })?;
-                // BF16 table, no key mean: src/kvq_atxpk.hpp:42-45;
-                // src/q35_atxpk3.cuh:343-380,427-430,454 (pk4:287-325,369-372,396).
-                if side == 0 {
-                    row.key_base(profile, self.group_index(head, side), channel)
-                } else {
-                    row.value_base(profile, self.group_index(head, side), channel)
-                }
+                let group = &profile.groups()[self.group_index(head, 1)];
+                // Missing packed means still add +0, preserving signed-zero operations.
+                Ok(Some(group.mean.as_ref().unwrap_or(&[0.0; 256])))
             }
         }
     }
 
-    fn add_value_mean(
-        &self,
-        split: &mut AttentionSplit,
-        head: usize,
-        row: &CacheRow,
-    ) -> Result<()> {
-        if matches!(row, CacheRow::Packed(_)) {
-            let profile = self.kv_profile.as_ref().expect("validated KV profile");
-            for (channel, numerator) in split.numerator.iter_mut().enumerate() {
-                let mean = row.value_mean(profile, self.group_index(head, 1), channel)?;
+    fn add_value_mean(split: &mut AttentionSplit, mean: Option<&[f32; 256]>) -> Result<()> {
+        if let Some(mean) = mean {
+            for (numerator, &mean) in split.numerator.iter_mut().zip(mean) {
                 // After self; denominator is FP32 including self, not BF16 weight sums.
                 // src/q35_atxpk3.cuh:443-475; src/q35_atxpk4.cuh:385-417.
                 *numerator += split.denominator * mean;
@@ -553,6 +595,7 @@ impl Attention {
             .checked_add(1)
             .ok_or_else(|| Error::InvalidModel("attention context length overflow".into()))?;
         let kv_head = query_head / (self.dimensions.query_heads / self.dimensions.kv_heads);
+        let mean = self.value_mean(kv_head, &current.values[kv_head])?;
         let schedule = prefix_schedule(length);
         let padded_count = schedule.len().next_power_of_two();
         let mut splits = Vec::with_capacity(padded_count);
@@ -571,10 +614,9 @@ impl Attention {
                     query,
                     &current.keys[kv_head],
                     &current.values[kv_head],
-                    kv_head,
                 )?;
             }
-            self.add_value_mean(&mut split, kv_head, &current.values[kv_head])?;
+            Self::add_value_mean(&mut split, mean)?;
             splits.push(split);
         }
         splits.resize_with(padded_count, || AttentionSplit {
@@ -633,14 +675,14 @@ impl Attention {
             let position = tile_start + tile_index;
             if visible.contains(&position) {
                 let key = &prefix[position].keys[kv_head];
+                let bases = key.bases();
                 let mut accumulator = 0.0;
                 for chunk in 0..self.dimensions.head_dim / 16 {
                     // D3: provisional mma16 order is ascending scalar multiply then add.
                     for (offset, &query_value) in
                         query[chunk * 16..(chunk + 1) * 16].iter().enumerate()
                     {
-                        accumulator +=
-                            query_value * self.base(key, kv_head, 0, chunk * 16 + offset)?;
+                        accumulator += query_value * bases[chunk * 16 + offset];
                     }
                 }
                 // Shipping QK8=false: no table-int8 scale, only the packed row scale.
@@ -682,6 +724,14 @@ impl Attention {
         for value in &mut split.numerator {
             *value *= rescale;
         }
+        // Widen each visible row once, before the channel/weight accumulation loops.
+        // Masked slots initialize only None, without zeroing an unread 256-value row.
+        let value_bases: [Option<[f32; 256]>; 32] = std::array::from_fn(|tile_index| {
+            let position = tile_start + tile_index;
+            visible
+                .contains(&position)
+                .then(|| prefix[position].values[kv_head].bases())
+        });
         let mut value_weights = [0.0; 32];
         for (tile_index, weight) in value_weights.iter_mut().enumerate() {
             let position = tile_start + tile_index;
@@ -698,12 +748,9 @@ impl Attention {
                 for (offset, &value_weight) in
                     value_weights[half * 16..(half + 1) * 16].iter().enumerate()
                 {
-                    let position = tile_start + half * 16 + offset;
                     // D9 skips masked operations entirely, including zero-valued products.
-                    if visible.contains(&position) {
-                        let value =
-                            self.base(&prefix[position].values[kv_head], kv_head, 1, channel)?;
-                        *numerator += value_weight * value;
+                    if let Some(bases) = &value_bases[half * 16 + offset] {
+                        *numerator += value_weight * bases[channel];
                     }
                 }
             }
@@ -718,15 +765,16 @@ impl Attention {
         query: &[f32],
         key: &CacheRow,
         value: &CacheRow,
-        kv_head: usize,
     ) -> Result<()> {
+        let key_bases = key.bases();
+        let value_bases = value.bases();
         let mut partial = [0.0; 4];
         for (lane, sum) in partial.iter_mut().enumerate() {
             for chunk in 0..self.dimensions.head_dim / 16 {
                 // Self has its own interleaved FP32 order; it is not the prefix mma16.
                 for offset in [2 * lane, 2 * lane + 1, 8 + 2 * lane, 9 + 2 * lane] {
                     let channel = 16 * chunk + offset;
-                    *sum += query[channel] * self.base(key, kv_head, 0, channel)?;
+                    *sum += query[channel] * key_bases[channel];
                 }
             }
         }
@@ -748,8 +796,7 @@ impl Attention {
         // src/q35_atxpk4.cuh:363-400. Packed self still uses the BF16 table base.
         let value_weight = probability * value.scale();
         for (channel, numerator) in split.numerator.iter_mut().enumerate() {
-            *numerator =
-                *numerator * rescale + value_weight * self.base(value, kv_head, 1, channel)?;
+            *numerator = *numerator * rescale + value_weight * value_bases[channel];
         }
         finite(&[split.denominator], "attention self denominator")?;
         finite(&split.numerator, "attention self numerator")
@@ -844,8 +891,7 @@ fn finite(values: &[f32], context: &'static str) -> Result<()> {
 }
 
 #[cfg(test)]
-#[path = "../tests/support/kv_profile.rs"]
-mod synthetic_kv_profile;
+use crate::test_support::kv_profile as synthetic_kv_profile;
 
 #[cfg(test)]
 #[path = "attention_kv_tests.rs"]
