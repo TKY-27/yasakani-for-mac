@@ -324,3 +324,26 @@ fn interrupt_at_the_prompt_exits() {
     assert!(status.success());
     assert!(exits_within_patience(&mut child).success());
 }
+// Review finding: errors returned outside the chat loop reached the terminal
+// unescaped, for example a model folder path or an argument holding an escape
+// sequence. Every top-level error is shown with visible control characters.
+#[test]
+fn top_level_errors_show_control_characters_visibly() {
+    let folder = "/nonexistent/\u{1b}]0;owned\u{7}\u{1b}[2J\u{202e}x";
+    for args in [
+        vec!["info", "--engine", "stub", "--model-dir", folder],
+        vec!["chat", "--engine", "stub", "--model-dir", folder],
+        vec!["chat", "--engine", "stub", "--raw", "--model-dir", folder],
+        vec!["info", "--engine", "stub", "--bad\u{1b}[2J"],
+    ] {
+        let r = run(&args, "");
+        assert!(!r.status.success());
+        let err = String::from_utf8(r.stderr).unwrap();
+        assert!(err.starts_with("error: "), "{err:?}");
+        assert!(err.contains("\\x1b[2J"), "{err:?}");
+        assert!(
+            !err.contains(|c: char| c.is_control() && c != '\n' || c == '\u{202e}'),
+            "{err:?}"
+        );
+    }
+}

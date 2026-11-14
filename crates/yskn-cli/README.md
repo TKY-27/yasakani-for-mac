@@ -29,7 +29,9 @@ than newline and tab, DEL and C1 controls (U+0080 to U+009F) shown as `\xNN`,
 and bidirectional overrides and isolates (U+202A to U+202E, U+2066 to U+2069)
 as `\uNNNN`, so escape sequences in model output cannot drive the terminal or
 reorder what it shows; the zero-width joiner and variation selectors stay, as
-emoji need them. `--raw` prints them unchanged. The HTTP API is unaffected: its text is JSON-encoded. Slash commands are
+emoji need them. `--raw` prints them unchanged. Errors that end the program (a
+model folder path, a bad argument, a load error) are always printed this way,
+also with `--raw`. The HTTP API is unaffected: its text is JSON-encoded. Slash commands are
 `/exit`, `/quit`, `/q`, `/reset`, `/think on|off`, `/effort low|medium|xhigh`,
 `/help`. Thinking appears between `[thinking]` and `[/thinking]` when an answer
 follows. Ctrl+C stops the current generation or exits at the input prompt; the
