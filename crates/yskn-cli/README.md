@@ -114,7 +114,7 @@ SHA-256 and reduces all 32 digest bytes without prefix-dependent branches.
 | Limit (`Limits` field) | Default | Why this number |
 |---|---:|---|
 | Actual request-body bytes, before JSON parsing (`max_body`) | 8 MiB | Upstream's `MAX_BODY` is 32 MiB. Lowered: by our estimate a full 262,144-token context is about 1 to 2.4 MiB of JSON (3 to 9 bytes per token, ASCII-escaped CJK at the top), so 8 MiB leaves 32 bytes per token. Tokenizing costs about 64 bytes of memory per prompt byte, so the body size bounds the engine thread's work. A client resending megabytes of old `reasoning_content` that the template drops could exceed it where upstream accepted it |
-| Bytes held by all requests together (`max_pending_bytes`) | 512 MiB | Charged as body bytes arrive, raised to the decode estimate (body bytes + 640 per JSON value) before parsing, and held while the request waits and generates. Over budget: 503 with `Retry-After: 5`. Must hold one largest request (8 MiB + 2^19 x 640 = 328 MiB) |
+| Bytes held by all requests together (`max_pending_bytes`) | 512 MiB | Charged as body bytes arrive; raised before parsing to what decoding can hold at most, 5 x the body bytes + 640 per JSON value (see below); lowered after decoding to the cleaned request's text bytes + 640 per value, which it holds while it waits and generates. Over budget: 503 with `Retry-After: 5`. Must hold one largest request (5 x 8 MiB + 2^19 x 640 = 360 MiB) |
 | JSON values per request, counted before parsing (`max_json_values`) | 524,288 | Bounds the parsed body and its cleaned copy (measured worst case about 590 bytes per value, for tool schemas of one-member objects). Covers 65,536 messages at 4 values each with room for tools; tool-call argument strings count too |
 | Messages (`max_messages`) | 65,536 | Even an empty message renders as 5 template tokens, so more than 262,144 / 5 = 52,429 can never fit |
 | Content parts per message (`max_content_parts`) | 1,024 | Clients send a handful of text parts per message |
@@ -150,6 +150,33 @@ text at most 3x): no tokenization could then fit it. The exact token check
 after tokenization stays. With a real vocabulary whose longest entry is long,
 this early check triggers only well beyond the body limit at the full context,
 so it mainly helps small `--max-ctx` values; the body limit bounds the rest.
+
+**What a request holds.** While a body is decoded its text exists at most
+twice at once: the raw body and the parsed JSON while parsing (the raw body is
+dropped as soon as parsing ends), then the parsed JSON and the cleaned request
+while cleaning. Cleaning moves nothing large twice (no temporary copies), but
+it can make text longer: Python-style `str()` of a non-string text part writes
+a raw DEL byte as the four characters `\x7f`. So at its peak a request holds
+at most 5 times its body bytes (`DECODE_FACTOR`), plus the structure of its
+values, which the 640 bytes per value cover; that is what it is charged while
+it is decoded. Afterwards it holds its cleaned text (at most `max_text_bytes`
+for messages and tools, plus template kwargs and stop strings). Measured on
+macOS 27.2 on an Apple M5 with the release binary, peak resident memory of the
+whole server while 64 clients each send one request with a 7 MiB string and
+never read the answer (`/usr/bin/time -l`; an idle server is 8 MiB):
+
+| 7 MiB string in | Before this round | After |
+|---|---:|---:|
+| `response_format.type` (400; the old message quoted it) | 2,115 MiB | 470 MiB |
+| a non-string text part, `[string]` (400; text limit) | 1,162 MiB | 451 MiB |
+| `chat_template_kwargs` (200; reaches the engine) | 485 MiB | 484 MiB |
+
+All three are dominated after the fix by the 64 bodies being received at once
+(64 x 7 MiB = 448 MiB, charged as they arrive). One such request alone peaks
+at 14 MiB above an idle server for `response_format`, 42 MiB (5.7 x the body)
+for the text part, where the allocator keeps the freed raw body resident, and
+28 MiB for template kwargs, of which the engine thread's copies for the
+template are the larger part (not charged, see below).
 
 Not covered by the budget: the one request on the engine thread renders and
 tokenizes its prompt (measured about 64 bytes per prompt byte for

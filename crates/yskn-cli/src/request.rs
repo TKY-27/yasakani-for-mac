@@ -1,6 +1,7 @@
 //! Validation at the OpenAI request boundary, matching chat.py/server.py.
 use crate::{Error, Result, chat::ChatParams, server::Limits};
 use serde_json::{Map, Value, json};
+use std::fmt;
 
 /// Upper bound on the number of values a JSON text can hold, counted without
 /// parsing it: every value except the root follows `[`, `,` or `:` outside a
@@ -136,48 +137,78 @@ fn py_string(v: &Value) -> String {
         py_repr(v)
     }
 }
-fn py_repr(v: &Value) -> String {
-    match v {
-        Value::String(s) => {
-            let quote = if s.contains('\'') && !s.contains('"') {
-                '"'
-            } else {
-                '\''
-            };
-            let mut out = String::new();
-            out.push(quote);
-            for c in s.chars() {
-                match c {
-                    '\\' => out.push_str("\\\\"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '\t' => out.push_str("\\t"),
-                    c if c == quote => {
-                        out.push('\\');
-                        out.push(c);
-                    }
-                    c if c.is_control() && (c as u32) <= 255 => {
-                        out.push_str(&format!("\\x{:02x}", c as u32))
-                    }
-                    c => out.push(c),
-                }
-            }
-            out.push(quote);
-            out
-        }
-        Value::Null => "None".into(),
-        Value::Bool(true) => "True".into(),
-        Value::Bool(false) => "False".into(),
-        Value::Array(a) => format!("[{}]", a.iter().map(py_repr).collect::<Vec<_>>().join(", ")),
-        Value::Object(m) => format!(
-            "{{{}}}",
-            m.iter()
-                .map(|(k, v)| format!("{}: {}", py_repr(&json!(k)), py_repr(v)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        _ => yskn_text::json_dumps(v, false),
+/// Counts the bytes written, to size a buffer before writing into it.
+struct Len(usize);
+impl fmt::Write for Len {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0 += s.len();
+        Ok(())
     }
+}
+fn py_repr(v: &Value) -> String {
+    // Sized exactly by a first pass: a buffer grown by doubling briefly holds
+    // its old and new copy, up to twice the result. Neither writer can fail.
+    let mut len = Len(0);
+    let _ = write_repr(v, &mut len);
+    let mut out = String::with_capacity(len.0);
+    let _ = write_repr(v, &mut out);
+    out
+}
+/// Python's repr() of `v`, written into one buffer: nested values are not
+/// copied once per level, so the result is the only large allocation.
+fn write_repr(v: &Value, out: &mut impl fmt::Write) -> fmt::Result {
+    match v {
+        Value::String(s) => write_str_repr(s, out),
+        Value::Null => out.write_str("None"),
+        Value::Bool(true) => out.write_str("True"),
+        Value::Bool(false) => out.write_str("False"),
+        Value::Array(a) => {
+            out.write_char('[')?;
+            for (i, v) in a.iter().enumerate() {
+                if i > 0 {
+                    out.write_str(", ")?;
+                }
+                write_repr(v, out)?;
+            }
+            out.write_char(']')
+        }
+        Value::Object(m) => {
+            out.write_char('{')?;
+            for (i, (k, v)) in m.iter().enumerate() {
+                if i > 0 {
+                    out.write_str(", ")?;
+                }
+                write_str_repr(k, out)?;
+                out.write_str(": ")?;
+                write_repr(v, out)?;
+            }
+            out.write_char('}')
+        }
+        _ => out.write_str(&yskn_text::json_dumps(v, false)),
+    }
+}
+fn write_str_repr(s: &str, out: &mut impl fmt::Write) -> fmt::Result {
+    let quote = if s.contains('\'') && !s.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    out.write_char(quote)?;
+    for c in s.chars() {
+        match c {
+            '\\' => out.write_str("\\\\")?,
+            '\n' => out.write_str("\\n")?,
+            '\r' => out.write_str("\\r")?,
+            '\t' => out.write_str("\\t")?,
+            c if c == quote => {
+                out.write_char('\\')?;
+                out.write_char(c)?;
+            }
+            c if c.is_control() && (c as u32) <= 255 => write!(out, "\\x{:02x}", c as u32)?,
+            c => out.write_char(c)?,
+        }
+    }
+    out.write_char(quote)
 }
 fn content(v: &Value, i: usize) -> Result<Value> {
     if let Some(parts) = v.as_array() {
@@ -191,7 +222,10 @@ fn content(v: &Value, i: usize) -> Result<Value> {
                     "messages[{i}]: only text content is supported"
                 )));
             }
-            out.push(json!({"type":"text","text":py_string(&p["text"])}));
+            // Assigned, not interpolated: json! would copy the value.
+            let mut part = json!({"type":"text"});
+            part["text"] = Value::String(py_string(&p["text"]));
+            out.push(part);
         }
         Ok(Value::Array(out))
     } else if v.is_null() {
@@ -219,18 +253,16 @@ fn clean_calls(v: &Value, i: usize) -> Result<Value> {
                     "messages[{i}].tool_calls[{k}]: a function call with a name is expected"
                 ))
             })?;
-        let mut args = f["arguments"].clone();
-        if let Some(s) = args.as_str() {
-            args = if s.trim().is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(s).map_err(|_| {
-                    Error::request(format!(
-                        "messages[{i}].tool_calls[{k}]: arguments is not valid JSON"
-                    ))
-                })?
-            };
-        }
+        // A string is parsed in place, not copied first.
+        let mut args = match f["arguments"].as_str() {
+            Some(s) if s.trim().is_empty() => json!({}),
+            Some(s) => serde_json::from_str(s).map_err(|_| {
+                Error::request(format!(
+                    "messages[{i}].tool_calls[{k}]: arguments is not valid JSON"
+                ))
+            })?,
+            None => f["arguments"].clone(),
+        };
         if args.is_null() {
             args = json!({});
         }
@@ -239,7 +271,11 @@ fn clean_calls(v: &Value, i: usize) -> Result<Value> {
                 "messages[{i}].tool_calls[{k}]: arguments must be a JSON object"
             )));
         }
-        out.push(json!({"type":"function","function":{"name":name,"arguments":args}}));
+        let mut function = json!({"name":name});
+        function["arguments"] = args;
+        let mut call = json!({"type":"function"});
+        call["function"] = function;
+        out.push(call);
     }
     Ok(Value::Array(out))
 }
@@ -259,7 +295,8 @@ pub fn clean_messages(v: &Value) -> Result<Value> {
                 )));
             }
         };
-        let mut msg = json!({"role":role,"content":content(&m["content"],i)?});
+        let mut msg = json!({"role":role});
+        msg["content"] = content(&m["content"], i)?;
         if role == "assistant" {
             if m["reasoning_content"].is_string() {
                 msg["reasoning_content"] = m["reasoning_content"].clone();
@@ -309,7 +346,9 @@ pub fn clean_tools(v: &Value) -> Result<Option<Value>> {
         } else {
             json!({"type":"object","properties":{}})
         };
-        out.push(json!({"type":"function","function":function}));
+        let mut tool = json!({"type":"function"});
+        tool["function"] = function;
+        out.push(tool);
     }
     Ok(Some(Value::Array(out)))
 }

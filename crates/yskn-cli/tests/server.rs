@@ -1152,34 +1152,57 @@ async fn far_too_long_input_is_refused_before_tokenization() {
 // All requests together are bounded: one that would push the bytes held by
 // received, queued and running requests past the budget gets 503 with
 // Retry-After, and the budget is returned when a request finishes.
+// Review finding (second round): a large string existed three times while
+// its request was decoded but was charged once. Decoding is now charged at
+// DECODE_FACTOR times the body; a decoded request keeps its cleaned text.
 #[tokio::test]
 async fn global_budget_refuses_with_retry_after_and_recovers() {
+    use yskn::server::{DECODE_FACTOR, VALUE_COST};
     let mut cfg = Config::default();
     cfg.limits.max_body = 64 * 1024;
     cfg.limits.max_json_values = 16;
-    cfg.limits.max_pending_bytes = 64 * 1024 + 16 * yskn::server::VALUE_COST;
+    cfg.limits.max_pending_bytes = DECODE_FACTOR * 64 * 1024 + 16 * VALUE_COST;
+    cfg.limits.queue_timeout = Duration::from_millis(300);
     // The budget must hold one largest request by itself.
     let mut small = cfg.clone();
     small.limits.max_pending_bytes -= 1;
     assert!(small.validate().is_err());
-    let h = Harness::start(cfg).await;
+    // One byte is one token: room for the 60 KiB prompts.
+    let h = Harness::start_with_capacity(cfg, 100_000).await;
     h.control.delay(Duration::from_millis(2));
     h.control.push(Script {
         ids: ids("busy "),
         loop_from: Some(0),
     });
-    let pad = "x".repeat(40 * 1024);
-    let b = json!({"messages":user(),"stream":true,"max_tokens":1000000,"enable_thinking":false,"loop_guard":false,"pad":pad});
+    let text = |n: usize| json!([{"role":"user","content":"x".repeat(n)}]);
+    let b = json!({"messages":text(40 * 1024),"stream":true,"max_tokens":1000000,"enable_thinking":false,"loop_guard":false});
     let (sender, mut body, task) = open_stream(&h, b).await;
     body.frame().await.unwrap().unwrap();
-    // Fits alone, but not beside the running request.
-    let big = json!({"messages":user(),"max_tokens":4,"pad":pad});
+    // Fits alone, but its decoding does not fit beside the running request,
+    // which holds its 40 KiB of text.
+    let big = json!({"messages":text(60 * 1024),"max_tokens":4});
     let r = h
         .request("POST", "/v1/chat/completions", Some(big.clone()), &[])
         .await;
     assert_eq!(r.status, 503, "{}", r.text);
     assert_eq!(r.headers["retry-after"], "5");
     assert_eq!(r.json()["error"]["type"], "unavailable");
+    assert_eq!(
+        error_message(&r),
+        "the server is busy with other requests; retry later"
+    );
+    // The running request's charge shrank to its cleaned text after decoding,
+    // so a request as large as it is decoded and waits for the engine.
+    let r = h
+        .request(
+            "POST",
+            "/v1/chat/completions",
+            Some(json!({"messages":text(40 * 1024),"max_tokens":4})),
+            &[],
+        )
+        .await;
+    assert_eq!(r.status, 503, "{}", r.text);
+    assert!(error_message(&r).contains("waited too long"), "{}", r.text);
     task.abort();
     drop((sender, body));
     // Served only after the cancelled request has left the engine thread,

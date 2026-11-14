@@ -39,11 +39,17 @@ use tokio::{
 };
 
 pub const MAX_BODY: usize = 8 * 1024 * 1024;
-/// Heap bytes charged per counted JSON value of a request, on top of its body
-/// bytes: an upper estimate for the parsed body and the cleaned copy that
-/// exist together while it is decoded. Measured worst case: about 590 bytes
-/// per value, for tool schemas made of one-member objects.
+/// Heap bytes charged per counted JSON value of a request, on top of its text
+/// bytes: an upper estimate for the structure of the parsed body and the
+/// cleaned copy that exist together while it is decoded. Measured worst case:
+/// about 590 bytes per value, for tool schemas made of one-member objects.
 pub const VALUE_COST: usize = 640;
+/// Text bytes a request can hold per body byte while it is decoded: the raw
+/// body and the parsed JSON (unescaping only shrinks) while parsing; then the
+/// parsed JSON and the cleaned copy, which Python-style `str()` of a
+/// non-string text part makes up to 4 times the body (a raw DEL byte becomes
+/// `\x7f`), while cleaning. The raw body is dropped once it is parsed.
+pub const DECODE_FACTOR: usize = 5;
 #[derive(Debug, Clone)]
 pub struct Limits {
     pub max_body: usize,
@@ -134,6 +140,7 @@ impl Config {
         // A single largest request must fit the budget when nothing else runs.
         let largest = l
             .max_body
+            .saturating_mul(DECODE_FACTOR)
             .saturating_add(l.max_json_values.saturating_mul(VALUE_COST));
         if l.max_pending_bytes < largest || l.max_pending_bytes > Semaphore::MAX_PERMITS {
             return Err(Error::request("invalid server limits"));
@@ -629,24 +636,27 @@ struct Decoded {
     stream: bool,
     include_usage: bool,
 }
-/// Validates and cleans a body. The charge grows to the estimated size of the
-/// parsed and cleaned request before parsing, so a request the budget cannot
-/// hold is never built. Synchronous: the parsed JSON never lives across an
-/// await, and only one body is decoded at a time on a current-thread runtime.
-fn decode(bytes: &[u8], cfg: &Config, charge: &mut Charge) -> Result<Decoded> {
+/// Validates and cleans a body. Before parsing, the charge grows to the most
+/// the request can hold while it is decoded, so a request the budget cannot
+/// hold is never built; afterwards it shrinks to the cleaned request, which
+/// is all the request holds while it waits and generates. Synchronous: the
+/// parsed JSON never lives across an await, and only one body is decoded at
+/// a time on a current-thread runtime.
+fn decode(bytes: Vec<u8>, cfg: &Config, charge: &mut Charge) -> Result<Decoded> {
     let limits = &cfg.limits;
+    let size = bytes.len();
     let estimate = |values: usize| {
-        bytes
-            .len()
+        size.saturating_mul(DECODE_FACTOR)
             .saturating_add(values.saturating_mul(VALUE_COST))
     };
-    let values = json_values(bytes);
+    let values = json_values(&bytes);
     check_values(values, limits)?;
     if !charge.resize(estimate(values)) {
         return Err(busy_error());
     }
-    let body: Value = serde_json::from_slice(if bytes.is_empty() { b"{}" } else { bytes })
+    let body: Value = serde_json::from_slice(if bytes.is_empty() { b"{}" } else { &bytes })
         .map_err(|_| Error::request("the request body is not valid JSON"))?;
+    drop(bytes);
     // Adds the values that tool-call argument strings expand to.
     let values = check_size(&body, limits, values)?;
     if !charge.resize(estimate(values)) {
@@ -660,11 +670,20 @@ fn decode(bytes: &[u8], cfg: &Config, charge: &mut Charge) -> Result<Decoded> {
             limits.max_text_bytes
         )));
     }
-    Ok(Decoded {
-        params,
+    let decoded = Decoded {
         stream: truthy(&body["stream"]),
         include_usage: truthy(&body["stream_options"]["include_usage"]),
-    })
+        params,
+    };
+    drop(body);
+    let held = text
+        + text_bytes(&decoded.params.template_kwargs)
+        + decoded.params.stop.iter().map(String::len).sum::<usize>();
+    // Normally below the decode estimate; growth past the budget is refused.
+    if !charge.resize(held.saturating_add(values.saturating_mul(VALUE_COST))) {
+        return Err(busy_error());
+    }
+    Ok(decoded)
 }
 async fn handle<B>(mut r: Request<B>, api: &Api) -> Response<HttpBody>
 where
@@ -768,10 +787,7 @@ where
         }
         Ok(Ok(b)) => b,
     };
-    // The raw body and the parsed JSON are gone once the cleaned request exists.
-    let decoded = decode(&bytes, cfg, &mut charge);
-    drop(bytes);
-    let decoded = match decoded {
+    let decoded = match decode(bytes, cfg, &mut charge) {
         Ok(d) => d,
         Err(e) if e.status == 503 => return busy(e),
         Err(e) => return error_response(e),
