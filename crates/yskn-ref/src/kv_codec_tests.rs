@@ -290,6 +290,7 @@ fn kv_packing_roundtrip_and_selected_reconstruction() {
             words: pack(&fields, bits),
             bits,
             scale: 1.0,
+            bases: Box::new([0.0; 256]),
         };
         for (i, &expected) in fields.iter().enumerate() {
             assert_eq!(field(&packed, i), expected);
@@ -311,11 +312,14 @@ fn kv_packing_roundtrip_and_selected_reconstruction() {
                 panic!()
             };
             let decoded = decode_packed(&p, 0, pk).unwrap();
+            let mut scratch = [f32::NAN; 256];
+            let cached = encoded.bases(&mut scratch);
             assert_eq!(pk.scale.to_bits(), s.scale.to_bits());
             for i in 0..256 {
                 assert_eq!(packed_state(pk, i), s.states[i]);
                 let code = p.tables()[0].reconstruction(s.states[i]);
                 assert_eq!(decoded[i].to_bits(), bfloat(code).to_bits());
+                assert_eq!(cached[i].to_bits(), decoded[i].to_bits());
                 assert_eq!(s.reconstruction[i].to_bits(), (code * pk.scale).to_bits());
                 assert_eq!(encoded.key_base(&p, 0, i).unwrap(), decoded[i]);
                 assert_eq!(encoded.value_base(&p, 0, i).unwrap(), decoded[i]);

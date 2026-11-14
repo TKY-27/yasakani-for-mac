@@ -281,3 +281,31 @@ fn manifest_profile_and_weights_paths_cannot_escape_folder() {
         Err(Error::InvalidModel(_))
     ));
 }
+
+#[test]
+fn cached_bases_preserve_pre_05j_mixed_model_logits_and_stored_state() {
+    // Frozen from the per-channel reader at 0b7bd5d5f7b322d4d23fc641ead23fb77de5bd7b.
+    let bytes = synthetic_model(0x05_0a, LAYERS);
+    let profile = Arc::new(KvProfile::parse(&mixed_profile()).unwrap());
+    let tokens: Vec<_> = (0..79).map(|row| (row * 31 + 9) % 128).collect();
+    for (mode, expected_logits, expected_state) in [
+        (
+            KvMode::Int8Profile,
+            "21989282711b06a63d9ca5aa21751489631eabd9ddede35f8ff7a1aaf4561a39",
+            0x8a9c_4cdd_880d_b9b3u64,
+        ),
+        (
+            KvMode::Kv5,
+            "daacebd19ce4ded62737155281bb8fc6697b1441712e6ebe75b87eda1f943496",
+            0xa6c6_5732_0f6e_ab1b,
+        ),
+    ] {
+        let mut model = model(&bytes, mode, Some(Arc::clone(&profile))).unwrap();
+        model.prefill(&[13, 2, 91, 7, 5]).unwrap();
+        model.prefill(&tokens).unwrap();
+        let logits = hash(&bits(model.row_logits()));
+        let state = model.state_digest();
+        assert_eq!(logits, expected_logits, "{mode:?} logits");
+        assert_eq!(state, expected_state, "{mode:?} stored state");
+    }
+}

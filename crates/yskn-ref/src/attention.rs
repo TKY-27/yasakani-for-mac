@@ -320,34 +320,21 @@ impl Attention {
         }
     }
 
-    fn base(&self, row: &CacheRow, head: usize, side: usize, channel: usize) -> Result<f32> {
+    fn value_mean<'a>(&'a self, head: usize, row: &CacheRow) -> Option<&'a [f32; 256]> {
         match row {
-            CacheRow::Int8(row) => Ok(f32::from(row.integers()[channel])),
+            CacheRow::Int8(_) => None,
             CacheRow::Packed(_) => {
-                let profile = self.kv_profile.as_ref().ok_or_else(|| {
-                    Error::InvalidInput("packed attention row requires a profile".into())
-                })?;
-                // BF16 table, no key mean: src/kvq_atxpk.hpp:42-45;
-                // src/q35_atxpk3.cuh:343-380,427-430,454 (pk4:287-325,369-372,396).
-                if side == 0 {
-                    row.key_base(profile, self.group_index(head, side), channel)
-                } else {
-                    row.value_base(profile, self.group_index(head, side), channel)
-                }
+                let profile = self.kv_profile.as_ref().expect("validated KV profile");
+                let group = &profile.groups()[self.group_index(head, 1)];
+                // Missing packed means still add +0, preserving signed-zero operations.
+                Some(group.mean.as_ref().unwrap_or(&[0.0; 256]))
             }
         }
     }
 
-    fn add_value_mean(
-        &self,
-        split: &mut AttentionSplit,
-        head: usize,
-        row: &CacheRow,
-    ) -> Result<()> {
-        if matches!(row, CacheRow::Packed(_)) {
-            let profile = self.kv_profile.as_ref().expect("validated KV profile");
-            for (channel, numerator) in split.numerator.iter_mut().enumerate() {
-                let mean = row.value_mean(profile, self.group_index(head, 1), channel)?;
+    fn add_value_mean(split: &mut AttentionSplit, mean: Option<&[f32; 256]>) -> Result<()> {
+        if let Some(mean) = mean {
+            for (numerator, &mean) in split.numerator.iter_mut().zip(mean) {
                 // After self; denominator is FP32 including self, not BF16 weight sums.
                 // src/q35_atxpk3.cuh:443-475; src/q35_atxpk4.cuh:385-417.
                 *numerator += split.denominator * mean;
@@ -606,6 +593,7 @@ impl Attention {
             .checked_add(1)
             .ok_or_else(|| Error::InvalidModel("attention context length overflow".into()))?;
         let kv_head = query_head / (self.dimensions.query_heads / self.dimensions.kv_heads);
+        let mean = self.value_mean(kv_head, &current.values[kv_head]);
         let schedule = prefix_schedule(length);
         let padded_count = schedule.len().next_power_of_two();
         let mut splits = Vec::with_capacity(padded_count);
@@ -624,10 +612,9 @@ impl Attention {
                     query,
                     &current.keys[kv_head],
                     &current.values[kv_head],
-                    kv_head,
                 )?;
             }
-            self.add_value_mean(&mut split, kv_head, &current.values[kv_head])?;
+            Self::add_value_mean(&mut split, mean)?;
             splits.push(split);
         }
         splits.resize_with(padded_count, || AttentionSplit {
@@ -681,19 +668,20 @@ impl Attention {
         tile_start: usize,
         visible: std::ops::Range<usize>,
     ) -> Result<()> {
+        let mut key_scratch = [0.0; 256];
         let mut scores = [f32::NEG_INFINITY; 32];
         for (tile_index, score) in scores.iter_mut().enumerate() {
             let position = tile_start + tile_index;
             if visible.contains(&position) {
                 let key = &prefix[position].keys[kv_head];
+                let bases = key.bases(&mut key_scratch);
                 let mut accumulator = 0.0;
                 for chunk in 0..self.dimensions.head_dim / 16 {
                     // D3: provisional mma16 order is ascending scalar multiply then add.
                     for (offset, &query_value) in
                         query[chunk * 16..(chunk + 1) * 16].iter().enumerate()
                     {
-                        accumulator +=
-                            query_value * self.base(key, kv_head, 0, chunk * 16 + offset)?;
+                        accumulator += query_value * bases[chunk * 16 + offset];
                     }
                 }
                 // Shipping QK8=false: no table-int8 scale, only the packed row scale.
@@ -735,6 +723,14 @@ impl Attention {
         for value in &mut split.numerator {
             *value *= rescale;
         }
+        let mut value_scratch = [[0.0; 256]; 32];
+        let mut value_bases = [None; 32];
+        for (tile_index, scratch) in value_scratch.iter_mut().enumerate() {
+            let position = tile_start + tile_index;
+            if visible.contains(&position) {
+                value_bases[tile_index] = Some(prefix[position].values[kv_head].bases(scratch));
+            }
+        }
         let mut value_weights = [0.0; 32];
         for (tile_index, weight) in value_weights.iter_mut().enumerate() {
             let position = tile_start + tile_index;
@@ -751,12 +747,9 @@ impl Attention {
                 for (offset, &value_weight) in
                     value_weights[half * 16..(half + 1) * 16].iter().enumerate()
                 {
-                    let position = tile_start + half * 16 + offset;
                     // D9 skips masked operations entirely, including zero-valued products.
-                    if visible.contains(&position) {
-                        let value =
-                            self.base(&prefix[position].values[kv_head], kv_head, 1, channel)?;
-                        *numerator += value_weight * value;
+                    if let Some(bases) = value_bases[half * 16 + offset] {
+                        *numerator += value_weight * bases[channel];
                     }
                 }
             }
@@ -771,15 +764,18 @@ impl Attention {
         query: &[f32],
         key: &CacheRow,
         value: &CacheRow,
-        kv_head: usize,
     ) -> Result<()> {
+        let mut key_scratch = [0.0; 256];
+        let key_bases = key.bases(&mut key_scratch);
+        let mut value_scratch = [0.0; 256];
+        let value_bases = value.bases(&mut value_scratch);
         let mut partial = [0.0; 4];
         for (lane, sum) in partial.iter_mut().enumerate() {
             for chunk in 0..self.dimensions.head_dim / 16 {
                 // Self has its own interleaved FP32 order; it is not the prefix mma16.
                 for offset in [2 * lane, 2 * lane + 1, 8 + 2 * lane, 9 + 2 * lane] {
                     let channel = 16 * chunk + offset;
-                    *sum += query[channel] * self.base(key, kv_head, 0, channel)?;
+                    *sum += query[channel] * key_bases[channel];
                 }
             }
         }
@@ -801,8 +797,7 @@ impl Attention {
         // src/q35_atxpk4.cuh:363-400. Packed self still uses the BF16 table base.
         let value_weight = probability * value.scale();
         for (channel, numerator) in split.numerator.iter_mut().enumerate() {
-            *numerator =
-                *numerator * rescale + value_weight * self.base(value, kv_head, 1, channel)?;
+            *numerator = *numerator * rescale + value_weight * value_bases[channel];
         }
         finite(&[split.denominator], "attention self denominator")?;
         finite(&split.numerator, "attention self numerator")

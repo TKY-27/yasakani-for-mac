@@ -23,6 +23,7 @@ pub struct PackedRow {
     words: Vec<u32>,
     bits: u8,
     scale: f32,
+    bases: Box<[f32; 256]>,
 }
 impl PackedRow {
     pub fn words(&self) -> &[u32] {
@@ -42,6 +43,20 @@ pub enum CacheRow {
     Packed(PackedRow),
 }
 impl CacheRow {
+    /// Attention reads only validated, immutable operands. Int8 conversion is
+    /// exact; packed operands were BF16-rounded once when the row was encoded.
+    pub(crate) fn bases<'a>(&'a self, scratch: &'a mut [f32; 256]) -> &'a [f32; 256] {
+        match self {
+            Self::Int8(row) => {
+                for (base, &integer) in scratch.iter_mut().zip(&row.integers) {
+                    *base = f32::from(integer);
+                }
+                scratch
+            }
+            Self::Packed(row) => &row.bases,
+        }
+    }
+
     pub fn scale(&self) -> f32 {
         match self {
             Self::Int8(r) => r.scale,
@@ -373,11 +388,14 @@ pub fn encode_packed(
     }
     let mask = (1 << g.bits) - 1;
     let fields = selected.states.map(|s| s & mask);
-    Ok(CacheRow::Packed(PackedRow {
+    let mut packed = PackedRow {
         words: pack(&fields, g.bits),
         bits: g.bits,
         scale: selected.scale,
-    }))
+        bases: Box::new([0.0; 256]),
+    };
+    *packed.bases = decode_packed(profile, group, &packed)?;
+    Ok(CacheRow::Packed(packed))
 }
 
 // src/kvq_fast.cuh:226-229: MSB-first fields in native (LE) u32 words.

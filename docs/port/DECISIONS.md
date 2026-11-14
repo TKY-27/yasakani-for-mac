@@ -741,6 +741,23 @@ absolute position, including guard bypass. The existing public stage
 signatures are unchanged. The profile uses `Arc` so the mapped engine's
 parallel prepared-row/output stages can continue sharing attention.
 
+Brief 05j keeps the packed words, bit width and FP32 scale, and additionally
+stores 256 decoded BF16 base operands as binary32 in a boxed 1,024-byte array.
+Encoding validates against the group and decodes once; attention borrows these
+immutable bases, converts int8 bases into tile-local scratch, and selects the
+value mean/group once per head. Stored-code/scale snapshot digests omit the
+derived array and retain their meaning. A five-bit packed row therefore has
+160 + 4 + 1,024 = 1,188 bytes of numeric payload (previously 164); an int8
+fallback remains 256 + 4 = 260. For the real architecture's 16 attention layers,
+4 KV heads and two sides, all 128 five-bit rows require 152,064 bytes/token
+(148.5 KiB, previously 20.5 KiB), including 128 KiB/token of derived bases;
+all-int8 payload is 33,280 bytes/token (32.5 KiB). With `p` packed rows the
+payload is `33,280 + 928*p` bytes/token; an eligible layer/side contributes four
+packed rows. These figures exclude enum/vector metadata, allocation overhead,
+and provisional prepared-row copies. Four-bit packed rows use 1,156 bytes each.
+Packed words remain available for digests and a future compact reader; the
+binary32 attention operation order and operands are unchanged.
+
 Reads are defined as follows:
 
 - `Int8` and `Int8Profile` consume exact signed-int8 base operands and the

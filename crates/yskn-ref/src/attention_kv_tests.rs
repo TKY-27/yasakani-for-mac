@@ -58,11 +58,11 @@ fn packed_zero_codebook_gives_exact_mean_in_prefix_and_self_splits() {
         .prefix_tile(&mut s, &[0.0; 256], 0, &prefix, 0, 0..2)
         .unwrap();
     layer
-        .add_self(&mut s, &[0.0; 256], &current.keys[0], &current.values[0], 0)
+        .add_self(&mut s, &[0.0; 256], &current.keys[0], &current.values[0])
         .unwrap();
     assert_eq!(s.denominator.to_bits(), 3.0_f32.to_bits());
     assert_eq!(bits(&s.numerator), vec![0; 256]);
-    layer.add_value_mean(&mut s, 0, &current.values[0]).unwrap();
+    Attention::add_value_mean(&mut s, layer.value_mean(0, &current.values[0])).unwrap();
     assert_eq!(bits(&s.numerator), vec![0.75_f32.to_bits(); 256]);
     // 73 prefix entries also exercise distinct splits, including self and empty splits.
     let prefix = vec![prefix[0].clone(); 73];
@@ -105,7 +105,7 @@ fn packed_key_mean_is_ignored_and_bf16_base_and_row_scale_define_scores() {
         assert_eq!(prefix.maximum.to_bits(), 8.0_f32.to_bits());
         let mut own = split();
         layer
-            .add_self(&mut own, &[0.25; 256], &cache.keys[0], &cache.values[0], 0)
+            .add_self(&mut own, &[0.25; 256], &cache.keys[0], &cache.values[0])
             .unwrap();
         assert_eq!(own.maximum.to_bits(), 8.0_f32.to_bits());
     }
@@ -137,7 +137,7 @@ fn prefix_rounds_probability_times_scale_but_self_weight_stays_f32() {
     assert_eq!(bits(&prefix.numerator), vec![1.0_f32.to_bits(); 256]);
     let mut own = split();
     layer
-        .add_self(&mut own, &[0.0; 256], &row.keys[0], &row.values[0], 0)
+        .add_self(&mut own, &[0.0; 256], &row.keys[0], &row.values[0])
         .unwrap();
     assert_eq!(
         bits(&own.numerator),
