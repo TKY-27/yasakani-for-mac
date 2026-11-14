@@ -565,8 +565,9 @@ alone does not capture the separately owned draft ring. Captured features remain
 an observation and do not contribute to the committed numerical-state digest.
 
 The following real-model commands are for the orchestrator and run serially.
-The scalar neural draft can take about 90 seconds **per proposal**; this
-integration provides correctness and acceptance diagnostics, not a fast path.
+Since D18 `generate --draft neural|both` and `draft_acceptance` use the fast
+draft (`yskn_engine::FastDraft`), bit-identical to the scalar reference; at
+D17 the scalar draft took about 90 seconds **per proposal**.
 No released model was opened for brief 05g.
 
 ```sh
@@ -593,3 +594,30 @@ position denominator. Neural and n-gram candidates are evaluated at the same
 frontier; the fixed n-gram-first combined metric reuses those candidates to
 avoid computing the expensive neural block twice. These are teacher-forced
 acceptance diagnostics, not a free-running quality or throughput measurement.
+
+## Fast block draft (D18)
+
+`yskn_engine::FastDraft` is the D15 draft with the same API as used by the
+proposer: `unsafe { FastDraft::load(MODEL_FOLDER) }` (kernel and backend from
+`YSKN_KERNEL`/`YSKN_BACKEND`, like `Model::load`) or `with_options(folder,
+engine, backend, options)`; `push_context`, `push_context_rows`,
+`push_rows(position, &[row])` (batched, up to 256 rows per dispatch),
+`propose`, `block_hidden`, `reset`, `snapshot`/`restore` (the reference's
+`DraftSnapshot`). Results equal the scalar reference bit for bit
+([D18](DECISIONS.md#d18--fast-block-draft-bit-identical-to-the-scalar-reference)).
+`timing()` returns the last proposal's stage times. Use it through
+`DraftProposer::new(fast, k, choice)`; `generate --draft neural|both` and
+`draft_acceptance` already do. The code streams and the SHEAD rescoring rows
+stay mapped; keep the draft files unchanged while the draft is alive.
+
+```sh
+export CARGO_NET_OFFLINE=true
+# Bits against the scalar reference (about 90 s for its one proposal) and
+# across Metal, CPU NEON x10/x1 and portable x4; exits non-zero on a difference.
+cargo run --release -p yskn-engine --example verify_draft -- "$HOME/models/qwen38-speed"
+# Proposal stage times with a full ring and push cost per row (1, 16, 256 rows).
+cargo run --release -p yskn-engine --example bench_draft -- "$HOME/models/qwen38-speed"
+# Options: --backend cpu|metal --kernel portable|neon|dotprod --threads N --samples N
+```
+
+Both examples open only `bdraft2_k8.yskn` and `bdraft2_k8.shead`.
