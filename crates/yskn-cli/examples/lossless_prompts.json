@@ -1,0 +1,408 @@
+[
+  {
+    "id": "english-prose",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Describe a rain barrel in one plain sentence."
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 8
+    }
+  },
+  {
+    "id": "japanese-prose",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "朝の商店街を、日本語の短い一文で描写してください。"
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 8
+    }
+  },
+  {
+    "id": "python-generation",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write only a tiny Python function last_or_none(xs) returning the last item or None for an empty list."
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 16
+    }
+  },
+  {
+    "id": "python-completion",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Complete this Python fragment with code only:\ndef twice(n):\n    ret"
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 16
+    }
+  },
+  {
+    "id": "rust-generation",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write only a Rust function square(n: i32) -> i32."
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 16
+    }
+  },
+  {
+    "id": "rust-completion",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Complete the Rust expression with code only:\nfn nonempty(s: &str) -> bool { !s.is_"
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 16
+    }
+  },
+  {
+    "id": "json-table",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Convert this table to a JSON array only: name | count\nblue | 2\ngold | 5"
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 16
+    }
+  },
+  {
+    "id": "json-schema",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Return only JSON matching {\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}},\"required\":[\"ok\"],\"additionalProperties\":false}. Set ok to true."
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 16
+    }
+  },
+  {
+    "id": "tool-call",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Use read_sensor to get the current temperature in the studio. Do not invent a reading; call the tool."
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 16,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read_sensor",
+            "description": "Read the current temperature from a named room sensor.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "room": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "room"
+              ]
+            }
+          }
+        }
+      ],
+      "tool_choice": "auto"
+    }
+  },
+  {
+    "id": "tool-result",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Read the studio temperature."
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "sensor_1",
+              "type": "function",
+              "function": {
+                "name": "read_sensor",
+                "arguments": "{\"room\":\"studio\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "sensor_1",
+          "content": "{\"celsius\":21}"
+        },
+        {
+          "role": "user",
+          "content": "State the reading in a short sentence."
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 8,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read_sensor",
+            "description": "Read the current temperature from a named room sensor.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "room": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "room"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "thinking-on",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "A box holds three green stones and two grey stones. How many stones? Think briefly."
+        }
+      ],
+      "enable_thinking": true,
+      "max_tokens": 8,
+      "thinking_budget": 4
+    }
+  },
+  {
+    "id": "thinking-off",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "A box holds three green stones and two grey stones. Answer only the total."
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 8,
+      "thinking": {
+        "type": "disabled"
+      }
+    }
+  },
+  {
+    "id": "multi-turn",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Remember this invented label: cedar-owl."
+        },
+        {
+          "role": "assistant",
+          "content": "The label is cedar-owl."
+        },
+        {
+          "role": "user",
+          "content": "What was the label? Reply with that label only."
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 8
+    }
+  },
+  {
+    "id": "system-prompt",
+    "request": {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Respond using exactly two English words."
+        },
+        {
+          "role": "user",
+          "content": "Name one small garden animal."
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 8
+    }
+  },
+  {
+    "id": "repetition",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Continue exactly the repeated refrain, with no commentary: amber bell / amber bell / amber bell / amber bell /"
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 16
+    }
+  },
+  {
+    "id": "anti-repetition",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write four unrelated nouns, all different, separated by commas. Avoid amber and bell."
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 8
+    }
+  },
+  {
+    "id": "arithmetic",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "A drawer has 14 clips. Six are removed and three added. Reply only with the number left."
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 8
+    }
+  },
+  {
+    "id": "unicode",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Echo exactly this mixed text, including the accent and symbols: é 👩🏽‍🔬 שלום مرحبا"
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 8
+    }
+  },
+  {
+    "id": "long-attention",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "These are invented observations from a night garden. Read them and answer the final question.\nPlot 1: the silver lantern stayed beside the quiet window overnight.\nPlot 2: the green lantern stayed beside the quiet window overnight.\nPlot 3: the violet lantern stayed beside the quiet window overnight.\nPlot 4: the blue lantern stayed beside the quiet window overnight.\nPlot 5: the amber lantern stayed beside the quiet window overnight.\nPlot 6: the silver lantern stayed beside the quiet window overnight.\nPlot 7: the green lantern stayed beside the quiet window overnight.\nPlot 8: the violet lantern stayed beside the quiet window overnight.\nPlot 9: the blue lantern stayed beside the quiet window overnight.\nPlot 10: the amber lantern stayed beside the quiet window overnight.\nPlot 11: the silver lantern stayed beside the quiet window overnight.\nPlot 12: the green lantern stayed beside the quiet window overnight.\nPlot 13: the violet lantern stayed beside the quiet window overnight.\nPlot 14: the blue lantern stayed beside the quiet window overnight.\nPlot 15: the amber lantern stayed beside the quiet window overnight.\nPlot 16: the silver lantern stayed beside the quiet window overnight.\nPlot 17: the green lantern stayed beside the quiet window overnight.\nPlot 18: the violet lantern stayed beside the quiet window overnight.\nPlot 19: the blue lantern stayed beside the quiet window overnight.\nPlot 20: the amber lantern stayed beside the quiet window overnight.\nPlot 21: the silver lantern stayed beside the quiet window overnight.\nPlot 22: the green lantern stayed beside the quiet window overnight.\nPlot 23: the violet lantern stayed beside the quiet window overnight.\nPlot 24: the blue lantern stayed beside the quiet window overnight.\nPlot 25: the amber lantern stayed beside the quiet window overnight.\nPlot 26: the silver lantern stayed beside the quiet window overnight.\nPlot 27: the green lantern stayed beside the quiet window overnight.\nPlot 28: the violet lantern stayed beside the quiet window overnight.\nPlot 29: the blue lantern stayed beside the quiet window overnight.\nPlot 30: the amber lantern stayed beside the quiet window overnight.\nPlot 31: the silver lantern stayed beside the quiet window overnight.\nPlot 32: the green lantern stayed beside the quiet window overnight.\nPlot 33: the violet lantern stayed beside the quiet window overnight.\nPlot 34: the blue lantern stayed beside the quiet window overnight.\nPlot 35: the amber lantern stayed beside the quiet window overnight.\nPlot 36: the silver lantern stayed beside the quiet window overnight.\nPlot 37: the green lantern stayed beside the quiet window overnight.\nPlot 38: the violet lantern stayed beside the quiet window overnight.\nPlot 39: the blue lantern stayed beside the quiet window overnight.\nPlot 40: the amber lantern stayed beside the quiet window overnight.\nPlot 41: the silver lantern stayed beside the quiet window overnight.\nPlot 42: the green lantern stayed beside the quiet window overnight.\nPlot 43: the violet lantern stayed beside the quiet window overnight.\nPlot 44: the blue lantern stayed beside the quiet window overnight.\nPlot 45: the amber lantern stayed beside the quiet window overnight.\nPlot 46: the silver lantern stayed beside the quiet window overnight.\nPlot 47: the green lantern stayed beside the quiet window overnight.\nPlot 48: the violet lantern stayed beside the quiet window overnight.\nPlot 49: the blue lantern stayed beside the quiet window overnight.\nPlot 50: the amber lantern stayed beside the quiet window overnight.\nPlot 51: the silver lantern stayed beside the quiet window overnight.\nPlot 52: the green lantern stayed beside the quiet window overnight.\nPlot 53: the violet lantern stayed beside the quiet window overnight.\nPlot 54: the blue lantern stayed beside the quiet window overnight.\nPlot 55: the amber lantern stayed beside the quiet window overnight.\nPlot 56: the silver lantern stayed beside the quiet window overnight.\nPlot 57: the green lantern stayed beside the quiet window overnight.\nPlot 58: the violet lantern stayed beside the quiet window overnight.\nPlot 59: the blue lantern stayed beside the quiet window overnight.\nPlot 60: the amber lantern stayed beside the quiet window overnight.\nPlot 61: the silver lantern stayed beside the quiet window overnight.\nPlot 62: the green lantern stayed beside the quiet window overnight.\nPlot 63: the violet lantern stayed beside the quiet window overnight.\nPlot 64: the blue lantern stayed beside the quiet window overnight.\nPlot 65: the amber lantern stayed beside the quiet window overnight.\nPlot 66: the silver lantern stayed beside the quiet window overnight.\nPlot 67: the green lantern stayed beside the quiet window overnight.\nPlot 68: the violet lantern stayed beside the quiet window overnight.\nPlot 69: the blue lantern stayed beside the quiet window overnight.\nPlot 70: the amber lantern stayed beside the quiet window overnight.\nPlot 71: the silver lantern stayed beside the quiet window overnight.\nPlot 72: the green lantern stayed beside the quiet window overnight.\nPlot 73: the violet lantern stayed beside the quiet window overnight.\nPlot 74: the blue lantern stayed beside the quiet window overnight.\nPlot 75: the amber lantern stayed beside the quiet window overnight.\nPlot 76: the silver lantern stayed beside the quiet window overnight.\nPlot 77: the green lantern stayed beside the quiet window overnight.\nPlot 78: the violet lantern stayed beside the quiet window overnight.\nPlot 79: the blue lantern stayed beside the quiet window overnight.\nPlot 80: the amber lantern stayed beside the quiet window overnight.\nPlot 81: the silver lantern stayed beside the quiet window overnight.\nPlot 82: the green lantern stayed beside the quiet window overnight.\nPlot 83: the violet lantern stayed beside the quiet window overnight.\nPlot 84: the blue lantern stayed beside the quiet window overnight.\nPlot 85: the amber lantern stayed beside the quiet window overnight.\nPlot 86: the silver lantern stayed beside the quiet window overnight.\nPlot 87: the green lantern stayed beside the quiet window overnight.\nPlot 88: the violet lantern stayed beside the quiet window overnight.\nPlot 89: the blue lantern stayed beside the quiet window overnight.\nPlot 90: the amber lantern stayed beside the quiet window overnight.\nThe keeper chose the password acorn. What password did the keeper choose? Reply with just that word."
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 8
+    }
+  },
+  {
+    "id": "mid-word",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Complete the final word, returning just the missing ending: The night sky glittered with starli"
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 8
+    }
+  },
+  {
+    "id": "empty-user",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": ""
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 8
+    }
+  },
+  {
+    "id": "stop-string",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write red, then END, then blue."
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 8,
+      "stop": [
+        "END"
+      ]
+    }
+  },
+  {
+    "id": "text-parts",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Join these syllables: "
+            },
+            {
+              "type": "text",
+              "text": "sun + rise. Reply with the word only."
+            }
+          ]
+        }
+      ],
+      "enable_thinking": false,
+      "max_tokens": 8
+    }
+  },
+  {
+    "id": "reasoning-effort",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Which is larger, 7/8 or 5/6? Briefly explain."
+        }
+      ],
+      "enable_thinking": true,
+      "max_tokens": 8,
+      "reasoning_effort": "low",
+      "thinking_budget": 4
+    }
+  }
+]

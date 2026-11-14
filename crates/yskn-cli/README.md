@@ -385,3 +385,59 @@ tests synchronize on responses, handshakes or a polled condition, never on a
 fixed sleep; their 30 s bounds are reached only by a failure, and the deadline
 under test is set small through `Limits`. A sandbox that forbids TCP bind must report the socket tests
 as blocked failures, never silently skip them or claim a pass.
+
+## Real-model lossless check (development example)
+
+```sh
+CARGO_NET_OFFLINE=true cargo run --release -p yskn --example lossless -- \
+  --model-dir MODEL_FOLDER --report lossless.json
+```
+
+This checks exact generated token IDs through the server's existing
+`parse_chat_request` and `ChatRunner` path, including the folder's tokenizer,
+chat template and generation defaults, EOS, tools, stop strings, thinking
+budget and loop guard. It loads one engine at a time using the normal loader
+and its physical-memory enforcement, then drops it before loading the next.
+Nothing from the example is linked into `yskn`.
+
+Default configurations: `none`, `ngram-k3-fixed`, `neural-k3-fixed`,
+`neural-k7-fixed`, `both-k7-adaptive`. `--configs` accepts a comma-separated
+subset of these names; `none` is always included first. Samplers are greedy,
+seeds 42 and 2027 at the model folder's default temperature/top-p/top-k/min-p,
+and seed 91 at temperature 1.3 (other settings remain the defaults).
+
+For each configuration and sampler, all 24 prompts run once. Each then runs
+again after a one-token prefix probe: the same request with its template's
+`enable_thinking` toggled. Thus unrelated requests intervene, then a distinct
+request sharing the chat prefix primes a snapshot. The last repeat in each
+sweep follows an explicit reset. Templates that ignore the toggle are refused
+with a prompt-naming error, rather than claiming this coverage. The report
+records common prefix length, cached tokens and actual snapshot modes; it
+shows what paths were reached. Every repeat is compared to its first run,
+and both runs of every draft configuration are compared to `none`.
+
+The JSON report includes each run's token count, SHA-256 (u32 IDs encoded
+little endian), finish reason, passes, offered/accepted guesses and elapsed
+time. IDs are the concatenated generated engine stages, including EOS and
+thinking tokens; loop-guard bridge *input* IDs are excluded and stage lengths
+are recorded. A mismatch prints the first zero-based position and both IDs
+(`null` means end of sequence). A draft configuration with zero accepted
+guesses over its compared runs fails even if all IDs match. Prefix probes
+are reported but do not satisfy this acceptance gate. Exit status is zero
+only when all comparisons and acceptance gates pass; input/load errors fail.
+
+`--prompts FILE` accepts an array of `{"id":"unique name","request":{...}}`
+entries (at least two). `request` is a normal supported OpenAI chat request;
+sampling fields are reserved for the harness. `--max-tokens N` (default 96)
+is a ceiling; each entry's `max_tokens`/`max_completion_tokens` can lower it.
+The authored default set uses 8 tokens for 16 entries and 16 for 8 entries:
+256 tokens per sweep. At 5 generated tokens/s, five configurations times
+four samplers times two sweeps is `5 × 4 × 2 × 256 / 5 = 2048 s` (34.1 min).
+The 480 one-token probes add 96 s, for 35.7 min plus loading and prefill;
+early EOS/stop can shorten this. A full 96 tokens for every entry would take
+307.2 min, so these intentionally short answers make the roughly 40-minute
+budget plausible, not a measured guarantee. Tool-call/code outputs may be
+truncated; this checks losslessness, not task quality. The long garden prompt
+is approximately 1,500 tokens (90 authored observations); the actual folder's
+`prompt_tokens` in the report is authoritative. Real-model duration, exact
+length and acceptance must be measured on the host with the real weights.
