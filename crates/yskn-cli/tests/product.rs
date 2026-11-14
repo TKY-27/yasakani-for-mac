@@ -120,51 +120,51 @@ fn repeated_snapshot_replacement_retains_bounded_live_allocations_for_every_draf
         return;
     }
     let folder = Folder::new();
-    // Extend, branch after the saved prefix, then switch to an unrelated
-    // prefix. Each request has new prefill rows and replaces the checkpoint.
-    let prompts = [
-        vec![1; 4],
-        vec![1; 8],
-        [vec![1; 7], vec![2, 3]].concat(),
-        vec![5; 12],
-        vec![5; 16],
-        [vec![5; 15], vec![6, 7]].concat(),
-    ];
+    // Two unrelated prefixes, each with 27 growing branches. Every shared
+    // request restores the previous prefix and then replaces its checkpoint;
+    // a leak cleared only by reset must also be caught before the next reset.
+    let prompts: Vec<Vec<u32>> = [1, 5]
+        .into_iter()
+        .flat_map(|prefix| {
+            (4..31).map(move |len| {
+                let mut prompt = vec![prefix; len];
+                prompt[len - 1] = prefix + 1 + (len % 2) as u32;
+                prompt
+            })
+        })
+        .collect();
     let expected: Vec<_> = prompts
         .iter()
         .map(|p| scalar(&folder, p, 2, &greedy()))
         .collect();
     for mode in modes() {
         let mut engine = folder.engine(mode);
-        let mut warmed_max = 0;
-        for cycle in 0..11 {
-            for (index, prompt) in prompts.iter().enumerate() {
-                let result = run(&mut engine, prompt, 2, &greedy());
+        // Warm scratch/KV/draft capacities beyond the largest measured prompt
+        // while retaining just one checkpoint, rather than warming a leak into
+        // the baseline by repeatedly replacing checkpoints first.
+        for _ in 0..3 {
+            drop(run(&mut engine, &[9; 96], 2, &greedy()));
+        }
+        let warmed = product_support::allocation::live_bytes();
+        for (index, prompt) in prompts.iter().enumerate() {
+            let result = run(&mut engine, prompt, 2, &greedy());
+            assert_eq!(result.ids, expected[index], "{mode:?}, prompt {index}");
+            if index % 27 == 0 {
+                assert_eq!((result.cached_tokens, result.snap_mode), (0, 0));
+            } else {
                 assert_eq!(
-                    result.ids, expected[index],
-                    "{mode:?}, cycle {cycle}, prompt {index}"
+                    (result.cached_tokens, result.snap_mode),
+                    (prompts[index - 1].len() - 1, 2)
                 );
-                if index % 3 == 0 {
-                    assert_eq!((result.cached_tokens, result.snap_mode), (0, 0));
-                } else {
-                    assert_eq!(
-                        (result.cached_tokens, result.snap_mode),
-                        (prompts[index - 1].len() - 1, 2)
-                    );
-                }
-                drop(result);
-                let live = product_support::allocation::live_bytes();
-                if cycle < 2 {
-                    warmed_max = warmed_max.max(live);
-                } else {
-                    // Small allocator/runtime bookkeeping is tolerated; even
-                    // one retained recurrent checkpoint exceeds this allowance.
-                    assert!(
-                        live <= warmed_max + 16 * 1024,
-                        "{mode:?}, cycle {cycle}, prompt {index}: live {live}, warmed maximum {warmed_max}"
-                    );
-                }
             }
+            drop(result);
+            let live = product_support::allocation::live_bytes();
+            // Small allocator/runtime bookkeeping is tolerated; even one
+            // retained recurrent checkpoint exceeds this allowance.
+            assert!(
+                live <= warmed + 16 * 1024,
+                "{mode:?}, prompt {index}: live {live}, warmed {warmed}"
+            );
         }
     }
 }
