@@ -39,13 +39,16 @@ impl Fixture {
         Self(path)
     }
     fn engine(&self, backend: Backend, mode: KvMode) -> Model {
+        self.engine_width(backend, mode, 9)
+    }
+    fn engine_width(&self, backend: Backend, mode: KvMode, width: usize) -> Model {
         // SAFETY: fixture files are immutable and outlive every model using them.
         unsafe {
             Model::with_options(
                 &self.0,
                 Engine::new(Kernel::fastest(), 2).unwrap(),
                 backend,
-                9,
+                width,
                 mode,
             )
         }
@@ -517,6 +520,155 @@ fn synthetic_model_generation_is_lossless_repeatable_for_every_proposer_and_samp
                         assert_eq!(engine.state_digest(), digest);
                     }
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn snapshot_after_partial_commit_restores_exact_prefix_and_future_state() {
+    let fixture = mixed();
+    for backend in backends() {
+        for mode in [KvMode::Int8, KvMode::Int8Profile, KvMode::Kv5] {
+            let mut engine = fixture.engine(backend, mode);
+            engine.prefill(&[1, 2, 3]).unwrap();
+            engine.run_provisional(&[4, 5, 6]).unwrap();
+            engine.commit(2).unwrap();
+            let snapshot = engine.snapshot().unwrap();
+            engine.prefill(&[11, 12, 13]).unwrap();
+            engine.restore(&snapshot).unwrap();
+            engine.prefill(&[7, 8]).unwrap();
+            let mut reference = fixture.reference(mode);
+            reference.prefill(&[1, 2, 3, 4, 5, 7, 8]).unwrap();
+            assert_eq!(engine.state_digest(), reference.state_digest());
+            assert_eq!(bits(engine.row_logits()), bits(reference.row_logits())[5..]);
+        }
+    }
+}
+
+fn capture_bits(rows: &[yskn_ref::model::CapturedRow]) -> Vec<(usize, Vec<u32>)> {
+    rows.iter()
+        .map(|row| {
+            (
+                row.position,
+                row.values.iter().map(|v| v.to_bits()).collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn residual_capture_matches_reference_across_widths_kv_backends_and_session_operations() {
+    use yskn_ref::model::CaptureOptions;
+    let fixture = mixed();
+    let options = CaptureOptions {
+        layers: vec![0, 2],
+        max_rows: 5,
+    };
+    for backend in backends() {
+        for mode in [KvMode::Int8, KvMode::Int8Profile, KvMode::Kv5] {
+            for width in [1, 3, 9] {
+                let mut reference = fixture.reference(mode);
+                let empty_reference = reference.snapshot().unwrap();
+                reference.set_capture(options.clone()).unwrap();
+                let mut engine = fixture.engine_width(backend, mode, width);
+                let empty_engine = engine.snapshot().unwrap();
+                engine.set_capture(options.clone()).unwrap();
+                assert!(engine.restore(&empty_engine).is_err());
+                assert!(reference.restore(&empty_reference).is_err());
+                assert_eq!(engine.capture_options(), &options);
+                assert_eq!(engine.position(), 0);
+                let mut unobserved = fixture.engine_width(backend, mode, width);
+                engine
+                    .prefill(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+                    .unwrap();
+                // Uneven reference calls deliberately differ from the engine's grouping.
+                for chunk in [&[1, 2][..], &[3, 4, 5, 6, 7], &[8, 9, 10, 11, 12]] {
+                    reference.prefill(chunk).unwrap();
+                }
+                unobserved
+                    .prefill(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+                    .unwrap();
+                assert_eq!(engine.state_digest(), unobserved.state_digest());
+                assert_eq!(bits(engine.row_logits()), bits(unobserved.row_logits()));
+                assert!(unobserved.captured_rows().is_empty());
+                assert_eq!(
+                    capture_bits(engine.captured_rows()),
+                    capture_bits(reference.captured_rows()),
+                    "{backend:?} {mode:?} width={width}"
+                );
+                assert_eq!(
+                    engine
+                        .captured_rows()
+                        .iter()
+                        .map(|row| row.position)
+                        .collect::<Vec<_>>(),
+                    vec![7, 8, 9, 10, 11]
+                );
+                assert!(
+                    engine
+                        .captured_rows()
+                        .iter()
+                        .all(|row| row.values.len() == 1024)
+                );
+                assert_eq!(
+                    engine.embedding(2).unwrap(),
+                    reference.embedding(2).unwrap()
+                );
+                assert!(engine.embedding(128).is_err());
+                assert!(engine.set_capture(options.clone()).is_err());
+                let original = capture_bits(engine.captured_rows());
+                let tokens = &[13, 14, 15][..width.min(3)];
+                engine.run_provisional(tokens).unwrap();
+                reference.run_provisional(tokens).unwrap();
+                assert_eq!(capture_bits(engine.captured_rows()), original);
+                assert_eq!(
+                    capture_bits(engine.provisional_captures()),
+                    capture_bits(reference.provisional_captures())
+                );
+                assert!(engine.set_capture(options.clone()).is_err());
+                engine.discard_provisional();
+                reference.discard_provisional();
+                assert!(engine.provisional_captures().is_empty());
+                assert_eq!(capture_bits(engine.captured_rows()), original);
+                engine.run_provisional(tokens).unwrap();
+                reference.run_provisional(tokens).unwrap();
+                engine.commit(tokens.len().min(2)).unwrap();
+                reference.commit(tokens.len().min(2)).unwrap();
+                assert!(engine.provisional_captures().is_empty());
+                assert_eq!(
+                    capture_bits(engine.captured_rows()),
+                    capture_bits(reference.captured_rows())
+                );
+                assert_eq!(engine.state_digest(), reference.state_digest());
+                let snapshot = engine.snapshot().unwrap();
+                let ref_snapshot = reference.snapshot().unwrap();
+                engine.prefill(&[16, 17, 18, 19, 20, 21]).unwrap();
+                reference.prefill(&[16, 17, 18, 19, 20, 21]).unwrap();
+                engine.restore(&snapshot).unwrap();
+                reference.restore(&ref_snapshot).unwrap();
+                assert_eq!(
+                    capture_bits(engine.captured_rows()),
+                    capture_bits(reference.captured_rows())
+                );
+                engine.prefill(&[22, 23]).unwrap();
+                reference.prefill(&[22, 23]).unwrap();
+                assert_eq!(
+                    capture_bits(engine.captured_rows()),
+                    capture_bits(reference.captured_rows())
+                );
+                assert_eq!(engine.state_digest(), reference.state_digest());
+                engine.reset().unwrap();
+                reference.reset().unwrap();
+                assert!(engine.captured_rows().is_empty());
+                assert!(engine.provisional_captures().is_empty());
+                assert_eq!(engine.capture_options(), &options);
+                engine.prefill(&[24]).unwrap();
+                reference.prefill(&[24]).unwrap();
+                assert_eq!(
+                    capture_bits(engine.captured_rows()),
+                    capture_bits(reference.captured_rows())
+                );
             }
         }
     }
