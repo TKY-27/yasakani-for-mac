@@ -1,3 +1,6 @@
+#[path = "../../yskn-ref/tests/support/proposals.rs"]
+mod proposals;
+
 #[allow(dead_code, clippy::manual_is_multiple_of)]
 #[path = "../../yskn-ref/tests/support/mod.rs"]
 mod support;
@@ -120,7 +123,14 @@ where
 {
     let mut limits = GenerationLimits::new(count, main.context_capacity());
     limits.max_draft_tokens = k;
-    let result = generate(main, proposer, &mut sampler.clone(), prompt, limits).unwrap();
+    let mut observed = proposals::Observed::new(proposer);
+    let result = generate(main, &mut observed, &mut sampler.clone(), prompt, limits).unwrap();
+    if k >= 3 && count == 5 {
+        assert!(
+            observed.max_offered > 1,
+            "request must offer multiple guesses in one pass"
+        );
+    }
     assert_eq!(result.tokens.len(), count);
     if k != 0 {
         assert!(result.statistics.guesses_offered > 0);
@@ -157,7 +167,7 @@ fn check_backend(backend: Backend, mode: KvMode, seed: Option<u64>) {
     let choice = seed.map_or(DraftChoice::Greedy, DraftChoice::sampled);
     let mut reference = fixture.reference(mode);
     reference.prefill(&prompt[..3]).unwrap();
-    let first_tokens = decode(&mut reference, &mut NoProposer, &sampler, &prompt, 0, 2);
+    let first_tokens = decode(&mut reference, &mut NoProposer, &sampler, &prompt, 0, 5);
     let last = *first_tokens.last().unwrap();
     let first_expected = (first_tokens, reference.state_digest());
     let continued_tokens = decode(&mut reference, &mut NoProposer, &sampler, &[last], 0, 8);
@@ -172,7 +182,7 @@ fn check_backend(backend: Backend, mode: KvMode, seed: Option<u64>) {
         &sampler,
         &second_prompt,
         0,
-        2,
+        5,
     );
     let second_expected = (second_tokens, fresh_reference.state_digest());
 
@@ -181,7 +191,7 @@ fn check_backend(backend: Backend, mode: KvMode, seed: Option<u64>) {
     sequential.prefill(&prompt[..3]).unwrap();
     let prefix = sequential.snapshot().unwrap();
     assert_eq!(
-        engine_decode(&mut sequential, &mut NoProposer, &sampler, &prompt, 0, 2),
+        engine_decode(&mut sequential, &mut NoProposer, &sampler, &prompt, 0, 5),
         first_expected
     );
     assert_eq!(
@@ -199,7 +209,7 @@ fn check_backend(backend: Backend, mode: KvMode, seed: Option<u64>) {
             &sampler,
             &second_prompt,
             0,
-            2,
+            5,
         ),
         second_expected
     );
@@ -211,13 +221,14 @@ fn check_backend(backend: Backend, mode: KvMode, seed: Option<u64>) {
         main.prefill(&prompt[..3]).unwrap();
         let prefix = proposer.snapshot_session(&mut main).unwrap();
         assert_eq!(
-            engine_decode(&mut main, &mut proposer, &sampler, &prompt, k, 2),
+            engine_decode(&mut main, &mut proposer, &sampler, &prompt, k, 5),
             first_expected,
             "{backend:?} {mode:?} seed={seed:?} K={k} first request"
         );
         let checkpoint = proposer.snapshot_session(&mut main).unwrap();
         let ring = proposer.draft().snapshot();
-        assert!(main.position() <= proposer.draft().dimensions().window);
+        assert_eq!(main.position(), 8);
+        assert_eq!(ring.position(), proposer.draft().dimensions().window);
         assert_eq!(
             engine_decode(&mut main, &mut proposer, &sampler, &[last], k, 8),
             continued_expected,
@@ -227,6 +238,7 @@ fn check_backend(backend: Backend, mode: KvMode, seed: Option<u64>) {
             main.position() > proposer.draft().dimensions().window,
             "continuation must wrap the ring"
         );
+        assert_eq!(main.position(), 16);
         proposer.restore_session(&mut main, &checkpoint).unwrap();
         assert_eq!(proposer.draft().snapshot(), ring);
         assert_eq!(
@@ -238,11 +250,15 @@ fn check_backend(backend: Backend, mode: KvMode, seed: Option<u64>) {
         main.prefill(&second_prompt[3..second_prompt.len() - 1])
             .unwrap();
         assert_eq!(
-            engine_decode(&mut main, &mut proposer, &sampler, &second_prompt, k, 2),
+            engine_decode(&mut main, &mut proposer, &sampler, &second_prompt, k, 5),
             second_expected,
             "{backend:?} {mode:?} seed={seed:?} K={k} reused prefix"
         );
-        // generate flushes every final committed capture into the ring.
+        assert_eq!(main.position(), 10);
+        assert!(
+            proposer.draft().position() > proposer.draft().dimensions().window,
+            "reused prefix must wrap the ring"
+        );
         assert_eq!(proposer.draft().position(), main.position());
     }
 }

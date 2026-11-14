@@ -1,3 +1,6 @@
+#[path = "../support/proposals.rs"]
+mod proposals;
+
 use crate::support;
 
 use std::io::Cursor;
@@ -293,7 +296,14 @@ fn decode(
 ) -> (Vec<u32>, u64) {
     let mut limits = GenerationLimits::new(count, main.context_capacity());
     limits.max_draft_tokens = k;
-    let result = generate(main, proposer, &mut sampler.clone(), prompt, limits).unwrap();
+    let mut observed = proposals::Observed::new(proposer);
+    let result = generate(main, &mut observed, &mut sampler.clone(), prompt, limits).unwrap();
+    if k >= 3 && count == 5 {
+        assert!(
+            observed.max_offered > 1,
+            "request must offer multiple guesses in one pass"
+        );
+    }
     assert_eq!(result.tokens.len(), count);
     if k != 0 {
         assert!(result.statistics.guesses_offered > 0);
@@ -316,7 +326,7 @@ fn check_neural_generation(seed: Option<u64>) {
     let choice = seed.map_or(DraftChoice::Greedy, DraftChoice::sampled);
     let mut sequential = base.new_session().unwrap();
     sequential.prefill(&prompt[..3]).unwrap();
-    let first_expected = decode(&mut sequential, &mut NoProposer, &sampler, &prompt, 0, 2);
+    let first_expected = decode(&mut sequential, &mut NoProposer, &sampler, &prompt, 0, 5);
     let last = *first_expected.0.last().unwrap();
     let continued_expected = decode(&mut sequential, &mut NoProposer, &sampler, &[last], 0, 8);
     // Prefix reuse is checked against a fresh, independently prefetched session.
@@ -330,7 +340,7 @@ fn check_neural_generation(seed: Option<u64>) {
         &sampler,
         &second_prompt,
         0,
-        2,
+        5,
     );
     for k in [1, 3, 7] {
         let mut proposer = DraftProposer::new(
@@ -351,13 +361,14 @@ fn check_neural_generation(seed: Option<u64>) {
             k
         );
         assert_eq!(
-            decode(&mut main, &mut proposer, &sampler, &prompt, k, 2),
+            decode(&mut main, &mut proposer, &sampler, &prompt, k, 5),
             first_expected,
             "seed={seed:?} K={k} first request"
         );
         let checkpoint = proposer.snapshot_session(&mut main).unwrap();
         let ring = proposer.draft().snapshot();
-        assert!(main.position() <= proposer.draft().dimensions().window);
+        assert_eq!(main.position(), 8);
+        assert_eq!(ring.position(), proposer.draft().dimensions().window);
         assert_eq!(
             decode(&mut main, &mut proposer, &sampler, &[last], k, 8),
             continued_expected,
@@ -367,6 +378,7 @@ fn check_neural_generation(seed: Option<u64>) {
             main.position() > proposer.draft().dimensions().window,
             "continuation must wrap the ring"
         );
+        assert_eq!(main.position(), 16);
         proposer.restore_session(&mut main, &checkpoint).unwrap();
         assert_eq!(proposer.draft().snapshot(), ring);
         assert_eq!(
@@ -378,9 +390,14 @@ fn check_neural_generation(seed: Option<u64>) {
         main.prefill(&second_prompt[3..second_prompt.len() - 1])
             .unwrap();
         assert_eq!(
-            decode(&mut main, &mut proposer, &sampler, &second_prompt, k, 2),
+            decode(&mut main, &mut proposer, &sampler, &second_prompt, k, 5),
             second_expected,
             "seed={seed:?} K={k} reused prefix"
+        );
+        assert_eq!(main.position(), 10);
+        assert!(
+            proposer.draft().position() > proposer.draft().dimensions().window,
+            "reused prefix must wrap the ring"
         );
         assert_eq!(proposer.draft().position(), main.position());
     }
