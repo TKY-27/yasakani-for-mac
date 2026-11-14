@@ -469,7 +469,8 @@ impl MetalEngine {
             .newCommandQueue()
             .ok_or_else(|| metal_error("queue", "newCommandQueue returned nil"))?;
         let options = MTLCompileOptions::new();
-        // Integer-only kernel; safe math anyway, so no float relaxation can creep in.
+        // Safe math, so no float relaxation can creep in (the binary32 mode is exact
+        // under any evaluation order or fusion anyway, METAL.md).
         options.setMathMode(MTLMathMode::Safe);
         let library = device
             .newLibraryWithSource_options_error(

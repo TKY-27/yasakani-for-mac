@@ -5,15 +5,21 @@ until D14 the separate `yskn-metal` probe crate). `MetalEngine::weighted_sums`
 has the contract of `yskn_engine::Engine::weighted_sums`: row-major M×N i64,
 padded physical rows included, prefix variant for head slices. `job` + `run`
 encode any number of matrix calls into one command buffer.
-`weighted_sums_shared` is what `Model` uses: several matrices reading one
-input in one command buffer, with reused input/output buffers (D14).
+`weighted_sums_shared` encodes several matrices reading one input into one
+command buffer, with reused input/output buffers (D14). Since D22 `Model`
+and the fast draft call `weighted_sums_split` instead: the same command
+buffer for the first rows of each matrix, while the CPU kernel computes the
+last share of the rows (see "CPU share" under Design).
 
-All numbers below are from an Apple M5 (10-core GPU, 24 GB), on a synthetic
-file written by `examples/synthetic_model.rs` (8 layers, hidden 5120,
+All machine numbers are from an Apple M5 (10-core GPU, 24 GB). Text and
+tables not marked D22 or "Round 2" describe the first round (D12, D14);
+its numbers are on a synthetic file written by
+`examples/synthetic_model.rs` (8 layers, hidden 5120,
 ffn 17408, warp layout, 6-bit body, 8-bit 4096-row head: 51 matrices,
 846,069,760 code bytes, 2.25 G weights). Another worker was using the CPU at
-times. Unless stated otherwise, times are the median wall time of a full pass in mode (a),
-which includes uploading inputs and reading back outputs.
+times. Unless stated otherwise, those times are the median wall time of a full pass in mode (a),
+which includes uploading inputs and reading back outputs. The round-two
+sections ("Round 2") also report the real model.
 
 ## Design
 
@@ -22,8 +28,10 @@ which includes uploading inputs and reading back outputs.
   clone keeps the mapping alive past the buffer). The length is rounded up
   to the page size (16 KB). Each dispatch binds it at the matrix's code-stream
   offset rounded down to 4 bytes. The device reports
-  `maxBufferLength = 14,302,248,960`. The 10.3 GB model file fits. No-copy over a
-  read-only mapping works for the synthetic file; the real file was not opened.
+  `maxBufferLength = 14,302,248,960`. The 10.3 GB model file fits. The first
+  round tried no-copy over a read-only mapping on the synthetic file only;
+  the real file is accepted the same way (D12, D14), and round two (D22)
+  measured with it.
 - **Threads.** One SIMD lane computes one output row: a threadgroup is 32
   consecutive rows × `splits` SIMD groups (default 4 → 128 threads). SIMD
   group `k` takes sequences `k, k+splits, …` of those rows. With the `warp`
@@ -48,8 +56,9 @@ which includes uploading inputs and reading back outputs.
   `short2`/`half2` per column pair, row-major M×K) on upload. All lanes of a SIMD group read the same address
   (broadcast).
 - **Arithmetic.** Two exact multiply-accumulate modes (function constant
-  `FLOAT_MAC`, `YSKN_METAL_MAC=float|integer`, default float since D22), both
-  compiled with `MTLMathMode::Safe`:
+  `FLOAT_MAC`, default float since D22; `YSKN_METAL_MAC=float|integer` is
+  read only by `Model::load`, `FastDraft::load` and the benchmarks, explicit
+  constructors use float), both compiled with `MTLMathMode::Safe`:
   - *integer*: per pair `short(w0*a0 + w1*a1)` is exact (|w| ≤ 127,
     |a| ≤ 128 → ≤ 32,512), accumulated to i32 per sequence (≤ 4.2 M);
   - *float* (D22): the table is widened to `half2` and the activations are
@@ -70,15 +79,27 @@ which includes uploading inputs and reading back outputs.
   checked-overflow error can never be the expected result.
 - **Specialisation.** Function constants: bits (4..8), activation rows per
   dispatch MC (1..16; M > 16 is split into dispatches of 16), layout,
-  4-byte alignment of the stream (unaligned streams use byte loads).
+  4-byte alignment of the stream (unaligned streams use byte loads) and,
+  since D22, the multiply-accumulate mode.
   Pipelines are compiled lazily and cached.
+- **CPU share (D22).** `weighted_sums_split` gives the CPU kernel the last
+  share(M)·N rows of each matrix, rounded down to the 32-row tile and leaving
+  the GPU at least one tile (no CPU rows below N = 64), from a constant
+  table or `YSKN_METAL_CPU_SHARE` (read like `YSKN_METAL_MAC`). It commits
+  the GPU part, runs the CPU part, waits and interleaves the rows. Every
+  commit returns a guard that waits for completion when dropped, so an
+  error or a panic in the CPU part cannot leave GPU work reading the reused
+  scratch buffers. The split always covers every physical row; head slices
+  (`weighted_sums_prefix`) run on the GPU alone.
 - **Bounds.** Before dispatch `job` checks: the stream length equals
   P·S·bits·16, the stream lies inside the mapping, warp needs P·S % 32 = 0,
   M·max(K, N) < 2^32 and the stream is < 4 GB. Grid and loop bounds come only
   from these values, so a hostile file cannot move a GPU read outside the
   mapped buffer. Table indices are masked to 12 bits.
 
-## Tried and rejected (same synthetic file; M=1 / M=16 unless noted)
+## Tried and rejected
+
+### Round 1 (synthetic file; M=1 / M=16 unless noted)
 
 | Variant | M=1 ms | M=16 ms | Note |
 |---|---|---|---|
@@ -119,6 +140,8 @@ took 54.9 / 59.2 / 64.1 / 76.3 / 100.7 ms for M = 1 / 2 / 4 / 8 / 16.
 | CPU share above the optimum (real model) | M=1 0.18: 153–158 ms vs 134 at 0.12 | steep: the GPU waits for the CPU |
 
 ## What limits it
+
+### Round 1 (synthetic file)
 
 - **M = 1–2** is close to memory streaming. The kernel takes 10.3 ms, of which
   9.9 ms is GPU time. A read-only kernel with the same access pattern takes
