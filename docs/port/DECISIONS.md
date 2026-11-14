@@ -1529,7 +1529,10 @@ working  = recurrent + W*replay_row + expanded_dense_vectors
 Draft files (since D21, for the fast draft) count the mapped draft container
 and reduced-head file once, plus what the fast draft owns: the repacked
 approximate head rows, f32 copies of the head projection and scales, and the
-draft's vectors expanded to f32. The scalar draft's owned code copy is gone. D17 ring and capture dimensions are
+draft's hidden/final norms, per-layer ln1/ln2/q_norm/k_norm/abase/mbase
+and selector hp expanded to f32. Selector pred/succ stay mapped as BF16;
+their per-row decoding is scratch, not a persistent f32 copy. The scalar
+draft's owned code copy is gone. D17 ring and capture dimensions are
 header-derived and appear in both working/checkpoint owners as appropriate.
 The margin covers process/allocator/OS overhead and unitemized tables/scratch;
 this is a startup fit estimate, not measured peak RSS or free-memory admission.
@@ -1844,9 +1847,15 @@ files under the documented file-stability contract). The draft gets its own
 main model's projection backend; the two pools never run at the same time.
 The scalar `Draft` is no longer reachable from the product. Memory accounting
 (D19) counts the mapped draft files once plus the fast draft's owned data;
-for the published folder `yskn info` with the defaults reports
-`draft_bytes` 3,230,464,536 and `needed_bytes` 21,020,305,718 (19.58 GiB)
-against 25,769,803,776 physical. Product tests with the synthetic draft
+for the published dimensions with the defaults, the formula gives
+`draft_bytes` 2,721,905,176 and `needed_bytes` 20,435,462,454 (19.03 GiB)
+against 25,769,803,776 physical. Corrected in brief 06m: the previous
+estimate double-counted 508,559,360 bytes of mapped BF16 selector tables as
+owned f32, plus 76,283,904 bytes of margin. Matrix code streams and head
+rescoring rows stay mapped; approximate int8 rows are repacked/owned, and
+head projection/scales are copied as f32. Matrix scales/signs/tables and
+short-lived selector rows remain covered by the conservative scratch/margin.
+Product tests with the synthetic draft
 (`crates/yskn-cli/tests/product.rs`) check that the product's output with the
 fast draft, for `neural` and `both`, adaptive and fixed depth, K = 1, 3, 7,
 greedy and seeded, equals the output with `--draft none` and the independent
@@ -2012,9 +2021,13 @@ orchestrator repeats the timings on a quiet machine.
 
 Projected from the table for these exact pass shapes (ms per token, mean of
 the four tasks): none 232.0, n-gram K=3 216.8, neural fixed K=2 160.5, K=3
-148.4, K=4 145.6, K=7 171.6, both adaptive 132.6. The adaptive default makes
-the fewest passes on code, structured and thinking, and one fewer than fixed
-K=3 on prose. Measured back to back at the lowest load (16:57-17:03), the
+148.4, K=4 145.6, K=7 171.6, both adaptive 132.6. Compared with neural fixed K=3, the adaptive
+default uses fewer
+passes on code, structured and thinking, and one fewer on prose. This is not
+a minimum across all fixed depths: neural fixed K=7 uses fewer on code
+(16 versus 19) and thinking (19 versus 21). The projected-time comparison
+includes pass width and proposal cost; fewer passes alone need not mean
+less time. Measured back to back at the lowest load (16:57-17:03), the
 default produced 5.31/7.70/6.68/6.52 tokens/s against 2.61/2.48/2.63/3.40
 without drafting (2.0-3.1x) and 4.36/7.82/4.75/6.99 with neural fixed K=3;
 the differences between the drafting configurations are within this run's

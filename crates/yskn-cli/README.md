@@ -40,7 +40,12 @@ The stub alone can omit a folder and use its synthetic byte tokenizer.
 model file and memory estimates. Before loading, real commands compare the
 estimate with physical memory with a stated reserve and refuse configurations
 that cannot fit. `--ctx`, `--kv` and `--draft` control that estimate; no system
-setting is changed. Sampling request defaults come from the folder's optional
+setting is changed. Fast-draft files are counted once as mappings; owned data
+adds the repacked int8 approximate head, f32 head projection/scales, draft
+norms/layer vectors and selector hp. Selector pred/succ remain mapped BF16.
+For the published default configuration, draft bytes are 2,721,905,176 and
+total needed bytes including margin are 20,435,462,454 (19.03 GiB; D19/D21).
+Sampling request defaults come from the folder's optional
 `generation_config.json`, falling back to upstream's 1.0 / 0.95 / 20 / 0.0
 (temperature / top-p / top-k / min-p). Explicit request values keep the existing
 validation and override those defaults.

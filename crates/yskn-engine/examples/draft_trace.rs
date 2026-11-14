@@ -103,9 +103,31 @@ impl Proposer for Recorder {
     }
 }
 
-fn median(mut values: Vec<f64>) -> f64 {
+fn median(mut values: Vec<f64>) -> Result<f64> {
     values.sort_by(f64::total_cmp);
-    values[values.len() / 2]
+    values
+        .get(values.len() / 2)
+        .copied()
+        .ok_or("no timing samples".into())
+}
+
+fn parse_prompts(input: &str) -> Result<Vec<(String, Vec<u32>)>> {
+    let prompts = input
+        .lines()
+        .map(|line| {
+            let prompt: Value = serde_json::from_str(line)?;
+            let task = prompt["task"].as_str().ok_or("task")?.to_owned();
+            let tokens: Vec<u32> = serde_json::from_value(prompt["tokens"].clone())?;
+            if tokens.is_empty() {
+                return Err("prompt tokens must not be empty".into());
+            }
+            Ok((task, tokens))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if prompts.is_empty() {
+        return Err("prompts must not be empty".into());
+    }
+    Ok(prompts)
 }
 
 fn record(mut args: impl Iterator<Item = String>) -> Result<()> {
@@ -121,6 +143,10 @@ fn record(mut args: impl Iterator<Item = String>) -> Result<()> {
         }
     }
     let out = out.ok_or(USAGE)?;
+    if n == 0 {
+        return Err("--n must be positive".into());
+    }
+    let prompts = parse_prompts(&std::fs::read_to_string(prompts)?)?;
     let backend = Backend::from_env()?;
     // SAFETY: the read-only model folder stays unchanged until exit.
     let fast = unsafe { FastDraft::load(&folder)? };
@@ -135,10 +161,7 @@ fn record(mut args: impl Iterator<Item = String>) -> Result<()> {
         record: Record::default(),
     };
     let mut traces = Vec::new();
-    for line in std::fs::read_to_string(prompts)?.lines() {
-        let prompt: Value = serde_json::from_str(line)?;
-        let task = prompt["task"].as_str().ok_or("task")?.to_owned();
-        let tokens: Vec<u32> = serde_json::from_value(prompt["tokens"].clone())?;
+    for (task, tokens) in prompts {
         model.reset()?;
         recorder.neural.reset();
         recorder.record = Record::default();
@@ -156,7 +179,7 @@ fn record(mut args: impl Iterator<Item = String>) -> Result<()> {
                     Ok(elapsed)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            pass_ms.push(median(samples));
+            pass_ms.push(median(samples)?);
         }
         let mut limits = GenerationLimits::new(n, model.context_capacity());
         limits.max_draft_tokens = DEPTH;
@@ -166,13 +189,13 @@ fn record(mut args: impl Iterator<Item = String>) -> Result<()> {
         let r = &recorder.record;
         eprintln!(
             "{task}: pass_ms={pass_ms:.1?} proposal_median_ms={:.1} generation_ms={generation_ms:.0}",
-            median(r.proposal_ms.clone())
+            median(r.proposal_ms.clone())?
         );
         traces.push(json!({
             "task": task, "prompt_tokens": tokens.len(), "tokens": result.tokens,
             "neural": r.neural, "margins": r.margins, "ngram": r.ngram,
             "ngram_match": r.ngram_match, "pass_ms": pass_ms,
-            "proposal_ms": median(r.proposal_ms.clone()),
+            "proposal_ms": median(r.proposal_ms.clone())?,
         }));
     }
     std::fs::write(out, serde_json::to_vec(&json!({"n": n, "traces": traces}))?)?;
@@ -310,6 +333,9 @@ fn replay(trace: &Trace, source: Source, depth: &Depth, confidence: f32) -> Outc
 fn load(path: &str, table: bool) -> Result<Vec<Trace>> {
     let value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let traces = value["traces"].as_array().ok_or("traces")?;
+    if traces.is_empty() {
+        return Err("traces must not be empty".into());
+    }
     traces
         .iter()
         .map(|t| {
@@ -321,7 +347,7 @@ fn load(path: &str, table: bool) -> Result<Vec<Trace>> {
                     proposal: t["proposal_ms"].as_f64().ok_or("proposal_ms")?,
                 }
             };
-            Ok(Trace {
+            let trace = Trace {
                 task: t["task"].as_str().ok_or("task")?.into(),
                 tokens: serde_json::from_value(t["tokens"].clone())?,
                 neural: serde_json::from_value(t["neural"].clone())?,
@@ -329,9 +355,35 @@ fn load(path: &str, table: bool) -> Result<Vec<Trace>> {
                 ngram: serde_json::from_value(t["ngram"].clone())?,
                 ngram_match: serde_json::from_value(t["ngram_match"].clone())?,
                 costs,
-            })
+            };
+            validate_trace(&trace)?;
+            Ok(trace)
         })
         .collect()
+}
+
+fn validate_trace(trace: &Trace) -> Result<()> {
+    let n = trace.tokens.len();
+    if n == 0
+        || trace.neural.len() != n
+        || trace.margins.len() != n
+        || trace.ngram.len() != n
+        || trace.ngram_match.len() != n
+        || trace.neural.iter().any(|v| v.len() != DEPTH)
+        || trace
+            .margins
+            .iter()
+            .any(|v| v.len() != DEPTH || v.iter().any(|x| !x.is_finite()))
+        || trace.ngram.iter().any(|v| v.len() > DEPTH)
+    {
+        return Err("invalid trace row dimensions or values".into());
+    }
+    AdaptiveDepth {
+        costs: trace.costs.clone(),
+        ..AdaptiveDepth::neural()
+    }
+    .validate()?;
+    Ok(())
 }
 
 fn report(traces: &[Trace], name: &str, source: Source, depth: &Depth, confidence: f32) -> f64 {
@@ -358,7 +410,14 @@ fn report(traces: &[Trace], name: &str, source: Source, depth: &Depth, confidenc
 
 fn replay_main(mut args: impl Iterator<Item = String>) -> Result<()> {
     let path = args.next().ok_or(USAGE)?;
-    let table = args.next().as_deref() == Some("--table");
+    let table = match args.next().as_deref() {
+        None => false,
+        Some("--table") => true,
+        _ => return Err(USAGE.into()),
+    };
+    if args.next().is_some() {
+        return Err(USAGE.into());
+    }
     let traces = load(&path, table)?;
     for trace in &traces {
         // Counterfactual acceptance profile of a proposal at every position.
@@ -548,5 +607,89 @@ fn main() -> Result<()> {
         Some("record") => record(args),
         Some("replay") => replay_main(args),
         _ => Err(USAGE.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_rejects_zero_output_and_empty_prompts_before_opening_model() {
+        assert!(parse_prompts(r#"{"task":"empty","tokens":[]}"#).is_err());
+        assert!(parse_prompts("").is_err());
+        let error = record(
+            [
+                "missing-model",
+                "missing-prompts",
+                "--n",
+                "0",
+                "--out",
+                "unused",
+            ]
+            .map(String::from)
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "--n must be positive");
+        let path =
+            std::env::temp_dir().join(format!("yskn-empty-prompts-{}.jsonl", std::process::id()));
+        std::fs::write(
+            &path,
+            "{\"task\":\"ok\",\"tokens\":[1]}\n{\"task\":\"empty\",\"tokens\":[]}",
+        )
+        .unwrap();
+        let error = record(
+            [
+                "missing-model".to_owned(),
+                path.to_string_lossy().into_owned(),
+                "--out".into(),
+                "unused".into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(error.to_string(), "prompt tokens must not be empty");
+        assert!(median(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn replay_rejects_empty_ragged_and_oversized_rows_and_invalid_costs() {
+        let trace = json!({
+            "task":"test", "tokens":[1], "neural":[vec![1; DEPTH]],
+            "margins":[vec![1.0; DEPTH]], "ngram":[[]], "ngram_match":[0],
+            "pass_ms":[1.0,2.0,3.0], "proposal_ms":1.0
+        });
+        let path = std::env::temp_dir().join(format!("yskn-replay-{}.json", std::process::id()));
+        let path_str = path.to_str().unwrap();
+        let write =
+            |value: &Value| std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+        write(&json!({"traces":[trace]}));
+        let valid = load(path_str, false).unwrap();
+        assert_eq!(
+            replay(&valid[0], Source::Neural, &Depth::Fixed(7), f32::MIN).passes,
+            1
+        );
+        for (key, value) in [
+            ("tokens", json!([])),
+            ("neural", json!([vec![1; DEPTH - 1]])),
+            ("margins", json!([])),
+            ("ngram", json!([vec![1; DEPTH + 1]])),
+            ("ngram_match", json!([])),
+            ("pass_ms", json!([])),
+            ("proposal_ms", json!(-1)),
+        ] {
+            let mut invalid = trace.clone();
+            invalid[key] = value;
+            write(&json!({"traces":[invalid]}));
+            assert!(load(path_str, false).is_err(), "{key}");
+            if !matches!(key, "pass_ms" | "proposal_ms") {
+                assert!(load(path_str, true).is_err(), "{key}, table");
+            }
+        }
+        write(&json!({"traces":[]}));
+        assert!(load(path_str, true).is_err());
+        std::fs::remove_file(path).unwrap();
     }
 }

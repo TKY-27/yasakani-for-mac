@@ -258,18 +258,25 @@ pub(crate) fn inspect(config: &RealEngineConfig) -> Result<ModelInfo> {
             &mut fs::File::open(&head_path).map_err(Error::engine)?,
         )
         .map_err(Error::engine)?;
-        // The fast draft (D18) maps both files, never copying the code streams
-        // or rescoring rows; it owns the repacked approximate rows, f32 copies
-        // of the head projection/scales and expanded f32 draft vectors.
+        // Code streams and selector pred/succ stay mapped. Only the norms,
+        // layer vectors and selector hp are expanded to f32 (FastDraft).
         let len = |range: &std::ops::Range<u64>| range.end - range.start;
         let owned_head = [0, 1, 2, 4]
             .into_iter()
             .try_fold(0, |n, i| add(n, len(&layout.arrays[i])))?;
-        let vectors = d
-            .header()
-            .vectors
-            .iter()
-            .try_fold(0, |n, v| add(n, mul(v.len as u64, 4)?))?;
+        let mut vector_elements = 0;
+        for name in ["bdraft2.hidden_norm", "bdraft2.norm", "bdraft2.sel.hp"] {
+            vector_elements = add(vector_elements, vector(d.header(), name)?)?;
+        }
+        for i in 0..dims.layers {
+            for name in ["ln1", "ln2", "q_norm", "k_norm", "abase", "mbase"] {
+                vector_elements = add(
+                    vector_elements,
+                    vector(d.header(), &format!("bdraft2.layers.{i}.{name}"))?,
+                )?;
+            }
+        }
+        let vectors = mul(vector_elements, 4)?;
         draft_bytes = [
             d.header().file_bytes,
             layout.file_bytes,

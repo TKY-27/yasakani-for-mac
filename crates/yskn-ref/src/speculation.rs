@@ -387,7 +387,14 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
         DepthPolicy::Fixed => None,
         DepthPolicy::Adaptive(config) => {
             config.validate().map_err(GenerationError::InvalidInput)?;
-            Some(DepthController::new(config, limits.max_draft_tokens))
+            let budget = limits.max_draft_tokens.min(
+                verifier
+                    .max_pass_width()
+                    .min(capacity.saturating_sub(verifier.position()))
+                    .min(limits.max_new_tokens)
+                    .saturating_sub(1),
+            );
+            Some(DepthController::new(config, budget))
         }
     };
     proposer
@@ -1076,47 +1083,72 @@ mod tests {
     #[test]
     fn eos_cancel_and_capacity_discard_later_rows_and_keep_last_token_pending() {
         let prompt = [1, 2, 3, 1, 2, 3, 1];
-        for sampler in samplers() {
-            let sequence = sequential(&prompt, &sampler, 16, 64, &[], None).0;
-            for k in [1, 2, 3, 7] {
-                for eos in [vec![sequence[0]], vec![sequence[3]], vec![sequence[7]]] {
-                    let mut oracle = GuidedProposer {
-                        sampler: sampler.clone(),
-                        wrong_after: None,
-                    };
-                    check(&prompt, &sampler, &mut oracle, k, (16, 64), &eos, None);
-                    // An EOS guess cannot stop generation until the selector chooses it.
-                    check(
-                        &prompt,
-                        &sampler,
-                        &mut ScriptProposer::new(vec![eos[0]; k]),
-                        k,
-                        (16, 64),
-                        &eos,
-                        None,
-                    );
-                }
-                for cancel in [1, 3, 6, 11] {
-                    let mut oracle = GuidedProposer {
-                        sampler: sampler.clone(),
-                        wrong_after: None,
-                    };
-                    check(
-                        &prompt,
-                        &sampler,
-                        &mut oracle,
-                        k,
-                        (16, 64),
-                        &[],
-                        Some(cancel),
-                    );
-                }
-                for capacity in [prompt.len() - 1, prompt.len(), prompt.len() + 3] {
-                    let mut oracle = GuidedProposer {
-                        sampler: sampler.clone(),
-                        wrong_after: None,
-                    };
-                    check(&prompt, &sampler, &mut oracle, k, (16, capacity), &[], None);
+        for policy in [
+            DepthPolicy::Fixed,
+            DepthPolicy::Adaptive(AdaptiveDepth::neural()),
+        ] {
+            for sampler in samplers() {
+                let sequence = sequential(&prompt, &sampler, 16, 64, &[], None).0;
+                for k in [1, 2, 3, 7] {
+                    for eos in [vec![sequence[0]], vec![sequence[3]], vec![sequence[7]]] {
+                        let mut oracle = GuidedProposer {
+                            sampler: sampler.clone(),
+                            wrong_after: None,
+                        };
+                        check_with(
+                            policy.clone(),
+                            &prompt,
+                            &sampler,
+                            &mut oracle,
+                            k,
+                            (16, 64),
+                            &eos,
+                            None,
+                        );
+                        // An EOS guess cannot stop generation until the selector chooses it.
+                        check_with(
+                            policy.clone(),
+                            &prompt,
+                            &sampler,
+                            &mut ScriptProposer::new(vec![eos[0]; k]),
+                            k,
+                            (16, 64),
+                            &eos,
+                            None,
+                        );
+                    }
+                    for cancel in [1, 3, 6, 11] {
+                        let mut oracle = GuidedProposer {
+                            sampler: sampler.clone(),
+                            wrong_after: None,
+                        };
+                        check_with(
+                            policy.clone(),
+                            &prompt,
+                            &sampler,
+                            &mut oracle,
+                            k,
+                            (16, 64),
+                            &[],
+                            Some(cancel),
+                        );
+                    }
+                    for capacity in [prompt.len() - 1, prompt.len(), prompt.len() + 3] {
+                        let mut oracle = GuidedProposer {
+                            sampler: sampler.clone(),
+                            wrong_after: None,
+                        };
+                        check_with(
+                            policy.clone(),
+                            &prompt,
+                            &sampler,
+                            &mut oracle,
+                            k,
+                            (16, capacity),
+                            &[],
+                            None,
+                        );
+                    }
                 }
             }
         }
@@ -1206,30 +1238,58 @@ mod tests {
 
     #[test]
     fn caller_capacity_and_pass_width_bound_every_verification() {
-        let mut verifier = SequenceVerifier::new(&[1, 2], 64, 2);
-        let mut proposer = GuidedProposer {
-            sampler: Sampler::Greedy,
-            wrong_after: None,
-        };
-        let mut limits = GenerationLimits::new(30, 7);
-        limits.max_draft_tokens = usize::MAX;
-        let result = generate(
-            &mut verifier,
-            &mut proposer,
-            &mut Greedy,
-            &[1, 2, 3],
-            limits,
-        )
-        .unwrap();
-        assert_eq!(result.stop_reason, StopReason::ContextCapacity);
-        assert_eq!(
-            result.tokens,
-            sequential(&[1, 2, 3], &Sampler::Greedy, 30, 7, &[], None).0
-        );
-        assert_eq!(verifier.position(), 7);
-        assert_eq!(result.statistics.tokens_confirmed_per_pass, [2, 2, 1]);
-        assert_eq!(result.statistics.rows_verified, 5);
-        assert_eq!(result.statistics.guesses_offered, 2);
+        for depth in [
+            DepthPolicy::Fixed,
+            DepthPolicy::Adaptive(AdaptiveDepth::neural()),
+        ] {
+            let mut verifier = SequenceVerifier::new(&[1, 2], 64, 2);
+            let mut proposer = GuidedProposer {
+                sampler: Sampler::Greedy,
+                wrong_after: None,
+            };
+            let mut limits = GenerationLimits::new(30, 7);
+            limits.max_draft_tokens = usize::MAX;
+            limits.depth = depth;
+            let result = generate(
+                &mut verifier,
+                &mut proposer,
+                &mut Greedy,
+                &[1, 2, 3],
+                limits,
+            )
+            .unwrap();
+            assert_eq!(result.stop_reason, StopReason::ContextCapacity);
+            assert_eq!(
+                result.tokens,
+                sequential(&[1, 2, 3], &Sampler::Greedy, 30, 7, &[], None).0
+            );
+            assert_eq!(verifier.position(), 7);
+            assert_eq!(result.statistics.tokens_confirmed_per_pass, [2, 2, 1]);
+            assert_eq!(result.statistics.rows_verified, 5);
+            assert_eq!(result.statistics.guesses_offered, 2);
+        }
+    }
+
+    #[test]
+    fn adaptive_controller_allocation_respects_output_and_context_without_width_cap() {
+        for (n, capacity) in [(0, usize::MAX), (1, usize::MAX), (30, 3), (30, 2)] {
+            let mut verifier = SequenceVerifier::new(&[1, 2], 64, usize::MAX);
+            let mut limits = GenerationLimits::new(n, capacity);
+            limits.max_draft_tokens = usize::MAX;
+            limits.depth = DepthPolicy::Adaptive(AdaptiveDepth::neural());
+            let result = generate(
+                &mut verifier,
+                &mut NoProposer,
+                &mut Greedy,
+                &[1, 2, 3],
+                limits,
+            )
+            .unwrap();
+            let expected = sequential(&[1, 2, 3], &Sampler::Greedy, n, capacity.min(64), &[], None);
+            assert_eq!(result.tokens, expected.0);
+            assert_eq!(result.stop_reason, expected.2);
+            assert!(result.statistics.requested_depths.iter().all(|&d| d == 0));
+        }
     }
 
     #[test]

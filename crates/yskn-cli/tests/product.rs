@@ -472,6 +472,32 @@ fn fast_draft_output_equals_no_draft_output_for_adaptive_and_fixed_depths() {
 }
 
 #[test]
+fn product_forwards_free_ngram_copy_in_full_before_adaptive_neural_depth() {
+    let folder = Folder::new();
+    let mut engine = fast_draft_engine(
+        &folder,
+        DraftMode::Both,
+        yskn::real_engine::DepthMode::Adaptive,
+        7,
+    );
+    let result = engine
+        .generate(
+            &[1, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4, 5, 6],
+            8,
+            &greedy(),
+            None,
+            &mut |ids| Ok(ids.is_empty()),
+        )
+        .unwrap();
+    assert_eq!(result.finish, Finish::Cancelled);
+    assert_eq!(result.ids.len(), 1);
+    assert_eq!(result.passes, 1);
+    assert_eq!(result.rows_verified, 8);
+    assert_eq!(result.guesses_offered, 7);
+    assert_eq!(result.draft_proposals, 0);
+}
+
+#[test]
 fn draft_work_counts_history_updates_even_without_a_proposal() {
     use yskn::real_engine::DepthMode;
     let folder = Folder::new();
@@ -500,6 +526,35 @@ fn draft_work_counts_history_updates_even_without_a_proposal() {
         assert_eq!((result.draft_proposals, result.draft_updates), (0, 0));
         assert_eq!(engine.info().draft_proposal_code_bytes, 0);
     }
+}
+
+#[test]
+fn synthetic_fast_draft_memory_counts_owned_vectors_and_mapped_selectors_once() {
+    let folder = Folder::new();
+    let memory = folder.config(DraftMode::Neural).inspect().unwrap().memory;
+    let mapped = std::fs::metadata(folder.0.join("draft.yskn"))
+        .unwrap()
+        .len()
+        + std::fs::metadata(folder.0.join("draft.shead"))
+            .unwrap()
+            .len();
+    // h=512, layers=2, correction rank=32, V=32, head rank=512.
+    // Two global norms, six vectors/layer, hp; pred/succ have no f32 owner.
+    let vectors = 4 * (2 * 512 + 2 * (10 * 512 + 2 * 128) + 32 * 512);
+    let head = 4 * 512 * 512 + 32 * 512 + 2 * 32 * 4;
+    assert_eq!(memory.draft_bytes, mapped + vectors + head);
+    let subtotal = memory.weights_bytes
+        + memory.draft_bytes
+        + memory.recurrent_bytes
+        + memory.cache_bytes
+        + memory.snapshot_bytes
+        + memory.working_bytes;
+    assert_eq!(
+        memory.margin_bytes,
+        (subtotal * 15).div_ceil(100) + 1_073_741_824
+    );
+    assert_eq!(memory.needed_bytes, subtotal + memory.margin_bytes);
+    assert!(memory.enforce(memory.needed_bytes - 1).is_err());
 }
 
 #[test]
@@ -659,6 +714,41 @@ fn product_command(folder: &Folder, subcommand: &str) -> Command {
         command.env_remove(key);
     }
     command
+}
+
+#[test]
+fn neural_benchmark_json_counts_one_history_update_without_a_proposal() {
+    let folder = Folder::new();
+    folder.neural_bench_fixture();
+    let path = folder.0.join("neural-bench.json");
+    let output = product_command(&folder, "bench")
+        .args(["--draft", "neural", "--n", "1", "--json"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(report["tokens_per_task"], 1);
+    let runs = report["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 4);
+    for run in runs {
+        let m = &run["metrics"];
+        assert_eq!(m["generated_tokens"], 1);
+        assert_eq!(m["passes"], 1);
+        assert_eq!(m["neural_proposals"], 0);
+        assert_eq!(m["draft_updates"], 1);
+        let main = m["main_code_bytes_per_pass"].as_u64().unwrap();
+        let update = m["draft_code_bytes_per_update"].as_u64().unwrap();
+        assert!(update > 0);
+        assert_eq!(
+            m["bytes_read_per_pass"].as_f64().unwrap(),
+            (main + update) as f64
+        );
+    }
 }
 
 #[test]

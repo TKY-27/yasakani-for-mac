@@ -106,6 +106,61 @@ impl Folder {
         );
         folder
     }
+    /// CLI defaults require five capture taps and the published mask ID.
+    /// Sparse zero head/selector data avoids manufacturing unused draft weights.
+    pub fn neural_bench_fixture(&self) {
+        self.write(
+            "weights.yskn",
+            model::synthetic_model_with_dimensions(19, &["full_attention"; 62], 512, 512, 248_071),
+        );
+        self.write(
+            "profile.bin",
+            model::kv_profile::Profile::new(62, 2).bytes(),
+        );
+        let mut draft = model::draft::container(23);
+        let header_len = u64::from_le_bytes(draft[8..16].try_into().unwrap()) as usize;
+        let data = u64::from_le_bytes(draft[16..24].try_into().unwrap()) as usize;
+        let mut header: Value = serde_json::from_slice(&draft[32..32 + header_len]).unwrap();
+        const VOCAB: u64 = 248_071;
+        header["model"]["vocab"] = json!(VOCAB);
+        // Enlarge only mapped selector extents, with zero-filled sparse data.
+        let mut end = (draft.len() as u64 + 255) & !255;
+        for vector in header["vectors"].as_array_mut().unwrap() {
+            if matches!(
+                vector["name"].as_str(),
+                Some("bdraft2.sel.pred" | "bdraft2.sel.succ")
+            ) {
+                vector["off"] = json!(end);
+                vector["n"] = json!(VOCAB * 32);
+                end = (end + VOCAB * 32 * 2 + 255) & !255;
+            }
+        }
+        let encoded = serde_json::to_vec(&header).unwrap();
+        assert!(32 + encoded.len() <= data);
+        draft[8..16].copy_from_slice(&(encoded.len() as u64).to_le_bytes());
+        draft[24..32].copy_from_slice(&end.to_le_bytes());
+        draft[32..data].fill(0);
+        draft[32..32 + encoded.len()].copy_from_slice(&encoded);
+        self.write("draft.yskn", draft);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(self.0.join("draft.yskn"))
+            .unwrap()
+            .set_len(end)
+            .unwrap();
+        let mut head = b"SHEAD001".to_vec();
+        for n in [VOCAB as i32, 512, 512, 12345] {
+            head.extend_from_slice(&n.to_le_bytes());
+        }
+        self.write("draft.shead", head);
+        let bytes = 24 + 4 * 512 * 512 + VOCAB * (512 + 4 + 512 + 4);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(self.0.join("draft.shead"))
+            .unwrap()
+            .set_len(bytes)
+            .unwrap();
+    }
     pub fn write(&self, name: &str, data: impl AsRef<[u8]>) {
         fs::write(self.0.join(name), data).unwrap();
     }
