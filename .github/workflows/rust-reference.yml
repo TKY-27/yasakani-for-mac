@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   scalar-reference:
     name: Apple Silicon / stable
@@ -25,7 +29,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # The dev profile is optimized (opt-level 2) and keeps debug assertions and
+      # overflow checks, so it is the stricter of the two profiles. A second pass
+      # in the release profile doubled the run time to about 25 minutes.
       - name: Tests
         run: cargo test --workspace
-      - name: Release tests
-        run: cargo test --workspace --release
