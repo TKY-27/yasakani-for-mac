@@ -51,14 +51,46 @@ follows. Ctrl+C stops the current generation or exits at the input prompt.
   and non-text response formats are rejected. Context errors are HTTP 400 with
   `error.code = "context_length_exceeded"`, before streaming headers.
 
-`Engine` is synchronous and object safe, with context capacity, reset, prompt
-reuse within generate, sampling, max-new-token and EOS control, a cancellable
-committed-token callback, and generation statistics. It has no Send bound. The
-server factory creates the runner on one owning thread; a bounded channel
-serializes requests, with later requests waiting. `Api::call` is also usable as
-an embedded Hyper service. Consumer failure, body drop and shutdown cancel via
-the callback. Tests use a scripted, loopable, delayed, failure-injectable stub
-with prompt-cache observations, matching the upstream fixture's responsibilities.
+## Engine contract
+
+```rust
+pub trait Engine {
+    fn context_capacity(&self) -> usize;
+    fn reset(&mut self) -> Result<()>;
+    fn generate(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        sampling: &Sampling,
+        stop_ids: Option<&[u32]>,
+        on_tokens: &mut dyn FnMut(&[u32]) -> Result<bool>,
+    ) -> Result<Generation>;
+}
+```
+
+- Synchronous, object safe and deliberately not `Send`. The server's factory
+  (which is `Send`) builds the runner and engine on one dedicated thread, and
+  every engine call stays on that thread.
+- `generate` reuses a compatible prompt prefix or resets its sequence itself.
+  It reserves the 64-token context margin, clamps to the room left and rejects
+  an empty or oversize prompt.
+- `max_new` counts the first predicted token and any EOS.
+- `on_tokens` receives the growing array of committed ids, including the final
+  ids, and is called even for chunks that decode to no text. Returning `false`
+  stops at the next commit boundary; an error stops generation and is
+  propagated once the engine has quiesced.
+- `Sampling` carries temperature, top_p, top_k, min_p and seed; greedy
+  defaults and the top_k range (1..20) follow upstream. `Generation` returns
+  the ids, finish (`Stop`, `Length`, `Cancelled`), cached tokens, snapshot
+  mode, passes, prefill and generation milliseconds.
+- `ChatRunner` turns this into `Reasoning`, `Content`, `ToolCall` and
+  `Done(Usage)` events.
+
+A bounded channel serializes requests to the engine thread, with later requests
+waiting. `Api::call` is also usable as an embedded Hyper service. Consumer
+failure, body drop and shutdown cancel through the callback. Tests use a
+scripted, loopable, delayed, failure-injectable stub with prompt-cache
+observations, matching the upstream fixture's responsibilities.
 
 ## Security and transport limits
 
@@ -69,19 +101,38 @@ or none. As upstream does, a keyed remote bind bypasses Host/Origin/Fetch checks
 and still requires the key. API-key comparison hashes both byte strings with
 SHA-256 and reduces all 32 digest bytes without prefix-dependent branches.
 
-| Limit | Default |
+| Limit (`Limits` field) | Default |
 |---|---:|
-| Actual request-body bytes, before JSON parsing | 32 MiB |
-| Concurrent connections | 64; excess connections are closed |
+| Actual request-body bytes, before JSON parsing (`max_body`) | 32 MiB |
+| Concurrent connections (`max_connections`, 1..1024) | 64; excess connections are closed unserved |
 | Queued engine jobs | 64 (bounded by active HTTP connections) |
 | Buffered events per response | 8 |
-| Header read buffer | 32 KiB |
-| Header count | 100 |
-| Complete header deadline | 10 s |
-| Complete body deadline | 30 s |
-| Idle socket read/write deadline | 300 s |
-| Full event-channel backpressure deadline | 30 s |
+| Header read buffer (`header_bytes`, at least 8192) | 32 KiB |
+| Header count (`max_headers`) | 100 |
+| Complete header deadline (`header_timeout`) | 10 s |
+| Complete body deadline (`body_timeout`) | 30 s |
+| Idle socket read/write deadline (`idle_timeout`) | 300 s |
+| Full event-channel backpressure deadline (`stream_timeout`) | 30 s |
+| Bytes discarded while closing (`linger_bytes`) | 256 KiB |
+| Closing deadline (`linger_timeout`) | 2 s |
 | Context reserve | 64 tokens |
+| Stop strings per request | 4 |
+| Loop guard: longest period, repeat run in thinking / answer, digit run in thinking | 16 tokens; 256 / 1024 tokens; 1000 tokens |
+
+Default bind is 127.0.0.1:8765 and the default `max_tokens` is 32768.
+
+**Closing a connection.** Whenever the server ends a connection after a
+response, it flushes the response, shuts down its write side, then reads and
+discards what the client still sends until the client closes, `linger_bytes`
+have been discarded, or `linger_timeout` passes, whichever is first. Closing a
+socket that still has unread request bytes makes the kernel send a reset, which
+can destroy the response before the client reads it; early rejections (403,
+401, 404, 408, 413, 501) and Hyper's own 400/414/431 responses would otherwise
+lose their answer. This is done in the connection's IO wrapper, which Hyper 1.12
+shuts down after flushing every response it ends a connection with, including
+its parse-error responses. A header timeout ends without a response: Hyper
+returns that error without writing one. The connection keeps its permit while
+it lingers, so the connection cap also bounds lingering clients.
 
 Library embedders may configure `Limits`; CLI defaults are fixed. Protection
 headers are X-Frame-Options DENY, CSP frame-ancestors 'none',
@@ -93,28 +144,43 @@ No CORS headers, TLS, file serving, outgoing HTTP, or prompt/answer logging.
 Rust uses Hyper HTTP/1 framing and compact outer JSON instead of Python's
 HTTPServer/json.dumps spacing; JSON strings containing tool arguments retain
 Python spacing/float spelling. Unsupported methods retain status 501 but use
-JSON errors instead of Python's HTML. Early rejected POSTs close rather than
-drain a potentially slow body; chunked requests are explicitly rejected (413),
-where Python never implemented their decoding. Hyper rejects malformed framing
-before the handler, using its own 400/431/connection-close behavior.
+JSON errors instead of Python's HTML. Early rejected POSTs answer and close
+with the bounded linger above instead of reading a potentially slow body;
+chunked requests are explicitly rejected (413), where Python never implemented
+their decoding. Hyper rejects malformed framing before the handler, using its
+own 400/414/431 responses and closing the connection.
 
-Duplicate security headers are rejected to avoid intermediary ambiguity. Added
-header/body/connection/event limits defend the hand-built transport. Non-finite
-numbers and integers outside i64 are rejected; Python accepts NaN/Infinity and
-arbitrary precision integers. Non-object template kwargs/stream_options and
-invalid effort types become 400 instead of Python conversion/attribute errors;
-all template failures become 400. These are deliberate validation defect fixes.
+Duplicate Host/Origin/Sec-Fetch-Site/Authorization headers are rejected to
+avoid intermediary ambiguity. Added header/body/connection/event limits defend
+the hand-built transport. The digest key comparison above takes the role of
+upstream's `hmac.compare_digest` with dependencies already in the lockfile.
+Non-finite numbers and integers outside i64 are rejected; Python accepts
+NaN/Infinity and arbitrary precision integers. Integer seeds within i64 do not
+pass through f64, so they keep full precision. Non-object template
+kwargs/stream_options and invalid effort types become 400 instead of Python
+conversion/attribute errors; all template failures become 400. These are
+deliberate validation defect fixes.
 
-Windows console/DLL/CUDA/GPU introspection and tuning environment changes have
-no equivalent here. Info reports this static Rust binary, stub and tokenizer.
-The explicit stub needs no model folder; `--model-dir` loads only text files.
-Terminal output is plain, without optional ANSI coloring. Verify/bench/selfcheck
-and actual model generation are outside this brief's product integration.
+Windows console code page and coloring, DLL/CUDA/device selection, nvidia-smi
+GPU-memory warnings and CUDA tuning environment changes have no equivalent
+here. Info reports this static Rust binary, stub and tokenizer. The explicit
+stub needs no model folder; `--model-dir` loads only text files, and nothing
+substitutes for the real engine implicitly. Warmup is a short trait
+`generate` plus `reset`, not a native CUDA warmup. Terminal output is plain
+line I/O. Command-line argument errors exit with status 1. `verify` is not
+ported; `bench` and `selfcheck` are deferred and only report that they are not
+available yet. Actual model generation is outside this crate's integration so
+far.
 
 Tests run automatically through Cargo/CI with synthetic assets, including real
-TCP tests on ephemeral ports; none require weights or a real tokenizer. Golden
-response bodies normalize only id/timestamp fields, and were constructed from
-the fixed protocol/byte-token contract, not captured from the implementation.
-See [REPORT.md](REPORT.md) for the upstream test mapping and this run's exact
-proof results. A sandbox that forbids TCP bind must report the socket tests as
-blocked failures, never silently skip them or claim a pass.
+TCP tests on ephemeral ports; none require weights or a real tokenizer. Each
+Rust test ported from upstream carries a comment naming its upstream case
+(`test_chat.py`, `test_server.py`, `test_tools.py`, `test_cli.py`). Upstream
+cases not ported: `test_cli` verify, bench and selfcheck round trip (commands
+not available) and the GPU memory warning (Windows/CUDA only). Golden response
+bodies normalize only id/timestamp fields, and were constructed from the fixed
+protocol/byte-token contract, not captured from the implementation. Socket
+tests synchronize on responses, handshakes or a polled condition, never on a
+fixed sleep; their 30 s bounds are reached only by a failure, and the deadline
+under test is set small through `Limits`. A sandbox that forbids TCP bind must report the socket tests
+as blocked failures, never silently skip them or claim a pass.

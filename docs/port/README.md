@@ -415,6 +415,6 @@ connection/event resources and deadlines protect the Hyper transport.
 Synthetic chat/service tests and real ephemeral TCP tests are ordinary Cargo
 tests. Real-socket tests must fail visibly if the environment denies bind;
 service tests do not establish transport verification. Full commands, security
-limits and deliberate Python/Windows differences are in
-[the CLI README](../../crates/yskn-cli/README.md); per-upstream-test mapping and
-this run's proof boundary are in [the report](../../crates/yskn-cli/REPORT.md).
+limits, the engine contract and deliberate Python/Windows differences are in
+[the CLI README](../../crates/yskn-cli/README.md); each ported test names its
+upstream case in a comment.
