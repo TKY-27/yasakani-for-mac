@@ -48,6 +48,9 @@ pub struct Generation {
     pub passes: usize,
     pub rows_verified: usize,
     pub guesses_offered: usize,
+    /// Verified offers by source, after adaptive depth truncation.
+    pub neural_guesses_offered: usize,
+    pub ngram_guesses_offered: usize,
     pub guesses_accepted: usize,
     /// Neural block proposals and draft history updates during generation;
     /// each reads the draft's proposal or update code once (D19).

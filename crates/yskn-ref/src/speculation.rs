@@ -138,6 +138,15 @@ impl Selector for Greedy {
     }
 }
 
+/// Diagnostic attribution of the most recent proposal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProposalSource {
+    #[default]
+    Unspecified,
+    Neural,
+    Ngram,
+}
+
 /// Guesses follow `last_selected`; `committed_history` excludes that pending
 /// token. History can be a known suffix of the committed session's full history.
 /// Return only valid vocabulary IDs, and at most `max_guesses` tokens.
@@ -148,6 +157,11 @@ pub trait Proposer {
         last_selected: u32,
         max_guesses: usize,
     ) -> Vec<u32>;
+    /// Source of the most recent proposal, including `free_guesses`.
+    /// Diagnostic only; unspecified proposers still contribute to total offers.
+    fn proposal_source(&self) -> ProposalSource {
+        ProposalSource::Unspecified
+    }
     /// Observe the retained prompt suffix before generation or a direct proposal.
     fn synchronize<V: Verifier>(&mut self, _verifier: &mut V) -> Result<()> {
         Ok(())
@@ -258,6 +272,9 @@ impl NgramProposer {
     }
 }
 impl Proposer for NgramProposer {
+    fn proposal_source(&self) -> ProposalSource {
+        ProposalSource::Ngram
+    }
     fn propose(&mut self, history: &[u32], last: u32, max: usize) -> Vec<u32> {
         self.continuation(history, last, max, 0)
     }
@@ -302,6 +319,9 @@ pub struct GenerationStatistics {
     pub rows_verified: usize,
     pub tokens_confirmed_per_pass: Vec<usize>,
     pub guesses_offered: usize,
+    /// Actual verified guesses after depth truncation, attributed by the proposer.
+    pub neural_guesses_offered: usize,
+    pub ngram_guesses_offered: usize,
     /// Proposer calls with a positive guess budget.
     pub proposals: usize,
     /// Guesses requested before each pass; zero when no proposal was made.
@@ -478,6 +498,11 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
         result.statistics.passes += 1;
         result.statistics.rows_verified += rows.len();
         result.statistics.guesses_offered += guesses.len();
+        match proposer.proposal_source() {
+            ProposalSource::Neural => result.statistics.neural_guesses_offered += guesses.len(),
+            ProposalSource::Ngram => result.statistics.ngram_guesses_offered += guesses.len(),
+            ProposalSource::Unspecified => {}
+        }
         let before = result.tokens.len();
         let mut stopped = false;
         for row in 0..rows.len() {
@@ -831,6 +856,75 @@ mod tests {
                 }
                 assert_eq!(proposer.calls, fail_on);
             }
+        }
+    }
+
+    #[test]
+    fn source_offers_count_verified_guesses_after_depth_truncation_even_when_cancelled() {
+        struct Sourced {
+            source: ProposalSource,
+            free: bool,
+        }
+        impl Proposer for Sourced {
+            fn propose(&mut self, _: &[u32], _: u32, max: usize) -> Vec<u32> {
+                vec![0; max]
+            }
+            fn free_guesses(&mut self, _: &[u32], _: u32, max: usize) -> Vec<u32> {
+                if self.free { vec![0; max] } else { Vec::new() }
+            }
+            fn proposal_source(&self) -> ProposalSource {
+                self.source
+            }
+        }
+        // This independent cost table favors exactly two paid guesses out of
+        // four available; free guesses bypass that depth and offer all four.
+        let policy = DepthPolicy::Adaptive(AdaptiveDepth {
+            costs: CostModel {
+                pass: vec![1.0, 1.0, 1.0, 100.0, 100.0],
+                proposal: 0.0,
+            },
+            prior: vec![1.0, 1.0, 0.0, 0.0],
+            rate: 0.25,
+            probe_after: 4,
+            relax: 0.0,
+        });
+        for (source, free, depth, expected) in [
+            (ProposalSource::Neural, false, policy.clone(), (2, 2, 0)),
+            (ProposalSource::Ngram, true, policy, (4, 0, 4)),
+            (ProposalSource::Ngram, false, DepthPolicy::Fixed, (4, 0, 4)),
+            (
+                ProposalSource::Unspecified,
+                false,
+                DepthPolicy::Fixed,
+                (4, 0, 0),
+            ),
+        ] {
+            let mut verifier = SequenceVerifier::new(&[1, 2], 64, 9);
+            let mut proposer = Sourced { source, free };
+            let mut limits = GenerationLimits::new(5, 64);
+            limits.max_draft_tokens = 7;
+            limits.depth = depth;
+            let mut cancel = |_| false;
+            limits.on_token = Some(&mut cancel);
+            let result = generate(
+                &mut verifier,
+                &mut proposer,
+                &mut Greedy,
+                &[1, 2, 3],
+                limits,
+            )
+            .unwrap();
+            assert_eq!(result.stop_reason, StopReason::Cancelled);
+            assert_eq!(result.tokens.len(), 1);
+            assert_eq!(result.statistics.rows_verified, expected.0 + 1);
+            assert_eq!(
+                (
+                    result.statistics.guesses_offered,
+                    result.statistics.neural_guesses_offered,
+                    result.statistics.ngram_guesses_offered
+                ),
+                expected
+            );
         }
     }
 
