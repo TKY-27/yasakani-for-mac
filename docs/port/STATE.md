@@ -4,7 +4,36 @@ This file is the single resumable record of the port. It is written so the
 orchestrator can continue from it alone. Update it at every merge, decision
 and measurement.
 
-Last updated: 2026-11-14 14:20 JST (step 3 done: both quality gates pass and all three upstream self-check outputs are reproduced; step 5 mostly merged; step 6 server merged, real engine being connected; draft fast path in progress).
+Last updated: 2026-11-14 16:45 JST (steps 1 to 4 done; step 5 merged except the wide prefill kernel and the prompt reuse and cancellable prefill that are part of PR #26; step 6: the product binary runs the real model and reproduces upstream's self-check, in review as PR #26; step 7 under way: CPU stage fast paths, kernel round two, draft depth policy). **Read "Work in flight" first when resuming.**
+
+## Work in flight (2026-11-14 16:45 JST)
+
+Each line: what, who, where, how to check it. Briefs are in
+`.work/briefs/`, worker reports in `.work/reports/`, real-model run
+outputs in `.work/runs/`, scratch notes in `.work/NOTES.md` (all ignored
+by git; if they are lost, the brief can be rewritten from this file).
+
+| Item | Worker | Worktree and branch | State |
+|---|---|---|---|
+| PR #26 product engine (D19) | Sol wrote, Opus fixed the socket tests | `.work/wt/06i`, `feat/06i-product-engine` | Astra reviewed: no wrong output, crash or unbounded memory; three test weaknesses (snapshot memory test compares an estimate with itself, disconnect test depends on scheduling, missing interrupted-prefix, seeded-reuse and context-boundary cases) being fixed by Sol (brief `06l`); the fourth finding (`yskn bench` leaves the draft's history updates out of bytes per pass) is added to brief `06k`. Then the orchestrator runs the socket tests 20 times and Astra confirms |
+| Draft depth policy and fast draft in the product | Opus (brief `06k-draft-policy`) | `.work/wt/06k`, `feat/06k-draft-policy` (on top of 06i) | Running |
+| CPU stages round two: KV codec selection, dense gates, scalar helpers, attention at long context | Astra (brief `07c-cpu-stages-2`) | `.work/wt/07c`, `feat/07c-cpu-stages-2` | Running |
+| Kernel round two: submission overhead, cost per row, CPU and GPU together | Opus (brief `07d-kernel-round-2`) | `.work/wt/07d`, `feat/07d-kernel-2` | Running |
+| CI test time under 8 minutes without losing proof | Sol (brief `08a-ci-test-time`) | `.work/wt/08a`, `ci/test-time` | Running |
+
+Workers that load the real model take the lock directory
+`.work/model.lock` (`mkdir` to take, `rmdir` to release) so that only one
+process holds the weights. The orchestrator takes the same lock for its
+own runs and repeats final timings on a quiet machine.
+
+Next, in order, once the above land: (a) repeat real-model timings on a
+quiet machine and record them; (b) a lossless check on the real model
+through the product (draft off against the shipping draft, greedy and
+seeded, repeated) over a varied prompt set; (c) the soak harness for the
+one-hour workload at 32,768 tokens; (d) step 8 audit of fallbacks and
+start-up checks; (e) both perplexity gates on the shipping binary; (f)
+whole-repository review; (g) tag, then the SwiftUI app; (h) repository
+cleanup and documents; (i) release summary.
 
 ## Goal and release criteria
 
@@ -70,7 +99,10 @@ Release criteria (all must hold):
    **Done: D12, Metal** (PR #8). The engine's `Model` runs on it (PR #13,
    D14); the Metal code now lives in `crates/yskn-engine/src/metal.rs`.
 5. Draft model, speculation loop, prompt snapshots, long-prompt prefill, KV5.
-   **In progress**: see the unit table under "Step 5 plan".
+   **Merged**, except a wide kernel for long-prompt prefill (brief `07d`)
+   and units K and L's product side (prompt reuse, cancellable prefill),
+   which are in PR #26, still in review: see the unit table under
+   "Step 5 plan".
 6. Product binary: terminal chat, OpenAI-compatible server, benchmark.
    **In progress.** `crates/yskn-text` merged (PR #12): tokenizer, chat
    template, stream decoding, tool helpers; 153 goldens generated from
@@ -99,7 +131,16 @@ Release criteria (all must hold):
    memory check at start, `yskn selfcheck`, `yskn bench`, `yskn info`.
    Sol's sandbox cannot open sockets or use the GPU, so the orchestrator
    runs those tests.
+   **Update 16:45:** brief `06i` is done and is PR #26. The product binary
+   on the real model: `yskn selfcheck` passes all three upstream cases,
+   `yskn info` and a one-shot `yskn chat` run (M14). Open: Astra's review;
+   `--draft neural` still loads the scalar draft (brief `06k` switches it
+   to the fast draft and adds the depth policy).
 7. Optimization to the machine limit (stop after five attempts under 2%).
+   **Under way.** Attempts so far and their effect on one pass at one row
+   (real model, Metal, quiet machine): CPU stage fast paths, PR #25:
+   264 ms to 232 ms, 12% (M13). Running: `07c`, `07d`, `06k`. The count of
+   consecutive attempts under 2% is 0.
 8. Other Macs: feature detection, forced fallbacks, memory check at start.
 9. SwiftUI chat app (only after the engine passes every criterion; tag first).
 10. Repository cleanup and documents written from nothing.
@@ -155,12 +196,12 @@ Units (B, C, I can run in parallel; F before D because both touch `model.rs`):
 | B | `yskn-ref/src/kv_profile.rs`: KVQP reader, fully validated | merged, PR #11 (Sol; Astra review) |
 | C | `yskn-ref/src/kv_codec.rs`: row codec ported from the source | merged, PR #11 |
 | D | Cache modes `Int8`, `Int8Profile`, `Kv5` in the reference attention, model load and the engine | merged, PR #14 (Sol; Astra reviewed the reference against the source, Opus the engine wiring); real scoring running |
-| E | KV codec fast path | not started; the codec runs inside the engine's parallel row preparation, measure first |
+| E | KV codec fast path | row encoding runs in parallel across heads and sides (PR #25, D20: 45 ms to 13 ms at one row); the codec's candidate selection is still the hottest CPU function (M13) and is in brief `07c` |
 | F | Main-model hooks: residual capture after layers 5, 19, 33, 47, 61; snapshot/restore; head rows | merged: PR #17 and PR #19 (D17; Sol; two Opus reviews) |
 | G | Speculation loop over Verifier and Proposer traits, lossless tests | merged, PR #17, D16 (Sol; Opus review) |
 | H | Engine `run_provisional`/`commit` without cloning the attention cache | merged, PR #17 |
 | I | Draft model reference (chapter 07) and `.shead` | merged, PR #15, D15 (Sol; Astra review against the source) |
-| J | Draft fast path (one scalar proposal takes about 90 s on the real files; target under 40 ms, bit-identical) | brief `05m` (Opus), worktree `.work/wt/05m`, branch `feat/05m-draft-fast`, in progress |
+| J | Draft fast path (one scalar proposal takes about 90 s on the real files; target under 40 ms, bit-identical) | merged, PR #24, D18 (Opus; Sol review; failure test by Luna): 47 ms per proposal on the real files, bit-identical to the scalar draft (M12) |
 | K | Prompt reuse modes (reset, live prefix, snapshot) | in brief `06i` |
 | L | Long-prompt prefill: bounded memory, head on last row only, large-M kernel | cancellable prefill with last-row logits in brief `06i`; a large-M kernel is step 7 |
 
@@ -234,11 +275,13 @@ measured cost model, pick the K and sources that minimise ms per token.
 
 ## Decisions
 
-D1 to D15 are in [DECISIONS.md](DECISIONS.md): D10 mapped CPU kernel,
+D1 to D18 and D20 are in [DECISIONS.md](DECISIONS.md): D10 mapped CPU kernel,
 D11 layer-major engine model, D12 Metal backend, D13 KV cache modes and
 codec, D14 engine on Metal with parallel recurrent heads, D15 draft model
-math and tie rule. D16 (generation state and speculation loop) is being
-written in brief `05e`. Owner-decided gaps:
+math and tie rule, D16 sessions, provisional passes, commit, snapshots
+and the lossless speculation loop, D17 residual capture and the draft
+proposer, D18 fast draft, D20 CPU stage fast paths. D19 (product engine)
+arrives with PR #26, D21 (kernel round two) with brief `07d`. Owner-decided gaps:
 
 - **D7** exp2(t) = portable exp of the binary32 product t × ln 2
   (bits 0x3f317218). Reason: upstream calls `exp2f(x * log2e)` and has no
@@ -260,6 +303,35 @@ Orchestrator decisions:
   build output was showing as untracked; briefs and worker reports are
   transient.
 
+- **O9 (2026-11-14)** The GPU kernel may use binary32 arithmetic where
+  every operand and partial sum is an integer of magnitude below 2^24.
+  Reason: such operations are exact, so the kernel still returns the
+  same signed 64-bit sums and bit identity holds by construction; the
+  first Metal brief forbade floating point in the kernel only as a
+  precaution, and each added row costs 35 ms of integer work, which
+  bounds prefill speed. The bound must be proven from the format's
+  limits and tested at the extremes (brief `07d`).
+- **O10 (2026-11-14)** The draft depth is chosen per proposal by a
+  deterministic controller, not fixed. Reason: measured acceptance (M11)
+  differs by a factor of three between easy and hard text, and a
+  verified row costs 40 to 60 ms here, so no fixed depth is right. The
+  controller only changes how many guesses are requested; output cannot
+  depend on it (D16). Its cost model comes from constants or a stored
+  calibration, never from timing inside the loop, so runs repeat.
+- **O11 (2026-11-14)** The one-hour workload of release criterion 4
+  fills the context once (about 30,000 prompt tokens) and then runs
+  mixed requests against the full context. Reason: prefill costs at
+  least 43 ms of kernel time per token today, so a full-context prompt
+  takes over 20 minutes; a workload that never reaches the limit would
+  not test "at 32,768-token context". If the fill alone exceeds the
+  hour, the run is extended, never shortened.
+- **O12 (2026-11-14)** The whole-repository review of release
+  criterion 8 goes to Sonnet 5.5 at high effort, in parts (one per
+  crate plus one for server security), with Astra cross-checking server
+  security. Reason: the criterion asks for a model that wrote none of
+  the code; Sol, Astra, Opus and Luna all have commits here, the
+  orchestrator made small edits and may not start a subagent on its own
+  model, and Sonnet has only forwarded tasks to Codex.
 - **D12 (2026-11-14) Backend: Metal for the compressed linear operator.**
   Measured on the real model (M2 below), whole pass, median ms, Metal vs
   CPU dotprod with 10 threads: 111 vs 646 at 1 row, 128 vs 671 at 2,
@@ -337,6 +409,10 @@ Orchestrator decisions:
 | 2026-11-14 | 6 | PR #18: `crates/yskn-cli` (binary `yskn`): chat logic, hyper server, terminal chat against an engine trait (Sol; socket and security fixes by Opus; four Astra reviews). | `cargo test -p yskn --release` (109 tests, repeated 5 times) |
 | 2026-11-14 | 3 | Gate 2 passed: KV5 perplexity 2.075687 (M9). Self-check outputs reproduced (M10). | M9, M10 below |
 | 2026-11-14 | CI | PR #22: one test pass in CI (Sol review). The test step still takes about 21 minutes on the runner. | `gh run view` |
+| 2026-11-14 | 5 J | PR #24: fast draft, D18 (Opus; Sol review approve; missing failure test added by Luna and run on the device). | `cargo test -p yskn-engine --release --test draft_fast`; `verify_draft` on the real files: fast equals scalar at position 300, Metal equals CPU equals portable (M12) |
+| 2026-11-14 | 5 | Draft acceptance measured on the real model (M11). | M11 below |
+| 2026-11-14 | 7 | PR #25 merged (187cebb, CI green on its head a939304): CPU stage fast paths, D20 (Astra; Opus review found no changed bit and asked for an aliasing fix, reference error identity and shared bodies; Astra fixed; Sol re-review approve). | `cargo test --workspace --release` (349 pass); `YSKN_CPU_STAGES=reference cargo test -p yskn-engine --release` (73 pass); M13 |
+| 2026-11-14 | 6 | PR #26 opened: real engine behind the product binary, `selfcheck`, `bench`, `info`, D19 (Sol; socket test fixture fixed by Opus). | `cargo test -p yskn --release` (125 pass); M14 |
 
 ## Process incident (2026-11-14)
 
@@ -354,13 +430,28 @@ orchestrator (PR #22) was reviewed by Sol before merging.
 ## Known debts
 
 - CI's test step takes about 21 minutes of a 30-minute limit. Reduce it to
-  under about 8 minutes without dropping coverage (the randomized
-  speculation and draft-generation tests dominate; use smaller synthetic
-  models). Consult the `test-audit` skill.
-- Scalar attention time grows linearly with context: about 1 s per 16-row
-  pass at 2,000 tokens, so on the order of a second per token at 32,768
-  (extrapolated, not measured). A fast attention path is required for the
-  32,768-token release criterion; step 7.
+  under about 8 minutes without dropping coverage. Seconds per test
+  binary on the runner (run 43565720700): engine `speculation` 509,
+  `draft_generation` 288, reference `draft_wiring` 109, engine `model`
+  92, `kv_attention` 57, `draft_fast` 45, compile 213. Brief `08a` (Sol),
+  written with the `test-audit` rules: reduce cost, not proof; a ledger
+  line per slow test; a mutation check per slow binary.
+- **Prefill speed.** A 16-row pass costs about 1.2 s (kernel 0.69 s), so
+  a prompt token costs at least 43 ms of kernel time plus the CPU
+  stages, and attention grows with context (0.31 s per 16-row pass at
+  2,000 tokens after PR #25). A 30,000-token prompt takes well over 20
+  minutes. Briefs `07d` (cost per row, CPU and GPU together) and `07c`
+  (attention at long context) address it; whatever remains is a stated
+  limit of this hardware in the README.
+- Swap: `sysctl vm.swapusage` showed 5.4 GB used at 16:03 with several
+  workers compiling while the real model was loaded. The one-hour run
+  must be measured with nothing else running and judged by swap-out
+  counters over the run, not by the absolute figure.
+- Attention time grows linearly with context. The scalar code took about
+  1 s per 16-row pass at 2,000 tokens; the fast path of PR #25 takes
+  0.31 s (M13), which still extrapolates to about 0.3 s per row at
+  32,768 tokens (not measured). The target is under 0.1 s per 16-row pass
+  at 2,000 tokens; brief `07c`.
 - The format's maximum context (262,144 tokens) does not fit this machine
   in `Kv5` with the current cache representation; the product caps the
   context by memory (brief `06i`). A compact fast path reading packed
@@ -370,9 +461,10 @@ orchestrator (PR #22) was reviewed by Sol before merging.
 
 - `generate` copies the whole recurrent state (about 157 MB) at the start
   of every provisional pass and again on a partial commit (D16); step 7.
-- Row encoding (`kv_encode`, 45 ms at one row) runs the scalar codec for
-  128 side-rows sequentially within a row; it can run in parallel across
-  heads and sides without changing bits; step 7.
+- Row encoding (`kv_encode`) was 45 ms at one row with the scalar codec
+  run sequentially; PR #25 runs it in parallel across heads and sides
+  (13 ms, M13). The codec's candidate selection is now the hottest CPU
+  function; brief `07c`.
 
 - Draft tests (from Astra's review of PR #15): a rank-projection test with
   off-diagonal entries and rank different from hidden width; a synthetic
@@ -549,6 +641,94 @@ PASS (engine state digest equals the scalar reference after a 3-row
 provisional pass and a 2-row commit), 960 s.
 
 Passes took 0.7 to 1.5 s in these runs because they predate PR #21.
+
+### M11: draft acceptance on the real model (2026-11-14)
+
+Command (run alone on the model; binaries of the PR #24 branch, saved in
+`.work/runs/05m`; for W in `0..1`, `7..8`, `13..14`):
+`./draft_acceptance ~/models/qwen38-speed tools/quality/windows_own_thinking.json --windows W --positions 150 --k 7 --kv kv5 --backend metal`
+(`cargo run --release -p yskn-engine --example draft_acceptance`).
+"Verified acceptance" is the fraction of positions at which the first d
+guesses all equal the main model's greedy choice when the guesses are
+checked the way generation checks them. 150 positions per window
+starting at token 1,024. Outputs in `.work/runs/acceptance_w*.out`.
+
+| Window | Neural draft, depth 1 to 7 | Mean accepted prefix | N-gram mean prefix |
+|---|---|---:|---:|
+| 0 | .913 .827 .780 .767 .727 .647 .560 | 5.22 | about 0.9 |
+| 7 | .693 .453 .253 .147 .087 .053 .033 | 1.72 | 0.04 |
+| 13 | .920 .833 .680 .580 .527 .460 .413 | 4.41 | 2.15 |
+
+N-gram first, neural second was worse than neural alone on all three.
+Projection from the pass times of M7 and 47 ms per proposal with
+window 0's acceptance: 264 ms per token without drafting, 124 at depth
+3, 115 at depth 5, 114 at depth 6 (about 8.7 tokens per second). On
+window 7 deep proposals lose. Hence decision O10.
+
+### M12: fast draft on the real draft files (2026-11-14)
+
+Binaries of the PR #24 branch, machine at low load.
+`./verify_draft ~/models/qwen38-speed` (example `verify_draft`): the fast
+draft's state equals the scalar reference after 3 context rows (the
+example's default for the independent scalar comparison), its proposal
+equals the scalar draft's at position 300 with the fast draft's snapshot
+restored into the scalar draft, and the Metal, CPU and portable
+configurations equal each other: PASS.
+`./bench_draft ~/models/qwen38-speed` (example `bench_draft`): one
+proposal 47.2 ms median (kernel 26.8, attention 5.7, approximate scores
+4.1); pushing context rows 0.39 ms per row in batches of 256, 1.5 ms for
+a single row; 2.2 GB resident. The scalar draft takes about 90 s per
+proposal.
+
+### M13: whole-model pass with the CPU stage fast paths (2026-11-14)
+
+Command, quiet machine, binaries of the PR #25 branch (saved in
+`.work/runs/07a`), minimum over the passes:
+`./bench_model ~/models/qwen38-speed --backend metal --kv kv5 --rows-per-pass 1 --passes 9`
+
+| Stage, one row | Before (M7) | With PR #25 |
+|---|---:|---:|
+| total | 264 ms | 232 ms |
+| kernel (GPU) | 146 | 136 |
+| recurrence | 40 | 39 |
+| row encoding | 45 | 13 |
+| rest | 29 | 26 |
+
+At 16 rows and a 2,000-token context the attention stage takes 0.31 s
+per pass (about 1.0 s before). A run under load (other workers
+compiling; `.work/runs/bench_model_kv5_07a.txt`) gave 0.438 s at 4 rows
+and 0.645 s at 8 rows.
+
+So the fast paths, tuned on a small synthetic model, helped row encoding
+and attention and did not help recurrence or the rest. A sampling
+profile of the one-row pass (`sample PID 10` on the running
+`bench_model`, on-CPU samples at the top of the stack, idle waits
+removed) shows why: `kv_codec::select` 532 samples,
+`GatedDeltaNet::dense_gates` 290, `portable_math::exp` 77, `recur_head`
+61, `attend_head` 60, `portable_math::half` 57, `hadamard512` 55,
+`require_finite` 49, `gated_deltanet::finite` 33. The time in the
+recurrent layers is in the dense gates computed by scalar reference
+code, not in the per-head update that was vectorized. Brief `07c`
+targets this list.
+
+### M14: the product binary on the real model (2026-11-14)
+
+Binary `yskn` built from PR #26 at 0df90ae (saved as
+`.work/runs/06i/yskn`), default settings (`Kv5`, Metal, n-gram drafting
+at depth 3, context 32,768):
+
+- `./yskn selfcheck --model-dir ~/models/qwen38-speed`: short-answer PASS
+  (3 tokens), thinking PASS (160 tokens), plain-text PASS (32 tokens);
+  82.7 s wall including loading.
+- `./yskn info --model-dir ~/models/qwen38-speed`: memory needed
+  17,205,034,189 bytes of 25,769,803,776 (weights 10.31 GB, cache
+  2.94 GB at 32,768 tokens, recurrent state 0.16 GB, working 0.46 GB,
+  margin 3.18 GB).
+- `printf 'What is the capital of Japan? Answer in one short sentence.\n' | ./yskn chat --model-dir ~/models/qwen38-speed --no-think --max-tokens 40 --temperature 0`:
+  "The capital of Japan is Tokyo.", 8 tokens, 34 s wall including
+  loading.
+
+`yskn bench` and `yskn serve` on the real model are not run yet.
 
 ## Blocked on the owner
 
