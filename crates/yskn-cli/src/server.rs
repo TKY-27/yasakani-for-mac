@@ -523,6 +523,17 @@ fn refused<B>(r: &Request<B>, cfg: &Config, post: bool) -> Option<&'static str> 
     {
         return Some("host");
     }
+    // An absolute-form target names its own authority: hold it to the same rule.
+    let uri = r.uri();
+    if let Some(authority) = uri.authority() {
+        if uri.scheme_str() != Some("http")
+            || !own
+                .iter()
+                .any(|h| authority.as_str().eq_ignore_ascii_case(h))
+        {
+            return Some("host");
+        }
+    }
     if post {
         if r.headers().get_all("origin").iter().count() > 1
             || (r.headers().contains_key("origin")

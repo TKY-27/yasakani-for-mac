@@ -105,8 +105,10 @@ observations, matching the upstream fixture's responsibilities.
 A non-loopback bind **is refused without a key**, as in upstream cli.py. On
 loopback, Host must be localhost/127.0.0.1/[::1] with the actual bound port;
 POST Origin must be the same HTTP origin, and Sec-Fetch-Site must be same-origin
-or none. As upstream does, a keyed remote bind bypasses Host/Origin/Fetch checks
-and still requires the key. API-key comparison hashes both byte strings with
+or none. An absolute-form request target (`GET http://host:port/path`) must name
+an allowed authority with the `http` scheme as well. As upstream does, a keyed
+remote bind bypasses Host/Origin/Fetch checks and still requires the key, and
+`/health` answers without the key on any bind. API-key comparison hashes both byte strings with
 SHA-256 and reduces all 32 digest bytes without prefix-dependent branches.
 
 | Limit (`Limits` field) | Default | Why this number |
@@ -191,7 +193,16 @@ text and global budget limits in the table above have no upstream equivalent;
 upstream parses any body within its limit and tokenizes it in full.
 
 Duplicate Host/Origin/Sec-Fetch-Site/Authorization headers are rejected to
-avoid intermediary ambiguity. Added header/body/connection/event limits defend
+avoid intermediary ambiguity; Python reads the first. An empty Sec-Fetch-Site is
+rejected; Python treats it as absent (`none`). An absolute-form target is
+checked as above and then routed by its path; Python compared the whole target
+with the route and answered 404. JSON nested deeper than 128 levels (serde_json's
+recursion limit) and strings with a lone surrogate escape (`"\ud800"`) are
+"not valid JSON" (400); Python accepts lone surrogates, and nesting up to
+its interpreter recursion limit. Integer strings are parsed by Rust rules, so
+`"1_000"` is rejected where Python's `int()` accepts it.
+`YASAKANI_THINKING_BUDGET` also sets the terminal chat's thinking budget, not
+only the server's default. Added header/body/connection/event limits defend
 the hand-built transport. The digest key comparison above takes the role of
 upstream's `hmac.compare_digest` with dependencies already in the lockfile.
 Non-finite numbers and integers outside i64 are rejected; Python accepts

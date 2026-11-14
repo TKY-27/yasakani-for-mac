@@ -1318,3 +1318,41 @@ async fn client_disconnect_during_a_non_streaming_request_stops_the_engine() {
     assert_eq!((seen.calls, seen.stops), (2, 1));
     h.stop().await;
 }
+// Review finding: an absolute-form request target's authority was not
+// checked against the Host allow-list. It is now held to the same rule.
+#[tokio::test]
+async fn absolute_form_target_authority_is_checked() {
+    let h = Harness::start(Config::default()).await;
+    let own = h.addr.to_string();
+    for (target, status) in [
+        (format!("http://evil.example:{}/health", h.addr.port()), 403),
+        ("http://evil.example/health".to_owned(), 403),
+        (format!("http://user@{own}/health"), 403),
+        (format!("https://{own}/health"), 403),
+        (format!("http://{own}/health"), 200),
+        (format!("http://localhost:{}/health", h.addr.port()), 200),
+    ] {
+        let r = raw(
+            h.addr,
+            &format!("GET {target} HTTP/1.1\r\nHost: {own}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert!(
+            r.starts_with(&format!("HTTP/1.1 {status}")),
+            "{target}: {r}"
+        );
+    }
+    let b = body().to_string();
+    let r = raw(
+        h.addr,
+        &format!(
+            "POST http://evil.example/v1/chat/completions HTTP/1.1\r\nHost: {own}\r\nContent-Length: {}\r\n\r\n{b}",
+            b.len()
+        ),
+    )
+    .await;
+    assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+    assert!(r.contains("forbidden: host"), "{r}");
+    assert_eq!(h.control.observation().calls, 0);
+    h.stop().await;
+}
