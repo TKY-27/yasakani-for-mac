@@ -1,19 +1,17 @@
 use std::{path::PathBuf, time::Duration};
-use yskn_engine::{Engine, Error, Model, Result};
+use yskn_engine::{Backend, Engine, Error, Model, Result};
 use yskn_ref::quality::{TokenWindows, score};
+
+const USAGE: &str = "MODEL_FOLDER WINDOWS.json [--backend cpu|metal] [--rows-per-pass N] [--windows A..B] [--json OUT]";
 
 fn main() -> Result<()> {
     let mut arguments = std::env::args_os().skip(1);
-    let folder = arguments.next().ok_or_else(|| {
-        Error::InvalidInput(
-            "expected MODEL_FOLDER WINDOWS.json [--rows-per-pass N] [--windows A..B] [--json OUT]"
-                .into(),
-        )
-    })?;
+    let folder = arguments
+        .next()
+        .ok_or_else(|| Error::InvalidInput(format!("expected {USAGE}")))?;
     if folder == "--help" || folder == "-h" {
-        println!(
-            "Usage: score_windows MODEL_FOLDER WINDOWS.json [--rows-per-pass N] [--windows A..B] [--json OUT]"
-        );
+        println!("Usage: score_windows {USAGE}");
+        println!("Without --backend, YSKN_BACKEND applies; its default is Metal when available.");
         return Ok(());
     }
     let path = arguments
@@ -21,6 +19,7 @@ fn main() -> Result<()> {
         .ok_or_else(|| Error::InvalidInput("missing WINDOWS.json".into()))?;
     let windows = TokenWindows::load(path)?;
     let mut rows = 16;
+    let mut backend = None;
     let mut range = 0..windows.windows.len();
     let mut json = None;
     while let Some(option) = arguments.next() {
@@ -28,6 +27,14 @@ fn main() -> Result<()> {
             .next()
             .ok_or_else(|| Error::InvalidInput("option requires a value".into()))?;
         match option.to_str() {
+            Some("--backend") => {
+                backend = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(|| Error::InvalidInput("invalid backend".into()))?
+                        .parse()?,
+                )
+            }
             Some("--rows-per-pass") => {
                 rows = value
                     .to_str()
@@ -54,8 +61,17 @@ fn main() -> Result<()> {
             _ => return Err(Error::InvalidInput("unknown score option".into())),
         }
     }
+    let backend = match backend {
+        Some(backend) => backend,
+        None => Backend::from_env()?,
+    };
     // SAFETY: this read-only scoring command requires stable input weights until exit.
-    let mut model = unsafe { Model::with_engine(folder, Engine::from_env()?, rows)? };
+    let mut model = unsafe { Model::with_backend(folder, Engine::from_env()?, backend, rows)? };
+    eprintln!(
+        "backend={} device={} rows_per_pass={rows}",
+        model.backend().name(),
+        model.device()
+    );
     let mut totals = [Duration::ZERO; 5];
     let mut passes = 0;
     let result = score(&mut model, &windows, range, rows, |model| {

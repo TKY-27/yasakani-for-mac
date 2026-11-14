@@ -275,6 +275,39 @@ fn kernel_rejects_invalid_shapes_without_poisoning_the_worker_pool() {
 }
 
 #[test]
+fn integer_overflow_in_a_worker_returns_an_error_and_the_pool_recovers() {
+    // 517 groups of 512 * 127 * -128 times i32::MIN exceed i64::MAX in every row.
+    let cols = 264_704;
+    let mut bytes = synthetic(6, "row", 96, 96, cols, false);
+    let table = DATA_OFFSET + 96 * (cols / 256) * 6 * 16;
+    let one = yskn_format::f32_to_f16(1.0).to_le_bytes();
+    for pair in bytes[table..table + 16_384].as_chunks_mut::<2>().0 {
+        *pair = one;
+    }
+    let file = TempFile::new(&bytes);
+    // SAFETY: the private file is never modified and outlives all mapping owners.
+    let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+    let matrix = model.matrix("linear").unwrap();
+    let scales = vec![i32::MIN; cols / 512];
+    for kernel in Kernel::available_variants() {
+        let mut engine = Engine::new(kernel, 4).unwrap();
+        assert!(
+            engine
+                .weighted_sums(&matrix, &vec![-128; cols], &scales)
+                .is_err(),
+            "{}",
+            kernel.name()
+        );
+        assert_eq!(
+            engine
+                .weighted_sums(&matrix, &vec![0; cols], &scales)
+                .unwrap(),
+            vec![0; 96]
+        );
+    }
+}
+
+#[test]
 fn worker_tasks_cover_large_matrices_and_the_final_partial_task() {
     let bytes = synthetic(6, "warp", 1025, 1056, 512, false);
     let file = TempFile::new(&bytes);
