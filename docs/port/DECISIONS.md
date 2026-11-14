@@ -1733,8 +1733,10 @@ idle. `MetalEngine::weighted_sums_split(cpu, matrices, activation, scales)`
 the GPU part, then runs the CPU kernel (D10, the oracle) on the *last* rows
 of every matrix of the group in one batch of pool tasks
 (`Engine::weighted_sums_rows`, which also serves `weighted_sums_prefix`),
-then waits for the GPU — also when the CPU part failed, so no shared buffer
-is reused while the GPU reads it — and interleaves both parts row by row
+then waits for the GPU — on every exit path, also when the CPU part
+returns an error or panics (a guard created right after the commit waits
+when it is dropped, also during an unwind), so no shared buffer is reused
+while the GPU reads it — and interleaves both parts row by row
 into the usual M×N result. The readback no longer zero-fills before
 copying. The split is a pure function of N, M and a constant table: CPU
 rows = share(M)·N rounded down to the 32-row tile, leaving the GPU at least
@@ -1747,7 +1749,11 @@ projections; a number in 0..=0.9 fixes the share for every M (calibration);
 and the table, for three matrices per call (padded and partial tiles, row
 and warp, M = 1, 3, 16, 20), equals the CPU kernel and the GPU-only path;
 CPU row ranges of several matrices (including an empty one) equal slices of
-whole-matrix sums for 1 and 4 workers.
+whole-matrix sums for 1 and 4 workers. A unit test in `src/metal.rs`
+(`gpu_work_completes_before_a_failing_cpu_part_returns_and_the_engine_is_reused`)
+replaces the CPU part by one that panics or fails after the commit, checks
+that the GPU rows are complete when the call has unwound or returned, and
+then reuses the same engine; without the guard it fails at the panic.
 
 Calibration, real model, engine-like grouping (257 calls per pass, as
 `Model` makes them):
