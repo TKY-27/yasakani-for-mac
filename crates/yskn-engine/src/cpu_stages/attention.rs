@@ -304,14 +304,14 @@ fn finite(values: &[f32], context: &'static str) -> Result<()> {
     }
 }
 
-fn dots32(query: &[f32], bases: &[[f32; 256]; 32], count: usize) -> [f32; 32] {
+fn dots32(query: &[f32], bases: &[[f32; 256]; 32], _count: usize) -> [f32; 32] {
     assert_eq!(query.len(), 256);
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: the production caller requires enabled(), tests require NEON;
         // query and every cache row contain exactly 256 elements.
         unsafe {
-            match count {
+            match _count {
                 0..=4 => dots32_neon::<1>(query, bases),
                 5..=8 => dots32_neon::<2>(query, bases),
                 9..=16 => dots32_neon::<4>(query, bases),

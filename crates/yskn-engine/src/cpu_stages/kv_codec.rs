@@ -16,7 +16,7 @@ pub(crate) fn search_chain(
         && table.codes.iter().all(|c| (-1100..=1100).contains(c))
     {
         // SAFETY: NEON detected, dimensions fixed, D13's reduced-cost bound
-        // (< 923,638,528 in magnitude) makes every i32 intermediate exact.
+        // (< 952,000,000 in magnitude) makes every i32 intermediate exact.
         return Ok(unsafe { vit2_neon(target, table, bits) });
     }
     kv_codec::search_chain(target, table, bits, vit2)
@@ -96,16 +96,29 @@ unsafe fn vit2_neon(target: &[i32; 64], table: &CodeTable, bits: u8) -> [u8; 64]
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn nine_scales(mut bytes: Vec<u8>) -> yskn_ref::kv_profile::KvProfile {
+        let offset = bytes.len() as u32;
+        for scale in [0.9f32, 0.93, 0.96, 0.98, 1.0, 1.02, 1.04, 1.07, 1.1] {
+            bytes.extend_from_slice(&scale.to_le_bytes());
+        }
+        bytes[24..26].copy_from_slice(&9u16.to_le_bytes());
+        bytes[32..36].copy_from_slice(&offset.to_le_bytes());
+        let length = bytes.len() as u32;
+        bytes[8..12].copy_from_slice(&length.to_le_bytes());
+        yskn_ref::kv_profile::KvProfile::parse(&bytes).unwrap()
+    }
+
     #[test]
     #[ignore = "one-core timing, run explicitly on a quiet machine"]
     fn bench_search_chain() {
+        type Search = fn(&[i32; 64], &CodeTable, u8, bool) -> Result<[u8; 64]>;
         let table = CodeTable {
             gain: 1.0,
             codes: std::array::from_fn(|i| ((i * 73 + 19) % 2049) as i16 - 1024),
         };
         let target = std::array::from_fn(|i| ((i * 137) % 4097) as i32 - 2048);
         for (name, search) in [
-            ("reference", kv_codec::search_chain as fn(_, _, _, _) -> _),
+            ("reference", kv_codec::search_chain as Search),
             ("auto", search_chain),
         ] {
             let mut times = Vec::new();
@@ -120,6 +133,36 @@ mod tests {
             }
             times.sort_by(f64::total_cmp);
             println!("{name} chain min_s={} median_s={}", times[0], times[4]);
+        }
+        let profile =
+            nine_scales(crate::model::session_test_support::kv_profile::Profile::new(1, 1).bytes());
+        let row = std::array::from_fn(|i| ((i * 37 % 257) as f32 - 128.0) / 64.0);
+        for (name, search) in [
+            ("reference", kv_codec::search_chain as Search),
+            ("auto", search_chain),
+        ] {
+            let mut times = Vec::new();
+            for _ in 0..9 {
+                let start = std::time::Instant::now();
+                for _ in 0..100 {
+                    std::hint::black_box(
+                        kv_codec::encode_packed_with_search(
+                            &profile,
+                            0,
+                            3,
+                            std::hint::black_box(&row),
+                            search,
+                        )
+                        .unwrap(),
+                    );
+                }
+                times.push(start.elapsed().as_secs_f64() / 100.0);
+            }
+            times.sort_by(f64::total_cmp);
+            println!(
+                "{name} complete_nine_scale_codec min_s={} median_s={}",
+                times[0], times[4]
+            );
         }
     }
 
@@ -148,6 +191,8 @@ mod tests {
                     0 | 4 => -2048,
                     1 | 5 => 2048,
                     2 => 0,
+                    7 => i32::MAX,
+                    8 => i32::MIN,
                     _ => (random() % 4097) as i32 - 2048,
                 });
                 let vit2 = bits != 3;
@@ -163,11 +208,29 @@ mod tests {
     }
 
     #[test]
+    fn equal_scale_errors_keep_the_first_candidate_bits() {
+        let mut fixture = crate::model::session_test_support::kv_profile::Profile::new(1, 1);
+        fixture.codes.fill(0);
+        let profile = nine_scales(fixture.bytes());
+        for value in [0.0, -0.0, 1.0, -1.0, f32::from_bits(1)] {
+            let row = [value; 256];
+            let expected = kv_codec::encode_packed(&profile, 0, 3, &row).unwrap();
+            let actual =
+                kv_codec::encode_packed_with_search(&profile, 0, 3, &row, search_chain).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.scale().to_bits(), expected.scale().to_bits());
+            if value.abs() == 1.0 {
+                assert_eq!(
+                    actual.scale().to_bits(),
+                    yskn_ref::portable_math::half(0.9).to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn selected_bytes_and_scale_match_scalar_on_random_and_tied_rows() {
-        use yskn_ref::kv_profile::KvProfile;
-        let profile =
-            KvProfile::parse(&crate::model::session_test_support::kv_profile::mixed_profile())
-                .unwrap();
+        let profile = nine_scales(crate::model::session_test_support::kv_profile::mixed_profile());
         let mut seed = 123u32;
         for case in 0..40 {
             let row = std::array::from_fn(|_| {

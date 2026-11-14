@@ -15,6 +15,9 @@ impl Elementwise for FastMath {
         map(values, Operation::Half(scale));
     }
     fn finite(values: &[f32], context: &'static str) -> crate::Result<()> {
+        if values.len() < 16 {
+            return ScalarMath::finite(values, context);
+        }
         #[cfg(target_arch = "aarch64")]
         if super::enabled() {
             // SAFETY: runtime NEON detection; the kernel handles the scalar tail.
@@ -26,6 +29,37 @@ impl Elementwise for FastMath {
         ScalarMath::finite(values, context)
     }
 }
+pub(crate) fn gated_product4(gate: [f32; 4], up: [f32; 4]) -> [f32; 4] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: gated_product calls this only after runtime NEON detection;
+        // both independent input arrays and the result contain four floats.
+        unsafe { gated_product4_neon(gate, up) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        use yskn_ref::portable_math::{bfloat, silu};
+        std::array::from_fn(|i| bfloat(bfloat(silu(bfloat(gate[i]))) * bfloat(up[i])))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn gated_product4_neon(gate: [f32; 4], up: [f32; 4]) -> [f32; 4] {
+    let mut output = [0.0; 4];
+    // SAFETY: four-element input/output arrays; no multiply-add contraction.
+    unsafe {
+        let g = bfloat4(vld1q_f32(gate.as_ptr()));
+        let activation = bfloat4(vdivq_f32(
+            g,
+            vaddq_f32(vdupq_n_f32(1.0), exp4(vnegq_f32(g))),
+        ));
+        let value = bfloat4(vld1q_f32(up.as_ptr()));
+        vst1q_f32(output.as_mut_ptr(), bfloat4(vmulq_f32(activation, value)));
+    }
+    output
+}
+
 pub(crate) fn exp2(values: &mut [f32]) {
     map(values, Operation::Exp2);
 }
@@ -82,7 +116,7 @@ unsafe fn all_finite(values: &[f32]) -> bool {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn bfloat4(value: float32x4_t) -> float32x4_t {
+pub(super) unsafe fn bfloat4(value: float32x4_t) -> float32x4_t {
     let bits = vreinterpretq_u32_f32(value);
     let rounded = vandq_u32(
         vaddq_u32(
@@ -111,6 +145,22 @@ unsafe fn half4(value: float32x4_t) -> float32x4_t {
     let bits = vreinterpretq_u32_f32(value);
     let sign = vandq_u32(bits, vdupq_n_u32(0x80000000));
     let exponent = vandq_u32(vshrq_n_u32::<23>(bits), vdupq_n_u32(255));
+    // Normal half inputs only need 13-bit significand rounding; keep the
+    // full integer conversion below for mixed/subnormal/exceptional vectors.
+    if vminvq_u32(exponent) >= 113 && vmaxvq_u32(exponent) <= 142 {
+        let magnitude = vandq_u32(bits, vdupq_n_u32(0x7fffffff));
+        let bias = vaddq_u32(
+            vdupq_n_u32(0xfff),
+            vandq_u32(vshrq_n_u32::<13>(magnitude), vdupq_n_u32(1)),
+        );
+        let rounded = vandq_u32(vaddq_u32(magnitude, bias), vdupq_n_u32(0xffffe000));
+        let rounded = vbslq_u32(
+            vcgeq_u32(rounded, vdupq_n_u32(0x47800000)),
+            vdupq_n_u32(0x7f800000),
+            rounded,
+        );
+        return vreinterpretq_f32_u32(vorrq_u32(sign, rounded));
+    }
     let fraction = vandq_u32(bits, vdupq_n_u32(0x007fffff));
     let rounded = vshrq_n_u32::<13>(vaddq_u32(
         fraction,
@@ -348,6 +398,8 @@ mod tests {
             0x42b17218,
             0x42cff1b5,
             0x00800000,
+            0x477ff000, // half overflow midpoint (65520)
+            0x38800000, // half normal/subnormal boundary
         ] {
             for delta in -8..=8 {
                 let x = f32::from_bits(bits.wrapping_add_signed(delta));

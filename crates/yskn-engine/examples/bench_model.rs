@@ -91,7 +91,7 @@ fn main() -> Result<()> {
     };
     println!("rows_per_pass={rows} passes={passes} context={context:?} stage min_s median_s");
     type Stage = fn(&PassTiming) -> Duration;
-    let stages: [(&str, Stage); 8] = [
+    let stages: [(&str, Stage); 13] = [
         ("total", |t| t.total),
         ("kernel", |t| t.kernel),
         ("recurrence", |t| t.recurrence),
@@ -100,6 +100,11 @@ fn main() -> Result<()> {
         ("attention", |t| t.attention),
         ("kv_encode", |t| t.kv_encode),
         ("rest", PassTiming::rest),
+        ("normalization", |t| t.normalization),
+        ("activation_encode", |t| t.activation_encode),
+        ("projection_restore", |t| t.projection_restore),
+        ("mlp_gate", |t| t.mlp_gate),
+        ("residual", |t| t.residual),
     ];
     for (name, stage) in stages {
         let mut seconds: Vec<f64> = timings.iter().map(|t| stage(t).as_secs_f64()).collect();

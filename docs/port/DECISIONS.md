@@ -1852,8 +1852,9 @@ preserved before editing attention. One warmup is excluded in each run.
 
 An intermediate score-only change (before direct value widening) measured
 .696305 / .760815 s at 2000/16. The final minimum improves 2.02x at 2000/16;
-the 0.1 s target is **not reached**. At 32768 the measured cost per row is
-724.074 / 730.233 ms (M=1), 1.22x minimum improvement. Shared-host scheduling
+the 0.1 s target is **not reached**. In this first campaign, at 32768 the
+measured cost per row is 724.074 / 730.233 ms (M=1), 1.22x minimum improvement.
+The lower-contention confirmation below is preferred for the final report. Shared-host scheduling
 varies materially; these are wall measurements, not hardware-counter claims.
 
 For the real packing mix, base operands and scales logically total about
@@ -1863,3 +1864,124 @@ repeated reads may hit caches. Sharing transient widening between queries,
 without changing each query's prefix/split arithmetic, is the principal
 remaining attention optimization. No unmeasured bandwidth ceiling establishes
 that the 0.1 s target can be reached on this host.
+
+#### Task 5: remaining rest work and final profile
+
+The real-model rest breakdown after task 4 (minimum / median ms) was:
+normalization 8.132 / 8.958, activation encoding 14.088 / 16.063,
+projection restoration 10.795 / 11.182, MLP gating 8.205 / 9.313,
+and residuals 1.819 / 1.915. These are nonoverlapping subsets of `rest`,
+which was 47.596 / 50.123 ms; allocations, embeddings, copies and dispatch
+outside those subsets account for the remainder. They are wall timers, not
+on-CPU samples or a claim about one function's CPU percentage.
+
+The final change keeps MLP BF16/SiLU/BF16/product/BF16 in registers, reusing
+the same rounding and exp kernels rather than dispatching three short vector
+maps per four elements. Residuals reuse that same BF16 implementation.
+Finite slices shorter than 16 use the original scalar check. For vectors
+whose four inputs are all normal binary16-range numbers, half rounding can
+round away 13 binary32 fraction bits directly and select infinity at the
+65520 midpoint. Other vectors retain the complete integer conversion.
+No floating operation is removed, reordered within an element or fused.
+The existing independent rest tests and expanded midpoint/overflow tests
+cover these paths; they keep the original scalar fallback under the switch.
+
+The VIT2 safety comment was also tightened for the full eligible +/-1100
+code range rather than quoting the released profile's narrower bound. With
+`D = 32*(2048+1100)^2+31 = 317116959`, every source reduced state can reach
+every destination and its squared-distance key lies in [0,D]. After the
+first step the cost spread is at most D+31 and normalized costs lie within
+[-D-62,D]. Emissions are at most 182899231 and the square term at most
+134217728. Thus the explicit add/subtract intermediates stay below 952000000
+in magnitude (the initial 536870912 infinity is also safe). Smaller four-bit
+terms are bounded by the same limit. This is a proof for all eligible inputs,
+not an inference from randomized tests.
+
+The final one-core codec benchmark also measures the **whole nine-candidate
+row encode** (selection, reconstruction, packing and decode), with synthetic
+256-channel rows/tables and the released nine multiplier values. Nine samples
+of 100 rows: reference minimum/median 414.495 / 431.348 us, fast
+61.703 / 62.228 us (6.72x minimum). The chain-only repeat was
+11.442 / 11.828 us versus 1.543 / 1.548 us. These do not load trained weights.
+The randomized whole-codec comparison now uses nine scales; an all-zero
+codebook makes every candidate error equal and explicitly checks that the
+first candidate's scale bits survive. Integer target extrema also exercise
+the checked scalar fallback.
+
+The four required proof commands passed with `CARGO_NET_OFFLINE=true`:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p yskn-ref -p yskn-format -p yskn-engine --release
+YSKN_CPU_STAGES=reference cargo test -p yskn-engine --release
+```
+
+After expanding the KV proof/benchmark fixture, its focused tests passed again
+in both modes, and fmt/workspace clippy passed again. No production code
+changed after the complete suites. The engine/reference integration coverage
+includes all three cache modes, frozen digests, varied workers/pass widths,
+commit/discard, snapshot/restore and failure atomicity. No tolerance or test
+expectation was weakened. GPU-dependent tests cannot establish Metal execution
+in this sandbox; real Metal and socket tests remain the orchestrator's work.
+
+Final real-model CPU profile, same five-pass one-row command as task 1.
+Values are minimum / median **milliseconds**. The task-3 serial run is kept
+below despite severe shared-host scheduling variation. Two other runs that
+started after a long lock wait overlapped this task's tests; their logs remain
+in `.work/07c-evidence/*contended*` / `task3.txt` and are excluded from this
+comparison. The final run occurred after all builds/tests and used its own
+model lock, released immediately at exit.
+
+| Stage | After task 3, serial | Before task 5 | Final |
+|---|---:|---:|---:|
+| total | 1627.957 / 3315.670 | 1579.735 / 1867.578 | 771.988 / 777.800 |
+| kernel | 1493.789 / 2548.914 | 1505.099 / 1784.461 | 725.780 / 731.182 |
+| recurrence | 27.923 / 251.173 | 19.036 / 22.542 | 13.786 / 14.045 |
+| recurrence_prepare | 12.271 / 198.739 | 9.390 / 10.921 | 7.436 / 7.517 |
+| dense_gate_work | 6.708 / 192.106 | 3.854 / 4.372 | 3.905 / 3.995 |
+| attention | 3.107 / 29.105 | 1.719 / 2.454 | 1.181 / 1.368 |
+| kv_encode | 7.694 / 42.317 | 6.286 / 7.014 | 3.590 / 3.654 |
+| rest | 56.234 / 360.345 | 47.596 / 50.123 | 27.386 / 27.456 |
+| normalization (rest subset) | — | 8.132 / 8.958 | 4.713 / 4.767 |
+| activation_encode (rest subset) | — | 14.088 / 16.063 | 8.238 / 8.271 |
+| projection_restore (rest subset) | — | 10.795 / 11.182 | 7.295 / 7.341 |
+| mlp_gate (rest subset) | — | 8.205 / 9.313 | 4.654 / 4.686 |
+| residual (rest subset) | — | 1.819 / 1.915 | 1.154 / 1.166 |
+
+Relative to the original CPU run, recurrence minimum changes from 40.413 to
+13.786 ms and KV preparation from 11.797 to 3.590 ms; rest changes modestly
+from 29.098 to 27.386 ms. Total minimum is 771.988 ms versus 739.576 ms:
+**no end-to-end CPU speedup is established**, because the unchanged kernel
+minimum moved from 656.200 to 725.780 ms. The heavily contended intermediate
+runs cannot isolate the incremental task-3/task-5 gain. Minima of individual
+stages may come from different passes and must not be summed as one pass.
+
+Remaining CPU work includes ordered quantizer/RMS reductions, projection
+restoration/Hadamard, recurring pool dispatch, allocation/copy traffic, and
+the recurrent state/output stages. They still exceed 3% of the non-kernel
+wall time; this run does not supply a new per-function on-CPU sample table
+because `sample` was denied. Their timer totals and limits are reported rather
+than attributing them to guessed hot functions. Further changes require a
+stable profile and preserving the mandated reduction orders. No Metal
+latency, real-token 2000/32768-context inference latency, full-model scalar
+logit comparison or full quality-score validation is claimed by this brief.
+
+After the final one-row run showed much lower scheduling variation, the same
+attention before/after binaries and commands were repeated serially, without
+builds/tests, acquiring/releasing the lock separately for each invocation.
+This confirmation resolves the large contention uncertainty in the earlier
+pair; it does not repeat or change any numerical proof.
+
+| Context / rows / samples | Before min / median (s) | Final min / median (s) |
+|---|---:|---:|
+| 2000 / 16 / 5 | .306970 / .313641 | .235090 / .237943 |
+| 32768 / 1 / 3 | .555328 / .561900 | .466282 / .468472 |
+
+Use this lower-variation pair as the final attention result: 1.31x at
+2000/16, still above the 0.1 s target; **466.282 / 468.472 ms per row at
+32768 (M=1)**, 1.19x minimum improvement. It remains the explicitly described
+stage-only real-shape benchmark, not real-token prefill. The earlier apparent
+2.02x ratio includes host-load variation and must not be presented as a stable
+algorithmic speedup. All raw logs and pre-change benchmark executables are
+retained under this worktree's ignored `.work/07c-evidence/` directory.

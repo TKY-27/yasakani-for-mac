@@ -221,7 +221,7 @@ pub(crate) fn residual_add(hidden: &[f32], projection: &[f32]) -> Result<Vec<f32
     for i in (0..end).step_by(4) {
         let a = hidden[i..i + 4].try_into().unwrap();
         let b = projection[i..i + 4].try_into().unwrap();
-        result[i..i + 4].copy_from_slice(&rounded_binary4(a, b, false));
+        result[i..i + 4].copy_from_slice(&residual4(a, b));
     }
     for i in end..hidden.len() {
         result[i] = bfloat(hidden[i] + bfloat(projection[i]));
@@ -244,12 +244,9 @@ pub(crate) fn gated_product(gate_projection: &[f32], up_projection: &[f32]) -> R
     let mut output = vec![0.0; gate_projection.len()];
     let end = output.len() / 4 * 4;
     for i in (0..end).step_by(4) {
-        let mut activation: [f32; 4] = gate_projection[i..i + 4].try_into().unwrap();
-        super::math::FastMath::bfloat(&mut activation);
-        super::math::FastMath::silu(&mut activation);
-        super::math::FastMath::bfloat(&mut activation);
+        let gate = gate_projection[i..i + 4].try_into().unwrap();
         let up = up_projection[i..i + 4].try_into().unwrap();
-        output[i..i + 4].copy_from_slice(&rounded_binary4(activation, up, true));
+        output[i..i + 4].copy_from_slice(&super::math::gated_product4(gate, up));
     }
     for i in end..output.len() {
         output[i] = bfloat(bfloat(silu(bfloat(gate_projection[i]))) * bfloat(up_projection[i]));
@@ -258,56 +255,30 @@ pub(crate) fn gated_product(gate_projection: &[f32], up_projection: &[f32]) -> R
     Ok(output)
 }
 
-fn rounded_binary4(a: [f32; 4], b: [f32; 4], multiply: bool) -> [f32; 4] {
+fn residual4(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: residual_add/gated_product check enabled() (runtime NEON detection)
+        // SAFETY: residual_add checks enabled() (runtime NEON detection)
         // before calling; both arrays have four elements.
-        unsafe { rounded_binary_neon(a, b, multiply) }
+        unsafe { residual_neon(a, b) }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        std::array::from_fn(|i| {
-            bfloat(if multiply {
-                a[i] * bfloat(b[i])
-            } else {
-                a[i] + bfloat(b[i])
-            })
-        })
+        std::array::from_fn(|i| bfloat(a[i] + bfloat(b[i])))
     }
 }
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn rounded_binary_neon(a: [f32; 4], b: [f32; 4], multiply: bool) -> [f32; 4] {
+unsafe fn residual_neon(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     use std::arch::aarch64::*;
     let mut out = [0.0; 4];
     // SAFETY: loads/stores cover precisely four floats; integer rounding matches
     // f32_to_bf16 including quieting NaNs and preserving the sign of zero.
     unsafe {
-        let round = |v: float32x4_t| {
-            let bits = vreinterpretq_u32_f32(v);
-            let bias = vaddq_u32(
-                vdupq_n_u32(0x7fff),
-                vandq_u32(vshrq_n_u32::<16>(bits), vdupq_n_u32(1)),
-            );
-            let rounded = vandq_u32(vaddq_u32(bits, bias), vdupq_n_u32(0xffff0000));
-            let nan = vcgtq_u32(
-                vandq_u32(bits, vdupq_n_u32(0x7fffffff)),
-                vdupq_n_u32(0x7f800000),
-            );
-            let quiet = vorrq_u32(
-                vandq_u32(bits, vdupq_n_u32(0xffff0000)),
-                vdupq_n_u32(0x00400000),
-            );
-            vreinterpretq_f32_u32(vbslq_u32(nan, quiet, rounded))
-        };
+        let round = super::math::bfloat4;
         let a = vld1q_f32(a.as_ptr());
         let b = round(vld1q_f32(b.as_ptr()));
-        let result = if multiply {
-            vmulq_f32(a, b)
-        } else {
-            vaddq_f32(a, b)
-        };
+        let result = vaddq_f32(a, b);
         vst1q_f32(out.as_mut_ptr(), round(result));
     }
     out

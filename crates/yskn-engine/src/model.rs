@@ -47,6 +47,12 @@ pub struct PassTiming {
     pub recurrence_prepare: Duration,
     /// Sum of dense callback elapsed times (overlaps across rows when M > 1).
     pub dense_gate_work: Duration,
+    /// Nonoverlapping diagnostic subsets of rest().
+    pub normalization: Duration,
+    pub activation_encode: Duration,
+    pub projection_restore: Duration,
+    pub mlp_gate: Duration,
+    pub residual: Duration,
 }
 impl PassTiming {
     pub fn rest(&self) -> Duration {
@@ -793,6 +799,7 @@ impl Model {
                 &self.weights.final_norm,
                 &self.weights.head,
                 self.weights.dimensions.epsilon,
+                &mut timing,
             )?;
             let [head] =
                 project_normalized(&mut self.engine, [&self.weights.head], &input, &mut timing)?;
@@ -925,10 +932,14 @@ fn normalize(
     norm: &[f32],
     linear: &Linear,
     epsilon: f32,
+    timing: &mut PassTiming,
 ) -> Result<Vec<NormalizedInput>> {
-    engine.map_range(0..rows.len(), |i| {
+    let start = Instant::now();
+    let output = engine.map_range(0..rows.len(), |i| {
         prepare_normalization(&rows[i], norm, linear.input_signs(), epsilon)
-    })
+    })?;
+    timing.normalization += start.elapsed();
+    Ok(output)
 }
 /// Projections that share one normalized input (and its first matrix's signs).
 fn project_normalized<const N: usize>(
@@ -961,6 +972,7 @@ fn project<const N: usize>(
     let start = Instant::now();
     let sums = engine.weighted_sums(&matrices, &activation, &scales)?;
     timing.kernel += start.elapsed();
+    let start = Instant::now();
     let m = inputs.len();
     let mut rows = engine
         .map_range(0..N * m, |index| {
@@ -980,6 +992,7 @@ fn project<const N: usize>(
             )
         })?
         .into_iter();
+    timing.projection_restore += start.elapsed();
     Ok(std::array::from_fn(|_| rows.by_ref().take(m).collect()))
 }
 fn project_rows(
@@ -988,9 +1001,11 @@ fn project_rows(
     rows: &[Vec<f32>],
     timing: &mut PassTiming,
 ) -> Result<Vec<Vec<f32>>> {
+    let start = Instant::now();
     let prepared = engine.map_range(0..rows.len(), |i| {
         quantize_activation(&rows[i], linear.input_signs())
     })?;
+    timing.activation_encode += start.elapsed();
     let inputs: Vec<_> = prepared.iter().map(|p| (p, None)).collect();
     let [projected] = project(engine, [linear], &inputs, timing)?;
     Ok(projected)
@@ -1214,7 +1229,14 @@ fn forward(
         Branch::Attention(l) => &l.query_gate,
         Branch::Recurrent(l) => &l.query_key_value,
     };
-    let input = normalize(engine, hidden, &layer.input_norm, input_projection, epsilon)?;
+    let input = normalize(
+        engine,
+        hidden,
+        &layer.input_norm,
+        input_projection,
+        epsilon,
+        timing,
+    )?;
     let projected = match (&layer.branch, state) {
         (Branch::Recurrent(l), LayerState::Recurrent(state)) => {
             let [qkv, z] =
@@ -1242,18 +1264,26 @@ fn forward(
         }
         _ => return Err(Error::InvalidModel("layer/state types differ".into())),
     };
+    let start = Instant::now();
     let hidden = engine.map_range(0..hidden.len(), |i| residual_add(&hidden[i], &projected[i]))?;
+    timing.residual += start.elapsed();
     let input = normalize(
         engine,
         &hidden,
         &layer.post_attention_norm,
         &layer.gate,
         epsilon,
+        timing,
     )?;
     let [gate, up] = project_normalized(engine, [&layer.gate, &layer.up], &input, timing)?;
+    let start = Instant::now();
     let product = engine.map_range(0..hidden.len(), |i| gated_product(&gate[i], &up[i]))?;
+    timing.mlp_gate += start.elapsed();
     let down = project_rows(engine, &layer.down, &product, timing)?;
-    engine.map_range(0..hidden.len(), |i| residual_add(&hidden[i], &down[i]))
+    let start = Instant::now();
+    let result = engine.map_range(0..hidden.len(), |i| residual_add(&hidden[i], &down[i]))?;
+    timing.residual += start.elapsed();
+    Ok(result)
 }
 
 impl yskn_ref::quality::ScoringModel for Model {
