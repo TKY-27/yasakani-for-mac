@@ -178,7 +178,7 @@ never read the answer (`/usr/bin/time -l`; an idle server is 8 MiB):
 | 7 MiB string in | Before this round | After |
 |---|---:|---:|
 | `response_format.type` (400; the old message quoted it) | 2,115 MiB | 470 MiB |
-| a non-string text part, `[string]` (400; text limit) | 1,162 MiB | 451 MiB |
+| a non-string text part, `[string]` (400; text limit) | 1,162 MiB | 451 to 497 MiB (two runs) |
 | `chat_template_kwargs` (200; reaches the engine) | 485 MiB | 484 MiB |
 
 All three are dominated after the fix by the 64 bodies being received at once
@@ -192,11 +192,11 @@ Not covered by the budget: the one request on the engine thread renders and
 tokenizes its prompt, which only the body and text limits bound. With the
 synthetic byte tokenizer (one token per byte, the most tokens a prompt byte
 can make), a request of 8 MiB of plain text renders an 8.4 million token
-prompt; preparing it took 0.6 s and the server peaked at 1.8 GiB resident
+prompt; preparing it took 0.4 to 0.6 s and the server peaked at 1.8 GiB resident
 (about 230 bytes per token, for CJK, emoji or DEL text; ASCII 1.4 GiB). The most tokens per body byte we
 found come from many short tool-call arguments, each rendered with its
 `<parameter=...>` tags: an 8.3 MB body of 250,000 arguments renders 13.5
-million tokens, taking 1.3 s and peaking at 2.5 GiB. These are measurements of
+million tokens, taking 0.8 to 1.3 s and peaking at 2.5 GiB. These are measurements of
 constructed cases, not a proven bound; other templates add other tags. A
 real tokenizer makes fewer tokens per byte; it has not been measured here.
 Embedders running `Api` on a multi-thread runtime can decode several bodies at
