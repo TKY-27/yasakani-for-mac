@@ -45,7 +45,7 @@ pub enum CacheRow {
 impl CacheRow {
     /// Attention reads only validated, immutable operands. Int8 conversion is
     /// exact; packed operands were BF16-rounded once when the row was encoded.
-    pub(crate) fn bases(&self) -> [f32; 256] {
+    pub fn bases(&self) -> [f32; 256] {
         match self {
             Self::Int8(row) => std::array::from_fn(|i| f32::from(row.integers[i])),
             Self::Packed(row) => row.bases.map(|bits| f32::from_bits(u32::from(bits) << 16)),

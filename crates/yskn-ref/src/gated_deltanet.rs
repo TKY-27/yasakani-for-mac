@@ -52,6 +52,17 @@ impl GatedDeltaNetState {
         self.history.copy_from_slice(&source.history);
     }
 
+    /// Copy only history when an engine writes the recurrent matrix out of place.
+    pub fn copy_history_from(&mut self, source: &Self) {
+        assert_eq!(self.dimensions, source.dimensions);
+        self.history.copy_from_slice(&source.history);
+    }
+
+    pub fn recurrent_heads(&self) -> std::slice::ChunksExact<'_, f32> {
+        self.recurrent_state
+            .chunks_exact(self.dimensions.head_dim * self.dimensions.head_dim)
+    }
+
     pub fn allocated_bytes(&self) -> usize {
         (self.recurrent_state.capacity() + self.history.capacity()) * std::mem::size_of::<f32>()
     }
@@ -443,6 +454,79 @@ impl GatedDeltaNet {
             }
             // The recurrent output is rounded before per-head normalization.
             *core_value = bfloat(sum4(output_part));
+        }
+        finite(&core, "DeltaNet recurrent output")?;
+        let square_sum = squares128(&core);
+        finite(&[square_sum], "DeltaNet output norm")?;
+        let normalization_argument = square_sum / head_dim as f32 + self.epsilon;
+        finite(&[normalization_argument], "DeltaNet output norm argument")?;
+        let output_inverse_rms = rsqrt(normalization_argument);
+        let mut gated = zeros(head_dim)?;
+        for (channel, output) in gated.iter_mut().enumerate() {
+            // Chapter 03 requires a round after RMS, after gain, and after gating.
+            let normalized = bfloat(
+                self.weights.normalization_weight[channel]
+                    * bfloat(core[channel] * output_inverse_rms),
+            );
+            *output = bfloat(normalized * silu(z[output_start + channel]));
+        }
+        finite(head_state, "DeltaNet recurrent state")?;
+        finite(&gated, "DeltaNet gated output")?;
+        Ok(gated)
+    }
+
+    /// Engine core hook; validation, decay, normalization and BF16 gating retain the scalar contract.
+    pub fn recur_head_with(
+        &self,
+        head_state: &mut [f32],
+        row: &GatedDeltaNetRow,
+        value_head: usize,
+        core_step: impl FnOnce(&mut [f32], &[f32], &[f32], &[f32], f32, f32) -> Result<Vec<f32>>,
+    ) -> Result<Vec<f32>> {
+        let head_dim = self.dimensions.head_dim;
+        if head_state.len() != head_dim * head_dim
+            || value_head >= self.dimensions.value_heads
+            || row.convolved.len() != self.convolution_channels
+            || row.z.len() != self.output_width
+        {
+            return Err(dimension_mismatch());
+        }
+        let GatedDeltaNetRow {
+            z,
+            convolved,
+            query,
+            key,
+            gates_a,
+            gates_b,
+            ..
+        } = row;
+        let value_heads_per_key_head =
+            self.dimensions.value_heads / self.dimensions.query_key_heads;
+        let key_head = value_head / value_heads_per_key_head;
+        let key_start = key_head * head_dim;
+        let output_start = value_head * head_dim;
+        // Beta has a BF16 boundary; log_decay and its exponential remain FP32.
+        let update_gate = bfloat(sigmoid(gates_b[value_head]));
+        let decay_weight = exp(self.weights.log_decay_weight[value_head]);
+        let biased_gate = gates_a[value_head] + self.weights.time_bias[value_head];
+        let log_decay = -decay_weight * softplus(biased_gate);
+        finite(
+            &[update_gate, decay_weight, biased_gate, log_decay],
+            "DeltaNet decay",
+        )?;
+        let decay = exp(log_decay);
+        finite(&[decay], "DeltaNet decay factor")?;
+        let core = core_step(
+            head_state,
+            &query[key_start..key_start + head_dim],
+            &key[key_start..key_start + head_dim],
+            &convolved[2 * self.query_key_width + output_start
+                ..2 * self.query_key_width + output_start + head_dim],
+            decay,
+            update_gate,
+        )?;
+        if core.len() != head_dim {
+            return Err(dimension_mismatch());
         }
         finite(&core, "DeltaNet recurrent output")?;
         let square_sum = squares128(&core);
