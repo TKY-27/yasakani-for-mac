@@ -310,7 +310,13 @@ impl Tensor {
 
     /// Read one state, including zero extension before the sequence begins.
     pub fn state(&self, row: usize, sequence: usize, step: usize) -> Result<u16> {
-        tensor_state(&self.descriptor, &self.stream, row, sequence, step)
+        // `TensorDescriptor::parse` already established every dimension check of
+        // `TrellisStates::new`, and this private descriptor cannot change since.
+        TrellisStates {
+            descriptor: &self.descriptor,
+            stream: &self.stream,
+        }
+        .state(row, sequence, step)
     }
 
     pub fn row_states(&self, row: usize) -> Result<Vec<u16>> {
@@ -341,6 +347,7 @@ impl Tensor {
 }
 
 /// Decode one state from a stored little-endian code stream, without owning it.
+/// Validates the descriptor on every call; use [`TrellisStates`] for repeated reads.
 pub fn tensor_state(
     descriptor: &TensorDescriptor,
     stream: &[u8],
@@ -348,31 +355,50 @@ pub fn tensor_state(
     sequence: usize,
     step: usize,
 ) -> Result<u16> {
-    if !(4..=8).contains(&descriptor.bits)
-        || descriptor.cols == 0
-        || descriptor.cols % 512 != 0
-        || descriptor
-            .physical_rows
-            .checked_mul(descriptor.cols / 256)
-            .and_then(|n| n.checked_mul(16 * descriptor.bits))
-            .is_none()
-    {
-        return Err(invalid("invalid trellis descriptor dimensions"));
-    }
-    if row >= descriptor.physical_rows || sequence >= descriptor.cols / 256 || step >= 128 {
-        return Err(invalid("trellis coordinate out of range"));
-    }
-    let end = descriptor.bits * (step + 1);
-    let mut state = 0_u16;
-    for state_bit in 0..12 {
-        let position = end as isize - 12 + state_bit as isize;
-        if position >= 0 {
-            let position = position as usize;
-            let word = sequence_word(descriptor, stream, row, sequence, position / 32)?;
-            state |= (((word >> (position % 32)) & 1) as u16) << state_bit;
+    TrellisStates::new(descriptor, stream)?.state(row, sequence, step)
+}
+
+/// A borrowed code stream whose descriptor dimensions were validated once.
+#[derive(Clone, Copy, Debug)]
+pub struct TrellisStates<'a> {
+    descriptor: &'a TensorDescriptor,
+    stream: &'a [u8],
+}
+
+impl<'a> TrellisStates<'a> {
+    pub fn new(descriptor: &'a TensorDescriptor, stream: &'a [u8]) -> Result<Self> {
+        if !(4..=8).contains(&descriptor.bits)
+            || descriptor.cols == 0
+            || descriptor.cols % 512 != 0
+            || descriptor
+                .physical_rows
+                .checked_mul(descriptor.cols / 256)
+                .and_then(|n| n.checked_mul(16 * descriptor.bits))
+                .is_none()
+        {
+            return Err(invalid("invalid trellis descriptor dimensions"));
         }
+        Ok(Self { descriptor, stream })
     }
-    Ok(state)
+
+    /// Read one state, including zero extension before the sequence begins.
+    pub fn state(&self, row: usize, sequence: usize, step: usize) -> Result<u16> {
+        let descriptor = self.descriptor;
+        if row >= descriptor.physical_rows || sequence >= descriptor.cols / 256 || step >= 128 {
+            return Err(invalid("trellis coordinate out of range"));
+        }
+        let end = descriptor.bits * (step + 1);
+        let mut state = 0_u16;
+        for state_bit in 0..12 {
+            let position = end as isize - 12 + state_bit as isize;
+            if position >= 0 {
+                let position = position as usize;
+                let word = sequence_word(descriptor, self.stream, row, sequence, position / 32)?;
+                state |= (((word >> (position % 32)) & 1) as u16) << state_bit;
+            }
+        }
+        Ok(state)
+    }
 }
 fn sequence_word(
     descriptor: &TensorDescriptor,

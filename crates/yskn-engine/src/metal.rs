@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::{Error, Matrix, Result};
 use objc2::{rc::Retained, rc::autoreleasepool, runtime::ProtocolObject};
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
@@ -14,7 +15,6 @@ use objc2_metal::{
     MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice, MTLFunctionConstantValues, MTLLibrary,
     MTLMathMode, MTLResourceOptions, MTLSize,
 };
-use yskn_engine::{Error, Matrix, Result};
 use yskn_format::Layout;
 
 // MTLCreateSystemDefaultDevice lives in CoreGraphics (objc2-metal crate documentation).
@@ -108,14 +108,11 @@ struct Dispatch {
     first_input: usize,
 }
 
-/// One matrix call with its own input and output buffers, ready to encode.
-pub struct Job {
+/// One validated matrix call without its input and output buffers.
+struct Plan {
     codes: Rc<CodeBuffer>,
     code_offset: usize,
     table: Retained<Buffer>,
-    activation: Retained<Buffer>,
-    scales: Retained<Buffer>,
-    output: Retained<Buffer>,
     params: Params,
     inputs: usize,
     groups: usize,
@@ -124,75 +121,152 @@ pub struct Job {
     dispatches: Vec<Dispatch>,
 }
 
+/// Widen the activation rows to i16 and copy the integer scales into shared buffers.
+///
+/// # Safety
+/// No GPU work and no other CPU reference may access either buffer's contents
+/// during the call.
+unsafe fn upload(
+    activation_buffer: &Buffer,
+    scales_buffer: &Buffer,
+    activation: &[i8],
+    scales: &[i32],
+) -> Result<()> {
+    if activation_buffer.length() < activation.len() * 2
+        || scales_buffer.length() < scales.len() * 4
+    {
+        return Err(metal_error("upload", "input buffer too small"));
+    }
+    // SAFETY: the lengths were just checked against the buffers, whose shared
+    // contents are page-aligned and CPU-visible; the caller guarantees exclusive
+    // access, so the mutable slice is not aliased.
+    unsafe {
+        let wide = std::slice::from_raw_parts_mut(
+            activation_buffer.contents().as_ptr().cast::<i16>(),
+            activation.len(),
+        );
+        for (wide, &value) in wide.iter_mut().zip(activation) {
+            *wide = i16::from(value);
+        }
+        std::ptr::copy_nonoverlapping(
+            scales.as_ptr(),
+            scales_buffer.contents().as_ptr().cast::<i32>(),
+            scales.len(),
+        );
+    }
+    Ok(())
+}
+
+/// Copy `len` i64 sums out of a shared output buffer.
+///
+/// # Safety
+/// No GPU work may be writing the buffer during the call.
+unsafe fn download(output: &Buffer, len: usize) -> Result<Vec<i64>> {
+    if output.length() < len * 8 {
+        return Err(metal_error("readback", "output buffer too small"));
+    }
+    let mut values = vec![0_i64; len];
+    // SAFETY: the buffer holds at least `len` i64 values (checked above; shared
+    // contents are page-aligned), and the caller guarantees no concurrent GPU write.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            output.contents().as_ptr().cast::<i64>(),
+            values.as_mut_ptr(),
+            len,
+        );
+    }
+    Ok(values)
+}
+
+/// The slot's shared buffer if it holds at least `bytes`, else a new one stored there.
+fn reserve(
+    device: &Device,
+    slot: &mut Option<Retained<Buffer>>,
+    bytes: usize,
+) -> Result<Retained<Buffer>> {
+    if let Some(buffer) = slot.as_ref().filter(|b| b.length() >= bytes) {
+        return Ok(buffer.clone());
+    }
+    let buffer = device
+        .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+        .ok_or_else(|| metal_error("buffer", "allocation failed"))?;
+    *slot = Some(buffer.clone());
+    Ok(buffer)
+}
+
+/// One matrix call with its own input and output buffers, ready to encode.
+pub struct Job {
+    plan: Plan,
+    activation: Retained<Buffer>,
+    scales: Retained<Buffer>,
+    output: Retained<Buffer>,
+}
+
 impl Job {
     /// Row-major M×N sums of the last completed [`MetalEngine::run`] containing this job.
     pub fn output(&self) -> Vec<i64> {
-        let len = self.inputs * self.params.rows as usize;
-        let mut values = vec![0_i64; len];
-        // SAFETY: the shared buffer was allocated with exactly `len` i64 values in
-        // `MetalEngine::job`. GPU writes finished before `run` returned (it waits for
-        // completion), and `run` takes jobs mutably, so none is executing now.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.output.contents().as_ptr().cast::<i64>(),
-                values.as_mut_ptr(),
-                len,
-            );
-        }
-        values
+        // SAFETY: `run` waits for completion and takes jobs mutably, so no GPU work
+        // writes this job's buffer while it is borrowed here.
+        unsafe { download(&self.output, self.plan.output_len()) }
+            // The buffer was allocated for exactly this length in `MetalEngine::job`.
+            .expect("job output buffer")
     }
 
     /// Replace this job's activation rows and integer scales (same M) before a rerun.
     pub fn write_inputs(&mut self, activation: &[i8], scales: &[i32]) -> Result<()> {
-        if activation.len() != self.inputs * self.params.cols as usize
-            || scales.len() != self.inputs * self.groups
+        if activation.len() != self.plan.inputs * self.plan.params.cols as usize
+            || scales.len() != self.plan.inputs * self.plan.groups
         {
             return Err(invalid("inputs must keep the job's M, K and K/512"));
         }
-        // SAFETY: the shared buffers hold exactly M×K i16 and M×G i32 values
-        // (allocated in `MetalEngine::job` from the same M, K, G; Metal buffers are
-        // page-aligned). No GPU work reads them now: `run` waits for completion and
-        // this method borrows the job exclusively, so the slice is not aliased.
-        unsafe {
-            let wide = std::slice::from_raw_parts_mut(
-                self.activation.contents().as_ptr().cast::<i16>(),
-                activation.len(),
-            );
-            for (wide, &value) in wide.iter_mut().zip(activation) {
-                *wide = i16::from(value);
-            }
-            std::ptr::copy_nonoverlapping(
-                scales.as_ptr(),
-                self.scales.contents().as_ptr().cast::<i32>(),
-                scales.len(),
-            );
-        }
-        Ok(())
+        // SAFETY: the job's private buffers are borrowed exclusively here, and `run`
+        // waits for completion, so no GPU work reads them now.
+        unsafe { upload(&self.activation, &self.scales, activation, scales) }
     }
 
     /// Bytes of compressed code this job reads (once per pass, independent of M).
     pub fn code_bytes(&self) -> u64 {
-        self.code_bytes
+        self.plan.code_bytes
     }
 
     fn encode(&self, encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
+        self.plan
+            .encode(encoder, &self.activation, &self.scales, &self.output);
+    }
+}
+
+impl Plan {
+    fn output_len(&self) -> usize {
+        self.inputs * self.params.rows as usize
+    }
+
+    /// The buffers must hold at least M×K i16, M×G i32 and M×N i64 values and stay
+    /// alive until the command buffer completes.
+    fn encode(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        activation: &Buffer,
+        scales: &Buffer,
+        output: &Buffer,
+    ) {
         let n = self.params.rows as usize;
         let cols = self.params.cols as usize;
         for dispatch in &self.dispatches {
             let first = dispatch.first_input;
             encoder.setComputePipelineState(&dispatch.pipeline);
-            // SAFETY: every buffer is retained by this job, which outlives the
-            // command buffer (run waits for completion). Offsets were validated in
-            // `MetalEngine::job`: the code offset plus the stream length lies inside
-            // the mapping buffer, and `first` < M addresses whole rows of the
-            // activation (M×K i16), scale (M×G i32) and output (M×N i64) buffers.
+            // SAFETY: the code and table buffers are retained by this plan and the
+            // others by the caller, all until the command buffer completes (every
+            // submission waits). Offsets were validated in `MetalEngine::plan`: the
+            // code offset plus the stream length lies inside the mapping buffer, and
+            // `first` < M addresses whole rows of the activation (M×K i16), scale
+            // (M×G i32) and output (M×N i64) buffers, which are at least that long.
             // Params is a plain repr(C) value copied by setBytes.
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(&self.codes.buffer), self.code_offset, 0);
                 encoder.setBuffer_offset_atIndex(Some(&self.table), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(&self.activation), first * cols * 2, 2);
-                encoder.setBuffer_offset_atIndex(Some(&self.scales), first * self.groups * 4, 3);
-                encoder.setBuffer_offset_atIndex(Some(&self.output), first * n * 8, 4);
+                encoder.setBuffer_offset_atIndex(Some(activation), first * cols * 2, 2);
+                encoder.setBuffer_offset_atIndex(Some(scales), first * self.groups * 4, 3);
+                encoder.setBuffer_offset_atIndex(Some(output), first * n * 8, 4);
                 encoder.setBytes_length_atIndex(
                     NonNull::from(&self.params).cast(),
                     size_of::<Params>(),
@@ -232,6 +306,11 @@ pub struct MetalEngine {
     /// may share a code stream but not a table.
     tables: HashMap<(usize, u64), Retained<Buffer>>,
     splits: usize,
+    /// Reusable input and per-matrix output buffers of `weighted_sums_shared`,
+    /// grown on demand and never shrunk.
+    scratch_activation: Option<Retained<Buffer>>,
+    scratch_scales: Option<Retained<Buffer>>,
+    scratch_outputs: Vec<Option<Retained<Buffer>>>,
 }
 
 impl MetalEngine {
@@ -269,7 +348,15 @@ impl MetalEngine {
             // Measured on the M5 (DESIGN.md): 4 beats 8 by 3-4% for M <= 8 and ties
             // at 16; 1-2 and 16-32 are slower.
             splits: 4,
+            scratch_activation: None,
+            scratch_scales: None,
+            scratch_outputs: Vec::new(),
         }))
+    }
+
+    /// Whether this process has a system default Metal device (no shader compilation).
+    pub fn device_exists() -> bool {
+        MTLCreateSystemDefaultDevice().is_some()
     }
 
     pub fn device_name(&self) -> String {
@@ -418,21 +505,40 @@ impl MetalEngine {
         scales: &[i32],
         n: usize,
     ) -> Result<Job> {
+        let plan = self.plan(matrix, activation.len(), scales.len(), n)?;
+        let mut job = Job {
+            activation: self.empty_buffer(activation.len() * 2)?,
+            scales: self.empty_buffer(scales.len() * 4)?,
+            output: self.empty_buffer(plan.output_len() * 8)?,
+            plan,
+        };
+        job.write_inputs(activation, scales)?;
+        Ok(job)
+    }
+
+    /// Validate one call of `activation_len` i8 inputs and `scales_len` integer scales.
+    fn plan(
+        &mut self,
+        matrix: &Matrix,
+        activation_len: usize,
+        scales_len: usize,
+        n: usize,
+    ) -> Result<Plan> {
         let d = matrix.descriptor();
         let (cols, physical_rows, bits) = (d.cols, d.physical_rows, d.bits);
-        if activation.is_empty()
+        if activation_len == 0
             || cols == 0
             || !cols.is_multiple_of(512)
-            || !activation.len().is_multiple_of(cols)
+            || !activation_len.is_multiple_of(cols)
             || n == 0
             || n > physical_rows
         {
             return Err(invalid("invalid activation width or output row count"));
         }
-        let inputs = activation.len() / cols;
+        let inputs = activation_len / cols;
         let groups = cols / 512;
         let sequences = cols / 256;
-        if scales.len() != inputs * groups {
+        if scales_len != inputs * groups {
             return Err(invalid("integer scales must have M times K/512 elements"));
         }
         if groups > MAX_GROUPS {
@@ -501,13 +607,10 @@ impl MetalEngine {
                 table
             }
         };
-        let mut job = Job {
+        Ok(Plan {
             codes,
             code_offset,
             table,
-            activation: self.empty_buffer(activation.len() * 2)?,
-            scales: self.empty_buffer(scales.len() * 4)?,
-            output: self.empty_buffer(inputs * n * 8)?,
             params,
             inputs,
             groups,
@@ -515,14 +618,78 @@ impl MetalEngine {
             // Idle SIMD groups would only add barrier work for short rows.
             splits: self.splits.min(sequences),
             dispatches,
-        };
-        job.write_inputs(activation, scales)?;
-        Ok(job)
+        })
     }
 
     /// Encode all jobs into one command buffer, commit, and wait once.
     /// Returns the GPU execution time reported by the command buffer.
     pub fn run(&self, jobs: &mut [Job]) -> Result<Duration> {
+        self.submit(|encoder| {
+            for job in jobs.iter() {
+                job.encode(encoder);
+            }
+        })
+    }
+
+    /// Row-major M×N sums (padded physical rows included) of several matrices
+    /// that read the same input, encoded into one command buffer. Input and
+    /// output buffers are reused across calls.
+    pub fn weighted_sums_shared(
+        &mut self,
+        matrices: &[&Matrix],
+        activation: &[i8],
+        scales: &[i32],
+    ) -> Result<Vec<Vec<i64>>> {
+        let plans = matrices
+            .iter()
+            .map(|m| {
+                self.plan(
+                    m,
+                    activation.len(),
+                    scales.len(),
+                    m.descriptor().physical_rows,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let activation_buffer = reserve(
+            &self.device,
+            &mut self.scratch_activation,
+            activation.len() * 2,
+        )?;
+        let scales_buffer = reserve(&self.device, &mut self.scratch_scales, scales.len() * 4)?;
+        if self.scratch_outputs.len() < plans.len() {
+            self.scratch_outputs.resize(plans.len(), None);
+        }
+        let outputs = plans
+            .iter()
+            .zip(&mut self.scratch_outputs)
+            .map(|(plan, slot)| reserve(&self.device, slot, plan.output_len() * 8))
+            .collect::<Result<Vec<_>>>()?;
+        // SAFETY: the scratch buffers are distinct objects owned by this engine,
+        // which is borrowed mutably here, and every submission waits for
+        // completion, so no GPU work or other reference touches them meanwhile.
+        unsafe { upload(&activation_buffer, &scales_buffer, activation, scales) }?;
+        self.submit(|encoder| {
+            for (plan, output) in plans.iter().zip(&outputs) {
+                plan.encode(encoder, &activation_buffer, &scales_buffer, output);
+            }
+        })?;
+        plans
+            .iter()
+            .zip(&outputs)
+            .map(|(plan, output)| {
+                // SAFETY: `submit` returned, so the command buffer has completed and
+                // nothing writes these engine-owned buffers any more.
+                unsafe { download(output, plan.output_len()) }
+            })
+            .collect()
+    }
+
+    /// Encode with `encode` into one command buffer, commit, and wait for completion.
+    fn submit(
+        &self,
+        encode: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
+    ) -> Result<Duration> {
         autoreleasepool(|_| {
             let command = self
                 .queue
@@ -531,9 +698,7 @@ impl MetalEngine {
             let encoder = command
                 .computeCommandEncoder()
                 .ok_or_else(|| metal_error("encoder", "nil"))?;
-            for job in jobs.iter() {
-                job.encode(&encoder);
-            }
+            encode(&encoder);
             encoder.endEncoding();
             command.commit();
             command.waitUntilCompleted();

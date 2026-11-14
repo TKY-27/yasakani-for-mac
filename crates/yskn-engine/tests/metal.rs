@@ -5,7 +5,6 @@ fn metal_matches_scalar_reference() {
 }
 
 #[cfg(target_os = "macos")]
-#[path = "../../yskn-engine/tests/fixture/mod.rs"]
 mod fixture;
 
 #[cfg(target_os = "macos")]
@@ -13,8 +12,8 @@ mod macos {
     use super::fixture::{DATA_OFFSET, TempFile, assert_sums, change_header, random, synthetic};
     use serde_json::json;
     use yskn_engine::MappedModel;
+    use yskn_engine::MetalEngine;
     use yskn_format::Container;
-    use yskn_metal::MetalEngine;
     use yskn_ref::compressed_linear::CompressedLinear;
 
     /// A missing device is reported on stdout and is the only way to skip.

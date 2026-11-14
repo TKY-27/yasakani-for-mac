@@ -21,8 +21,8 @@ fn main() {
 mod macos {
     use std::{hint::black_box, ops::Range, path::PathBuf, time::Instant};
     use yskn_engine::{Engine, Error, MappedModel, Matrix, Result};
+    use yskn_engine::{Job, MetalEngine};
     use yskn_format::Role;
-    use yskn_metal::{Job, MetalEngine};
 
     fn usage() -> Error {
         Error::InvalidInput(

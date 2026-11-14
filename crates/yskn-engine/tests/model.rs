@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
-use yskn_engine::{Engine, Kernel, Model};
+use yskn_engine::{Backend, Engine, Kernel, Model};
 use yskn_format::Container;
 
 struct Fixture(PathBuf);
@@ -33,6 +33,11 @@ impl Fixture {
     fn model(&self, kernel: Kernel, threads: usize, rows: usize) -> Model {
         // SAFETY: fixture contents are immutable until every model is dropped before Fixture.
         unsafe { Model::with_engine(&self.0, Engine::new(kernel, threads).unwrap(), rows) }.unwrap()
+    }
+    fn backend_model(&self, backend: Backend, threads: usize, rows: usize) -> Model {
+        let engine = Engine::new(Kernel::fastest(), threads).unwrap();
+        // SAFETY: fixture contents are immutable until every model is dropped before Fixture.
+        unsafe { Model::with_backend(&self.0, engine, backend, rows) }.unwrap()
     }
 }
 impl Drop for Fixture {
@@ -81,47 +86,68 @@ fn compare(bytes: Vec<u8>, count: usize, baseline: &str) {
     reference.reset().unwrap();
     reference.prefill(&[5, 13, 7, 1]).unwrap();
     let after_reset = reference.row_logits().to_vec();
+    let check = |context: &str, mut model: Model| {
+        assert_eq!(model.context_capacity(), 320);
+        model.prefill(&[1, 2, 3]).unwrap();
+        same(model.row_logits(), &initial, context);
+        model.prefill(&tokens).unwrap();
+        same(model.row_logits(), &expected, context);
+        assert_eq!(model.position(), 3 + count);
+        assert_eq!(model.logits().unwrap().len(), expected[0].len());
+        model.reset().unwrap();
+        assert_eq!(model.position(), 0);
+        assert!(model.logits().is_none());
+        model.prefill(&[5, 13, 7, 1]).unwrap();
+        same(model.row_logits(), &after_reset, context);
+        model.reset().unwrap();
+        model.prefill(&[1, 2, 3]).unwrap();
+        let mut actual = Vec::new();
+        let mut first = 0;
+        for chunk in [1, 3, 7, 2, 19, 5, 11, 23, 100] {
+            if first == tokens.len() {
+                break;
+            }
+            let end = (first + chunk).min(tokens.len());
+            model.prefill(&tokens[first..end]).unwrap();
+            actual.extend_from_slice(model.row_logits());
+            first = end;
+        }
+        same(&actual, &expected, context);
+        let last = model.row_logits().to_vec();
+        model.prefill(&[]).unwrap();
+        same(model.row_logits(), &last, "empty prefill");
+        // Continuing the sequence proves the persistent cache/recurrence too.
+        model.prefill(&[17, 21]).unwrap();
+        let continued = model.row_logits().to_vec();
+        same(&continued, &continuation, context);
+    };
     for kernel in Kernel::available_variants() {
         for threads in [1, 4] {
             for rows in [1, 2, 5, 16, 17, 40] {
                 let context = format!("{} threads={threads} rows_per_pass={rows}", kernel.name());
-                let mut model = fixture.model(kernel, threads, rows);
-                assert_eq!(model.context_capacity(), 320);
-                model.prefill(&[1, 2, 3]).unwrap();
-                same(model.row_logits(), &initial, &context);
-                model.prefill(&tokens).unwrap();
-                same(model.row_logits(), &expected, &context);
-                assert_eq!(model.position(), 3 + count);
-                assert_eq!(model.logits().unwrap().len(), expected[0].len());
-                model.reset().unwrap();
-                assert_eq!(model.position(), 0);
-                assert!(model.logits().is_none());
-                model.prefill(&[5, 13, 7, 1]).unwrap();
-                same(model.row_logits(), &after_reset, &context);
-                model.reset().unwrap();
-                model.prefill(&[1, 2, 3]).unwrap();
-                let mut actual = Vec::new();
-                let mut first = 0;
-                for chunk in [1, 3, 7, 2, 19, 5, 11, 23, 100] {
-                    if first == tokens.len() {
-                        break;
-                    }
-                    let end = (first + chunk).min(tokens.len());
-                    model.prefill(&tokens[first..end]).unwrap();
-                    actual.extend_from_slice(model.row_logits());
-                    first = end;
-                }
-                same(&actual, &expected, &context);
-                let last = model.row_logits().to_vec();
-                model.prefill(&[]).unwrap();
-                same(model.row_logits(), &last, "empty prefill");
-                // Continuing the sequence proves the persistent cache/recurrence too.
-                model.prefill(&[17, 21]).unwrap();
-                let continued = model.row_logits().to_vec();
-                same(&continued, &continuation, &context);
+                check(&context, fixture.model(kernel, threads, rows));
             }
         }
     }
+    if metal_device() {
+        for threads in [1, 4] {
+            for rows in [1, 2, 5, 16, 17, 40] {
+                let context = format!("metal threads={threads} rows_per_pass={rows}");
+                let model = fixture.backend_model(Backend::Metal, threads, rows);
+                assert_eq!(model.backend(), Backend::Metal);
+                check(&context, model);
+            }
+        }
+    }
+}
+/// A missing device is reported on stdout and is the only way to skip Metal cases.
+fn metal_device() -> bool {
+    #[cfg(target_os = "macos")]
+    if yskn_engine::MetalEngine::device_exists() {
+        return true;
+    }
+    println!("skipped: no Metal device");
+    false
 }
 #[test]
 fn recurrent_model_is_identical_for_all_kernels_threads_pass_widths_and_chunks() {
@@ -213,6 +239,53 @@ fn invalid_requests_preserve_logits_position_and_future_sequence_state() {
     );
 }
 #[test]
+fn failure_after_a_completed_pass_preserves_logits_position_and_state() {
+    // Token 100's dense embedding is finite but its squares overflow, so the
+    // first layer norm fails in whichever pass contains it.
+    let mut bytes = support::synthetic_model_with_dense_embeddings(21, &["linear_attention"]);
+    let embedding = Container::from_bytes(bytes.clone())
+        .unwrap()
+        .header()
+        .vectors
+        .iter()
+        .find(|v| v.name == "embed_tokens")
+        .unwrap()
+        .clone();
+    let huge = yskn_format::f32_to_bf16(1.0e38).to_le_bytes();
+    let row = embedding.offset as usize + 100 * 512 * 2;
+    for pair in bytes[row..row + 1024].as_chunks_mut::<2>().0 {
+        *pair = huge;
+    }
+    let fixture = Fixture::new(&bytes);
+    let mut reference = yskn_ref::Model::load_folder(&fixture.0).unwrap();
+    reference.prefill(&[1, 2, 3]).unwrap();
+    assert!(reference.prefill(&[4, 5, 6, 7, 8, 100, 9]).is_err());
+    reference.prefill(&[4, 5, 6, 7, 8]).unwrap();
+    let continuation = reference.row_logits().to_vec();
+    let mut backends = vec![Backend::Cpu];
+    if metal_device() {
+        backends.push(Backend::Metal);
+    }
+    for backend in backends {
+        let context = backend.name();
+        let mut model = fixture.backend_model(backend, 4, 2);
+        model.prefill(&[1, 2, 3]).unwrap();
+        let before = model.row_logits().to_vec();
+        let timings = model.pass_timings().len();
+        // Passes [4, 5] and [6, 7] complete before [8, 100] fails.
+        assert!(matches!(
+            model.prefill(&[4, 5, 6, 7, 8, 100, 9]),
+            Err(yskn_engine::Error::NonFinite(_))
+        ));
+        assert_eq!(model.position(), 3, "{context}");
+        assert_eq!(model.pass_timings().len(), timings, "{context}");
+        same(model.row_logits(), &before, context);
+        // Unchanged recurrent state: continuing equals the reference continuing.
+        model.prefill(&[4, 5, 6, 7, 8]).unwrap();
+        same(model.row_logits(), &continuation, context);
+    }
+}
+#[test]
 fn persistent_range_pool_preserves_order_borrows_and_recovers_after_errors() {
     let mut engine = Engine::new(Kernel::Portable, 4).unwrap();
     let input: Vec<_> = (0..101).map(|i| i * 3).collect();
@@ -239,6 +312,17 @@ fn persistent_range_pool_preserves_order_borrows_and_recovers_after_errors() {
             })
             .is_err()
     );
+    // Several failures, including a panic after the first: the lowest index wins.
+    for _ in 0..20 {
+        let error = engine
+            .map_range(0..101, |i| match i {
+                97 => panic!("expected range closure panic"),
+                _ if i % 10 == 3 => Err(yskn_engine::Error::InvalidInput(format!("index {i}"))),
+                _ => Ok(i),
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "invalid input: index 3");
+    }
     assert_eq!(engine.map_range(0..101, |i| Ok(input[i])).unwrap(), input);
     assert!(engine.map_range(0..0, |_| Ok(())).unwrap().is_empty());
 }

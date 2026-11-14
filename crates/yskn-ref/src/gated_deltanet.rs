@@ -43,6 +43,42 @@ pub struct GatedDeltaNetState {
     history: Vec<f32>,
 }
 
+impl GatedDeltaNetState {
+    /// Rounded projections of the previous rows, oldest first.
+    pub fn history_rows(&self) -> std::slice::ChunksExact<'_, f32> {
+        let rows = self.dimensions.convolution_width - 1;
+        self.history.chunks_exact(self.history.len() / rows)
+    }
+
+    /// Each value head's `head_dim × head_dim` recurrent block, in head order.
+    pub fn recurrent_heads_mut(&mut self) -> std::slice::ChunksExactMut<'_, f32> {
+        let head_dim = self.dimensions.head_dim;
+        self.recurrent_state.chunks_exact_mut(head_dim * head_dim)
+    }
+}
+
+/// One row after [`GatedDeltaNet::prepare`]: BF16 projections, convolution,
+/// normalized query/key and dense gates. It does not depend on the recurrent state.
+#[derive(Clone, Debug)]
+pub struct GatedDeltaNetRow {
+    projected: Vec<f32>,
+    z: Vec<f32>,
+    convolved: Vec<f32>,
+    query: Vec<f32>,
+    key: Vec<f32>,
+    gates_a: Vec<f32>,
+    gates_b: Vec<f32>,
+}
+
+/// The BF16 projection boundary; the result is also what the convolution history keeps.
+pub fn round_projection(projected_qkv: &[f32]) -> Vec<f32> {
+    projected_qkv.iter().map(|&value| bfloat(value)).collect()
+}
+
+fn dimension_mismatch() -> Error {
+    Error::InvalidModel("DeltaNet row or state dimensions do not match the layer".into())
+}
+
 impl GatedDeltaNet {
     pub fn new(
         dimensions: GatedDeltaNetDimensions,
@@ -133,6 +169,11 @@ impl GatedDeltaNet {
     }
 
     /// Consume one causal row and return the input to the compressed output projection.
+    ///
+    /// The row runs through the public stages in order: [`prepare`](Self::prepare),
+    /// [`recur_head`](Self::recur_head) for each value head, then
+    /// [`advance_history`](Self::advance_history). Heads do not interact, so a
+    /// caller may instead run each head's chain of rows independently.
     pub fn step(
         &self,
         state: &mut GatedDeltaNetState,
@@ -141,14 +182,54 @@ impl GatedDeltaNet {
         weighted_hidden_bf16: &[f32],
         inverse_rms: f32,
     ) -> Result<Vec<f32>> {
-        if state.dimensions != self.dimensions
+        if state.dimensions != self.dimensions {
+            return Err(dimension_mismatch());
+        }
+        let history: Vec<&[f32]> = state.history_rows().collect();
+        let row = self.prepare(
+            &history,
+            projected_qkv,
+            projected_z,
+            weighted_hidden_bf16,
+            inverse_rms,
+        )?;
+        // Work on a copy so a later finite-value error leaves the caller's state intact.
+        let mut next_recurrent_state = state.recurrent_state.clone();
+        let mut gated = zeros(self.output_width)?;
+        let head_dim = self.dimensions.head_dim;
+        for (value_head, (head_state, output)) in next_recurrent_state
+            .chunks_exact_mut(head_dim * head_dim)
+            .zip(gated.chunks_exact_mut(head_dim))
+            .enumerate()
+        {
+            output.copy_from_slice(&self.recur_head(head_state, &row, value_head)?);
+        }
+        state.recurrent_state = next_recurrent_state;
+        self.advance_history(state, &row)?;
+        Ok(gated)
+    }
+
+    /// Stage 1 of [`step`](Self::step): everything that does not read the recurrent
+    /// state. `history` holds the previous `convolution_width - 1` rows' rounded
+    /// projections ([`round_projection`]), oldest first, as in
+    /// [`GatedDeltaNetState::history_rows`] followed by any earlier rows of a pass.
+    pub fn prepare(
+        &self,
+        history: &[&[f32]],
+        projected_qkv: &[f32],
+        projected_z: &[f32],
+        weighted_hidden_bf16: &[f32],
+        inverse_rms: f32,
+    ) -> Result<GatedDeltaNetRow> {
+        if history.len() != self.dimensions.convolution_width - 1
+            || history
+                .iter()
+                .any(|row| row.len() != self.convolution_channels)
             || projected_qkv.len() != self.convolution_channels
             || projected_z.len() != self.output_width
             || weighted_hidden_bf16.len() != self.dimensions.hidden_width
         {
-            return Err(Error::InvalidModel(
-                "DeltaNet row or state dimensions do not match the layer".into(),
-            ));
+            return Err(dimension_mismatch());
         }
         finite(projected_qkv, "DeltaNet QKV projection")?;
         finite(projected_z, "DeltaNet Z projection")?;
@@ -156,7 +237,7 @@ impl GatedDeltaNet {
         finite(&[inverse_rms], "DeltaNet inverse RMS")?;
 
         // The projection boundary is BF16, including the history retained for later rows.
-        let projected: Vec<f32> = projected_qkv.iter().map(|&value| bfloat(value)).collect();
+        let projected = round_projection(projected_qkv);
         let z: Vec<f32> = projected_z.iter().map(|&value| bfloat(value)).collect();
         finite(&projected, "DeltaNet rounded QKV projection")?;
         finite(&z, "DeltaNet rounded Z projection")?;
@@ -164,11 +245,11 @@ impl GatedDeltaNet {
         let mut convolved = zeros(self.convolution_channels)?;
         for (channel, output) in convolved.iter_mut().enumerate() {
             let weight_start = channel * self.dimensions.convolution_width;
-            let mut value = self.weights.convolution_weight[weight_start] * state.history[channel];
+            let mut value = self.weights.convolution_weight[weight_start] * history[0][channel];
             // Oldest tap first, with no leading zero addition and no fused multiply-add.
             for tap in 1..self.dimensions.convolution_width - 1 {
-                value += self.weights.convolution_weight[weight_start + tap]
-                    * state.history[tap * self.convolution_channels + channel];
+                value +=
+                    self.weights.convolution_weight[weight_start + tap] * history[tap][channel];
             }
             value += self.weights.convolution_weight
                 [weight_start + self.dimensions.convolution_width - 1]
@@ -214,81 +295,123 @@ impl GatedDeltaNet {
             weighted_hidden_bf16,
             inverse_rms,
         )?;
-        // Work on a copy so a later finite-value error leaves the caller's state intact.
-        let mut next_recurrent_state = state.recurrent_state.clone();
-        let mut gated = zeros(self.output_width)?;
+        Ok(GatedDeltaNetRow {
+            projected,
+            z,
+            convolved,
+            query,
+            key,
+            gates_a,
+            gates_b,
+        })
+    }
+
+    /// Stage 2 of [`step`](Self::step): one value head's recurrence for one row.
+    /// `head_state` is that head's `head_dim × head_dim` block of the recurrent
+    /// state (see [`GatedDeltaNetState::recurrent_heads_mut`]); it is updated in
+    /// place, so callers keep a copy if an error must leave it unchanged. Returns
+    /// the head's `head_dim` gated outputs. No other head is read or written.
+    pub fn recur_head(
+        &self,
+        head_state: &mut [f32],
+        row: &GatedDeltaNetRow,
+        value_head: usize,
+    ) -> Result<Vec<f32>> {
+        let head_dim = self.dimensions.head_dim;
+        if head_state.len() != head_dim * head_dim
+            || value_head >= self.dimensions.value_heads
+            || row.convolved.len() != self.convolution_channels
+            || row.z.len() != self.output_width
+        {
+            return Err(dimension_mismatch());
+        }
+        let GatedDeltaNetRow {
+            z,
+            convolved,
+            query,
+            key,
+            gates_a,
+            gates_b,
+            ..
+        } = row;
         let value_heads_per_key_head =
             self.dimensions.value_heads / self.dimensions.query_key_heads;
-        for value_head in 0..self.dimensions.value_heads {
-            let key_head = value_head / value_heads_per_key_head;
-            let key_start = key_head * self.dimensions.head_dim;
-            let output_start = value_head * self.dimensions.head_dim;
-            let matrix_start = output_start * self.dimensions.head_dim;
-            // Beta has a BF16 boundary; log_decay and its exponential remain FP32.
-            let update_gate = bfloat(sigmoid(gates_b[value_head]));
-            let decay_weight = exp(self.weights.log_decay_weight[value_head]);
-            let biased_gate = gates_a[value_head] + self.weights.time_bias[value_head];
-            let log_decay = -decay_weight * softplus(biased_gate);
-            finite(
-                &[update_gate, decay_weight, biased_gate, log_decay],
-                "DeltaNet decay",
-            )?;
-            let decay = exp(log_decay);
-            finite(&[decay], "DeltaNet decay factor")?;
-            let mut core = zeros(self.dimensions.head_dim)?;
-            for (value_channel, core_value) in core.iter_mut().enumerate() {
-                let mut prediction_part = [0.0; 4];
-                for (group, partial) in prediction_part.iter_mut().enumerate() {
-                    // Four ordered 32-term sums are distinct from XOR reduction.
-                    for offset in 0..32 {
-                        let key_channel = group * 32 + offset;
-                        let index =
-                            matrix_start + key_channel * self.dimensions.head_dim + value_channel;
-                        next_recurrent_state[index] *= decay;
-                        *partial += next_recurrent_state[index] * key[key_start + key_channel];
-                    }
+        let key_head = value_head / value_heads_per_key_head;
+        let key_start = key_head * head_dim;
+        let output_start = value_head * head_dim;
+        // Beta has a BF16 boundary; log_decay and its exponential remain FP32.
+        let update_gate = bfloat(sigmoid(gates_b[value_head]));
+        let decay_weight = exp(self.weights.log_decay_weight[value_head]);
+        let biased_gate = gates_a[value_head] + self.weights.time_bias[value_head];
+        let log_decay = -decay_weight * softplus(biased_gate);
+        finite(
+            &[update_gate, decay_weight, biased_gate, log_decay],
+            "DeltaNet decay",
+        )?;
+        let decay = exp(log_decay);
+        finite(&[decay], "DeltaNet decay factor")?;
+        let mut core = zeros(head_dim)?;
+        for (value_channel, core_value) in core.iter_mut().enumerate() {
+            let mut prediction_part = [0.0; 4];
+            for (group, partial) in prediction_part.iter_mut().enumerate() {
+                // Four ordered 32-term sums are distinct from XOR reduction.
+                for offset in 0..32 {
+                    let key_channel = group * 32 + offset;
+                    let index = key_channel * head_dim + value_channel;
+                    head_state[index] *= decay;
+                    *partial += head_state[index] * key[key_start + key_channel];
                 }
-                let prediction = sum4(prediction_part);
-                let value = convolved[2 * self.query_key_width + output_start + value_channel];
-                let correction = (value - prediction) * update_gate;
-                finite(&[prediction, correction], "DeltaNet recurrent prediction")?;
-                let mut output_part = [0.0; 4];
-                for (group, partial) in output_part.iter_mut().enumerate() {
-                    for offset in 0..32 {
-                        let key_channel = group * 32 + offset;
-                        let index =
-                            matrix_start + key_channel * self.dimensions.head_dim + value_channel;
-                        next_recurrent_state[index] += key[key_start + key_channel] * correction;
-                        *partial += next_recurrent_state[index] * query[key_start + key_channel];
-                    }
+            }
+            let prediction = sum4(prediction_part);
+            let value = convolved[2 * self.query_key_width + output_start + value_channel];
+            let correction = (value - prediction) * update_gate;
+            finite(&[prediction, correction], "DeltaNet recurrent prediction")?;
+            let mut output_part = [0.0; 4];
+            for (group, partial) in output_part.iter_mut().enumerate() {
+                for offset in 0..32 {
+                    let key_channel = group * 32 + offset;
+                    let index = key_channel * head_dim + value_channel;
+                    head_state[index] += key[key_start + key_channel] * correction;
+                    *partial += head_state[index] * query[key_start + key_channel];
                 }
-                // The recurrent output is rounded before per-head normalization.
-                *core_value = bfloat(sum4(output_part));
             }
-            finite(&core, "DeltaNet recurrent output")?;
-            let square_sum = squares128(&core);
-            finite(&[square_sum], "DeltaNet output norm")?;
-            let normalization_argument =
-                square_sum / self.dimensions.head_dim as f32 + self.epsilon;
-            finite(&[normalization_argument], "DeltaNet output norm argument")?;
-            let output_inverse_rms = rsqrt(normalization_argument);
-            for channel in 0..self.dimensions.head_dim {
-                // Chapter 03 requires a round after RMS, after gain, and after gating.
-                let normalized = bfloat(
-                    self.weights.normalization_weight[channel]
-                        * bfloat(core[channel] * output_inverse_rms),
-                );
-                gated[output_start + channel] =
-                    bfloat(normalized * silu(z[output_start + channel]));
-            }
+            // The recurrent output is rounded before per-head normalization.
+            *core_value = bfloat(sum4(output_part));
         }
-        finite(&next_recurrent_state, "DeltaNet recurrent state")?;
+        finite(&core, "DeltaNet recurrent output")?;
+        let square_sum = squares128(&core);
+        finite(&[square_sum], "DeltaNet output norm")?;
+        let normalization_argument = square_sum / head_dim as f32 + self.epsilon;
+        finite(&[normalization_argument], "DeltaNet output norm argument")?;
+        let output_inverse_rms = rsqrt(normalization_argument);
+        let mut gated = zeros(head_dim)?;
+        for (channel, output) in gated.iter_mut().enumerate() {
+            // Chapter 03 requires a round after RMS, after gain, and after gating.
+            let normalized = bfloat(
+                self.weights.normalization_weight[channel]
+                    * bfloat(core[channel] * output_inverse_rms),
+            );
+            *output = bfloat(normalized * silu(z[output_start + channel]));
+        }
+        finite(head_state, "DeltaNet recurrent state")?;
         finite(&gated, "DeltaNet gated output")?;
-        state.recurrent_state = next_recurrent_state;
+        Ok(gated)
+    }
+
+    /// Stage 3 of [`step`](Self::step): append the row's rounded projection to the
+    /// convolution history, after every head of that row has succeeded.
+    pub fn advance_history(
+        &self,
+        state: &mut GatedDeltaNetState,
+        row: &GatedDeltaNetRow,
+    ) -> Result<()> {
+        if state.dimensions != self.dimensions || row.projected.len() != self.convolution_channels {
+            return Err(dimension_mismatch());
+        }
         state.history.copy_within(self.convolution_channels.., 0);
         let newest = state.history.len() - self.convolution_channels;
-        state.history[newest..].copy_from_slice(&projected);
-        Ok(gated)
+        state.history[newest..].copy_from_slice(&row.projected);
+        Ok(())
     }
 
     fn dense_gates(
@@ -452,6 +575,67 @@ mod tests {
             );
         }
         assert_eq!(committed, provisional);
+    }
+
+    #[test]
+    fn head_major_stages_equal_row_major_steps() {
+        let mut layer = layer();
+        for (index, weight) in layer.weights.projection_a.iter_mut().enumerate() {
+            *weight = (index % 13) as f32 / 64.0 - 0.09;
+        }
+        let rows: Vec<(Vec<f32>, Vec<f32>)> = (0..6)
+            .map(|row| {
+                let qkv = (0..layer.convolution_channels)
+                    .map(|i| ((i * 7 + row * 5) % 23) as f32 / 32.0 - 0.3)
+                    .collect();
+                let z = (0..layer.output_width)
+                    .map(|i| ((i + row) % 9) as f32 / 8.0 - 0.5)
+                    .collect();
+                (qkv, z)
+            })
+            .collect();
+        let hidden = vec![0.125; layer.dimensions.hidden_width];
+        let mut stepped = layer.new_state().unwrap();
+        let expected: Vec<Vec<f32>> = rows
+            .iter()
+            .map(|(qkv, z)| layer.step(&mut stepped, qkv, z, &hidden, 0.75).unwrap())
+            .collect();
+
+        let mut state = layer.new_state().unwrap();
+        let rounded: Vec<_> = rows.iter().map(|(qkv, _)| round_projection(qkv)).collect();
+        let taps: Vec<&[f32]> = state
+            .history_rows()
+            .chain(rounded.iter().map(Vec::as_slice))
+            .collect();
+        let prepared: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (qkv, z))| {
+                layer
+                    .prepare(&taps[i..i + 3], qkv, z, &hidden, 0.75)
+                    .unwrap()
+            })
+            .collect();
+        drop(taps);
+        let mut actual = vec![Vec::new(); rows.len()];
+        // Heads in reverse order: no head may depend on another.
+        for (head, head_state) in state.recurrent_heads_mut().enumerate().rev() {
+            for (row, output) in prepared.iter().zip(&mut actual) {
+                let mut values = layer.recur_head(head_state, row, head).unwrap();
+                values.extend_from_slice(output);
+                *output = values;
+            }
+        }
+        for row in &prepared {
+            layer.advance_history(&mut state, row).unwrap();
+        }
+        let bits = |rows: &[Vec<f32>]| -> Vec<Vec<u32>> {
+            rows.iter()
+                .map(|row| row.iter().map(|v| v.to_bits()).collect())
+                .collect()
+        };
+        assert_eq!(bits(&actual), bits(&expected));
+        assert_eq!(state, stepped);
     }
 
     #[test]
