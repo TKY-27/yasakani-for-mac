@@ -3,9 +3,11 @@
 use std::sync::Arc;
 
 use crate::gated_deltanet::xor_sum32;
-use crate::kv_codec::{CacheRow, Int8Row, encode_packed, requantize_int8};
+use crate::kv_codec::{
+    CacheRow, Int8Row, encode_packed_with_search, requantize_int8_with_search, search_chain,
+};
 use crate::kv_profile::KvProfile;
-use crate::portable_math::{bfloat, exp, exp2, rsqrt, sigmoid, sincos};
+use crate::portable_math::{bfloat, exp, exp2, rsqrt, sincos};
 use crate::{Error, Result};
 
 const FREQUENCY_BITS: [u32; 32] = [
@@ -322,6 +324,17 @@ impl Attention {
         position: usize,
         row: &[f32],
     ) -> Result<CacheRow> {
+        self.encode_row_with_search(head, side, position, row, search_chain)
+    }
+
+    fn encode_row_with_search(
+        &self,
+        head: usize,
+        side: usize,
+        position: usize,
+        row: &[f32],
+        search: impl Fn(&[i32; 64], &crate::kv_profile::CodeTable, u8, bool) -> Result<[u8; 64]>,
+    ) -> Result<CacheRow> {
         if self.kv_mode == KvMode::Int8 {
             return encode_int8(row);
         }
@@ -331,10 +344,10 @@ impl Attention {
         // src/kvq_fast.cuh:78,189,218-234: guard uses the absolute cache position.
         match self.kv_mode {
             KvMode::Int8 => unreachable!(),
-            KvMode::Int8Profile => Ok(CacheRow::Int8(requantize_int8(
-                profile, group, position, row,
+            KvMode::Int8Profile => Ok(CacheRow::Int8(requantize_int8_with_search(
+                profile, group, position, row, &search,
             )?)),
-            KvMode::Kv5 => encode_packed(profile, group, position, row),
+            KvMode::Kv5 => encode_packed_with_search(profile, group, position, row, &search),
         }
     }
 
@@ -465,6 +478,55 @@ impl Attention {
         query_head: usize,
         attend: impl FnOnce(AttentionOperands<'_>) -> Result<Vec<f32>>,
     ) -> Result<Vec<f32>> {
+        self.output_head_with_math::<crate::portable_math::ScalarMath>(
+            state, position, prepared, query_head, attend,
+        )
+    }
+
+    /// Shared attention boundary with independent elementwise output kernels.
+    pub fn output_head_with_math<M: crate::portable_math::Elementwise>(
+        &self,
+        state: &AttentionState,
+        position: usize,
+        prepared: &PreparedRow,
+        query_head: usize,
+        attend: impl FnOnce(AttentionOperands<'_>) -> Result<Vec<f32>>,
+    ) -> Result<Vec<f32>> {
+        let operands = self.head_operands(state, position, prepared, query_head)?;
+        let mut output = Vec::with_capacity(self.dimensions.head_dim);
+        {
+            let start = query_head * self.dimensions.head_dim;
+            let attended = attend(operands)?;
+            if attended.len() != self.dimensions.head_dim {
+                return Err(Error::InvalidInput(
+                    "invalid attention head output width".into(),
+                ));
+            }
+            let unrotated = inverse_rotate_cache(&attended);
+            M::finite(&unrotated, "attention inverse cache rotation")?;
+            let mut gates: [f32; 256] = std::array::from_fn(|i| prepared.gates[start + i]);
+            M::sigmoid(&mut gates);
+            M::bfloat(&mut gates);
+            for (channel, value) in unrotated.into_iter().enumerate() {
+                // The inverse rotation, sigmoid, and product have separate BF16 boundaries.
+                let rounded_attended = bfloat(value);
+                let gate = gates[channel];
+                output.push(bfloat(rounded_attended * gate));
+            }
+        }
+        M::finite(&output, "attention gated output")?;
+        Ok(output)
+    }
+
+    /// Borrow validated causal operands for engines that share KV tiles across queries.
+    /// The scalar output hook uses this same validation and operand selection body.
+    pub fn head_operands<'a>(
+        &'a self,
+        state: &'a AttentionState,
+        position: usize,
+        prepared: &'a PreparedRow,
+        query_head: usize,
+    ) -> Result<AttentionOperands<'a>> {
         if state.dimensions != self.dimensions
             || position > state.rows.len()
             || query_head >= self.dimensions.query_heads
@@ -475,33 +537,15 @@ impl Attention {
                 "invalid attention prefix or head".into(),
             ));
         }
-        let mut output = Vec::with_capacity(self.dimensions.head_dim);
-        {
-            let start = query_head * self.dimensions.head_dim;
-            let kv_head = query_head / (self.dimensions.query_heads / self.dimensions.kv_heads);
-            let attended = attend(AttentionOperands {
-                query: &prepared.queries[start..start + self.dimensions.head_dim],
-                kv_head,
-                prefix: &state.rows[..position],
-                current: &prepared.cache,
-                value_mean: self.value_mean(kv_head, &prepared.cache.values[kv_head])?,
-            })?;
-            if attended.len() != self.dimensions.head_dim {
-                return Err(Error::InvalidInput(
-                    "invalid attention head output width".into(),
-                ));
-            }
-            let unrotated = inverse_rotate_cache(&attended);
-            finite(&unrotated, "attention inverse cache rotation")?;
-            for (channel, value) in unrotated.into_iter().enumerate() {
-                // The inverse rotation, sigmoid, and product have separate BF16 boundaries.
-                let rounded_attended = bfloat(value);
-                let gate = bfloat(sigmoid(prepared.gates[start + channel]));
-                output.push(bfloat(rounded_attended * gate));
-            }
-        }
-        finite(&output, "attention gated output")?;
-        Ok(output)
+        let start = query_head * self.dimensions.head_dim;
+        let kv_head = query_head / (self.dimensions.query_heads / self.dimensions.kv_heads);
+        Ok(AttentionOperands {
+            query: &prepared.queries[start..start + self.dimensions.head_dim],
+            kv_head,
+            prefix: &state.rows[..position],
+            current: &prepared.cache,
+            value_mean: self.value_mean(kv_head, &prepared.cache.values[kv_head])?,
+        })
     }
 
     fn validate_projected_rows(
@@ -627,6 +671,18 @@ impl Attention {
         side: usize,
         projected: &[f32],
     ) -> Result<CacheRow> {
+        self.prepare_cache_side_with_search(position, head, side, projected, search_chain)
+    }
+
+    /// Same projection boundaries with an independent integer trellis search.
+    pub fn prepare_cache_side_with_search(
+        &self,
+        position: usize,
+        head: usize,
+        side: usize,
+        projected: &[f32],
+        search: impl Fn(&[i32; 64], &crate::kv_profile::CodeTable, u8, bool) -> Result<[u8; 64]>,
+    ) -> Result<CacheRow> {
         if head >= self.dimensions.kv_heads || side > 1 || projected.len() != self.kv_width {
             return Err(Error::InvalidInput("invalid attention cache side".into()));
         }
@@ -649,7 +705,7 @@ impl Attention {
         } else {
             rotate_cache(&row)
         };
-        self.encode_row(head, side, position, &rotated)
+        self.encode_row_with_search(head, side, position, &rotated, search)
     }
 
     /// Finish an engine-prepared row; sides are interleaved key/value in head order.

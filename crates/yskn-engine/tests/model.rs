@@ -182,6 +182,12 @@ fn compare_mode(bytes: Vec<u8>, count: usize, baseline: &str, mode: KvMode) {
             }
             for threads in [1, 4] {
                 for &rows in widths {
+                    // Pass grouping is above Compute::weighted_sums/map_range. The
+                    // linear suite keeps the full kernel × pool × M product; here
+                    // cover every kernel/pool at width 17 and every width at x4.
+                    if rows != 17 && (kernel != Kernel::fastest() || threads != 4) {
+                        continue;
+                    }
                     let context = format!(
                         "{mode:?} {backend:?} {} threads={threads} rows_per_pass={rows}",
                         kernel.name()
@@ -203,10 +209,10 @@ fn compare_mode(bytes: Vec<u8>, count: usize, baseline: &str, mode: KvMode) {
                     };
                     assert_eq!(model.backend(), backend);
                     check(&context, model);
+                    println!("ran: {context}");
                 }
             }
         }
-        println!("ran: {mode:?} {backend:?} threads=1,4 rows_per_pass={widths:?}");
     }
 }
 /// A missing device is reported on stdout and is the only way to skip Metal cases.

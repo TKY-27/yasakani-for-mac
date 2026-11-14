@@ -18,6 +18,37 @@ pub fn bfloat(value: f32) -> f32 {
     yskn_format::bf16_to_f32(yskn_format::f32_to_bf16(value))
 }
 
+/// Elementwise engine hooks. Default bodies are the scalar numeric contract.
+/// Implementations may only reorder work between independent elements.
+pub trait Elementwise {
+    fn bfloat(values: &mut [f32]) {
+        for value in values {
+            *value = bfloat(*value);
+        }
+    }
+    fn sigmoid(values: &mut [f32]) {
+        for value in values {
+            *value = sigmoid(*value);
+        }
+    }
+    fn silu(values: &mut [f32]) {
+        for value in values {
+            *value = silu(*value);
+        }
+    }
+    fn scale_half(values: &mut [f32], scale: f32) {
+        for value in values {
+            *value = half(*value * scale);
+        }
+    }
+    fn finite(values: &[f32], context: &'static str) -> Result<()> {
+        crate::require_finite(values, context)
+    }
+}
+
+pub struct ScalarMath;
+impl Elementwise for ScalarMath {}
+
 const fn single(bits: u32) -> f32 {
     f32::from_bits(bits)
 }

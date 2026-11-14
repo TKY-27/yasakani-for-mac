@@ -10,8 +10,10 @@ use std::time::{Duration, Instant};
 use crate::model::{CaptureOptions, CapturedRow, ModelDimensions};
 use crate::{Error, Model, Result, Sampler};
 
+pub use crate::draft_depth::{AdaptiveDepth, CostModel, DepthController, DepthPolicy};
 pub use crate::draft_proposer::{
-    CombinedProposer, DraftProposer, DraftProposerSnapshot, ProposalOrder, SessionSnapshot,
+    CombinedProposer, DraftProposer, DraftProposerSnapshot, DraftWork, ProposalOrder,
+    SessionSnapshot,
 };
 
 /// A causal verifier. Failed passes are atomic; commit retains exactly its first
@@ -154,6 +156,12 @@ pub trait Proposer {
     fn observe_committed(&mut self, _rows: &[CapturedRow]) -> Result<()> {
         Ok(())
     }
+    /// Guesses that cost nothing worth counting to make (an exact n-gram copy).
+    /// An adaptive depth policy offers these, up to its maximum, without
+    /// consulting or updating its estimate; empty defers to the policy.
+    fn free_guesses(&mut self, _history: &[u32], _last: u32, _max: usize) -> Vec<u32> {
+        Vec::new()
+    }
     /// Fallible, verifier-aware entry point; token-only proposers keep their API.
     fn propose_with<V: Verifier>(
         &mut self,
@@ -206,8 +214,19 @@ impl NgramProposer {
         Ok(Self { n, k })
     }
 }
-impl Proposer for NgramProposer {
-    fn propose(&mut self, history: &[u32], last: u32, max: usize) -> Vec<u32> {
+impl NgramProposer {
+    /// As `propose`, but only when the most recent match of the last `n` known
+    /// tokens extends backwards to at least `min_match` equal tokens.
+    pub fn propose_long(
+        &self,
+        history: &[u32],
+        last: u32,
+        max: usize,
+        min_match: usize,
+    ) -> Vec<u32> {
+        self.continuation(history, last, max, min_match)
+    }
+    fn continuation(&self, history: &[u32], last: u32, max: usize, min_match: usize) -> Vec<u32> {
         let max = max.min(self.k);
         if max == 0 || history.len() < self.n {
             return Vec::new();
@@ -224,6 +243,13 @@ impl Proposer for NgramProposer {
         let suffix_start = known_len - self.n;
         for start in (0..suffix_start).rev() {
             if (0..self.n).all(|offset| token(start + offset) == token(suffix_start + offset)) {
+                let earlier = (1..=start)
+                    .take_while(|&i| token(start - i) == token(suffix_start - i))
+                    .take(min_match.saturating_sub(self.n))
+                    .count();
+                if self.n + earlier < min_match {
+                    return Vec::new();
+                }
                 let continuation = start + self.n;
                 return (continuation..known_len).take(max).map(token).collect();
             }
@@ -231,10 +257,18 @@ impl Proposer for NgramProposer {
         Vec::new()
     }
 }
+impl Proposer for NgramProposer {
+    fn propose(&mut self, history: &[u32], last: u32, max: usize) -> Vec<u32> {
+        self.continuation(history, last, max, 0)
+    }
+}
 
 pub struct GenerationLimits<'a> {
     pub max_new_tokens: usize,
+    /// Fixed depth, or the maximum depth of an adaptive policy.
     pub max_draft_tokens: usize,
+    /// Changes only how many guesses are requested, never the output.
+    pub depth: DepthPolicy,
     /// An additional caller limit, clamped to the verifier's own capacity.
     pub context_capacity: usize,
     pub eos_ids: &'a [u32],
@@ -246,6 +280,7 @@ impl GenerationLimits<'_> {
         Self {
             max_new_tokens,
             max_draft_tokens: 0,
+            depth: DepthPolicy::Fixed,
             context_capacity,
             eos_ids: &[],
             on_token: None,
@@ -267,6 +302,10 @@ pub struct GenerationStatistics {
     pub rows_verified: usize,
     pub tokens_confirmed_per_pass: Vec<usize>,
     pub guesses_offered: usize,
+    /// Proposer calls with a positive guess budget.
+    pub proposals: usize,
+    /// Guesses requested before each pass; zero when no proposal was made.
+    pub requested_depths: Vec<usize>,
     /// Guesses equal to selected tokens, including a matching terminal token.
     pub guesses_accepted: usize,
     /// End-to-end pass time, including selection, streaming callback and commit.
@@ -344,6 +383,20 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
         statistics: GenerationStatistics::default(),
         stop_reason: StopReason::MaxNewTokens,
     };
+    let mut controller = match &limits.depth {
+        DepthPolicy::Fixed => None,
+        DepthPolicy::Adaptive(config) => {
+            config.validate().map_err(GenerationError::InvalidInput)?;
+            let budget = limits.max_draft_tokens.min(
+                verifier
+                    .max_pass_width()
+                    .min(capacity.saturating_sub(verifier.position()))
+                    .min(limits.max_new_tokens)
+                    .saturating_sub(1),
+            );
+            Some(DepthController::new(config, budget))
+        }
+    };
     proposer
         .synchronize(verifier)
         .map_err(GenerationError::Proposer)?;
@@ -357,13 +410,24 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
         }
         let remaining = limits.max_new_tokens - result.tokens.len();
         let width = room.min(remaining).min(verifier.max_pass_width());
-        let mut guesses = if drafting {
-            match proposer.propose_with(
-                verifier,
-                &history,
-                pending,
-                limits.max_draft_tokens.min(width - 1),
-            ) {
+        let limit = limits.max_draft_tokens.min(width - 1);
+        let free = if drafting && controller.is_some() {
+            proposer.free_guesses(&history, pending, limit)
+        } else {
+            Vec::new()
+        };
+        // The proposer is asked for its whole budget; an adaptive depth only
+        // truncates the offer, and zero skips the call (and its cost).
+        let depth = match &mut controller {
+            Some(controller) if drafting && free.is_empty() => controller.depth(limit),
+            _ => limit,
+        };
+        let call = drafting && free.is_empty() && (controller.is_none() || depth > 0);
+        result.statistics.proposals += usize::from(call && limit > 0);
+        let mut guesses = if !free.is_empty() {
+            free
+        } else if call {
+            match proposer.propose_with(verifier, &history, pending, limit) {
                 Ok(guesses) => guesses,
                 Err(error) if result.tokens.is_empty() => {
                     return Err(GenerationError::Proposer(error));
@@ -380,7 +444,7 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
             .dimensions()
             .map(|dimensions| dimensions.vocabulary_size)
             .or_else(|| verifier.logits().map(<[f32]>::len));
-        let invalid_guesses = if guesses.len() > limits.max_draft_tokens.min(width - 1) {
+        let invalid_guesses = if guesses.len() > limit {
             Some("proposer exceeded the requested guess limit")
         } else if vocabulary.is_some_and(|size| guesses.iter().any(|&id| id as usize >= size)) {
             Some("proposer returned a token outside the vocabulary")
@@ -394,6 +458,16 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
             drafting = false;
             guesses.clear();
         }
+        if let Some(controller) = &mut controller {
+            if call && drafting {
+                controller.proposed(result.tokens.len(), &guesses);
+            }
+            guesses.truncate(depth);
+        }
+        result
+            .statistics
+            .requested_depths
+            .push(if call { depth } else { guesses.len() });
         let mut rows = Vec::with_capacity(guesses.len() + 1);
         rows.push(pending);
         rows.extend_from_slice(&guesses);
@@ -470,6 +544,9 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
         let outputs = &result.tokens[before..];
         history.extend_from_slice(&outputs[..outputs.len() - 1]);
         pending = outputs[outputs.len() - 1];
+        if let Some(controller) = &mut controller {
+            controller.observe(&result.tokens);
+        }
         if stopped {
             break;
         }
@@ -843,6 +920,29 @@ mod tests {
         eos: &[u32],
         cancel_after: Option<usize>,
     ) -> GenerationResult {
+        check_with(
+            DepthPolicy::Fixed,
+            prompt,
+            sampler,
+            proposer,
+            k,
+            sizes,
+            eos,
+            cancel_after,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_with(
+        depth: DepthPolicy,
+        prompt: &[u32],
+        sampler: &Sampler,
+        proposer: &mut impl Proposer,
+        k: usize,
+        sizes: (usize, usize),
+        eos: &[u32],
+        cancel_after: Option<usize>,
+    ) -> GenerationResult {
         let (max, capacity) = sizes;
         let expected = sequential(prompt, sampler, max, capacity, eos, cancel_after);
         let mut verifier = SequenceVerifier::new(&prompt[..prompt.len() - 1], capacity, 9);
@@ -854,6 +954,7 @@ mod tests {
         };
         let mut limits = GenerationLimits::new(max, capacity);
         limits.max_draft_tokens = k;
+        limits.depth = depth;
         limits.eos_ids = eos;
         limits.on_token = Some(&mut callback);
         let result = generate(&mut verifier, proposer, &mut selector, prompt, limits).unwrap();
@@ -911,49 +1012,143 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_depth_preserves_sequential_tokens_and_repeats_its_depths() {
+        let prompt = [1, 2, 3, 1, 2, 3, 1];
+        let policy = DepthPolicy::Adaptive(AdaptiveDepth::neural());
+        for sampler in samplers() {
+            for k in [1, 3, 7] {
+                for wrong_after in [None, Some(0), Some(2), Some(usize::MAX)] {
+                    let mut proposer = GuidedProposer {
+                        sampler: sampler.clone(),
+                        wrong_after,
+                    };
+                    for (eos, cancel) in [(vec![], None), (vec![5], None), (vec![], Some(9))] {
+                        let run = |proposer: &mut GuidedProposer| {
+                            let sizes = (40, 64);
+                            let p = policy.clone();
+                            check_with(p, &prompt, &sampler, proposer, k, sizes, &eos, cancel)
+                        };
+                        let first = run(&mut proposer);
+                        let again = run(&mut proposer);
+                        let stats = (&first.statistics, &again.statistics);
+                        assert_eq!(stats.0.requested_depths, stats.1.requested_depths);
+                        assert_eq!(stats.0.passes, stats.0.requested_depths.len());
+                        assert!(stats.0.requested_depths.iter().all(|&d| d <= k));
+                        let calls = stats.0.requested_depths.iter().filter(|&&d| d > 0);
+                        assert_eq!(calls.count(), stats.0.proposals);
+                        if wrong_after.is_none() && cancel.is_none() && eos.is_empty() {
+                            assert!(stats.0.passes < first.tokens.len());
+                        }
+                        if wrong_after == Some(0) && eos.is_empty() && cancel.is_none() {
+                            // Never right: the proposer is skipped on most passes.
+                            assert!(stats.0.proposals * 2 < stats.0.passes, "{stats:?}");
+                        }
+                    }
+                }
+                let mut ngram = NgramProposer::new(2, k).unwrap();
+                check_with(
+                    policy.clone(),
+                    &prompt,
+                    &sampler,
+                    &mut ngram,
+                    k,
+                    (23, 64),
+                    &[],
+                    None,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_adaptive_configuration_is_rejected_before_any_pass() {
+        let mut verifier = SequenceVerifier::new(&[1, 2], 32, 4);
+        let mut config = AdaptiveDepth::neural();
+        config.rate = f64::NAN;
+        let mut limits = GenerationLimits::new(7, 32);
+        limits.max_draft_tokens = 3;
+        limits.depth = DepthPolicy::Adaptive(config);
+        let error = generate(
+            &mut verifier,
+            &mut NoProposer,
+            &mut Greedy,
+            &[1, 2, 3],
+            limits,
+        );
+        assert!(matches!(error, Err(GenerationError::InvalidInput(_))));
+        assert!(verifier.pending.is_none());
+        assert_eq!(verifier.committed, [1, 2]);
+    }
+
+    #[test]
     fn eos_cancel_and_capacity_discard_later_rows_and_keep_last_token_pending() {
         let prompt = [1, 2, 3, 1, 2, 3, 1];
-        for sampler in samplers() {
-            let sequence = sequential(&prompt, &sampler, 16, 64, &[], None).0;
-            for k in [1, 2, 3, 7] {
-                for eos in [vec![sequence[0]], vec![sequence[3]], vec![sequence[7]]] {
-                    let mut oracle = GuidedProposer {
-                        sampler: sampler.clone(),
-                        wrong_after: None,
-                    };
-                    check(&prompt, &sampler, &mut oracle, k, (16, 64), &eos, None);
-                    // An EOS guess cannot stop generation until the selector chooses it.
-                    check(
-                        &prompt,
-                        &sampler,
-                        &mut ScriptProposer::new(vec![eos[0]; k]),
-                        k,
-                        (16, 64),
-                        &eos,
-                        None,
-                    );
-                }
-                for cancel in [1, 3, 6, 11] {
-                    let mut oracle = GuidedProposer {
-                        sampler: sampler.clone(),
-                        wrong_after: None,
-                    };
-                    check(
-                        &prompt,
-                        &sampler,
-                        &mut oracle,
-                        k,
-                        (16, 64),
-                        &[],
-                        Some(cancel),
-                    );
-                }
-                for capacity in [prompt.len() - 1, prompt.len(), prompt.len() + 3] {
-                    let mut oracle = GuidedProposer {
-                        sampler: sampler.clone(),
-                        wrong_after: None,
-                    };
-                    check(&prompt, &sampler, &mut oracle, k, (16, capacity), &[], None);
+        for policy in [
+            DepthPolicy::Fixed,
+            DepthPolicy::Adaptive(AdaptiveDepth::neural()),
+        ] {
+            for sampler in samplers() {
+                let sequence = sequential(&prompt, &sampler, 16, 64, &[], None).0;
+                for k in [1, 2, 3, 7] {
+                    for eos in [vec![sequence[0]], vec![sequence[3]], vec![sequence[7]]] {
+                        let mut oracle = GuidedProposer {
+                            sampler: sampler.clone(),
+                            wrong_after: None,
+                        };
+                        check_with(
+                            policy.clone(),
+                            &prompt,
+                            &sampler,
+                            &mut oracle,
+                            k,
+                            (16, 64),
+                            &eos,
+                            None,
+                        );
+                        // An EOS guess cannot stop generation until the selector chooses it.
+                        check_with(
+                            policy.clone(),
+                            &prompt,
+                            &sampler,
+                            &mut ScriptProposer::new(vec![eos[0]; k]),
+                            k,
+                            (16, 64),
+                            &eos,
+                            None,
+                        );
+                    }
+                    for cancel in [1, 3, 6, 11] {
+                        let mut oracle = GuidedProposer {
+                            sampler: sampler.clone(),
+                            wrong_after: None,
+                        };
+                        check_with(
+                            policy.clone(),
+                            &prompt,
+                            &sampler,
+                            &mut oracle,
+                            k,
+                            (16, 64),
+                            &[],
+                            Some(cancel),
+                        );
+                    }
+                    for capacity in [prompt.len() - 1, prompt.len(), prompt.len() + 3] {
+                        let mut oracle = GuidedProposer {
+                            sampler: sampler.clone(),
+                            wrong_after: None,
+                        };
+                        check_with(
+                            policy.clone(),
+                            &prompt,
+                            &sampler,
+                            &mut oracle,
+                            k,
+                            (16, capacity),
+                            &[],
+                            None,
+                        );
+                    }
                 }
             }
         }
@@ -977,31 +1172,124 @@ mod tests {
     }
 
     #[test]
-    fn caller_capacity_and_pass_width_bound_every_verification() {
-        let mut verifier = SequenceVerifier::new(&[1, 2], 64, 2);
-        let mut proposer = GuidedProposer {
-            sampler: Sampler::Greedy,
-            wrong_after: None,
-        };
-        let mut limits = GenerationLimits::new(30, 7);
-        limits.max_draft_tokens = usize::MAX;
-        let result = generate(
-            &mut verifier,
-            &mut proposer,
-            &mut Greedy,
-            &[1, 2, 3],
-            limits,
-        )
-        .unwrap();
-        assert_eq!(result.stop_reason, StopReason::ContextCapacity);
-        assert_eq!(
-            result.tokens,
-            sequential(&[1, 2, 3], &Sampler::Greedy, 30, 7, &[], None).0
+    fn long_ngram_requires_the_match_to_extend_backwards() {
+        let proposer = NgramProposer::new(2, 7).unwrap();
+        let history = [7, 5, 1, 2, 9, 7, 5, 1];
+        assert_eq!(proposer.propose_long(&history, 2, 7, 4), [9, 7, 5, 1, 2]);
+        assert_eq!(proposer.propose_long(&history, 2, 3, 0), [9, 7, 5]);
+        assert!(proposer.propose_long(&history, 2, 7, 5).is_empty());
+        // The most recent match decides, as for `propose`.
+        assert!(
+            proposer
+                .propose_long(&[1, 2, 3, 1, 2, 4, 1], 2, 7, 3)
+                .is_empty()
         );
-        assert_eq!(verifier.position(), 7);
-        assert_eq!(result.statistics.tokens_confirmed_per_pass, [2, 2, 1]);
-        assert_eq!(result.statistics.rows_verified, 5);
-        assert_eq!(result.statistics.guesses_offered, 2);
+    }
+
+    #[test]
+    fn free_guesses_bypass_the_adaptive_policy_and_stay_lossless() {
+        struct Free {
+            oracle: GuidedProposer,
+            calls: usize,
+        }
+        impl Proposer for Free {
+            fn propose(&mut self, _: &[u32], _: u32, _: usize) -> Vec<u32> {
+                self.calls += 1;
+                Vec::new()
+            }
+            fn free_guesses(&mut self, history: &[u32], last: u32, max: usize) -> Vec<u32> {
+                self.oracle.propose(history, last, max)
+            }
+        }
+        let prompt = [1, 2, 3, 1, 2, 3, 1];
+        for sampler in samplers() {
+            for wrong_after in [None, Some(0)] {
+                let mut proposer = Free {
+                    oracle: GuidedProposer {
+                        sampler: sampler.clone(),
+                        wrong_after,
+                    },
+                    calls: 0,
+                };
+                let policy = DepthPolicy::Adaptive(AdaptiveDepth::neural());
+                let result = check_with(
+                    policy,
+                    &prompt,
+                    &sampler,
+                    &mut proposer,
+                    5,
+                    (30, 64),
+                    &[],
+                    None,
+                );
+                // Free guesses are always offered in full; the paid proposer never runs.
+                assert_eq!(proposer.calls, 0);
+                assert_eq!(result.statistics.proposals, 0);
+                assert_eq!(
+                    result.statistics.guesses_offered,
+                    result.statistics.rows_verified - result.statistics.passes
+                );
+                if wrong_after.is_none() {
+                    assert_eq!(result.statistics.passes, 5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn caller_capacity_and_pass_width_bound_every_verification() {
+        for depth in [
+            DepthPolicy::Fixed,
+            DepthPolicy::Adaptive(AdaptiveDepth::neural()),
+        ] {
+            let mut verifier = SequenceVerifier::new(&[1, 2], 64, 2);
+            let mut proposer = GuidedProposer {
+                sampler: Sampler::Greedy,
+                wrong_after: None,
+            };
+            let mut limits = GenerationLimits::new(30, 7);
+            limits.max_draft_tokens = usize::MAX;
+            limits.depth = depth;
+            let result = generate(
+                &mut verifier,
+                &mut proposer,
+                &mut Greedy,
+                &[1, 2, 3],
+                limits,
+            )
+            .unwrap();
+            assert_eq!(result.stop_reason, StopReason::ContextCapacity);
+            assert_eq!(
+                result.tokens,
+                sequential(&[1, 2, 3], &Sampler::Greedy, 30, 7, &[], None).0
+            );
+            assert_eq!(verifier.position(), 7);
+            assert_eq!(result.statistics.tokens_confirmed_per_pass, [2, 2, 1]);
+            assert_eq!(result.statistics.rows_verified, 5);
+            assert_eq!(result.statistics.guesses_offered, 2);
+        }
+    }
+
+    #[test]
+    fn adaptive_controller_allocation_respects_output_and_context_without_width_cap() {
+        for (n, capacity) in [(0, usize::MAX), (1, usize::MAX), (30, 3), (30, 2)] {
+            let mut verifier = SequenceVerifier::new(&[1, 2], 64, usize::MAX);
+            let mut limits = GenerationLimits::new(n, capacity);
+            limits.max_draft_tokens = usize::MAX;
+            limits.depth = DepthPolicy::Adaptive(AdaptiveDepth::neural());
+            let result = generate(
+                &mut verifier,
+                &mut NoProposer,
+                &mut Greedy,
+                &[1, 2, 3],
+                limits,
+            )
+            .unwrap();
+            let expected = sequential(&[1, 2, 3], &Sampler::Greedy, n, capacity.min(64), &[], None);
+            assert_eq!(result.tokens, expected.0);
+            assert_eq!(result.stop_reason, expected.2);
+            assert!(result.statistics.requested_depths.iter().all(|&d| d == 0));
+        }
     }
 
     #[test]

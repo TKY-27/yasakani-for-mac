@@ -1437,6 +1437,166 @@ No other heavy process ran at 14:18, but this task's own builds and runs had
 just ended; the orchestrator's quiet-machine re-measurement supersedes these
 numbers.
 
+## D19 — Real engine behind the product commands
+
+The default `yskn` engine loads the published model folder. `--engine stub`
+remains an explicit deterministic development fixture. The public
+`RealEngineConfig` holds the same settings used by terminal/server factories:
+cache `Kv5`, context 32,768, prefill width 16, normal engine backend selection
+and normal CPU-worker defaults. Drafting defaults changed with brief 06k (D21):
+`--draft both --k 7 --depth adaptive`, where `both` copies long n-gram matches
+and otherwise asks the fast neural draft (D18, with its own pool of the main
+model's kernel and worker count and the same projection backend), K is the
+maximum depth and the adaptive policy picks each pass's depth. None/n-gram/
+neural/both and `--depth fixed` remain selectable. The scalar draft is no
+longer reachable from the product; tests and examples still use it. The
+server creates the model on its existing dedicated engine thread, retaining
+the non-`Send` engine contract and every existing request/security limit.
+Mapped model files must remain unchanged through process exit; command help,
+startup and info make that contract visible.
+
+### Sampling and stopping
+
+`python/yasakani/engine.py:25-42,165-176` defines the mapping: mode 3 maps to
+reference `SamplingVersion::Gumbel`; temperature <=0 selects greedy, and
+otherwise temperature/top-p/min-p are multiplied by 1000 and rounded with
+Python's nearest-even rule before the integer native call. Rust performs the
+same nearest-even conversion and constructs reference parameters from those
+thousandths. A positive temperature rounding to zero consequently becomes
+greedy. top-k outside 1..20 becomes 20, then is bounded by the actual vocabulary
+for synthetic models. The native signed-int setter narrows seeds to the low
+32 bits, reinterpreted unsigned. Token-keyed noise uses absolute prediction
+positions, retaining reference-loop losslessness across proposal settings.
+Draft Gumbel selection uses that same effective seed and its independent D17
+temperature/candidate policy.
+
+Upstream `python/yasakani/chat.py:20-21,36-41` hardcodes the published
+`generation_config.json` values 1.0/0.95/20/0.0. The product reads those four
+fields from the optional folder file, with those same fallbacks, so a published
+folder can supply its actual request defaults. Per-request validation remains
+unchanged; explicit values override defaults. `RequestDefaults` carries the
+sampling defaults for HTTP and terminal parsing.
+
+`python/yasakani/runtime.py:20-21,54-59` names EOS 248046/248044 and snapshot
+marker 248045. `engine.py:190-212` makes `None` ignore EOS; an explicit stop-ID
+slice instead controls stops. Selfcheck uses the two EOS IDs; fixed-length
+bench ignores them. The existing chat layer continues to own request EOS,
+stop-string, loop-guard and thinking-budget behavior.
+
+### Prompt reuse and bounded work
+
+Reuse follows `docs/spec/08_SPECULATION.md` section 2,
+`src/specx.cpp:94-126` and `src/engine35.cpp:1244-1266,1550-1583`. A nonempty
+committed prefix strictly shorter than the new prompt takes live mode 1;
+otherwise a strict saved prefix restores mode 2; otherwise mode 0 resets.
+Equal prompts do not satisfy either strict-prefix branch. The new suffix's
+last marker determines the snapshot cut immediately after 248045; without
+one, the cut is before the final prompt token. One replaceable joint
+main/draft checkpoint retains the recurrent state, prefix and D17 draft ring;
+attention remains in the main owner and is truncated on restore. Prompt reuse
+reports cached token count and mode, without accumulating request snapshots.
+
+Prefill is divided into configurable passes and checks the callback between
+passes. Only the final requested prompt row needs logits. Captured committed
+prompt rows feed the draft ring as in D17. Generation uses the shared lossless
+reference loop and reports verification passes/rows, guesses offered/accepted,
+prefill time and generation time. Callback cancellation/errors retain the
+existing synchronous engine contract.
+
+### Startup memory estimate
+
+Metadata inspection reads container headers/file sizes, manifest and required
+KV/draft profiles, without mapping main weights or running inference. Context
+is checked against the manifest's unrounded `max_ctx`. The cache allocation
+uses the next power-of-two context capacity to account for vector growth.
+Before load, compare the following conservative estimate with physical memory
+(`sysctl -n hw.memsize` on macOS, falling back to Foundation's
+`NSProcessInfo.physicalMemory` through a fixed `/usr/bin/osascript` program
+when sandboxed sysctl cannot report it); fail with needed/physical byte counts and
+suggest lowering `--ctx`, choosing `--kv int8`, or `--draft ngram/none`:
+
+```text
+W = max(prefill_width, K+1)
+subtotal = weights_file + draft_files + recurrent + cache + snapshot + working
+margin   = ceil(0.15 * subtotal) + 1 GiB
+needed   = subtotal + margin
+snapshot = recurrent + 4*context + 4*vocabulary + draft_ring
+working  = recurrent + W*replay_row + expanded_dense_vectors
+         + 256*W*(hidden+ffn) + draft_ring + draft_captures
+         + 8*context + 4*W*vocabulary
+```
+
+Draft files (since D21, for the fast draft) count the mapped draft container
+and reduced-head file once, plus what the fast draft owns: the repacked
+approximate head rows, f32 copies of the head projection and scales, and the
+draft's hidden/final norms, per-layer ln1/ln2/q_norm/k_norm/abase/mbase
+and selector hp expanded to f32. Selector pred/succ stay mapped as BF16;
+their per-row decoding is scratch, not a persistent f32 copy. The scalar
+draft's owned code copy is gone. D17 ring and capture dimensions are
+header-derived and appear in both working/checkpoint owners as appropriate.
+The margin covers process/allocator/OS overhead and unitemized tables/scratch;
+this is a startup fit estimate, not measured peak RSS or free-memory admission.
+No settings are changed. A physically fitting model may still encounter memory
+pressure from other processes.
+
+For the published architecture from `docs/spec/01_MODEL_ARCHITECTURE.md`, model
+file 10,311,344,128 bytes, context 32,768, W=16, n-gram K=3:
+recurrent = 156,893,184; replay = 94,666,752; dense vectors = 104,953,856;
+snapshot = 158,017,536; working = 464,943,104 bytes. D13's actual Rust row
+representation costs 37,632 bytes/token in either int8 mode and 89,600 in
+real-profile Kv5. Kv5 retains derived BF16 bases and currently allocates more
+than int8; the compact theoretical packed reader is not implemented.
+
+| Cache | Cache bytes | Subtotal bytes | Margin bytes | Needed bytes (GiB) |
+|---|---:|---:|---:|---:|
+| int8 | 1,233,125,376 | 12,324,323,328 | 2,922,390,324 | 15,246,713,652 (14.199609) |
+| int8-profile | 1,233,125,376 | 12,324,323,328 | 2,922,390,324 | 15,246,713,652 (14.199609) |
+| kv5, real profile | 2,936,012,800 | 14,027,210,752 | 3,177,823,437 | 17,205,034,189 (16.023437) |
+
+These figures are derived from the documented architecture/profile, without
+opening the real model during this brief. `yskn info` computes the same formula
+from the actual chosen folder/configuration and is authoritative for that run.
+
+### Selfcheck and benchmark evidence
+
+Selfcheck follows `python/yasakani/cli.py:400-471`: the three fixed cases,
+exact template options, greedy output, little-endian int32 SHA-256, prompt
+and output counts/hashes and twelve-token head. It prints one result per case
+and exits nonzero for any mismatch. A stored mismatch reports a zero-based
+index and both IDs. Published records contain no IDs past the first twelve,
+so a later first-difference index/expected ID cannot be recovered from SHA-256;
+that diagnostic explicitly reports the limitation. An optional full `ids`
+array supports exact later diagnostics without changing the upstream fields.
+
+Bench reuses prose/code/proof text from `python/yasakani/cli.py:339-344` and
+adds a fixed neutral CSV-to-JSON prompt. Each run resets the session, uses
+greedy decoding, ignores EOS and requires exactly `--n` output tokens to fit
+with the prompt plus the unchanged 64-token reserve. Repeated draft and K
+settings compare their Cartesian product. Printed metrics are also written by
+`--json OUT`, including the loaded backend/device, cache, context, threads,
+model file size/name and proposal settings. Prefill rate counts only prompt rows
+processed before the final pending row; the latter is timed in the shared
+loop's first verification pass. Logical code bytes count body/head
+compressed streams once per main pass, plus the draft work counted inside the
+timed generation, normalised by main passes (corrected in brief 06k: before,
+history updates were not counted, so `--n 1` with a neural draft reported main
+bytes only). A neural proposal reads the draft block streams (every layer
+matrix; not the FC input projection) plus `7 * (vocabulary*rank +
+shortlist*hidden)` int8 head reads: the seven output positions each score the
+approximate head and only the shortlisted rescore rows (default shortlist
+512). It does not count the full rescore matrix, whose other rows are
+untouched. A history update, one push of the consecutive rows a pass commits
+(the fast draft reads its codes once per push of up to 256 rows), reads the FC
+and every layer's key/value streams. Updates follow every commit, also when no
+proposal ran. `DraftProposer::work` counts both; `Generation` carries the
+counts for the generation call, and `yskn info`/bench JSON report the bytes of
+one proposal (1,740,636,160 for the published model) and of one update
+(91,750,400). Embedding row reads, vectors, lookup tables, scales,
+cache and recurrent traffic are excluded; it is not a hardware DRAM counter.
+Neither synthetic tests nor these accounting definitions establish released
+model throughput. The real-model selfcheck/bench/chat/server commands remain
+for the orchestrator; this brief never opens the in-use model.
+
 ## D20 — Exact CPU stages around compressed projections (brief 07a)
 
 All new fast paths live in `yskn-engine`. `YSKN_CPU_STAGES=auto` (default)
@@ -1670,6 +1830,744 @@ matrix copies are gone; (4) profile software half conversion and residual/MLP
 allocation/dispatch. No SIMD-within-score reduction or additional persistent
 cache bytes are proposed as an unapproved shortcut.
 
+
+### D20 round two: real-shape CPU profiling (brief 07c)
+
+All measurements below use the CPU projection backend, dotprod/10 workers,
+`CARGO_NET_OFFLINE=true`, and the read-only `$HOME/models/qwen38-speed`.
+Model access is exclusive and read-only. macOS `sample PID 5 1` was denied
+process inspection by the sandbox; stage timers are the available profile,
+not on-CPU sample counts.
+
+#### Task 1: integer VIT2 selection
+
+Only the engine replaces VIT2. Four lanes represent four independent reduced
+states `g`. The integer emissions, paired minimum **before** shared-cost
+addition for five bits, low predecessor bits, normalization and signed
+final `(cost,state)` minimum are unchanged. Stack arrays replace per-step
+allocation. The fast path checks 4/5 bits, target bounds +/-2048 and table
+bounds +/-1100; D13's reduced-cost bound keeps every intermediate in i32.
+Other inputs use the checked scalar oracle. There is no floating change:
+additive search hooks share the original scale-candidate fold, first strict
+minimum, reconstruction and packing. `YSKN_CPU_STAGES=reference` disables
+both this search and the previous side parallelism.
+
+`cargo test --release -p yskn-engine --lib cpu_stages::kv_codec` checks 360
+random/boundary/tied chain cases (including checked-overflow fallback), and
+complete packed/int8-profile encoding across random, constant, signed-zero,
+subnormal, guarded and mixed-side rows. It compares exact selected states,
+encoded representation and scale bits to the unchanged scalar search.
+
+One-core explicit benchmark, nine samples of 1000 synthetic five-bit chains:
+`cargo test --release -p yskn-engine --lib bench_search_chain -- --ignored --nocapture`.
+Reference minimum/median 9.719/9.889 us; fast 1.340/1.343 us (7.25x minimum).
+This benchmark does not load the model.
+
+Real-model command, before and after task 1, five passes after warmup:
+
+```sh
+target/release/examples/bench_model "$HOME/models/qwen38-speed" \
+  --backend cpu --kv kv5 --rows-per-pass 1 --passes 5
+```
+
+| Stage (ms, minimum / median) | Before 07c | After task 1 |
+|---|---:|---:|
+| total | 739.576 / 756.953 | 828.407 / 830.701 |
+| kernel | 656.200 / 669.637 | 752.224 / 754.442 |
+| recurrence | 40.413 / 40.805 | 41.204 / 41.639 |
+| attention | 1.225 / 1.251 | 1.185 / 1.330 |
+| kv_encode | 11.797 / 12.177 | 3.425 / 3.499 |
+| rest | 29.098 / 29.437 | 28.627 / 28.923 |
+
+Kernel timing varies on the shared host; total-time improvement is not claimed
+from this pair. KV preparation minimum improves 3.44x.
+
+#### Task 2: dense gates and recurrence profile
+
+NEON deinterleaves four adjacent eight-element partitions. Each lane still
+visits `8*p + 1024*chunk + e` in ascending chunk/e order, with separate
+multiply and add. The scalar hook retains the exact XOR and four-group fold,
+finite checks and BF16 boundary. Partial final blocks use the scalar path.
+Single-row passes dispatch the independent gate outputs on the existing pool;
+multi-row passes parallelize rows and use SIMD within each row. No nested
+pool dispatch is used. The forced-off path invokes the original scalar
+partition body through the same preparation hook.
+
+Focused tests compare arbitrary widths, partial chunks, 5120-wide random
+inputs, signed zero, subnormals, BF16 ties, nonfinite and overflowing inputs
+against `dense_gate`, in addition to the existing recurrent-state comparisons.
+`bench_model` now exposes `recurrence_prepare` (a subset of recurrence) and
+`dense_gate_work` (elapsed callback time summed across rows, hence overlapping
+for M>1). These are diagnostic subsets and are not subtracted twice from rest.
+Detailed subsets require `Model::set_detailed_timing(true)`, as requested by
+`bench_model`; ordinary passes retain only the coarse stage clocks and skip
+callback clock reads and atomic additions.
+
+The same real-model five-pass command gives, after task 2, minimum/median ms:
+
+| Stage | After task 2 |
+|---|---:|
+| total | 977.476 / 981.700 |
+| kernel | 922.520 / 929.170 |
+| recurrence | 16.158 / 16.636 |
+| recurrence_prepare | 7.408 / 7.684 |
+| dense_gate_work | 3.726 / 3.929 |
+| attention | 1.427 / 1.536 |
+| kv_encode | 3.628 / 3.727 |
+| rest | 28.443 / 30.371 |
+
+Recurrence improves from task 1's 41.204 ms minimum to 16.158 ms (2.55x).
+Kernel variation again dominates total time. Preparation outside dense gates
+is about 3.7 ms; recurrence/update/output/checks about 8.8 ms. Task 3 therefore
+addresses wide elementwise math and checks in preparation and recurrent output,
+plus the still-large rest stage, rather than further changing ordered reductions.
+
+#### Task 3: portable elementwise kernels
+
+A small `Elementwise` hook supplies scalar default bodies shared by the
+reference preparation, quantizer and output routines. The engine selects
+NEON only when CPU stages are enabled. BF16 uses the existing integer
+nearest-even bias/NaN quieting rule. Binary16 uses integer exponent/significand
+rounding, including variable subnormal shifts, carry, signed zero, canonical
+NaN and exact widening; it does not depend on FP16 hardware modes.
+
+Portable exp runs the same range reduction, constants, separately rounded
+polynomial, divisions and exponent rescaling across four independent elements.
+Branch masks choose the original expressions. Rare range-limit/nonfinite
+lanes execute the scalar oracle, including its NaN payload behavior. SiLU and
+sigmoid retain their exact numerator and denominator expressions. Finite scans
+OR integer exponent masks across lanes, with a scalar tail. No reduced
+precision reciprocal or fused arithmetic is introduced.
+
+The hooks cover activation half rounding, normalization BF16, MLP SiLU,
+GDN convolution activation and recurrent output SiLU/state validation, and
+attention output sigmoid. Scalar single-value decay/softplus and ordered
+reductions stay scalar. The recurrence convolution multiply/add loop itself
+is unchanged; wide rounding/activation/check passes now run in SIMD.
+
+Tests compare exact bits for every finite half code and midpoint with adjacent
+binary32 values, all BF16 upper words/midpoints (including NaNs), exp branch
+boundaries, signed zero/subnormals and 100,003 random binary32 bit patterns.
+They also check direct exp, non-vector tails and every invalid-value lane.
+The task-3 measurement is recorded in the final table below.
+
+#### Task 4: long-context attention memory and independent score chains
+
+A tile now interleaves 1/2/4/8 four-key accumulators (according to visible
+width). Each key still visits all 256 channels in ascending order with a
+separate product and sum. Four-channel transposes occur in registers rather
+than a second channel-major scratch buffer. Prefix exp2 runs the portable
+vector algorithm; masked probabilities are restored to positive zero before
+the original denominator fold. Value accumulation widens immutable cached
+BF16/int8 operands directly into registers, eliminating the intermediate
+256-float value array. The scalar `bases()` API and fast view share one
+`base_view` body. The original scalar attention remains the forced-off path.
+
+Logical key operands touched are 512 BF16 bytes plus a four-byte scale for a
+packed row, or 256 signed bytes plus scale for int8 (excluding metadata/cache
+lines). Keys are visited in absolute tile order, channels ascending; values
+remain in ascending visible-key order for each channel. Register transpose
+removes 1024 bytes written and read back per key; direct value widening removes
+the same intermediate traffic per value. There is no persistent cache growth.
+Threads still span rows and query heads. Six query heads sharing a KV head
+still reread its operands; widening is not shared across rows/heads.
+
+The existing full attention oracle tests cover all three cache modes,
+31/42-split and tile boundaries, mixed packed/int8 sides, means and masked
+negative zero. The direct score test now covers 1/4/5/8/9/16/17/31/32 keys,
+checking every valid lane against its scalar 256-term chain. Elementwise
+boundary tests also cover the exp2 product before portable exp.
+
+Stage-only measurement reads the **real model header, actual attention norm
+vectors and profile**, constructs all 16 layers/24 query heads/4 KV heads,
+and uses a deterministic synthetic projected-row bank to fill distinct cache
+allocations. This excludes CPU prefill from the timed workload. It times the
+actual attention core on the ten-worker CPU pool,
+including 31/42 splits, self, means and final combination. It excludes query
+preparation, output inverse rotation/gating and compressed projections; it is
+**not a real-token end-to-end context benchmark**. Compressed weights are not
+loaded. Peak cache payload and repeated key reads have the real dimensions.
+
+Stage-only benchmark commands (exclusive model access):
+
+```sh
+cargo test --release -p yskn-engine --lib --no-run
+YSKN_MODEL_DIR="$HOME/models/qwen38-speed" \
+  cargo test --release -p yskn-engine --lib bench_real_attention_shapes -- --ignored --nocapture
+YSKN_MODEL_DIR="$HOME/models/qwen38-speed" YSKN_BENCH_CONTEXT=32768 \
+  YSKN_BENCH_ROWS=1 YSKN_BENCH_PASSES=3 \
+  cargo test --release -p yskn-engine --lib bench_real_attention_shapes -- --ignored --nocapture
+```
+
+The reported measurements exclude compilation and one warmup per run.
+The baseline is the task-3 implementation with the same harness.
+
+| Context / rows / samples | Before min / median (s) | After min / median (s) |
+|---|---:|---:|
+| 2000 / 16 / 5 | .953321 / 1.043144 | .472496 / .492316 |
+| 32768 / 1 / 3 | .882691 / .897571 | .724074 / .730233 |
+
+An intermediate score-only change (before direct value widening) measured
+.696305 / .760815 s at 2000/16. The final minimum improves 2.02x at 2000/16;
+the 0.1 s target is **not reached**. In this first campaign, at 32768 the
+measured cost per row is 724.074 / 730.233 ms (M=1), 1.22x minimum improvement.
+The lower-contention confirmation below is preferred for the final report. Shared-host scheduling
+varies materially; these are wall measurements, not hardware-counter claims.
+
+For the real packing mix, base operands and scales logically total about
+2.064 GB per 32768-token row with perfect KV-head reuse, or 12.382 GB without
+reuse across six grouped queries. Cache-line/pointer traffic is additional;
+repeated reads may hit caches. Sharing transient widening between queries,
+without changing each query's prefix/split arithmetic, is the principal
+remaining attention optimization. No unmeasured bandwidth ceiling establishes
+that the 0.1 s target can be reached on this host.
+
+#### Task 5: remaining rest work and final profile
+
+The real-model rest breakdown after task 4 (minimum / median ms) was:
+normalization 8.132 / 8.958, activation encoding 14.088 / 16.063,
+projection restoration 10.795 / 11.182, MLP gating 8.205 / 9.313,
+and residuals 1.819 / 1.915. These are nonoverlapping subsets of `rest`,
+which was 47.596 / 50.123 ms; allocations, embeddings, copies and dispatch
+outside those subsets account for the remainder. They are wall timers, not
+on-CPU samples or a claim about one function's CPU percentage.
+
+The final change keeps MLP BF16/SiLU/BF16/product/BF16 in registers, reusing
+the same rounding and exp kernels rather than dispatching three short vector
+maps per four elements. Residuals reuse that same BF16 implementation.
+Finite slices shorter than 16 use the original scalar check. For vectors
+whose four inputs are all normal binary16-range numbers, half rounding can
+round away 13 binary32 fraction bits directly and select infinity at the
+65520 midpoint. Other vectors retain the complete integer conversion.
+No floating operation is removed, reordered within an element or fused.
+The existing independent rest tests and expanded midpoint/overflow tests
+cover these paths; they keep the original scalar fallback under the switch.
+
+The VIT2 safety comment was also tightened for the full eligible +/-1100
+code range rather than quoting the released profile's narrower bound. With
+`D = 32*(2048+1100)^2+31 = 317116959`, every source reduced state can reach
+every destination and its squared-distance key lies in [0,D]. After the
+first step the cost spread is at most D+31 and normalized costs lie within
+[-D-62,D]. Emissions are at most 182899231 and the square term at most
+134217728. Thus the explicit add/subtract intermediates stay below 952000000
+in magnitude (the initial 536870912 infinity is also safe). Smaller four-bit
+terms are bounded by the same limit. This is a proof for all eligible inputs,
+not an inference from randomized tests.
+
+The final one-core codec benchmark also measures the **whole nine-candidate
+row encode** (selection, reconstruction, packing and decode), with synthetic
+256-channel rows/tables and the released nine multiplier values. Nine samples
+of 100 rows: reference minimum/median 414.495 / 431.348 us, fast
+61.703 / 62.228 us (6.72x minimum). The chain-only repeat was
+11.442 / 11.828 us versus 1.543 / 1.548 us. These do not load trained weights.
+The randomized whole-codec comparison now uses nine scales; an all-zero
+codebook makes every candidate error equal and explicitly checks that the
+first candidate's scale bits survive. Integer target extrema also exercise
+the checked scalar fallback.
+
+Engine/reference integration coverage includes all three cache modes,
+frozen digests, varied workers/pass widths, commit/discard, snapshot/restore
+and failure atomicity, with exact comparisons in both CPU-stage modes.
+GPU-dependent tests cannot establish Metal execution in this sandbox;
+real Metal and socket execution are outside this validation boundary.
+
+Final real-model CPU profile, same five-pass one-row command as task 1.
+Values are minimum / median **milliseconds**. The task-3 serial run is kept
+below despite severe shared-host scheduling variation. Two additional runs
+with concurrent host load are excluded from this comparison. Their logs are
+`.work/07c-evidence/*contended*` / `task3.txt`. The final measurement had no
+concurrent build/test load.
+
+| Stage | After task 3, serial | Before task 5 | Final |
+|---|---:|---:|---:|
+| total | 1627.957 / 3315.670 | 1579.735 / 1867.578 | 771.988 / 777.800 |
+| kernel | 1493.789 / 2548.914 | 1505.099 / 1784.461 | 725.780 / 731.182 |
+| recurrence | 27.923 / 251.173 | 19.036 / 22.542 | 13.786 / 14.045 |
+| recurrence_prepare | 12.271 / 198.739 | 9.390 / 10.921 | 7.436 / 7.517 |
+| dense_gate_work | 6.708 / 192.106 | 3.854 / 4.372 | 3.905 / 3.995 |
+| attention | 3.107 / 29.105 | 1.719 / 2.454 | 1.181 / 1.368 |
+| kv_encode | 7.694 / 42.317 | 6.286 / 7.014 | 3.590 / 3.654 |
+| rest | 56.234 / 360.345 | 47.596 / 50.123 | 27.386 / 27.456 |
+| normalization (rest subset) | — | 8.132 / 8.958 | 4.713 / 4.767 |
+| activation_encode (rest subset) | — | 14.088 / 16.063 | 8.238 / 8.271 |
+| projection_restore (rest subset) | — | 10.795 / 11.182 | 7.295 / 7.341 |
+| mlp_gate (rest subset) | — | 8.205 / 9.313 | 4.654 / 4.686 |
+| residual (rest subset) | — | 1.819 / 1.915 | 1.154 / 1.166 |
+
+Relative to the original CPU run, recurrence minimum changes from 40.413 to
+13.786 ms and KV preparation from 11.797 to 3.590 ms; rest changes modestly
+from 29.098 to 27.386 ms. Total minimum is 771.988 ms versus 739.576 ms:
+**no end-to-end CPU speedup is established**, because the unchanged kernel
+minimum moved from 656.200 to 725.780 ms. The heavily contended intermediate
+runs cannot isolate the incremental task-3/task-5 gain. Minima of individual
+stages may come from different passes and must not be summed as one pass.
+
+Remaining CPU work includes ordered quantizer/RMS reductions, projection
+restoration/Hadamard, recurring pool dispatch, allocation/copy traffic, and
+the recurrent state/output stages. They still exceed 3% of the non-kernel
+wall time; this run does not supply a new per-function on-CPU sample table
+because `sample` was denied. Their timer totals and limits are reported rather
+than attributing them to guessed hot functions. Further changes require a
+stable profile and preserving the mandated reduction orders. No Metal
+latency, real-token 2000/32768-context inference latency, full-model scalar
+logit comparison or full quality-score validation is claimed by this brief.
+
+The lower-variation attention comparison uses the same before/after binaries
+and commands, measured serially with no concurrent build/test load and
+exclusive model access. It reduces the contention uncertainty in the earlier
+pair.
+
+| Context / rows / samples | Before min / median (s) | Final min / median (s) |
+|---|---:|---:|
+| 2000 / 16 / 5 | .306970 / .313641 | .235090 / .237943 |
+| 32768 / 1 / 3 | .555328 / .561900 | .466282 / .468472 |
+
+Use this lower-variation pair as the final attention result: 1.31x at
+2000/16, still above the 0.1 s target; **466.282 / 468.472 ms per row at
+32768 (M=1)**, 1.19x minimum improvement. It remains the explicitly described
+stage-only real-shape benchmark, not real-token prefill. The earlier apparent
+2.02x ratio includes host-load variation and must not be presented as a stable
+algorithmic speedup. All raw logs and pre-change benchmark executables are
+retained under this worktree's ignored `.work/07c-evidence/` directory.
+
+### D20 round three: grouped long-context attention (brief 07e)
+
+The fast attention pass groups every row/query head by KV head. Each absolute
+32-key tile is widened once for that group: keys become a temporary
+`[channel][key]` FP32 tile, values a `[key][channel]` FP32 tile. All queries
+consume that tile before its storage is dropped. The ordinary scalar
+`output_head` remains the `YSKN_CPU_STAGES=reference` implementation. The
+additive scalar `head_operands` hook shares validation and operand selection
+with the existing scalar output hook; the reference remains safe, scalar,
+and single-threaded.
+
+Each row retains its own 31/42 split count, ceil-divided split width, absolute
+32-slot tile boundaries, and self position. Eight consecutive split ranges
+per KV head give 32 tasks at the real shape, including a one-row pass. A tile
+inside one task's range is loaded by that worker alone. Tiles intersecting
+multiple task ranges (including differences between rows' split schedules)
+are widened once before dispatch and borrowed immutably by their owners.
+No two workers stream the same cache operands. Only these boundary tiles
+survive between tasks; there is no persistent second cache copy.
+
+Each score lane visits channels 0..255 in order with separate multiply and
+add, exactly the sixteen ordered D3 groups. Complete groups of four visible
+keys use NEON; partial groups use scalar edge chains, so masked keys do no
+arithmetic. Each query/split visits its own intersecting tiles in ascending
+order. The shared probability helper retains the original online maximum,
+rescale, exp2, paired four-lane denominator fold and BF16 probability/scale
+boundary. Value channels consume only their visible keys in ascending order;
+masked scales and value products are skipped, including with a negative-zero
+numerator. Thirty-two value-channel accumulators stay in registers for the
+complete key chain, avoiding a numerator load/store for every key. Self
+keeps its distinct score and FP32 weight. Means follow self, and padded
+splits combine in original index order regardless of task finish order.
+Combination and final output run as independent query tasks on the existing
+pool; final inverse rotation and gating still use the scalar-owned hook.
+On a parallel error, read-only scalar row/head replay selects the original
+first error; transaction ownership and rollback remain in the existing model.
+
+Cache layout is unchanged: 736 allocated bytes per five-bit packed side-row,
+288 per int8 side-row, and 89,600 bytes/token for the released profile's
+116 packed + 12 int8 rows across 16 layers (including token structs). Growth
+is zero. The scan touches a packed side's 512 BF16 operand bytes + four-byte
+scale, or an int8 side's 256 operand bytes + scale; it does not read packed
+words. K/V pairs therefore touch 1,032 bytes per key for packed/packed and
+776 for packed/int8 (520 for int8/int8). Positions ascend within a task;
+within a position the immutable cache bases ascend in channel order. The
+row/heap layout is not one contiguous per-head tile: pointer/cache-line
+traffic remains, but no allocation-format or snapshot/partial-commit change
+is needed. A temporary full tile is 65,792 bytes including both scale arrays.
+
+For the real packing mix, a single stream is 62,976 logical operand bytes
+per context token across all layers, about 2.064 GB at 32,768. This stream is
+shared by all six heads and all pass rows, instead of about 12.382 GB per
+row. Widened scratch writes, repeated L1 operand reads, output state traffic,
+metadata and actual cache-line transfers are additional; logical GB/s must
+not be described as measured DRAM bandwidth. Score and value chains together
+perform approximately `4 * 256 * 24 * 16 * context * rows` scalar FP32
+operations: 12.885 GFLOP at 32768/1 and 12.583 GFLOP at 2000/16, before
+softmax, checks, self and split combination.
+
+The scalar-oracle attention test now also runs four grouped rows at every
+listed boundary (0, 1, 30..33, 61..64, 2000, 4094..4096, 4106), with multiple
+queries per KV head, all three modes and reverse task completion.
+`attention_matches_reference_at_tile_and_split_boundaries_with_mixed_sides`
+covers packed/packed and packed-key/int8-value rows;
+`attention_matches_reference_at_tile_and_split_boundaries_with_int8_keys_packed_values`
+adds int8-key/packed-value rows. Both tests assert the stored cache row variants,
+so both mixed packed/int8 directions are exercised. Each crosses the 31/42
+transition within one pass.
+New direct grouped score tests cover signed zero, subnormals, BF16 ties and
+extreme int8 values; masked-tile tests poison invisible scales with NaN and
+require exact negative-zero numerators. The model failure test places a bad
+row between good rows and compares the exact error and committed state in
+all three modes, then checks successful continuation. A second failure test
+uses six queries per KV head and finite prepared operands that overflow in
+the attention prefix score of the middle row (not during preparation); it
+checks the scalar error and unchanged state with 1/4/10 workers. Existing model,
+snapshot, partial-commit and frozen-digest tests remain independent proofs.
+
+
+The four required proof commands are run from this worktree with
+`CARGO_NET_OFFLINE=true` (no network or new dependencies):
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p yskn-ref -p yskn-format -p yskn-engine --release
+YSKN_CPU_STAGES=reference cargo test -p yskn-engine --release
+```
+
+The stage harness additionally accepts `YSKN_BENCH_THREADS` to compare four
+and ten CPU workers. It reports setup (partition-boundary tiles), worker
+execution and split combination separately; all three remain included in
+the total. It retains the same real header/norm/profile and deterministic
+synthetic projected-row bank, and excludes preparation, final inverse
+rotation/gating and projections just as the before harness does. Neither
+real-token inference nor Metal execution is established by these timings.
+
+
+All four proof commands above **passed**. GPU cases report no available
+Metal device in this sandbox, so a passing suite is not Metal execution
+proof. No real-token 32,768-context inference, hardware-counter bandwidth,
+physical P/E-core affinity or trained-model scalar logit comparison was run.
+
+Measurement commands (2026-11-14 UTC; five samples after one excluded warmup):
+
+```sh
+export CARGO_NET_OFFLINE=true
+cargo test --release -p yskn-engine --lib --no-run
+# Retain each built executable as .work/07e-evidence/{before,after}.
+# before is unmodified 92c7277791f461d35a4cc5cf4b69941c3b0e4dc8.
+run_stage() (
+  lock=/Users/anag2bgod/Projects/yasakani-for-mac/.work/model.lock
+  acquired=0
+  trap '[ "$acquired" = 0 ] || rmdir "$lock"' EXIT
+  until mkdir "$lock" 2>/dev/null; do sleep 2; done
+  acquired=1
+  date -u
+  uptime
+  YSKN_MODEL_DIR="$HOME/models/qwen38-speed" \
+    YSKN_BENCH_CONTEXT="$2" YSKN_BENCH_ROWS="$3" \
+    YSKN_BENCH_PASSES=5 YSKN_BENCH_THREADS="${4:-10}" \
+    ".work/07e-evidence/$1" bench_real_attention_shapes --ignored --nocapture
+  result=$?
+  uptime
+  exit "$result"
+)
+# Twice, in this order, each invocation acquiring/releasing its own lock:
+run_stage before 2000 16
+run_stage after 2000 16
+run_stage before 32768 1
+run_stage after 32768 1
+run_stage before 32768 4
+run_stage after 32768 4
+# In repetition one, immediately after the matching ten-worker after run:
+run_stage after 2000 16 4
+run_stage after 32768 1 4
+```
+
+The actual runner is `.work/07e-evidence/run.py`, which uses atomic `mkdir`,
+wait/retry on an existing lock and `finally: rmdir` on successful or failed
+subprocess exit. It never removes a lock it did not acquire. The real model
+folder is read-only and was never copied. Each `final*.txt` log contains UTC,
+both full `uptime` triples and every sample. Final pairs ran after all proof
+commands, without this task's builds/tests in parallel. Other workers still
+caused substantial load variation. Seconds below are minimum / median;
+load columns are the one-minute load at start -> finish, not core utilization.
+
+| Repeat | Context / rows | Before min / median (s) | After min / median (s) | Before load | After load |
+|---|---|---:|---:|---|---|
+| 1 | 2000 / 16 | 0.227841 / 0.232880 | 0.086395 / 0.087310 | 5.05 -> 5.61 | 5.61 -> 5.61 |
+| 1 | 32768 / 1 | 0.451866 / 0.551876 | 0.191839 / 0.196624 | 5.61 -> 6.04 | 6.04 -> 7.00 |
+| 1 | 32768 / 4 | 2.224248 / 2.794284 | 0.407230 / 0.424792 | 7.00 -> 11.85 | 11.85 -> 12.26 |
+| 2 | 2000 / 16 | 0.320551 / 0.335975 | 0.112140 / 0.116632 | 12.26 -> 12.26 | 12.26 -> 11.76 |
+| 2 | 32768 / 1 | 1.592318 / 1.726584 | 0.442352 / 0.514554 | 11.76 -> 14.41 | 14.41 -> 16.66 |
+| 2 | 32768 / 4 | 3.399618 / 4.662573 | 1.097581 / 1.171935 | 16.66 -> 23.57 | 23.57 -> 24.90 |
+
+Use the lower-load first pair as the least-contended observation, retaining
+both pairs rather than hiding the second. Its minima improve 2.64x at
+2000/16, 2.36x at 32768/1 and 5.46x at 32768/4. The last ratio is especially
+load-sensitive (before pass times grew from 2.22 to 6.88 seconds). It is not
+a stable hardware speedup claim. Both targets remain **unmet**: best observed
+86.395 ms exceeds 60 ms at 2000/16, and 191.839 ms exceeds 100 ms at 32768/1.
+At 32768/4 the best amortized minimum/median is 101.808 / 106.198 ms per row.
+
+Four-worker after runs, following their ten-worker counterparts, measured:
+2000/16 126.442 / 132.425 ms (load 5.61 -> 5.61), and 32768/1
+282.218 / 282.965 ms (load 7.00 -> 7.00). Ten workers are retained: their
+medians were 87.310 and 196.624 ms. This supports using all ten workers on
+this host, but without affinity/counters it does not isolate efficiency-core
+execution from scheduler placement.
+
+The remaining limitation is mixed. At 2000/16 only 0.126897 GB of logical
+cache operands are fetched, 1.47 GB/s at the 86.395 ms minimum, while ordered
+score/value work is 12.630 GFLOP (including the rows' increasing prefixes),
+146.2 GFLOP/s. Worker time is 73.479 ms, setup 4.494 ms and combination
+3.161 ms in that same pass; allocation/drop/dispatch account for the rest.
+This is primarily arithmetic, softmax/checks and temporary-state traffic,
+not repeated full-cache streaming. At 32768/1, 2.063598 GB / 191.839 ms is
+10.76 logical GB/s, with 12.885 GFLOP / 191.839 ms = 67.2 GFLOP/s. Comparable
+arithmetic costs 2.22x as much as the short-context pass, indicating that
+cache traversal/widening and memory latency remain material. Its worker time
+is 186.791 ms; setup 3.134 ms and combination 1.208 ms. At 32768/4, the cache
+stream stays 2.063786 GB, while work grows to 51.542 GFLOP; the minimum
+corresponds to 5.07 logical GB/s and 126.6 GFLOP/s. These counts characterize
+the remaining memory/arithmetic pressure; they are neither DRAM counters nor
+a proof of a hard hardware ceiling. D3 still prohibits replacing each ordered
+score chain with a reassociated reduction or FMA. No operation-order rule
+prevented the implemented cache sharing, and target attainment is not claimed.
+
+A final rejected experiment added eight-row software prefetch and a NEON
+4x4 key-tile transpose with an extra temporary 32 KiB row-major key tile.
+It passed the focused bit tests. Two reversed-order comparisons at high
+load (one-minute load 29..33) gave about 6% lower long-context medians
+(.451099 -> .422695 and .329878 -> .310331 s), but inconsistent short-context
+results (.276660 -> .272356 and .163963 -> .174650 s). That did not justify
+additional unsafe assembly/scratch and the short-context regression. The
+experiment was removed; the final source is the previously fully verified
+version. The trial binaries/logs are retained only in ignored local evidence.
+
+## D21 — Fast draft in the product and an adaptive draft depth
+
+Decision (2026-11-14, brief 06k). The product runs the fast neural draft
+(D18) and chooses, before every pass, how many guesses to request. Defaults:
+`--draft both --k 7 --depth adaptive`. Output is unchanged by construction:
+the policy only changes how many guesses are offered, and the D16 loop keeps
+only guesses equal to the main model's own selections.
+
+### Fast draft in the product
+
+`--draft neural|both` load `DraftProposer<FastDraft>` through the crate's one
+mapping boundary (`map_files`, which maps the main weights and the two draft
+files under the documented file-stability contract). The draft gets its own
+`yskn_engine::Engine` with the main model's kernel and worker count and the
+main model's projection backend; the two pools never run at the same time.
+The scalar `Draft` is no longer reachable from the product. Memory accounting
+(D19) counts the mapped draft files once plus the fast draft's owned data;
+for the published dimensions with the defaults, the formula gives
+`draft_bytes` 2,721,905,176 and `needed_bytes` 20,435,462,454 (19.03 GiB)
+against 25,769,803,776 physical. Corrected in brief 06m: the previous
+estimate double-counted 508,559,360 bytes of mapped BF16 selector tables as
+owned f32, plus 76,283,904 bytes of margin. Matrix code streams and head
+rescoring rows stay mapped; approximate int8 rows are repacked/owned, and
+head projection/scales are copied as f32. Matrix scales/signs/tables and
+short-lived selector rows remain covered by the conservative scratch/margin.
+Product tests with the synthetic draft
+(`crates/yskn-cli/tests/product.rs`) check that the product's output with the
+fast draft, for `neural` and `both`, adaptive and fixed depth, K = 1, 3, 7,
+greedy and seeded, equals the output with `--draft none` and the independent
+scalar loop, and that a repeated request repeats passes, rows and proposals.
+
+### The policy
+
+`yskn_ref::speculation::DepthController` (`crates/yskn-ref/src/draft_depth.rs`):
+
+- **Estimate.** `e[j]` approximates P(accepted prefix >= j) of a neural
+  proposal, j = 1..K, starting from a prior (the measured mean profile,
+  0.84 0.70 0.57 0.50 0.45 0.39 0.34).
+- **Scoring every depth.** The proposer is always asked for its whole budget
+  (the block draft computes all seven tokens anyway); only the offer is
+  truncated. Once later output is known, a proposal's counterfactual accepted
+  prefix (how many of all its guesses equal the output) is exact, because the
+  output does not depend on the proposal. So each proposal updates every
+  `e[j]`, offered or not: `e[j] += 0.25 * ([prefix >= j] - e[j])`, applied when
+  the outcome is decided (at the first mismatch, or when all guesses are
+  confirmed). This is upstream's deferred scoring of pending proposals
+  (`src/specx.cpp:441-447`, `dpend_`), applied to depth.
+- **Choice.** Depth d in 0..=min(K, room) maximizing
+  `(1 + e[1] + ... + e[d]) / (pass(d + 1) + [d > 0] * proposal)`; ties keep
+  the smaller d. d = 0 does not call the draft at all.
+- **Probing and recovery.** Every pass without a proposal moves `e` 5% back
+  toward the prior (old evidence goes stale), and after 4 such passes one
+  proposal at the best positive depth is forced. Since one proposal scores all
+  depths, one probe on easy text measures the whole profile again. Unit tests
+  on synthetic sequences: all accepted reaches K = 7 within 3 passes and stays;
+  none accepted stops proposing within 4 passes and then probes at least every
+  5 passes, at most one pass in three; alternating 120-token regimes back off
+  within 8 passes and return to depth 7 within 3 * (probe_after + 1) + 2 = 17;
+  the same recovery bound holds from estimates of zero for probe intervals
+  0, 2, 4 and 8.
+- **Free guesses.** A proposer may offer guesses that cost nothing worth
+  counting (`Proposer::free_guesses`); they are offered in full, up to K,
+  without consulting or updating the estimate. `--draft both` uses this for an
+  n-gram copy whose most recent match of the last three tokens spans at least
+  six tokens (`ProposalOrder::LongNgramFirst(6)`, also used with a fixed
+  depth). The controller therefore only ever sees neural proposals.
+
+**Cost model and determinism.** The cost model is a fixed table measured on
+this machine (main pass 232, 300, 345, 390, 455, 520, 585, 650 ms for 1..8 rows
+from the brief's measurements, rows 3 and 5..7 interpolated; one fast proposal
+47 ms, D18), `CostModel::apple_m5_neural`. It is not timed inside the loop:
+every decision is a function of the tokens produced so far, the proposals made
+and constants, so the depth sequence repeats exactly for a given input
+(`GenerationStatistics::requested_depths`; tested). A calibration measured at
+start was rejected: this machine is shared and its timings vary by 2x within
+minutes (below), which would make depths, and therefore speed, differ between
+identical runs. Decisions depend on cost ratios, so a uniformly slower or
+faster machine does not change them. Context length raises every row count's
+cost roughly alike; the table is for short context.
+
+Upstream's `src/specx.cpp:143-160,241-265,378-384` adapts the source (draft or
+n-gram, by EMAs of accepted counts on long matches, `dema_`, rate 1/16, with
+periodic draft probes, `bdr_adapt`/`bdr_probe`) and the block width (8 or 16
+rows, `b16_*`, with exponential probe back-off). Its GPU makes extra rows
+nearly free, so it never shortens a block. Here rows are expensive (a pass with
+8 rows costs 2.8 times one row), so the policy chooses the depth itself, down
+to zero.
+
+### What the proposers know (measured)
+
+`draft_trace record` (below) records, before each of 256 one-row passes per
+bench task, the full neural proposal, its per-position confidence margin
+(best minus second corrected score) and the n-gram proposal with its match
+length. Counterfactual P(prefix >= j), j = 1..7:
+
+| Task | Neural | N-gram (n = 3) |
+|---|---|---|
+| prose | .852 .699 .523 .367 .250 .180 .098 | .004 0 0 0 0 0 0 |
+| code | .965 .910 .863 .816 .766 .695 .641 | .023 .012 0 0 0 0 0 |
+| structured | .727 .414 .195 .191 .188 .184 .180 | .793 .781 .770 .016 .008 .004 0 |
+| thinking | .922 .852 .785 .707 .645 .594 .523 | .098 .059 .035 .023 .016 .012 .008 |
+
+The structured task (CSV to JSON with EOS ignored) finishes its answer after
+about 48 tokens and then repeats a three-token cycle that the n-gram copies
+exactly and the neural draft gets mostly wrong. Confidence predicts acceptance
+(prose: guesses with margin < 0.5 are accepted 35%, others 81%; code 50% vs
+96%; structured 11% vs 77%; thinking 55% vs 94%).
+
+**Replay.** `draft_trace replay` runs any policy over the trace with the real
+controller code and reports exact passes, rows and proposals, and time from
+the cost table. Its pass counts equal `yskn bench` exactly for every
+configuration measured below (one discrepancy found this way was a missing
+`free_guesses` forwarding in the product's proposer enum, fixed). Projected
+ms per token, all four tasks (256 tokens each; 96 in parentheses):
+
+| Configuration | prose | code | structured | thinking | all |
+|---|---:|---:|---:|---:|---:|
+| none | 232.0 | 232.0 | 232.0 | 232.0 | 232.0 (232.0) |
+| n-gram K=3 (old default) | 234.6 | 234.9 | 126.8 | 226.2 | 205.6 (216.8) |
+| neural fixed K=2 | 157.5 | 137.2 | 151.4 | 143.9 | 147.5 (160.5) |
+| neural fixed K=3 | 144.9 | 117.0 | 161.8 | 128.9 | 138.2 (148.4) |
+| neural fixed K=4 | 150.6 | 108.3 | 179.8 | 122.5 | 140.3 (145.6) |
+| neural fixed K=7 | 181.2 | 111.8 | 237.5 | 129.3 | 164.9 (171.6) |
+| both, n-gram first (old), fixed K=3 | 149.3 | 124.2 | 110.8 | 137.1 | 130.3 (138.4) |
+| neural adaptive K=7 | 146.1 | 110.3 | 145.9 | 128.7 | 132.8 (143.1) |
+| neural fixed K=7, truncate below margin 1 | 146.4 | 105.1 | 168.1 | 116.5 | 134.0 (142.7) |
+| **both adaptive K=7 (default)** | 146.1 | 110.3 | 110.0 | 126.8 | **123.3** (132.6) |
+
+### What did not help
+
+- **Neural adaptive without the n-gram, or with other rates/probe intervals.**
+  Without free n-gram copies the structured task's three-token cycle can
+  alias with a fixed probe interval: probes every 3 passes always land on the
+  hard position, and the structured task fell to 236 ms/token (rates 0.1-0.5,
+  probe intervals 2 and 8 without relaxation). With the long-match copy, every
+  probe interval 2/4/8, relaxation 0/0.02/0.05 and match length 6/8 gave
+  123.1-125.5 ms/token; the chosen values sit in that flat region.
+- **Confidence truncation.** Stopping a proposal at the first guess with
+  margin below a threshold helps a fixed depth (K=7: 164.9 to 134.0 at margin
+  1) but adds little to the adaptive policy (132.8 to 132.4 at margin 0.25,
+  worse above 1), whose depth already reflects the same information on
+  average; it also biases the counterfactual estimate. Not adopted.
+- **N-gram first for any match (old `both`), or n-gram alone.** Short matches
+  are usually wrong on prose and code; an n-gram-only adaptive policy gave
+  207.2 ms/token, no better than fixed K=3. N-gram mode keeps a fixed K.
+- **Deeper fixed K.** K = 7 offers too many expensive rows on prose and
+  structured text; fixed K = 3-4 is the best fixed depth.
+
+### Measured (`yskn bench --n 96`, Metal, Kv5, 2026-11-14)
+
+The machine was shared with other workers' test suites during every run
+(their test binaries used 1-2 cores; load averages are given per run), so
+times are noisy: the same no-draft configuration measured 461-565 ms per pass
+at 16:38 (load 13.6) and 294-403 at 16:57 (load 6.0), against about 232 on a
+quiet machine. Passes, rows, proposals and bytes are exact and noise-free; the
+projected column applies the cost table to the exact pass shapes. The
+orchestrator repeats the timings on a quiet machine.
+
+| Configuration (start, load) | Task | tokens/s | ms/pass | passes | tokens/pass | rows | proposals | GB read/pass |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| none (16:57, 6.0) | prose | 2.61 | 383 | 96 | 1.000 | 96 | 0 | 9.758 |
+| | code | 2.48 | 403 | 96 | 1.000 | 96 | 0 | 9.758 |
+| | structured | 2.63 | 380 | 96 | 1.000 | 96 | 0 | 9.758 |
+| | thinking | 3.40 | 294 | 96 | 1.000 | 96 | 0 | 9.758 |
+| n-gram fixed K=3 (16:42, 11.1) | prose | 1.72 | 580 | 96 | 1.000 | 96 | 0 | 9.758 |
+| | code | 2.02 | 507 | 94 | 1.021 | 112 | 0 | 9.758 |
+| | structured | 4.69 | 330 | 62 | 1.548 | 109 | 0 | 9.758 |
+| | thinking | 3.49 | 320 | 86 | 1.116 | 113 | 0 | 9.758 |
+| neural fixed K=2 (16:45, 7.7; K=2/4/7 one run) | prose | 5.44 | 420 | 42 | 2.286 | 123 | 41 | 11.549 |
+| | code | 6.53 | 420 | 35 | 2.743 | 103 | 34 | 11.541 |
+| | structured | 4.91 | 434 | 45 | 2.133 | 133 | 44 | 11.552 |
+| | thinking | 5.99 | 433 | 37 | 2.595 | 109 | 36 | 11.544 |
+| neural fixed K=4 (same run) | prose | 4.85 | 618 | 32 | 3.000 | 153 | 31 | 11.536 |
+| | code | 7.59 | 632 | 20 | 4.800 | 100 | 20 | 11.591 |
+| | structured | 4.05 | 624 | 38 | 2.526 | 185 | 37 | 11.545 |
+| | thinking | 6.61 | 631 | 23 | 4.174 | 114 | 23 | 11.591 |
+| neural fixed K=7 (same run) | prose | 3.90 | 849 | 29 | 3.310 | 215 | 28 | 11.531 |
+| | code | 2.94 | 2044 | 16 | 6.000 | 123 | 16 | 11.591 |
+| | structured | 2.94 | 959 | 34 | 2.824 | 260 | 33 | 11.540 |
+| | thinking | 5.29 | 954 | 19 | 5.053 | 148 | 19 | 11.591 |
+| neural fixed K=3 (17:00, 3.5) | prose | 4.36 | 595 | 37 | 2.595 | 143 | 36 | 11.544 |
+| | code | 7.82 | 472 | 26 | 3.692 | 101 | 25 | 11.524 |
+| | structured | 4.75 | 493 | 41 | 2.341 | 161 | 40 | 11.548 |
+| | thinking | 6.99 | 490 | 28 | 3.429 | 112 | 28 | 11.591 |
+| **both adaptive K=7** (17:01, 4.7) | prose | 5.31 | 502 | 36 | 2.667 | 139 | 35 | 11.542 |
+| | code | 7.70 | 657 | 19 | 5.053 | 106 | 19 | 11.591 |
+| | structured | 6.68 | 599 | 24 | 4.000 | 133 | 15 | 10.938 |
+| | thinking | 6.52 | 701 | 21 | 4.571 | 137 | 20 | 11.508 |
+
+Projected from the table for these exact pass shapes (ms per token, mean of
+the four tasks): none 232.0, n-gram K=3 216.8, neural fixed K=2 160.5, K=3
+148.4, K=4 145.6, K=7 171.6, both adaptive 132.6. Compared with neural fixed K=3, the adaptive
+default uses fewer
+passes on code, structured and thinking, and one fewer on prose. This is not
+a minimum across all fixed depths: neural fixed K=7 uses fewer on code
+(16 versus 19) and thinking (19 versus 21). The projected-time comparison
+includes pass width and proposal cost; fewer passes alone need not mean
+less time. Measured back to back at the lowest load (16:57-17:03), the
+default produced 5.31/7.70/6.68/6.52 tokens/s against 2.61/2.48/2.63/3.40
+without drafting (2.0-3.1x) and 4.36/7.82/4.75/6.99 with neural fixed K=3;
+the differences between the drafting configurations are within this run's
+noise, which is why the defaults rest on the exact pass counts. GB read per
+pass: main 9.758 (code streams), plus 1.741 per proposal and 0.092 per
+history update, divided by passes (D19).
+
+Default size, defaults (`yskn bench --model-dir "$M"`, 17:06-17:12, load 4.3
+at start, 6.8 at end; no no-draft run at this size, so no ratio):
+
+| Task | tokens/s | ms/pass | passes | tokens/pass | GB read/pass |
+|---|---:|---:|---:|---:|---:|
+| prose | 6.24 | 558 | 147 | 3.483 | 11.591 |
+| code | 7.05 | 733 | 99 | 5.172 | 11.432 |
+| structured | 8.43 | 475 | 128 | 4.000 | 10.054 |
+| thinking | 6.42 | 699 | 114 | 4.491 | 11.331 |
+
+`yskn selfcheck --model-dir "$M"` with the defaults passed all three cases
+(17:05, load 6.4, 38.2 s wall).
+
+Commands (model lock held around each; `$M` is the model folder):
+
+```sh
+cargo run --release -p yskn --example bench_prompts -- "$M" > prompts.jsonl
+cargo run --release -p yskn-engine --example draft_trace -- record "$M" prompts.jsonl --n 256 --out trace256.json
+cargo run --release -p yskn-engine --example draft_trace -- replay trace256.json --table
+yskn bench --model-dir "$M" --n 96 --draft none
+yskn bench --model-dir "$M" --n 96 --draft ngram --k 3 --depth fixed
+yskn bench --model-dir "$M" --n 96 --draft neural --depth fixed --k 2 --k 3 --k 4 --k 7
+yskn bench --model-dir "$M" --n 96            # defaults: both, K=7, adaptive
+```
+
+The trace run (16:14-16:24, load 7.2 rising to 21) took 628.6 s wall and
+peaked at 2,696,183,808 bytes resident; its own pass timings (310-1,590 ms)
+were too disturbed to replace the table.
+
+**Not verified.** Timings on a quiet machine; long contexts (the table is for
+short ones); sampled requests on the real model (sampled losslessness is
+tested with synthetic models only; the bench is greedy); that the four bench
+tasks, one of which ends in a repetition loop because EOS is ignored,
+represent real use.
 
 ## D22 — Kernel round two (brief 07d)
 

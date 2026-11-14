@@ -129,26 +129,19 @@ fn cpu_stage_override_rejects_unknown_values_before_opening_weights() {
     }
 }
 
-#[test]
-fn public_model_runs_vector_and_forced_reference_stages() {
+fn check_public_stages(variant: &str, mode: KvMode, test: &str) {
     const CHILD: &str = "YSKN_CPU_STAGE_VARIANT_CHILD";
-    let Ok(variant) = std::env::var(CHILD) else {
-        // Selection is process-wide: fresh children avoid environment mutation races.
-        for variant in ["auto", "reference"] {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "public_model_runs_vector_and_forced_reference_stages",
-                    "--nocapture",
-                ])
-                .env(CHILD, variant)
-                .env("YSKN_CPU_STAGES", variant)
-                .status()
-                .unwrap();
-            assert!(status.success(), "CPU stages {variant} failed");
-        }
+    if std::env::var_os(CHILD).is_none() {
+        // Stage selection is process-wide; isolate each selector in a child.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, variant)
+            .env("YSKN_CPU_STAGES", variant)
+            .status()
+            .unwrap();
+        assert!(status.success(), "CPU stages {variant} {mode:?} failed");
         return;
-    };
+    }
     let neon = {
         #[cfg(target_arch = "aarch64")]
         {
@@ -187,33 +180,70 @@ fn public_model_runs_vector_and_forced_reference_stages() {
         r#"{"files":{"weights":"weights.yskn"},"max_ctx":64}"#,
     )
     .unwrap();
-    for mode in [KvMode::Int8, KvMode::Int8Profile, KvMode::Kv5] {
-        let mut reference = yskn_ref::Model::load_folder_with(&folder, mode).unwrap();
-        // SAFETY: these synthetic weights remain immutable until both models are dropped.
-        let mut model = unsafe {
-            yskn_engine::Model::with_options(
-                &folder,
-                Engine::new(Kernel::Portable, 4).unwrap(),
-                yskn_engine::Backend::Cpu,
-                16,
-                mode,
-            )
+    let mut reference = yskn_ref::Model::load_folder_with(&folder, mode).unwrap();
+    // SAFETY: these synthetic weights remain immutable until both models are dropped.
+    let mut model = unsafe {
+        yskn_engine::Model::with_options(
+            &folder,
+            Engine::new(Kernel::Portable, 4).unwrap(),
+            yskn_engine::Backend::Cpu,
+            16,
+            mode,
+        )
+    }
+    .unwrap();
+    let tokens: Vec<_> = (0..36).map(|i| (i * 7 + 11) % 65).collect();
+    for chunk in [&[1, 2, 3][..], &tokens, &[17, 21]] {
+        reference.prefill(chunk).unwrap();
+        model.prefill(chunk).unwrap();
+        assert_eq!(model.row_logits().len(), reference.row_logits().len());
+        for (actual, expected) in model.row_logits().iter().zip(reference.row_logits()) {
+            assert_eq!(bits(actual), bits(expected), "{variant} {mode:?}");
         }
-        .unwrap();
-        let tokens: Vec<_> = (0..36).map(|i| (i * 7 + 11) % 65).collect();
-        for chunk in [&[1, 2, 3][..], &tokens, &[17, 21]] {
-            reference.prefill(chunk).unwrap();
-            model.prefill(chunk).unwrap();
-            assert_eq!(model.row_logits().len(), reference.row_logits().len());
-            for (actual, expected) in model.row_logits().iter().zip(reference.row_logits()) {
-                assert_eq!(bits(actual), bits(expected), "{variant} {mode:?}");
-            }
-            assert_eq!(
-                model.state_digest(),
-                reference.state_digest(),
-                "{variant} {mode:?}"
-            );
-        }
+        assert_eq!(
+            model.state_digest(),
+            reference.state_digest(),
+            "{variant} {mode:?}"
+        );
     }
     std::fs::remove_dir_all(folder).unwrap();
 }
+
+macro_rules! stage_case {
+    ($name:ident, $variant:expr, $mode:expr) => {
+        #[test]
+        fn $name() {
+            check_public_stages($variant, $mode, stringify!($name));
+        }
+    };
+}
+stage_case!(
+    auto_int8_model_matches_scalar_across_pass_and_tile_boundaries,
+    "auto",
+    KvMode::Int8
+);
+stage_case!(
+    auto_int8_profile_model_matches_scalar_across_pass_and_tile_boundaries,
+    "auto",
+    KvMode::Int8Profile
+);
+stage_case!(
+    auto_kv5_model_matches_scalar_across_pass_and_tile_boundaries,
+    "auto",
+    KvMode::Kv5
+);
+stage_case!(
+    forced_reference_int8_model_matches_scalar_across_pass_and_tile_boundaries,
+    "reference",
+    KvMode::Int8
+);
+stage_case!(
+    forced_reference_int8_profile_model_matches_scalar_across_pass_and_tile_boundaries,
+    "reference",
+    KvMode::Int8Profile
+);
+stage_case!(
+    forced_reference_kv5_model_matches_scalar_across_pass_and_tile_boundaries,
+    "reference",
+    KvMode::Kv5
+);

@@ -1,20 +1,54 @@
 # yskn chat and HTTP API
 
-One Rust binary; no Python runtime. The real generation engine is not connected
-in this brief. `--engine stub` explicitly selects deterministic demo output;
-without it `chat`, `serve` and `info` fail clearly. No weights are opened.
+One Rust binary; no Python runtime. `chat`, `serve`, `bench`, `selfcheck` and
+`info` use the real mapped engine by default. `--engine stub` explicitly
+selects deterministic demo output for chat/server development.
 
 ```sh
-CARGO_NET_OFFLINE=true cargo run -p yskn -- chat --engine stub
-CARGO_NET_OFFLINE=true cargo run -p yskn -- serve --engine stub --port 8765
-CARGO_NET_OFFLINE=true cargo run -p yskn -- info --engine stub
-cargo run -p yskn -- serve --engine stub --port 0 --help
+CARGO_NET_OFFLINE=true cargo run --release -p yskn -- info --model-dir MODEL
+CARGO_NET_OFFLINE=true cargo run --release -p yskn -- selfcheck --model-dir MODEL
+CARGO_NET_OFFLINE=true cargo run --release -p yskn -- bench --model-dir MODEL --draft none --draft both --k 7 --json bench.json
+printf 'Say hello.\n/exit\n' | cargo run --release -p yskn -- chat --model-dir MODEL --no-think --temperature 0 --max-tokens 48
+cargo run --release -p yskn -- serve --model-dir MODEL --port 8765
+cargo run -p yskn -- chat --engine stub
 ```
 
-`--help` lists the hand-parsed options. Common options: `--model-dir` (optional
-read-only tokenizer/template folder; defaults to the embedded synthetic byte
-tokenizer), `--max-ctx` (262144), `--seed0` (1). The synthetic template is only
-for the stub; it makes no model-format fidelity claim.
+`--model-dir` (or `YASAKANI_MODEL_DIR`) names the published model folder.
+Model files must remain unchanged until the engine exits: its weights are
+mapped read only. The real defaults are `--kv kv5`, `--draft both`, `--k 7`,
+`--depth adaptive`, `--ctx 32768`, `--prefill-width 16`; `--backend cpu|metal`
+follows `Model::load` selection when omitted, and `--threads N` selects CPU
+workers (the fast draft gets its own pool with the same kernel, worker count
+and backend). `--max-ctx` remains an alias for `--ctx`; giving both is an
+error. Context cannot exceed the folder's `max_ctx`. `--seed0` defaults to 1.
+
+Drafting never changes the output, only its speed. `--draft none|ngram|neural|both`:
+`neural` and `both` use the fast block draft (D18, bit-identical to the scalar
+reference); `both` copies an n-gram continuation when the most recent match of
+the last three tokens spans at least six tokens, and otherwise asks the neural
+draft. `--k` is the most guesses per pass (1..7 for neural/both). With
+`--depth adaptive` the neural draft runs only when the expected tokens per
+second say so, at the depth (0..K) that maximizes them, learned from how its
+earlier proposals fared in this request and a fixed cost table of this
+machine; long n-gram copies are offered in full without running it. The depth
+sequence is deterministic for a given input. `--depth fixed` offers K guesses
+on every pass (for tests and comparison). N-gram mode always offers up to K.
+Measurements and the policy are in `docs/port/DECISIONS.md` D21.
+The stub alone can omit a folder and use its synthetic byte tokenizer.
+
+`info` inspects model architecture, context, selected cache/backend/device,
+model file and memory estimates. Before loading, real commands compare the
+estimate with physical memory with a stated reserve and refuse configurations
+that cannot fit. `--ctx`, `--kv` and `--draft` control that estimate; no system
+setting is changed. Fast-draft files are counted once as mappings; owned data
+adds the repacked int8 approximate head, f32 head projection/scales, draft
+norms/layer vectors and selector hp. Selector pred/succ remain mapped BF16.
+For the published default configuration, draft bytes are 2,721,905,176 and
+total needed bytes including margin are 20,435,462,454 (19.03 GiB; D19/D21).
+Sampling request defaults come from the folder's optional
+`generation_config.json`, falling back to upstream's 1.0 / 0.95 / 20 / 0.0
+(temperature / top-p / top-k / min-p). Explicit request values keep the existing
+validation and override those defaults.
 
 `serve`: `--host` (127.0.0.1), `--port` (8765; 0 = ephemeral), `--api-key`
 (or `YASAKANI_API_KEY`), `--default-max-tokens` (32768), `--max-tokens-cap`,
@@ -22,7 +56,7 @@ for the stub; it makes no model-format fidelity claim.
 (0 = unlimited; invalid/negative values become 0).
 
 `chat`: `--system`, `--max-tokens`, `--temperature`, `--top-p`, `--top-k`,
-`--seed`, `--no-think`, `--effort low|medium|xhigh`, `--hide-thinking`,
+`--min-p`, `--seed`, `--no-think`, `--effort low|medium|xhigh`, `--hide-thinking`,
 `--no-loop-guard`, `--raw`. Plain stdin/stdout supports pipes. Model text,
 reasoning text and error messages are printed with C0 control characters other
 than newline and tab, DEL and C1 controls (U+0080 to U+009F) shown as `\xNN`,
@@ -41,7 +75,35 @@ terminal thread does not hold the standard output lock while it waits for input.
 Tests cover the prompt case by sending SIGINT to a `yskn chat` process on pipes,
 and the generation case through `chat_loop` with an injected cancel flag; Ctrl+C
 typed at a real terminal (which sends the same SIGINT) is checked by hand only.
-`bench` and `selfcheck` are recognized and report `not available yet`.
+`selfcheck` uses upstream's exact short-answer, thinking and plain-text cases,
+greedy decoding, and the model folder's `selfcheck.json` (or `--reference FILE`).
+It checks prompt counts/hashes, output counts/hashes and the first twelve IDs,
+prints one result per case and fails on any mismatch. Hashes are SHA-256 of
+little-endian u32 token bytes. A differing stored ID reports its zero-based
+index and expected/actual IDs. Published references store only twelve IDs and
+a hash, so later differences cannot be localized from them; the diagnostic
+says so. An optional full `ids` array permits exact later diagnostics.
+
+`bench` runs fixed prose/code/CSV-to-JSON/thinking tasks greedily with EOS
+ignored. `--n N` defaults to 512 and must fit every prompt plus the 64-token
+reserve. Repeat `--draft`, `--k` and `--depth` for their Cartesian product; `--json OUT`
+writes the same per-task metrics with architecture and run configuration.
+Prefill rate counts the processed prompt rows (all but the final pending row),
+which match the reported prefill time; the final prompt row is timed in the
+first generation pass. It reports prompt/prefill rate, generated tokens, verification passes and rows,
+ms/pass, tokens/pass and tokens/s, guesses offered/accepted and logical code
+bytes/pass. The byte model counts main body/head code streams once per pass,
+plus the draft work counted inside the timed generation: each neural proposal
+reads the draft block streams (every layer matrix except the FC input
+projection) plus seven head evaluations, each reading
+`vocabulary*rank + shortlist*hidden` int8 bytes (shortlist 512 by default;
+untouched rescore rows are excluded), and each draft history update (one push
+of the consecutive rows a pass commits) reads the FC and every layer's
+key/value streams. Updates run after every commit even when no proposal ran
+(`--n 1`, or an adaptive pass that skipped the draft). JSON reports
+`neural_proposals`, `draft_updates` and both per-call byte counts. It excludes
+embedding row reads, vectors/tables/scales and cache traffic. It is a logical
+code-read estimate, not a measured DRAM bandwidth counter.
 
 ## HTTP surface
 
@@ -98,7 +160,8 @@ pub trait Engine {
 - `Sampling` carries temperature, top_p, top_k, min_p and seed; greedy
   defaults and the top_k range (1..20) follow upstream. `Generation` returns
   the ids, finish (`Stop`, `Length`, `Cancelled`), cached tokens, snapshot
-  mode, passes, prefill and generation milliseconds.
+  mode, passes, rows, guesses, neural proposals and draft history updates,
+  prefill and generation milliseconds.
 - `ChatRunner` turns this into `Reasoning`, `Content`, `ToolCall` and
   `Done(Usage)` events.
 
@@ -180,14 +243,15 @@ values, which the 640 bytes per value cover; that is what it is charged while
 it is decoded. Afterwards it holds its cleaned text (at most `max_text_bytes`
 for messages, tools and template kwargs, plus stop strings). Measured on
 macOS 27.2 on an Apple M5 with the release binary, peak resident memory of the
-whole server while 64 clients each send one request with a 7 MiB string and
+whole server, measured before the 2 MiB request-text limit was added, while
+64 clients each send one request with a 7 MiB string and
 never read the answer (`/usr/bin/time -l`; an idle server is 8 MiB):
 
 | 7 MiB string in | Before this round | After |
 |---|---:|---:|
 | `response_format.type` (400; the old message quoted it) | 2,115 MiB | 470 MiB |
 | a non-string text part, `[string]` (400; text limit) | 1,162 MiB | 451 to 497 MiB (two runs) |
-| `chat_template_kwargs` (200; reaches the engine) | 485 MiB | 484 MiB |
+| `chat_template_kwargs` (historically 200; now refused by text limit) | 485 MiB | 484 MiB |
 
 All three are dominated after the fix by the 64 bodies being received at once
 (64 x 7 MiB = 448 MiB, charged as they arrive). One such request alone peaks
@@ -232,8 +296,9 @@ most 64 characters of its Python repr followed by `…` (`response_format`, the
 method of a 501), or, as upstream, the first 80 characters of its JSON text
 (`tool_choice`); control characters appear escaped in both. The repr or JSON
 text is written into a sink that stops the writer once it has the excerpt, so
-quoting a value costs no more than the excerpt, however large or nested the
-value is (measured: 434 bytes allocated for the 80-character excerpt of an
+the error excerpt bounds the additional memory allocation, however large
+or nested the value is; scanning the quoted value can still take time
+proportional to its size, bounded by the request-body limit (measured: 434 bytes allocated for the 80-character excerpt of an
 8.3 MB `tool_choice` of 25,600 strings of 80 emoji, which allocated 151 MiB
 when the excerpt was cut from a shortened copy of the value). Template and
 tokenizer errors are cut to 500 characters. An error response is therefore a
@@ -305,21 +370,15 @@ These are deliberate validation defect fixes.
 
 Windows console code page and coloring, DLL/CUDA/device selection, nvidia-smi
 GPU-memory warnings and CUDA tuning environment changes have no equivalent
-here. Info reports this static Rust binary, stub and tokenizer. The explicit
-stub needs no model folder; `--model-dir` loads only text files, and nothing
-substitutes for the real engine implicitly. Warmup is a short trait
-`generate` plus `reset`, not a native CUDA warmup. Terminal output is plain
-line I/O. Command-line argument errors exit with status 1. `verify` is not
-ported; `bench` and `selfcheck` are deferred and only report that they are not
-available yet. Actual model generation is outside this crate's integration so
-far.
+here. Physical-memory checking and the CPU/Metal engine are native Rust.
+Warmup is a short trait `generate` plus `reset`. Terminal output is plain line
+I/O. Command-line errors exit with status 1. `verify` is not ported.
 
 Tests run automatically through Cargo/CI with synthetic assets, including real
 TCP tests on ephemeral ports; none require weights or a real tokenizer. Each
 Rust test ported from upstream carries a comment naming its upstream case
 (`test_chat.py`, `test_server.py`, `test_tools.py`, `test_cli.py`). Upstream
-cases not ported: `test_cli` verify, bench and selfcheck round trip (commands
-not available) and the GPU memory warning (Windows/CUDA only). Golden response
+cases not ported: `test_cli` verify and the GPU memory warning (Windows/CUDA only). Golden response
 bodies normalize only id/timestamp fields, and were constructed from the fixed
 protocol/byte-token contract, not captured from the implementation. Socket
 tests synchronize on responses, handshakes or a polled condition, never on a

@@ -42,6 +42,7 @@ fn main() -> Result<()> {
         unsafe { Model::with_options(&path, Engine::from_env()?, backend, rows, mode)? };
     // As Model::load: YSKN_METAL_MAC and YSKN_METAL_CPU_SHARE select the Metal modes.
     model.configure_metal_from_env()?;
+    model.set_detailed_timing(true);
     println!(
         "backend={} device={} kv={mode:?} cpu_stages={}",
         model.backend().name(),
@@ -93,13 +94,20 @@ fn main() -> Result<()> {
     };
     println!("rows_per_pass={rows} passes={passes} context={context:?} stage min_s median_s");
     type Stage = fn(&PassTiming) -> Duration;
-    let stages: [(&str, Stage); 6] = [
+    let stages: [(&str, Stage); 13] = [
         ("total", |t| t.total),
         ("kernel", |t| t.kernel),
         ("recurrence", |t| t.recurrence),
+        ("recurrence_prepare", |t| t.recurrence_prepare),
+        ("dense_gate_work", |t| t.dense_gate_work),
         ("attention", |t| t.attention),
         ("kv_encode", |t| t.kv_encode),
         ("rest", PassTiming::rest),
+        ("normalization", |t| t.normalization),
+        ("activation_encode", |t| t.activation_encode),
+        ("projection_restore", |t| t.projection_restore),
+        ("mlp_gate", |t| t.mlp_gate),
+        ("residual", |t| t.residual),
     ];
     for (name, stage) in stages {
         let mut seconds: Vec<f64> = timings.iter().map(|t| stage(t).as_secs_f64()).collect();
