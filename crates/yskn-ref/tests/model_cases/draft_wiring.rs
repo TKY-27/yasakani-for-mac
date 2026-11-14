@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 
 use std::io::Cursor;
 
@@ -301,87 +301,104 @@ fn decode(
     (result.tokens, main.state_digest())
 }
 
-#[test]
-fn reference_neural_generation_matches_k0_across_joint_restore_and_reused_prefix() {
+fn check_neural_generation(seed: Option<u64>) {
     let base = model(main_bytes());
     let draft_artifact = draft_bytes();
     let head_artifact = support::draft::shead(37);
     let prompt = [3, 7, 11, 9];
     let second_prompt = [3, 7, 11, 13, 5, 17];
-    for seed in [None, Some(17), Some(0xabcdef)] {
-        let sampler = seed.map_or(Sampler::Greedy, |seed| {
-            Sampler::Sampled(SamplingParameters {
-                seed,
-                ..SamplingParameters::default()
-            })
-        });
-        let choice = seed.map_or(DraftChoice::Greedy, DraftChoice::sampled);
-        let mut sequential = base.new_session().unwrap();
-        sequential.prefill(&prompt[..3]).unwrap();
-        let first_expected = decode(&mut sequential, &mut NoProposer, &sampler, &prompt, 0, 5);
-        let last = *first_expected.0.last().unwrap();
-        let continued_expected = decode(&mut sequential, &mut NoProposer, &sampler, &[last], 0, 8);
-        // Prefix reuse is checked against a fresh, independently prefetched session.
-        let mut fresh_second = base.new_session().unwrap();
-        fresh_second
-            .prefill(&second_prompt[..second_prompt.len() - 1])
-            .unwrap();
-        let second_expected = decode(
-            &mut fresh_second,
-            &mut NoProposer,
-            &sampler,
-            &second_prompt,
-            0,
-            5,
+    let sampler = seed.map_or(Sampler::Greedy, |seed| {
+        Sampler::Sampled(SamplingParameters {
+            seed,
+            ..SamplingParameters::default()
+        })
+    });
+    let choice = seed.map_or(DraftChoice::Greedy, DraftChoice::sampled);
+    let mut sequential = base.new_session().unwrap();
+    sequential.prefill(&prompt[..3]).unwrap();
+    let first_expected = decode(&mut sequential, &mut NoProposer, &sampler, &prompt, 0, 2);
+    let last = *first_expected.0.last().unwrap();
+    let continued_expected = decode(&mut sequential, &mut NoProposer, &sampler, &[last], 0, 8);
+    // Prefix reuse is checked against a fresh, independently prefetched session.
+    let mut fresh_second = base.new_session().unwrap();
+    fresh_second
+        .prefill(&second_prompt[..second_prompt.len() - 1])
+        .unwrap();
+    let second_expected = decode(
+        &mut fresh_second,
+        &mut NoProposer,
+        &sampler,
+        &second_prompt,
+        0,
+        2,
+    );
+    for k in [1, 3, 7] {
+        let mut proposer = DraftProposer::new(
+            draft_from(draft_artifact.clone(), head_artifact.clone()),
+            k,
+            choice,
+        )
+        .unwrap();
+        let mut main = base.new_session().unwrap();
+        main.set_capture(proposer.capture_options()).unwrap();
+        main.prefill(&prompt[..3]).unwrap();
+        let prefix = proposer.snapshot_session(&mut main).unwrap();
+        assert_eq!(
+            proposer
+                .propose_with(&mut main, &prompt[..3], prompt[3], k)
+                .unwrap()
+                .len(),
+            k
         );
-        for k in [1, 3, 7] {
-            let mut proposer = DraftProposer::new(
-                draft_from(draft_artifact.clone(), head_artifact.clone()),
-                k,
-                choice,
-            )
+        assert_eq!(
+            decode(&mut main, &mut proposer, &sampler, &prompt, k, 2),
+            first_expected,
+            "seed={seed:?} K={k} first request"
+        );
+        let checkpoint = proposer.snapshot_session(&mut main).unwrap();
+        let ring = proposer.draft().snapshot();
+        assert!(main.position() <= proposer.draft().dimensions().window);
+        assert_eq!(
+            decode(&mut main, &mut proposer, &sampler, &[last], k, 8),
+            continued_expected,
+            "seed={seed:?} K={k} continuation"
+        );
+        assert!(
+            main.position() > proposer.draft().dimensions().window,
+            "continuation must wrap the ring"
+        );
+        proposer.restore_session(&mut main, &checkpoint).unwrap();
+        assert_eq!(proposer.draft().snapshot(), ring);
+        assert_eq!(
+            decode(&mut main, &mut proposer, &sampler, &[last], k, 8),
+            continued_expected,
+            "seed={seed:?} K={k} restored continuation"
+        );
+        proposer.restore_session(&mut main, &prefix).unwrap();
+        main.prefill(&second_prompt[3..second_prompt.len() - 1])
             .unwrap();
-            let mut main = base.new_session().unwrap();
-            main.set_capture(proposer.capture_options()).unwrap();
-            main.prefill(&prompt[..3]).unwrap();
-            let prefix = proposer.snapshot_session(&mut main).unwrap();
-            assert_eq!(
-                proposer
-                    .propose_with(&mut main, &prompt[..3], prompt[3], k)
-                    .unwrap()
-                    .len(),
-                k
-            );
-            assert_eq!(
-                decode(&mut main, &mut proposer, &sampler, &prompt, k, 5),
-                first_expected,
-                "seed={seed:?} K={k} first request"
-            );
-            let checkpoint = proposer.snapshot_session(&mut main).unwrap();
-            let ring = proposer.draft().snapshot();
-            assert_eq!(
-                decode(&mut main, &mut proposer, &sampler, &[last], k, 8),
-                continued_expected,
-                "seed={seed:?} K={k} continuation"
-            );
-            proposer.restore_session(&mut main, &checkpoint).unwrap();
-            assert_eq!(proposer.draft().snapshot(), ring);
-            assert_eq!(
-                decode(&mut main, &mut proposer, &sampler, &[last], k, 8),
-                continued_expected,
-                "seed={seed:?} K={k} restored continuation"
-            );
-            proposer.restore_session(&mut main, &prefix).unwrap();
-            main.prefill(&second_prompt[3..second_prompt.len() - 1])
-                .unwrap();
-            assert_eq!(
-                decode(&mut main, &mut proposer, &sampler, &second_prompt, k, 5),
-                second_expected,
-                "seed={seed:?} K={k} reused prefix"
-            );
-            assert_eq!(proposer.draft().position(), main.position());
-        }
+        assert_eq!(
+            decode(&mut main, &mut proposer, &sampler, &second_prompt, k, 2),
+            second_expected,
+            "seed={seed:?} K={k} reused prefix"
+        );
+        assert_eq!(proposer.draft().position(), main.position());
     }
+}
+
+#[test]
+fn reference_neural_greedy_matches_k0_across_joint_restore_and_reused_prefix() {
+    check_neural_generation(None);
+}
+
+#[test]
+fn reference_neural_seed17_matches_k0_across_joint_restore_and_reused_prefix() {
+    check_neural_generation(Some(17));
+}
+
+#[test]
+fn reference_neural_seedabcdef_matches_k0_across_joint_restore_and_reused_prefix() {
+    check_neural_generation(Some(0xabcdef));
 }
 
 #[test]

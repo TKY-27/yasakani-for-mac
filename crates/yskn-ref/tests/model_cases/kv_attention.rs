@@ -1,5 +1,5 @@
+use crate::support;
 use sha2::{Digest, Sha256};
-mod support;
 
 use std::{
     fs,
@@ -41,90 +41,98 @@ fn hash(rows: &[Vec<u32>]) -> String {
     )
 }
 
-#[test]
-fn all_modes_freeze_logits_and_profile_modes_preserve_long_pass_reset_and_continuation() {
+fn check_frozen_mode(mode: KvMode, frozen: &str) {
     let bytes = synthetic_model(107, LAYERS);
     let profile = Arc::new(KvProfile::parse(&mixed_profile()).unwrap());
     assert!(profile.packable(0, 0) && profile.packable(0, 1));
     assert!(profile.packable(1, 0) && !profile.packable(1, 1));
     let tokens: Vec<_> = (0..73).map(|row| (row * 17 + 4) % 128).collect();
-    let mut digests = Vec::new();
-    for mode in [KvMode::Int8, KvMode::Int8Profile, KvMode::Kv5] {
-        let mut whole = model(&bytes, mode, Some(Arc::clone(&profile))).unwrap();
-        let mut individual = whole.new_session().unwrap();
-        let mut chunks = whole.new_session().unwrap();
-        for model in [&mut whole, &mut individual, &mut chunks] {
-            model.prefill(&[8, 21, 5]).unwrap();
-        }
-        whole.prefill(&tokens).unwrap();
-        let expected = bits(whole.row_logits());
-        assert_eq!(expected.len(), 73);
-        assert!(expected.windows(2).any(|p| p[0] != p[1]));
-        let value = hash(&expected);
-        digests.push(value);
-        if mode == KvMode::Int8 {
-            continue;
-        } // existing Int8 tests already cover these paths
-        let mut actual = Vec::new();
-        for &token in &tokens {
-            individual.prefill(&[token]).unwrap();
-            actual.extend(bits(individual.row_logits()));
-        }
-        assert_eq!(actual, expected, "{mode:?} single rows");
-        actual.clear();
-        let mut start = 0;
-        for count in [1, 31, 2, 33, 6] {
-            chunks.prefill(&tokens[start..start + count]).unwrap();
-            start += count;
-            actual.extend(bits(chunks.row_logits()));
-        }
-        assert_eq!(start, 73);
-        assert_eq!(actual, expected, "{mode:?} uneven chunks");
-        let position = whole.position();
-        assert!(whole.prefill(&[3, 128]).is_err());
-        assert!(whole.run_provisional(&[3, 128]).is_err());
-        assert!(!whole.has_provisional_pass());
-        assert_eq!(whole.position(), position);
-        assert_eq!(bits(whole.row_logits()), expected);
-        for model in [&mut whole, &mut individual, &mut chunks] {
-            model.prefill(&[19, 11]).unwrap();
-        }
-        assert_eq!(bits(whole.row_logits()), bits(individual.row_logits()));
-        assert_eq!(bits(whole.row_logits()), bits(chunks.row_logits()));
-        // Reset with different inputs checks both removal of old cache and retained mode/profile.
-        whole.reset().unwrap();
-        individual.reset().unwrap();
-        assert_eq!(whole.position(), 0);
-        assert!(whole.logits().is_none());
-        whole.prefill(&[7, 3, 1, 9]).unwrap();
-        let reset = bits(whole.row_logits());
-        actual.clear();
-        for token in [7, 3, 1, 9] {
-            individual.prefill(&[token]).unwrap();
-            actual.extend(bits(individual.row_logits()));
-        }
-        assert_eq!(reset, actual);
-        // Partial provisional acceptance must preserve encoded state through replay.
-        whole.run_provisional(&[17, 6, 21]).unwrap();
-        assert!(whole.commit(4).is_err());
-        assert_eq!(whole.position(), 4);
-        whole.commit(2).unwrap();
-        individual.prefill(&[17, 6]).unwrap();
-        whole.prefill(&[13]).unwrap();
-        individual.prefill(&[13]).unwrap();
-        assert_eq!(bits(whole.row_logits()), bits(individual.row_logits()));
+    let mut whole = model(&bytes, mode, Some(Arc::clone(&profile))).unwrap();
+    let mut individual = whole.new_session().unwrap();
+    let mut chunks = whole.new_session().unwrap();
+    for model in [&mut whole, &mut individual, &mut chunks] {
+        model.prefill(&[8, 21, 5]).unwrap();
     }
-    assert_ne!(digests[0], digests[1]);
-    assert_ne!(digests[0], digests[2]);
-    assert_ne!(digests[1], digests[2]);
-    // Frozen source-port results, not CUDA golden captures. Int8 also retains D11's old digests.
-    assert_eq!(
-        digests,
-        [
-            "1e9a723c945f8b0b36a5204b16cf237500fdc2183727e5beb07b841b148114fd",
-            "3b952134c81b86e93601de75379c10e80ac898cae92e30275f22265d781710dd",
-            "5d474ca9559bcc6d8eb367a2634e578842c0813fc66a55a862f054f4521422e4"
-        ]
+    whole.prefill(&tokens).unwrap();
+    let expected = bits(whole.row_logits());
+    assert_eq!(expected.len(), 73);
+    assert!(expected.windows(2).any(|p| p[0] != p[1]));
+    let value = hash(&expected);
+    assert_eq!(value, frozen, "frozen source-port logits {mode:?}");
+    if mode == KvMode::Int8 {
+        return;
+    } // existing Int8 tests already cover these paths
+    let mut actual = Vec::new();
+    for &token in &tokens {
+        individual.prefill(&[token]).unwrap();
+        actual.extend(bits(individual.row_logits()));
+    }
+    assert_eq!(actual, expected, "{mode:?} single rows");
+    actual.clear();
+    let mut start = 0;
+    for count in [1, 31, 2, 33, 6] {
+        chunks.prefill(&tokens[start..start + count]).unwrap();
+        start += count;
+        actual.extend(bits(chunks.row_logits()));
+    }
+    assert_eq!(start, 73);
+    assert_eq!(actual, expected, "{mode:?} uneven chunks");
+    let position = whole.position();
+    assert!(whole.prefill(&[3, 128]).is_err());
+    assert!(whole.run_provisional(&[3, 128]).is_err());
+    assert!(!whole.has_provisional_pass());
+    assert_eq!(whole.position(), position);
+    assert_eq!(bits(whole.row_logits()), expected);
+    for model in [&mut whole, &mut individual, &mut chunks] {
+        model.prefill(&[19, 11]).unwrap();
+    }
+    assert_eq!(bits(whole.row_logits()), bits(individual.row_logits()));
+    assert_eq!(bits(whole.row_logits()), bits(chunks.row_logits()));
+    // Reset with different inputs checks both removal of old cache and retained mode/profile.
+    whole.reset().unwrap();
+    individual.reset().unwrap();
+    assert_eq!(whole.position(), 0);
+    assert!(whole.logits().is_none());
+    whole.prefill(&[7, 3, 1, 9]).unwrap();
+    let reset = bits(whole.row_logits());
+    actual.clear();
+    for token in [7, 3, 1, 9] {
+        individual.prefill(&[token]).unwrap();
+        actual.extend(bits(individual.row_logits()));
+    }
+    assert_eq!(reset, actual);
+    // Partial provisional acceptance must preserve encoded state through replay.
+    whole.run_provisional(&[17, 6, 21]).unwrap();
+    assert!(whole.commit(4).is_err());
+    assert_eq!(whole.position(), 4);
+    whole.commit(2).unwrap();
+    individual.prefill(&[17, 6]).unwrap();
+    whole.prefill(&[13]).unwrap();
+    individual.prefill(&[13]).unwrap();
+    assert_eq!(bits(whole.row_logits()), bits(individual.row_logits()));
+}
+
+#[test]
+fn int8_freezes_logits_and_preserves_long_pass_reset_and_continuation() {
+    check_frozen_mode(
+        KvMode::Int8,
+        "1e9a723c945f8b0b36a5204b16cf237500fdc2183727e5beb07b841b148114fd",
+    );
+}
+
+#[test]
+fn int8_profile_freezes_logits_and_preserves_long_pass_reset_and_continuation() {
+    check_frozen_mode(
+        KvMode::Int8Profile,
+        "3b952134c81b86e93601de75379c10e80ac898cae92e30275f22265d781710dd",
+    );
+}
+
+#[test]
+fn kv5_freezes_logits_and_preserves_long_pass_reset_and_continuation() {
+    check_frozen_mode(
+        KvMode::Kv5,
+        "5d474ca9559bcc6d8eb367a2634e578842c0813fc66a55a862f054f4521422e4",
     );
 }
 

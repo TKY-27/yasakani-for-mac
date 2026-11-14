@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 
 use support::{
     synthetic_model, synthetic_model_with_dense_embeddings, synthetic_model_with_dimensions,
