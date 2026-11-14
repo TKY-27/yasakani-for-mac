@@ -512,8 +512,8 @@ mod sockets {
     use std::{
         net::SocketAddr,
         sync::{
-            Arc,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -525,10 +525,17 @@ mod sockets {
     };
 
     const PATIENCE: Duration = Duration::from_secs(30);
+    /// A cancelled call: prompt length, its empty (prefill) callbacks, ids returned.
+    #[derive(Debug)]
+    struct Cancelled {
+        prompt: usize,
+        prefill_callbacks: usize,
+        ids: usize,
+    }
     #[derive(Default)]
     struct Observation {
         prefill: AtomicUsize,
-        cancelled: AtomicBool,
+        cancelled: Mutex<Vec<Cancelled>>,
     }
     struct Observed {
         inner: RealEngine,
@@ -549,14 +556,20 @@ mod sockets {
             stop: Option<&[u32]>,
             cb: &mut dyn FnMut(&[u32]) -> yskn::Result<bool>,
         ) -> yskn::Result<Generation> {
+            let mut prefill_callbacks = 0;
             let result = self.inner.generate(p, n, s, stop, &mut |ids| {
                 if ids.is_empty() {
+                    prefill_callbacks += 1;
                     self.observation.prefill.fetch_add(1, Ordering::Release);
                 }
                 cb(ids)
             })?;
             if result.finish == Finish::Cancelled {
-                self.observation.cancelled.store(true, Ordering::Release);
+                self.observation.cancelled.lock().unwrap().push(Cancelled {
+                    prompt: p.len(),
+                    prefill_callbacks,
+                    ids: result.ids.len(),
+                });
             }
             Ok(result)
         }
@@ -638,7 +651,19 @@ mod sockets {
             .unwrap()
             .0;
         let expected_ids = scalar(&folder, &prompt, 4, &greedy());
+        assert_eq!(expected_ids.len(), 4);
         let expected_text = formatter.decode(&expected_ids).unwrap();
+        // The server must report usage for each request, as D16 defines it.
+        let check_usage = |usage: &Value, cached: usize| {
+            assert_eq!(usage["prompt_tokens"], prompt.len(), "{usage}");
+            assert_eq!(usage["completion_tokens"], expected_ids.len(), "{usage}");
+            assert_eq!(
+                usage["total_tokens"],
+                prompt.len() + expected_ids.len(),
+                "{usage}"
+            );
+            assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], cached);
+        };
         let (addr, shutdown, task) = start(&folder, Arc::default()).await;
         let body =
             json!({"messages":messages,"temperature":0,"max_tokens":4,"enable_thinking":false});
@@ -646,9 +671,9 @@ mod sockets {
         assert_eq!(status, 200, "{text}");
         let response: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(response["choices"][0]["message"]["content"], expected_text);
-        assert_eq!(response["usage"]["prompt_tokens"], prompt.len());
-        assert_eq!(response["usage"]["completion_tokens"], 4);
-        assert_eq!(response["usage"]["total_tokens"], prompt.len() + 4);
+        assert_eq!(response["choices"][0]["finish_reason"], "length");
+        // A fresh engine has nothing cached.
+        check_usage(&response["usage"], 0);
         let mut stream_body = body;
         stream_body["stream"] = json!(true);
         stream_body["stream_options"] = json!({"include_usage":true});
@@ -666,13 +691,18 @@ mod sockets {
             .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
             .collect();
         assert_eq!(generated, expected_text);
+        let finishes: Vec<_> = chunks
+            .iter()
+            .filter_map(|chunk| chunk["choices"][0]["finish_reason"].as_str())
+            .collect();
+        assert_eq!(finishes, ["length"], "{text}");
         let usage = chunks
             .iter()
             .find_map(|chunk| chunk.get("usage").filter(|v| v.is_object()))
             .expect("streamed usage");
-        assert_eq!(usage["prompt_tokens"], prompt.len());
-        assert_eq!(usage["completion_tokens"], 4);
-        assert_eq!(usage["total_tokens"], prompt.len() + 4);
+        // The same prompt again restores the snapshot taken before its final,
+        // pending token: everything but that token is reused.
+        check_usage(usage, prompt.len() - 1);
         shutdown.send(()).unwrap();
         task.await.unwrap().unwrap();
     }
@@ -681,7 +711,8 @@ mod sockets {
         let folder = Folder::new();
         let observation = Arc::new(Observation::default());
         let (addr, shutdown, task) = start(&folder, observation.clone()).await;
-        let body=json!({"messages":[{"role":"user","content":"1 ".repeat(256)}],"stream":true,"max_tokens":4,"temperature":0,"enable_thinking":false}).to_string();
+        let long_messages = json!([{"role":"user","content":"1 ".repeat(256)}]);
+        let body=json!({"messages":long_messages,"stream":true,"max_tokens":4,"temperature":0,"enable_thinking":false}).to_string();
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(format!("POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
         let deadline = tokio::time::Instant::now() + PATIENCE;
@@ -693,18 +724,46 @@ mod sockets {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         drop(client);
-        let (status,text)=request(addr,json!({"messages":[{"role":"user","content":"2"}],"max_tokens":2,"temperature":0,"enable_thinking":false})).await;
+        let messages = json!([{"role":"user","content":"2"}]);
+        let (status, text) = request(
+            addr,
+            json!({"messages":messages,"max_tokens":2,"temperature":0,"enable_thinking":false}),
+        )
+        .await;
         assert_eq!(status, 200, "next request did not acquire engine: {text}");
+        let formatter = yskn_text::ChatFormatter::load(&folder.0).unwrap();
+        let long_prompt = formatter
+            .prompt(&long_messages, None, &json!({"enable_thinking":false}))
+            .unwrap()
+            .0;
+        let cancelled = std::mem::take(&mut *observation.cancelled.lock().unwrap());
+        assert_eq!(cancelled.len(), 1, "{cancelled:?}");
+        let cancelled = &cancelled[0];
+        assert_eq!(cancelled.prompt, long_prompt.len(), "{cancelled:?}");
+        // Width-1 prefill calls back once before and once after each of the
+        // prompt.len() - 1 rows; cancellation must land strictly inside.
+        assert_eq!(cancelled.ids, 0, "cancelled after prefill: {cancelled:?}");
         assert!(
-            observation.cancelled.load(Ordering::Acquire),
-            "long prefill completed instead of cancelling"
+            (2..long_prompt.len()).contains(&cancelled.prefill_callbacks),
+            "disconnect was not observed between prefill passes: {cancelled:?}"
         );
-        assert!(
-            observation.prefill.load(Ordering::Acquire) < 256,
-            "disconnect was not observed between prefill passes"
-        );
+        // The released engine answers the next chat exactly as a fresh one.
+        let prompt = formatter
+            .prompt(&messages, None, &json!({"enable_thinking":false}))
+            .unwrap()
+            .0;
+        let expected = scalar(&folder, &prompt, 2, &greedy());
         let response: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(response["usage"]["completion_tokens"], 2);
+        assert_eq!(
+            response["choices"][0]["message"]["content"],
+            formatter.decode(&expected).unwrap()
+        );
+        assert_eq!(response["usage"]["prompt_tokens"], prompt.len());
+        assert_eq!(response["usage"]["completion_tokens"], expected.len());
+        assert_eq!(
+            response["usage"]["prompt_tokens_details"]["cached_tokens"],
+            0
+        );
         shutdown.send(()).unwrap();
         task.await.unwrap().unwrap();
     }
