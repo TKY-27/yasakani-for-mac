@@ -18,7 +18,9 @@ jobs:
   scalar-reference:
     name: Apple Silicon / stable
     runs-on: macos-15
-    timeout-minutes: 30
+    # The product tests brought the job to 29 minutes before the test-time
+    # reduction; keep headroom until the new duration has been measured.
+    timeout-minutes: 45
     env:
       # Assertions, overflow checks and opt-level 2 stay enabled. Full DWARF
       # is unnecessary for the CI proof and expensive across integration crates.
