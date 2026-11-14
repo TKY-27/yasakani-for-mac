@@ -1343,7 +1343,8 @@ single-row push. All D15–D17 tests and frozen digests pass unchanged.
 
 **Tests (synthetic, no model files).** `tests/draft_fast.rs`: three shapes
 (4/4 heads, window 8, two layers; 8/2 heads, hidden 1024, window 16, vocabulary
-40, rank 64; 8/2 heads, window 256 with a 290-row push), each wrapping its ring,
+40, rank 64; 8/2 heads, window 256 with a largest 257-row batch), each
+wrapping its ring,
 pushed in uneven chunks through all three push APIs. After every chunk the
 ring equals the reference; at the empty, partial and final rings, greedy and
 two sampled proposals (tokens, top-16 and corrected scores) and an explicit

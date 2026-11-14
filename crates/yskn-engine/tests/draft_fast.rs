@@ -354,6 +354,92 @@ fn failed_rows_snapshot_restore_and_reset_match_reference() {
 }
 
 #[test]
+fn processing_failure_keeps_prior_rows_and_matches_reference_on_every_backend() {
+    let shape = Shape::default();
+    let folder = Folder::new(23, &shape);
+    let mut rows: Vec<Vec<f32>> = (0..9)
+        .map(|r| fixture::features_width(r, shape.slots * shape.hidden))
+        .collect();
+    // This finite BF16 value passes context validation. The first Hadamard
+    // butterfly in activation quantization overflows, so the reference fails
+    // while processing row 4, after rows 0 through 3 have been committed.
+    let largest_bf16 = yskn_format::bf16_to_f32(0x7f7f);
+    assert!(largest_bf16.is_finite());
+    assert_eq!(
+        yskn_ref::portable_math::bfloat(largest_bf16).to_bits(),
+        largest_bf16.to_bits()
+    );
+    rows[4][..512].fill(largest_bf16);
+
+    for (name, kernel, threads, backend) in configurations() {
+        for api in ["single row", "slice", "batch"] {
+            let mut reference = Draft::load_with_options(&folder.0, options(&shape)).unwrap();
+            let mut fast = fast(&folder, &shape, kernel, threads, backend);
+            let reference_error = match api {
+                "single row" => rows
+                    .iter()
+                    .enumerate()
+                    .find_map(|(position, row)| {
+                        reference
+                            .push_context(position, ContextFeatures { values: row })
+                            .err()
+                    })
+                    .expect("row 4 must fail during processing"),
+                "slice" => reference.push_context_rows(0, &rows.concat()).unwrap_err(),
+                "batch" => reference.push_context_rows(0, &rows.concat()).unwrap_err(),
+                _ => unreachable!(),
+            };
+            let actual_error = match api {
+                "single row" => rows
+                    .iter()
+                    .enumerate()
+                    .find_map(|(position, row)| {
+                        fast.push_context(position, ContextFeatures { values: row })
+                            .err()
+                    })
+                    .expect("row 4 must fail during processing"),
+                "slice" => {
+                    let slices: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+                    fast.push_rows(0, &slices).unwrap_err()
+                }
+                "batch" => fast.push_context_rows(0, &rows.concat()).unwrap_err(),
+                _ => unreachable!(),
+            };
+            let context = format!("{name} {api}");
+            assert!(
+                matches!(
+                    &reference_error,
+                    yskn_ref::Error::NonFinite("FP16-rounded rotated activation")
+                ),
+                "{context}: reference error was {reference_error}"
+            );
+            assert!(
+                matches!(
+                    &actual_error,
+                    yskn_engine::Error::NonFinite("FP16-rounded rotated activation")
+                ),
+                "{context}: fast error was {actual_error}"
+            );
+            assert_eq!(
+                actual_error.to_string(),
+                reference_error.to_string(),
+                "{context}"
+            );
+            assert_eq!(fast.snapshot(), reference.snapshot(), "{context}: ring");
+            assert_eq!(fast.position(), 4, "{context}: fast position");
+            assert_eq!(reference.position(), 4, "{context}: reference position");
+
+            let embedding = |token| fixture::embedding_width(token, shape.hidden);
+            let expected = reference
+                .propose(3, embedding, DraftChoice::Greedy)
+                .unwrap();
+            let actual = fast.propose(3, embedding, DraftChoice::Greedy).unwrap();
+            assert_proposals(&actual, &expected, &context);
+        }
+    }
+}
+
+#[test]
 fn loading_rejects_the_reference_errors() {
     let shape = Shape::default();
     let folder = Folder::new(23, &shape);
