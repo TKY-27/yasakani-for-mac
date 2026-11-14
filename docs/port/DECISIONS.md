@@ -914,3 +914,123 @@ attention/filter/sparse-head oracles, explicit shortlist/selection ties,
 common signs/ignored output rotations and frozen proposal/score digests.
 Digests freeze this port, not a CUDA golden capture. CUDA bit equality,
 acceptance quality and end-to-end text equality are not claimed.
+
+## D16 — Bounded transactional sessions and lossless speculation
+
+`yskn-engine::Model` now implements the reference's explicit sequence ABI:
+`run_provisional(tokens)`, `commit(k)` and `discard_provisional()`. k counts
+input rows including row zero; zero discards. There is no one-row precommit
+or implicit +1, and a pending pass rejects another pass/prefill/snapshot/restore.
+Provisional width is bounded by the constructor's positive `rows_per_pass`.
+Long prefill still chunks at that width, atomically across every chunk.
+
+### Ownership, copying and bounds
+
+Attention cache rows append directly to their existing layer cache. Discard,
+partial commit, failed provisional execution and failed prefill truncate the
+appended suffix. The engine never clones an attention cache. The reference
+keeps its existing scalar copy/recompute behavior as the independent oracle.
+
+Each recurrent layer has a committed state and one preallocated working state,
+both including convolution history. At transaction start `copy_from` copies
+only recurrence/history into the existing working allocation; the committed
+state stays unchanged until success. Successful prefill swaps these states.
+Provisional execution retains the prepared per-row recurrence inputs in fixed
+replay slots allocated once when the model loads: rounded projections, z,
+convolution outputs, normalized q/k and dense gates. Each slot copies into its
+existing vectors. Full commit swaps the already-computed working state;
+partial commit resets working recurrence from committed state and replays only
+accepted recurrence/history through the same `recur_head`/`advance_history`
+operations. No embedding, compressed projection, attention or MLP is replayed.
+Failure cannot publish working recurrence. Ordinary transient projection,
+attention and row-preparation allocations remain; fixed replay payload does
+not allocate or grow per pass. Context-dependent cache/history storage grows
+only with the retained context, not with the number of retries/checkpoints.
+
+The alternative, retaining a full recurrent snapshot per row, was rejected
+for memory. With chapter 03's 48 GDN layers, each state has
+`48 * (48*128*128 + 3*10240) * 4 = 156,893,184` payload bytes, including
+BF16-rounded convolution history represented in f32 by this reference.
+The two fixed committed/working states therefore hold 313,786,368 bytes.
+A prepared row costs
+`48 * (2*10240 + 6144 + 2*2048 + 2*48) * 4 = 5,916,672` bytes.
+For maximum pass width W, fixed recurrent/replay payload is
+`313,786,368 + W*5,916,672` bytes (408,453,120 bytes at default W=16),
+plus small Vec metadata, W token IDs and requested logits. A per-row-state
+design would instead add `W*156,893,184` bytes (2,510,290,944 at W=16).
+These are dimension-derived payload counts, not measured real-model RSS;
+weights, attention caches, operator scratch and output logits are additional.
+`session_memory()` reports actual state/replay payload and buffer capacities.
+
+`prefill_with_logits(tokens, LogitRows::{All,Last,None})` controls head work.
+All is the unchanged scoring default; Last runs only the final prompt row's
+head; None skips heads and clears predictions. Empty prefill remains a no-op.
+Failure preserves position, committed recurrence/cache, logits and timings.
+
+### Checkpoints and exactness
+
+Both models' owned `snapshot()` captures recurrence/history, position, the
+last committed prediction and exact prefix token IDs, with a session identity.
+Attention is retained in the owner, never copied. `restore` checks session/reset,
+position and prefix equality before truncating attention and copying recurrent
+values into existing allocations. A changed prefix, another session, pending
+pass or future checkpoint returns an error. Snapshot values are not accumulated
+inside the model; each dropped value releases its own payload. One checkpoint
+costs one recurrent state plus `4*position` prefix bytes and one vocabulary row.
+Repeated restore at a fixed maximum context extent preserves capacities.
+
+The one generic `yskn_ref::speculation::generate` loop is used by both models.
+The supplied prompt tail ends in a pending, unconsumed token. Each pass runs
+`[pending, guesses...]`. Guess j is accepted only if it equals the selector's
+choice from row j-1. The first mismatch yields the correction token and stops
+reading later rows. EOS/callback cancellation stop at their selected token.
+Committing exactly the consumed predecessors leaves the final selected token
+pending, identically for K=0 and K>0. Output and context limits bound drafting
+before the pass. No artificial EOS is introduced by a proposal.
+
+D1/D9 guarantee the same row logits for every straight-chain grouping. The
+existing sampler is keyed by seed, absolute prediction position and candidate
+ID, with no pass-local RNG consumption. Inductively the selector therefore
+chooses the same token at every depth and commits the same state for greedy
+and seeded runs, independent of proposer accuracy. Tests compare both token
+sequences and a digest over all committed numeric state (including KV codes,
+scales, convolution history and committed logits), plus explicit future rows.
+The diagnostic digest is FNV-1a, not a cryptographic proof; logit comparisons
+check every f32 bit independently. No frozen reference digest was changed.
+
+The upstream source confirms recurrence-only replay (`src/engine35.cpp:843-851`),
+its different +1 ABI/one-row shortcut (`1299-1329`) and retained-cache snapshots
+(`1550-1583`). Chapter 08 now distinguishes those upstream conventions from
+the Rust contract. No new discrepancy was found in those source ranges.
+HCAP, adaptive 8/16-row blocks, the next-token table and cost/source policy were
+not ported. No draft/draft_head files or D15 section were created.
+
+### D16 synthetic measurement (2026-11-14)
+
+Fresh temporary directory, generated exactly with
+`cargo run --release -p yskn-engine --example synthetic_model -- FILE 8`:
+856,300,800-byte model, hidden 5120, FFN 17408, vocabulary 4096, six GDN/two
+attention layers. No released model was opened. The process could not obtain
+a Metal device, so these are CPU dotprod/10-worker timings only. No task build,
+test or other model run overlapped the timed run. `bench_speculation FILE
+--backend cpu --passes 7` takes one warmup and seven measured samples per
+width. Values are medians in milliseconds, including real operator allocation
+and dispatch costs:
+
+| Width | Provisional | Partial accepted rows | Partial commit | Full commit | Snapshot-copy proxy |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 74.378042 | 1 (full) | 0.000750 | 0.000833 | 0.031750 |
+| 2 | 126.326667 | 1 | 0.331166 | 0.001000 | 0.059666 |
+| 4 | 134.122792 | 2 | 0.420208 | 0.001083 | 0.109417 |
+| 8 | 162.727500 | 4 | 0.696042 | 0.001000 | 0.266459 |
+
+The rejected design's proxy copies and retains W owned recurrent checkpoints
+at one position; it measures copy/allocation cost, not a second implementation
+of per-row snapshot execution. Copying is faster than recurrence replay on
+this small-state synthetic fixture, but needs 1,646,592 bytes per checkpoint
+versus 73,920 replay bytes per row. The chosen session at W=8 holds 3,293,184
+bytes of recurrent states and 591,360 replay bytes, fixed across passes.
+For the real dimensions the memory ratio is about 26.5x per retained row;
+that bound motivates replay despite its measured extra CPU work. Full
+acceptance avoids replay entirely. These timings do not predict real-model
+speed or the optimal draft width, and no Metal timing is claimed.

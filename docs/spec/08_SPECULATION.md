@@ -512,7 +512,7 @@ produce bit-identical scores.
 (`src/specx.cpp:376,438-440`; `src/q35_sample.cu:180-197`;
 `src/smp_hash.cuh:12-15`)
 
-Explicit differences to preserve are the one-row precommit optimization,
+Explicit differences in the upstream ABI are the one-row precommit optimization,
 HCAP's leaf-versus-trunk state semantics, full 8/16-row **noncausal** draft
 blocks even when verifying only their prefix, and the width/source
 estimators above. Main-model attention and recurrent arithmetic differences
@@ -617,3 +617,34 @@ second-choice, third-choice. (`src/engine35.cpp:1689-1692`)
 | 6 | 0.084400 | 0.083685 | 0.081487 | 0.079582 | 0.078168 | 0.074986 | 0.071933 | 0.068266 | 0.064263 | 0.058578 | 0.051723 | 0.011425 |
 
 (`src/hcap_tables.inc:7`)
+
+
+## 12. Rust port boundary (D16)
+
+The source's `commit(n_accept)` replays `n_accept+1` rows
+(`src/engine35.cpp:1319-1329`), and one-row verification can already commit
+its state (`src/engine35.cpp:1299-1305`). These are upstream ABI conventions,
+not requirements to carry that optimization into the Rust reference. Both
+Rust models deliberately expose `commit(k)` counting input rows directly,
+including row zero; k=0 discards, and even a one-row provisional pass waits
+for commit. This prevents a different state convention when drafting is off.
+
+Source inspection confirms recurrence-only replay from cached per-row inputs
+(`src/engine35.cpp:843-851`) and snapshots that copy recurrence/history but
+retain live attention prefixes (`src/engine35.cpp:1550-1583`). Rust follows
+these state ownership choices synchronously. Its owned checkpoint also keeps
+the committed prediction, allowing restoration without re-running a head;
+the upstream snapshot's omitted frontier is described in section 2. Rust
+checks session identity, position and exact prefix IDs before truncation.
+No contrary source behavior was found in these inspected ranges; these notes
+clarify the port boundary rather than asserting a new CUDA equivalence proof.
+
+Unlike the upstream width-dependent paths discussed in section 9, D1/D9's
+canonical per-row math makes the Rust main logits independent of pass width.
+The generic loop accepts a guess only when the main selector chooses that ID
+at the same absolute prediction position. It ignores all later rows after a
+mismatch/EOS/cancellation and commits only predecessors of the last returned
+token. Induction over selected tokens therefore gives the same tokens and
+committed state as K=0 for greedy and the existing position-keyed sampler.
+HCAP, adaptive 8/16-row blocks, the next-token table and cost/source selection
+remain upstream policy and are outside this Rust mechanism.

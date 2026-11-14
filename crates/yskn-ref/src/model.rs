@@ -144,6 +144,27 @@ pub enum LayerState {
     Recurrent(GatedDeltaNetState),
 }
 
+impl LayerState {
+    /// Add all persistent state bytes to a backend-independent FNV-1a digest.
+    pub fn update_digest(&self, digest: &mut u64) {
+        let tag = match self {
+            Self::Attention(_) => 0,
+            Self::Recurrent(_) => 1,
+        };
+        digest_bytes(digest, &[tag]);
+        match self {
+            Self::Attention(state) => state.update_digest(digest),
+            Self::Recurrent(state) => state.update_digest(digest),
+        }
+    }
+}
+
+fn digest_bytes(digest: &mut u64, bytes: &[u8]) {
+    for &byte in bytes {
+        *digest = (*digest ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+}
+
 impl<L> Layer<L> {
     pub fn new_state(&self) -> Result<LayerState> {
         match &self.branch {
@@ -233,6 +254,18 @@ pub struct Weights<L = CompressedLinear, T = yskn_format::Tensor> {
     pub head: L,
 }
 
+/// An owned committed checkpoint. Attention rows stay in the originating session.
+///
+/// A checkpoint can only restore its own session, before reset, while its exact
+/// token prefix is still present. It contains no attention cache copies.
+pub struct Snapshot {
+    session: Rc<()>,
+    position: usize,
+    tokens: Vec<u32>,
+    recurrent_states: Vec<Option<GatedDeltaNetState>>,
+    committed_logits: Option<Vec<f32>>,
+}
+
 /// A single sequence. Immutable weights are shared only through a single-threaded Rc.
 pub struct Model {
     weights: Rc<Weights>,
@@ -242,6 +275,8 @@ pub struct Model {
     committed_logits: Option<Vec<f32>>,
     last_pass_logits: Vec<Vec<f32>>,
     pending_tokens: Option<Vec<u32>>,
+    committed_tokens: Vec<u32>,
+    session: Rc<()>,
 }
 
 impl Model {
@@ -299,6 +334,8 @@ impl Model {
             committed_logits: None,
             last_pass_logits: Vec::new(),
             pending_tokens: None,
+            committed_tokens: Vec::new(),
+            session: Rc::new(()),
         })
     }
 
@@ -335,6 +372,8 @@ impl Model {
             committed_logits: None,
             last_pass_logits: Vec::new(),
             pending_tokens: None,
+            committed_tokens: Vec::new(),
+            session: Rc::new(()),
         })
     }
 
@@ -350,6 +389,8 @@ impl Model {
         self.committed_logits = None;
         self.last_pass_logits.clear();
         self.pending_tokens = None;
+        self.committed_tokens.clear();
+        self.session = Rc::new(());
         Ok(())
     }
 
@@ -362,6 +403,7 @@ impl Model {
         let (states, logits) = self.compute_rows(tokens)?;
         self.layer_states = states;
         self.position += tokens.len();
+        self.committed_tokens.extend_from_slice(tokens);
         self.committed_logits = logits.last().cloned();
         self.last_pass_logits = logits;
         Ok(())
@@ -401,6 +443,8 @@ impl Model {
         let (states, logits) = self.compute_rows(&tokens[..accepted_rows])?;
         self.layer_states = states;
         self.position += accepted_rows;
+        self.committed_tokens
+            .extend_from_slice(&tokens[..accepted_rows]);
         self.committed_logits = logits.last().cloned();
         self.last_pass_logits = logits;
         self.pending_tokens = None;
@@ -411,6 +455,85 @@ impl Model {
         if self.pending_tokens.take().is_some() {
             self.last_pass_logits = self.committed_logits.iter().cloned().collect();
         }
+    }
+
+    /// Capture a committed checkpoint without copying any attention cache rows.
+    pub fn snapshot(&self) -> Result<Snapshot> {
+        self.require_no_pending_pass()?;
+        Ok(Snapshot {
+            session: Rc::clone(&self.session),
+            position: self.position,
+            tokens: self.committed_tokens.clone(),
+            recurrent_states: self
+                .layer_states
+                .iter()
+                .map(|state| match state {
+                    LayerState::Attention(_) => None,
+                    LayerState::Recurrent(state) => Some(state.clone()),
+                })
+                .collect(),
+            committed_logits: self.committed_logits.clone(),
+        })
+    }
+
+    /// Return to a checkpoint on this session's retained causal prefix.
+    /// Invalid checkpoints leave all observable state unchanged.
+    pub fn restore(&mut self, snapshot: &Snapshot) -> Result<()> {
+        self.require_no_pending_pass()?;
+        if !Rc::ptr_eq(&self.session, &snapshot.session) {
+            return Err(Error::InvalidInput(
+                "snapshot belongs to a different session or reset".into(),
+            ));
+        }
+        if snapshot.position > self.position {
+            return Err(Error::InvalidInput(
+                "snapshot is beyond the current position".into(),
+            ));
+        }
+        if self.committed_tokens[..snapshot.position] != snapshot.tokens {
+            return Err(Error::InvalidInput(
+                "snapshot token prefix is no longer retained".into(),
+            ));
+        }
+        // Validate every cache before mutating any layer, so restore remains atomic.
+        for state in &self.layer_states {
+            if let LayerState::Attention(state) = state {
+                if state.len() < snapshot.position {
+                    return Err(Error::InvalidInput(
+                        "snapshot attention prefix is unavailable".into(),
+                    ));
+                }
+            }
+        }
+        for (state, recurrent) in self.layer_states.iter_mut().zip(&snapshot.recurrent_states) {
+            match (state, recurrent) {
+                (LayerState::Attention(state), None) => state.truncate(snapshot.position)?,
+                (LayerState::Recurrent(state), Some(saved)) => state.copy_from(saved),
+                _ => unreachable!("checkpoint layer kinds are fixed within a session"),
+            }
+        }
+        self.position = snapshot.position;
+        self.committed_tokens.truncate(snapshot.position);
+        self.committed_logits.clone_from(&snapshot.committed_logits);
+        self.last_pass_logits.clear();
+        self.last_pass_logits
+            .extend(self.committed_logits.iter().cloned());
+        Ok(())
+    }
+
+    /// Digest the committed numeric state, independent of provisional rows.
+    pub fn state_digest(&self) -> u64 {
+        let mut digest = 0xcbf29ce484222325;
+        digest_bytes(&mut digest, &(self.position as u64).to_le_bytes());
+        for state in &self.layer_states {
+            state.update_digest(&mut digest);
+        }
+        if let Some(logits) = &self.committed_logits {
+            for value in logits {
+                digest_bytes(&mut digest, &value.to_bits().to_le_bytes());
+            }
+        }
+        digest
     }
 
     fn require_no_pending_pass(&self) -> Result<()> {
@@ -928,6 +1051,61 @@ mod tests {
             assert!(
                 matches!(rotary_width_from_header(&header), Err(Error::InvalidModel(message)) if message == expected)
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_owned_checkpoints_do_not_grow_session_buffers() {
+        let mut model = Model::from_container(
+            Container::from_bytes(crate::test_support::synthetic_model(
+                139,
+                &["linear_attention", "full_attention"],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        model.prefill(&[1, 2]).unwrap();
+        let capacities = |model: &Model| {
+            (
+                model.layer_states.capacity(),
+                model.committed_tokens.capacity(),
+                model.committed_logits.as_ref().unwrap().capacity(),
+                model.last_pass_logits.capacity(),
+                model
+                    .layer_states
+                    .iter()
+                    .map(|state| match state {
+                        LayerState::Attention(state) => state.capacity(),
+                        LayerState::Recurrent(state) => state.allocated_bytes(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let expected = capacities(&model);
+        let saved = model.snapshot().unwrap();
+        let snapshot_capacities = (
+            saved.tokens.capacity(),
+            saved.recurrent_states.capacity(),
+            saved.committed_logits.as_ref().unwrap().capacity(),
+        );
+        for _ in 0..64 {
+            let snapshot = model.snapshot().unwrap();
+            assert_eq!(capacities(&model), expected);
+            assert_eq!(
+                (
+                    snapshot.tokens.capacity(),
+                    snapshot.recurrent_states.capacity(),
+                    snapshot.committed_logits.as_ref().unwrap().capacity(),
+                ),
+                snapshot_capacities
+            );
+            model.restore(&saved).unwrap();
+            assert_eq!(capacities(&model), expected);
         }
     }
 }

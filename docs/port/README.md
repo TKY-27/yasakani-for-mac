@@ -104,7 +104,8 @@ are unsafe solely because callers must keep the backing weights file
 unchanged and untruncated until model drop. The engine offers `prefill`,
 `row_logits`, `logits`, `position`, `reset`, `context_capacity`,
 `dimensions`, `rows_per_pass`, `kv_mode`, `backend`, `device` and measured
-`pass_timings`. It has no provisional, commit, draft or speculation API.
+`pass_timings`. D16 adds `run_provisional`, `commit`, `discard_provisional`,
+`snapshot`, `restore`, and the shared `yskn_ref::speculation::generate` loop.
 See D11 for the causal attention and parallelism contract and D14 for the
 backends and the parallel recurrent heads.
 
@@ -388,3 +389,80 @@ tests need no artifact files or network. On the real files one scalar
 `propose` takes about 90 seconds and about 1.6 GB resident.
 The scalar reference intentionally remains slow; no main capture wiring,
 speculation loop, 16-row option or HCAP side policy is included.
+
+
+## Lossless generation and prompt reuse (D16)
+
+Both models implement `speculation::Verifier`. `generate` accepts any `Proposer`
+and a `Sampler` (greedy or seeded), a nonempty known prompt tail and
+`GenerationLimits`. Prefill **except the last prompt token** first: that token
+is pending and becomes verification row zero. The result contains new token IDs
+only; its last ID remains pending. Thus `position` advances once per returned
+ID, including EOS or a callback cancellation token, identically with K=0.
+`max_new_tokens=0` runs no pass. Callbacks return false to cancel; EOS IDs are
+caller parameters. Both stop immediately after selecting a token and commit
+only its consumed predecessors. `max_draft_tokens`, remaining output room,
+context capacity and verifier pass width jointly bound every proposal.
+
+`NoProposer`, `ScriptProposer` and `NgramProposer::new(n,k)` are supplied.
+N-grams copy only known continuation from the most recent earlier exact match;
+there is no neural model or upstream adaptive-width/source policy in this loop.
+Statistics report verified rows, passes, matching guesses, confirmed tokens per
+pass and elapsed time including commit/callbacks. A terminal matching guess
+counts as accepted even though the final selected token stays pending.
+
+Engine `run_provisional` accepts 1..=`rows_per_pass` rows, never advances
+position, and rejects an existing pending pass. `commit(k)` consumes exactly
+k rows including row zero; zero discards. `prefill_with_logits(tokens,
+LogitRows::{All,Last,None})` commits arbitrary-length prompts atomically;
+`prefill` preserves the scoring default All. Last computes the vocabulary head
+only once at the end, None skips it and clears predictions. Empty prefill is
+a no-op. `row_logits` includes only requested rows. Following continuation is
+identical in all three modes.
+
+`snapshot()?` returns an owned value containing recurrent matrices/history,
+position, token prefix and the committed prediction. Neither model copies
+attention in a snapshot. `restore(&snapshot)` truncates attention and reinstalls
+recurrence/prediction. It rejects pending passes, another session, a reset,
+a future position, or a changed prefix. Keep only checkpoints you need: each
+owned value costs another recurrent state, and is freed on drop. Restoring
+invalidates later checkpoints until their exact token prefix is present again.
+`session_memory()` reports persistent payload/capacities; `state_digest()`
+hashes committed numeric bits (all cache codes/scales, recurrence/history,
+position and last committed prediction) without allocation. This diagnostic
+FNV-1a value is not a cryptographic identity or a weight-file checksum.
+
+All commands below are offline and must run serially. The real-model commands
+are for the orchestrator; brief 05e never opens released weights.
+
+```sh
+export CARGO_NET_OFFLINE=true
+MODEL_FOLDER=/path/to/model-folder
+# Scalar oracle is dropped before loading the mapped engine. Exercise partial,
+# zero and full commit with --accept 2, 0 and 3 respectively in all modes.
+for kv in int8 int8-profile kv5; do
+  cargo run --release -p yskn-engine --example verify_speculation -- \
+    "$MODEL_FOLDER" --tokens 1,2,3 --accept 2 --backend metal --kv "$kv" || exit
+done
+
+# Compare stdout's first line (IDs); statistics/times may differ.
+cargo run --release -p yskn-engine --example generate -- \
+  "$MODEL_FOLDER" --tokens 1,2,3,1,2,3,1 --max-new 32 --draft none --greedy --backend metal --kv kv5
+cargo run --release -p yskn-engine --example generate -- \
+  "$MODEL_FOLDER" --tokens 1,2,3,1,2,3,1 --max-new 32 --draft ngram --k 7 --greedy --backend metal --kv kv5
+# Repeat both commands replacing --greedy with --seed 17, then --seed 11259375.
+# Optional --eos 248046,248044 selects the model's stopping IDs.
+
+# Synthetic timing only: create a fresh directory and delete its file afterwards.
+# Replace FILE with a path inside that directory.
+cargo run --release -p yskn-engine --example synthetic_model -- FILE 8
+cargo run --release -p yskn-engine --example bench_speculation -- FILE --backend cpu --passes 7
+```
+
+`verify_speculation` checks every vocabulary bit for provisional, committed and
+continuation rows plus the full committed-state digest against the scalar
+reference. It deliberately heap-loads the scalar weights first and releases
+them before mapping the engine. Use `--backend cpu` too. `bench_speculation`
+reports widths 1/2/4/8, full and half-prefix commit costs and a checkpoint-copy
+cost proxy for the rejected per-row snapshot design. See D16 for measured
+memory, timings and verification boundaries.
