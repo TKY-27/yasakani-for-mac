@@ -314,6 +314,14 @@ impl Proposer for Drafts {
             Self::Both(p) => p.propose(h, last, max),
         }
     }
+    fn free_guesses(&mut self, h: &[u32], last: u32, max: usize) -> Vec<u32> {
+        match self {
+            Self::None(p) => p.free_guesses(h, last, max),
+            Self::Ngram(p) => p.free_guesses(h, last, max),
+            Self::Neural(p) => p.free_guesses(h, last, max),
+            Self::Both(p) => p.free_guesses(h, last, max),
+        }
+    }
     fn synchronize<V: Verifier>(&mut self, v: &mut V) -> yskn_ref::Result<()> {
         match self {
             Self::None(p) => p.synchronize(v),
