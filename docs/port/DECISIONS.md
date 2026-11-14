@@ -2329,6 +2329,245 @@ additional unsafe assembly/scratch and the short-context regression. The
 experiment was removed; the final source is the previously fully verified
 version. The trial binaries/logs are retained only in ignored local evidence.
 
+### D20 round four: compact attention tiles and finer tasks (brief 07h)
+
+The first measurement preceded algorithm changes. The unchanged stage harness
+at this worktree's starting revision measured 181.890 / 188.685 ms at
+32768/1, 87.595 / 93.782 ms at 2000/16, and 319.910 / 321.752 ms at
+32768/4 (minimum / median of five, excluding warmup). One-minute load was
+3.27, 2.32 and 2.32 -> 3.10 respectively. These are the D20 stage-only
+real-header/norm/profile cases, with synthetic projected operands; they do
+not time real-token prefill, projections or final inverse rotation/gating.
+
+A separate, uncommitted diagnostic build times tile loading, score formation,
+online softmax/exp/BF16 weights, value accumulation/finite checks, and each
+worker task. It accumulates per-task phase times in thread-local storage and
+publishes one record per task. Setup and combination retain the harness's
+wall timers. Diagnostic phase times are **summed worker elapsed seconds**,
+not additive wall stages or hardware CPU counters; descheduling is included.
+Idle capacity is `10 * worker_dispatch_wall - sum(task_elapsed)`. Tail wait
+is summed from each active worker's last task end to the layer's last task
+end. The former also includes dispatch and workers not scheduled by the OS;
+the latter excludes waiting inside a task. Instrumented totals must not be
+substituted for the uninstrumented performance comparison. Before, tile-load
+time includes allocation and zeroing; after, fill time excludes the reusable
+buffer allocation (in other task time). Before, shared tile construction is
+in caller setup; after, it is included in worker loading time.
+
+In the initial diagnostic at 32768/1, approximately 1.09 of 1.67 summed
+worker seconds was loading/widening/transposing tiles, versus 0.18 for
+scores, 0.07 for softmax and 0.24 for values/checks. The original 32 tasks
+were already dynamically claimed by `map_range`'s atomic counter, with
+results indexed independently of completion order. They were not equal
+static assignments. On the lightly loaded first profile, faster workers
+completed roughly 65--78 tasks per pass and slower workers 33--49; this is
+not a measurement of physical core affinity. Idle capacity was about 0.21
+worker-seconds per pass. At 2000/16 loading was only about 0.037 of 0.76
+worker-seconds; scores and values/checks cost about 0.27 and 0.23 respectively.
+Thus fixing only DRAM bandwidth or only the pool's claiming policy would
+miss the principal costs.
+
+The retained implementation:
+
+- Holds temporary keys and values as exact BF16 bit patterns, about 32 KiB
+  per tile (33,024 bytes with scales), and widens directly into NEON registers
+  at consumption. Packed cache bases already have this representation; every
+  signed int8 is exactly representable in BF16. No arithmetic rounding is
+  introduced. Four keys are transposed in registers, without a second FP32
+  staging tile. Bounded prefetch hints resolve the live cache rows before
+  consuming them. Int8 loads at the last four channels read exactly four bytes.
+- Reuses an owned tile within a task, allocating it only if an unshared tile
+  is encountered. This removes repeated allocation, full zeroing and temporary
+  copies from the context scan. Stale lanes in a reused tile are invisible.
+- Uses 32 consecutive split ranges per KV head (128 tasks at the real shape).
+  The existing pool dynamically claims them. A `OnceLock` for each shared
+  boundary tile lets its first consumer construct it on a worker; all other
+  consumers borrow that single immutable copy. Initial construction no longer
+  serially loads every boundary tile. Completion order cannot alter a split's
+  ascending tile visits or its index in the final combination.
+- Vectorizes edge score groups too. The up-to-three extra lanes read only
+  initialized tile storage; their products never enter the visible scores,
+  finite validation, probabilities or values. Masked value arithmetic is still
+  skipped. Each visible score retains all 256 ascending separate multiply/add
+  steps. Value accumulators retain eight independent four-channel vectors,
+  original key order, and separately rounded operations.
+- Reuses the existing `FastMath::finite` implementation for wide finite scans.
+  It returns the same context error when any lane is nonfinite; small scans
+  remain scalar. Portable exp, online softmax, BF16 prefix weights, FP32 self,
+  means, padding and split reduction are unchanged.
+
+The reference implementation, forced-off route, cache format, committed state,
+snapshots and partial-commit machinery are unchanged. D13 persistent growth
+is zero: 89,600 allocated bytes/token for the real profile. Parallel failures
+still replay read-only scalar heads to select the original first error.
+The existing independent scalar-oracle tests now also execute grouped tasks
+with 1/4/10 workers, comparing with deliberately reversed serial completion
+before comparing every final output bit with the reference. Their all-mode,
+mixed-side, per-row prefix, tile and 31/42-split boundary coverage remains.
+Masked-tile tests now poison both invisible bases and scales with NaNs while
+requiring the negative-zero numerator. Existing failing-row/state tests remain.
+
+Dominant byte and arithmetic accounting (decimal GB, **per pass**; divide by
+rows for amortized per-row values):
+
+| Context / rows | Cache bases + scales read | FP32 scratch fill writes before | BF16 scratch fill writes after | Scratch K/V consumption before / after | Numerator read/write/check traffic | Semantic score + value GFLOP |
+|---|---:|---:|---:|---:|---:|---:|
+| 32768 / 1 | 2.063598 | 4.294967 | 2.147484 | 25.769804 / 12.909281 | 2.091909 | 12.884902 |
+| 2000 / 16 | 0.126897 | 0.264110 | 0.132055 | 25.260196 / 12.917932 | 2.923561 | 12.630098 |
+| 32768 / 4 | 2.063786 | 4.295361 | 2.147680 | 103.083934 / 51.640664 | 8.373535 | 51.541967 |
+
+Scratch reads after include padded edge score lanes; values read only visible
+lanes. The added edge score arithmetic is 0.024379, 0.287834 and 0.098697
+GFLOP respectively. Fill writes exclude scales (eight bytes per cached key)
+and zero initialization. Before, full-tile zeroing alone additionally writes
+4.311745 / 0.265273 / 4.315955 GB, before any compiler-generated stack/copy
+traffic. After, owned tiles are zeroed at most once per task, plus shared
+boundary tiles once: 0.131039 GB in each of these three cases. There is no
+context-length-times full scratch zeroing.
+Numerator accounting includes 2,048 bytes for load/store accumulation, 2,048
+for softmax rescaling and 1,024 for validation per query/split/tile call.
+Those call counts are 408,576 / 571,008 / 1,635,456. Each also performs
+256 numerator rescale multiplies, a 32-score maximum fold, and 33 portable
+exponentials including rescale (13,483,008 / 18,843,264 / 53,970,048 prefix
+exponentials per pass). The GFLOP column excludes those operations, score
+scaling, weight conversion, self, means and combination. FP32 score/query/weight
+arrays, split metadata, self/mean/final-combination traffic and allocator
+metadata are additional. Cache row/token structs alone contain another
+4,864 bytes/context-token over all layers. These are logical accessed-byte
+counts, not measured DRAM transfers: cache-line fetches, compiler-elided
+scratch, write allocation and prefetch effectiveness require counters.
+
+The 2.064 GB cache stream alone has an 18.76 ms ideal read floor at the
+brief's approximately 110 GB/s. It cannot explain the original 182 ms
+attention minimum. The temporary tile traffic and instruction work are
+material; comparing only cache operand GB/s with streaming DRAM GB/s is
+misleading. Register-only eight-chain NEON microbenchmarks explicitly use
+separate `fmul` and `fadd` (assembly inspected). A single foreground thread
+reached 46.3 GFLOP/s; sustained ten-worker execution delivered approximately
+270 GFLOP/s. Assuming four P cores at 46 GFLOP/s, the residual estimate for
+six E cores is about 14.3 GFLOP/s each. This is an inferred capacity model,
+not an affinity-controlled E-core measurement. Background QoS alone did not
+isolate E cores, and `taskpolicy -b` was denied by the sandbox. The committed
+ignored `bench_attention_core_rates` additionally measures actual hot-tile
+score widths 4/16/32 and value accumulation without opening model files.
+A pure-arithmetic 12.63 GFLOP floor at 270 GFLOP/s is 46.8 ms, before
+softmax, conversions, data movement, dispatch, allocation and combination.
+That empirical floor is not a proof of the machine's maximum possible rate.
+
+Experiments retaining FP32 scratch, increasing value accumulators to sixteen
+vectors, and using sixteen tasks/head did not establish a better overall
+tradeoff. Sixteen accumulator vectors regressed the short-context runs.
+Only the eight-vector, compact-tile, 32-task/head implementation is retained.
+
+The paired final diagnostic runs (20:06 JST, 2026-11-14; load about 14--16)
+gave the following **medians of five**. Worker entries are summed seconds;
+setup/combination are wall seconds. Independently selected medians need not
+sum to the median total.
+
+| Component | 32768/1 before | 32768/1 after | 2000/16 before | 2000/16 after |
+|---|---:|---:|---:|---:|
+| Cache read/transpose/fill | 1.257447 | 0.325600 | 0.043235 | 0.016447 |
+| Scores, including scaling/check | 0.214101 | 0.275196 | 0.297653 | 0.272935 |
+| Online softmax, exp, BF16 weights | 0.085215 | 0.108079 | 0.109355 | 0.115745 |
+| Value accumulation + finite checks | 0.293759 | 0.278847 | 0.277818 | 0.265824 |
+| Other task work, allocation, self, means, waits | 0.106756 | 0.073742 | 0.106225 | 0.116702 |
+| Total task elapsed | 1.900656 | 1.098139 | 0.833899 | 0.793887 |
+| Tail wait after each worker's last task | 0.253097 | 0.061518 | 0.148079 | 0.048169 |
+| Unoccupied/undispatched worker capacity | 0.428451 | 0.198116 | 0.223762 | 0.130654 |
+| Caller setup (wall) | 0.004057 | 0.000436 | 0.005532 | 0.000765 |
+| Split collect/combine (wall) | 0.004569 | 0.002490 | 0.005759 | 0.006087 |
+| Instrumented total (wall) | 0.244387 | 0.135307 | 0.123591 | 0.109114 |
+
+The short case's per-output-row worker figures are the corresponding entries
+divided by sixteen. Longer-context load/transpose work falls by about 74%,
+and tail wait falls by about 76% (67% for the short case). Extra register
+widening trades some score cost for much less tile construction/traffic.
+The short case now spends about 68% of task time in score/value work and
+another 15% in softmax; loading accounts for only about 2%. This is an
+arithmetic/instruction and local-scratch workload rather than a DRAM-streaming
+limit. The measured hardware capacity model explains why the 60 ms goal is
+tight: even the 46.8 ms arithmetic-only floor leaves just 13.2 ms for all
+other stages. It does **not** establish a hard hardware impossibility proof;
+physical core placement, cache-line traffic and OS descheduling remain
+unmeasured. No speedup below the observed spread is asserted.
+
+The earlier final-diagnostic attempt at lower average load is also retained:
+32768/1 before 188.471 / 197.483 ms, after 156.525 / 238.183 ms. Its after
+run had about 0.996 worker-seconds of idle capacity versus 0.234 before.
+This apparent regression is not discarded from the evidence and illustrates
+why load average alone cannot certify a quiet measurement. It is not used
+to claim an arithmetic or memory ceiling.
+
+Final uninstrumented comparisons, 20:11--20:12 JST, 2026-11-14. Each cell is
+minimum / median seconds from five timed passes after one excluded warmup.
+These pairs ran after the proof commands, with no concurrent build/test from
+this task. The one-minute load at entry/exit is shown; every raw sample and
+all three uptime load averages are retained in the local evidence.
+
+| Repeat | Context / rows | Before min / median (s) | After min / median (s) | Before load | After load |
+|---|---|---:|---:|---|---|
+| 1 | 2000 / 16 | 0.282149 / 0.314090 | 0.288038 / 0.338177 | 15.17 -> 16.04 | 16.04 -> 20.04 |
+| 1 | 32768 / 1 | 0.263266 / 0.279591 | 0.129306 / 0.138035 | 20.04 -> 19.88 | 19.88 -> 19.88 |
+| 1 | 32768 / 4 | 0.609675 / 0.654418 | 0.465605 / 0.470504 | 19.88 -> 19.81 | 19.66 -> 19.66 |
+| 2 | 2000 / 16 | 0.268199 / 0.304028 | 0.175102 / 0.261741 | 19.66 -> 18.41 | 18.41 -> 20.46 |
+| 2 | 32768 / 1 | 0.426122 / 0.464953 | 0.345219 / 0.395254 | 20.46 -> 20.90 | 20.90 -> 21.95 |
+| 2 | 32768 / 4 | 0.892030 / 1.011696 | 0.794600 / 0.821517 | 21.95 -> 24.76 | 24.76 -> 26.50 |
+
+Neither target is established by these final high-load runs. The first long
+one-row pair has a clear within-pair gap, but the second pair and the short
+case show substantial contention; no stable percentage gain is claimed for
+the short case. The first long after minimum corresponds to 15.96 logical
+cache GB/s and 99.65 semantic GFLOP/s, far below both 110 GB/s streaming and
+the approximately 270 GFLOP/s register-only capacity model. Thus these final
+runs do not demonstrate a hard hardware ceiling.
+
+Earlier lower-load trials of the same compact-tile/32-part/eight-vector
+design (before lazy owned-buffer allocation and the final cold-lock test
+strengthening) reached 91.577 / 91.910 ms at 32768/1 and 77.874 / 78.108 ms
+at 2000/16, at load 4.79. Another compact trial gave 92.503 / 94.700 and
+92.832 / 93.151 ms in repeated long-context runs. These support the long
+target as achievable, but are not substituted for final-revision timings.
+The short target remains unmet. Quiet-machine confirmation, direct P/E-core
+rates and physical cache-line/DRAM accounting remain outstanding.
+
+Commands (from the worktree root):
+
+```sh
+export CARGO_NET_OFFLINE=true
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p yskn-ref -p yskn-format -p yskn-engine --release
+YSKN_CPU_STAGES=reference cargo test -p yskn-engine --release
+# Build/retain the baseline and final library test executables as before/after.
+cargo test --release -p yskn-engine --lib --no-run
+# run.py acquires the shared directory with atomic mkdir, retries only
+# FileExistsError, and rmdirs only its own lock in finally, including failure.
+# It prints date/uptime, then sets:
+# YSKN_MODEL_DIR=$HOME/models/qwen38-speed
+# YSKN_BENCH_PASSES=5 YSKN_BENCH_THREADS=10
+# YSKN_BENCH_CONTEXT=$context YSKN_BENCH_ROWS=$rows
+# and runs: $binary bench_real_attention_shapes --ignored --nocapture
+python3 .work/07h-evidence/run.py .work/07h-evidence/before 2000 16
+python3 .work/07h-evidence/run.py .work/07h-evidence/after 2000 16
+# Repeat before/after for 32768 1 and 32768 4, then repeat all three pairs.
+# Diagnostic builds use the same runner and lock, at 32768/1 and 2000/16:
+python3 .work/07h-evidence/run.py .work/07h-evidence/before-profile-tail 32768 1
+python3 .work/07h-evidence/run.py .work/07h-evidence/after-profile-tail 32768 1
+# No model files or lock needed for the hot-cache arithmetic microbenchmark:
+cargo test --release -p yskn-engine --lib bench_attention_core_rates -- --ignored --nocapture
+```
+
+The baseline binary is from `21291a530b28cb7e8dbb163cd1069fc44507255d`.
+The lock path is `/Users/anag2bgod/Projects/yasakani-for-mac/.work/model.lock`;
+model files were read only and were never copied. Diagnostic injection scripts
+and binaries are in ignored `.work/07h-evidence/`; timers are not in production
+source. The four proof commands passed: 280 unfiltered tests in the
+combined suite and 109 in forced-reference mode, zero failures; three explicit
+benchmarks ignored in each. Filtered subprocess repetitions are not counted
+again. GPU cases cannot prove Metal execution in this sandbox. Real-token
+end-to-end inference, trained-model scalar logits and physical hardware
+counters were not verified.
+
 ## D21 — Fast draft in the product and an adaptive draft depth
 
 Decision (2026-11-14, brief 06k). The product runs the fast neural draft

@@ -290,11 +290,8 @@ fn xor_sum4(mut partial: [f32; 4]) -> f32 {
 }
 
 fn finite(values: &[f32], context: &'static str) -> Result<()> {
-    if values.iter().all(|value| value.is_finite()) {
-        Ok(())
-    } else {
-        Err(Error::NonFinite(context))
-    }
+    use yskn_ref::portable_math::Elementwise;
+    super::math::FastMath::finite(values, context)
 }
 
 #[cfg(test)]
@@ -570,26 +567,43 @@ mod tests {
                                 );
                             }
                         }
-                        let operands = prepared
-                            .iter()
-                            .enumerate()
-                            .flat_map(|(i, p)| {
-                                let layer = &layer;
-                                let pass_state = &pass_state;
-                                (0..4).map(move |head| {
-                                    layer
-                                        .head_operands(pass_state, position + i, p, head)
-                                        .unwrap()
+                        let operands = || {
+                            prepared
+                                .iter()
+                                .enumerate()
+                                .flat_map(|(i, p)| {
+                                    let layer = &layer;
+                                    let pass_state = &pass_state;
+                                    (0..4).map(move |head| {
+                                        layer
+                                            .head_operands(pass_state, position + i, p, head)
+                                            .unwrap()
+                                    })
                                 })
-                            })
-                            .collect();
-                        let batch = grouped::Batch::new(operands, 2);
+                                .collect()
+                        };
+                        let batch = grouped::Batch::new(operands(), 2);
                         // Reverse task completion order must not change split combination.
                         let parts = (0..batch.tasks())
                             .rev()
                             .map(|task| batch.run(task).unwrap())
                             .collect();
                         let actual = batch.finish(parts).unwrap();
+                        // Compare real pool scheduling against the reversed completion
+                        // order, then compare that result to the independent scalar oracle.
+                        for workers in [1, 4, 10] {
+                            // Fresh locks also exercise concurrent first construction.
+                            let batch = grouped::Batch::new(operands(), 2);
+                            let mut pool =
+                                crate::Engine::new(crate::Kernel::Portable, workers).unwrap();
+                            let parts = pool
+                                .map_range(0..batch.tasks(), |task| batch.run(task))
+                                .unwrap();
+                            let parallel = batch.finish(parts).unwrap();
+                            for (got, expected) in parallel.iter().zip(&actual) {
+                                assert_eq!(bits(got), bits(expected), "workers={workers}");
+                            }
+                        }
                         for (i, attended) in actual.into_iter().enumerate() {
                             let expected = layer
                                 .output_head(&pass_state, position + i / 4, &prepared[i / 4], i % 4)
