@@ -582,6 +582,68 @@ mod tests {
     }
 
     #[test]
+    fn grouped_error_priority_follows_scalar_rows_before_task_order() {
+        use yskn_ref::attention::AttentionDimensions;
+        let layer = Attention::new(
+            AttentionDimensions {
+                query_heads: 12,
+                kv_heads: 2,
+                head_dim: 256,
+                rotary_dim: 64,
+            },
+            vec![1e37; 256],
+            vec![1e37; 256],
+            1e-6,
+        )
+        .unwrap();
+        let good = vec![0.0; 12 * 512];
+        let keys = vec![1e-20; 512];
+        let values = vec![0.25; 512];
+        let mut state = layer.new_state().unwrap();
+        // A zero KV head 1 prefix lets row 0 reach its overflowing self score.
+        let mut prefix_keys = keys.clone();
+        prefix_keys[256..].fill(0.0);
+        let first = layer.prepare_row(0, &good, &prefix_keys, &values).unwrap();
+        layer.output_row(&state, 0, &first).unwrap();
+        layer.append_prepared(&mut state, 0, &first).unwrap();
+        let mut prepared = Vec::new();
+        for (row, head) in [6, 0].into_iter().enumerate() {
+            let mut query = good.clone();
+            query[head * 512..head * 512 + 256].fill(1e-20);
+            let p = layer.prepare_row(row + 1, &query, &keys, &values).unwrap();
+            layer.append_prepared(&mut state, row + 1, &p).unwrap();
+            prepared.push(p);
+        }
+        // Row 1's KV head 0 tasks precede row 0's KV head 1 tasks.
+        assert!(matches!(
+            layer.output_row(&state, 2, &prepared[1]),
+            Err(Error::NonFinite("attention prefix score"))
+        ));
+        let expected = prepared
+            .iter()
+            .enumerate()
+            .map(|(row, p)| layer.output_row(&state, row + 1, p))
+            .collect::<Result<Vec<_>>>()
+            .unwrap_err();
+        assert!(matches!(expected, Error::NonFinite("attention self score")));
+        let before = state.clone();
+        for threads in [1, 4, 10] {
+            let mut engine = Compute::new(
+                crate::Engine::new(crate::Kernel::Portable, threads).unwrap(),
+                crate::Backend::Cpu,
+            )
+            .unwrap();
+            let actual = output_rows(&mut engine, &layer, &state, 1, &prepared).unwrap_err();
+            assert_eq!(
+                actual.to_string(),
+                expected.to_string(),
+                "{threads} workers"
+            );
+            assert_eq!(state, before);
+        }
+    }
+
+    #[test]
     fn grouped_masks_skip_poisoned_scales_and_preserve_negative_zero() {
         if !super::super::super::neon_available() {
             return;

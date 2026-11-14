@@ -2561,8 +2561,7 @@ The baseline binary is from `21291a530b28cb7e8dbb163cd1069fc44507255d`.
 The lock path is `/Users/anag2bgod/Projects/yasakani-for-mac/.work/model.lock`;
 model files were read only and were never copied. Diagnostic injection scripts
 and binaries are in ignored `.work/07h-evidence/`; timers are not in production
-source. All final source files were restored byte-for-byte before the final
-proof/build. The four proof commands passed: 280 unfiltered tests in the
+source. The four proof commands passed: 280 unfiltered tests in the
 combined suite and 109 in forced-reference mode, zero failures; three explicit
 benchmarks ignored in each. Filtered subprocess repetitions are not counted
 again. GPU cases cannot prove Metal execution in this sandbox. Real-token
