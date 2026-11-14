@@ -9,9 +9,13 @@ repository.workspace = true
 [dependencies]
 bytes = "1"
 http-body-util = "0.1.5"
-hyper = { version = "1.12", default-features = false, features = ["http1", "server", "client"] }
+hyper = { version = "1.12", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 serde_json.workspace = true
 tokio = { version = "1.54", default-features = false, features = ["rt", "net", "sync", "time", "signal", "macros", "io-util"] }
 yskn-text = { version = "0.1.0", path = "../yskn-text" }
 sha2.workspace = true
+
+# Only the tests drive the server through an HTTP client.
+[dev-dependencies]
+hyper = { version = "1.12", default-features = false, features = ["http1", "client"] }
