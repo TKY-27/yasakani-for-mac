@@ -39,7 +39,7 @@ impl Proposer for Draft {
             Self::Both(proposer) => proposer.propose(history, last, max),
         }
     }
-    fn synchronize<V: Verifier>(&mut self, verifier: &V) -> yskn_ref::Result<()> {
+    fn synchronize<V: Verifier>(&mut self, verifier: &mut V) -> yskn_ref::Result<()> {
         match self {
             Self::None(proposer) => proposer.synchronize(verifier),
             Self::Ngram(proposer) => proposer.synchronize(verifier),
@@ -57,7 +57,7 @@ impl Proposer for Draft {
     }
     fn propose_with<V: Verifier>(
         &mut self,
-        verifier: &V,
+        verifier: &mut V,
         history: &[u32],
         last: u32,
         max: usize,

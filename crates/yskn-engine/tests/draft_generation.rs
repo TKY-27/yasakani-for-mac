@@ -210,13 +210,13 @@ fn check_backend(backend: Backend) {
                 let mut main = fixture.engine(backend, mode);
                 main.set_capture(proposer.capture_options()).unwrap();
                 main.prefill(&prompt[..3]).unwrap();
-                let prefix = proposer.snapshot_session(&main).unwrap();
+                let prefix = proposer.snapshot_session(&mut main).unwrap();
                 assert_eq!(
                     engine_decode(&mut main, &mut proposer, &sampler, &prompt, k, 5),
                     first_expected,
                     "{backend:?} {mode:?} seed={seed:?} K={k} first request"
                 );
-                let checkpoint = proposer.snapshot_session(&main).unwrap();
+                let checkpoint = proposer.snapshot_session(&mut main).unwrap();
                 let ring = proposer.draft().snapshot();
                 assert_eq!(
                     engine_decode(&mut main, &mut proposer, &sampler, &[last], k, 8),
@@ -259,4 +259,45 @@ fn metal_neural_generation_is_lossless_across_joint_restore_and_reused_prefix() 
         return;
     }
     println!("skipped: no Metal device");
+}
+
+#[test]
+fn engine_handover_counts_memory_reseeds_long_suffix_and_detects_main_only_restore() {
+    let fixture = Fixture::new();
+    let artifact = draft_artifact();
+    let head = support::draft::shead(37);
+    let mut main = fixture.engine(Backend::Cpu, KvMode::Int8);
+    let mut reference = fixture.reference(KvMode::Int8);
+    let mut neural = proposer(&artifact, &head, 3, DraftChoice::Greedy);
+    reference.set_capture(neural.capture_options()).unwrap();
+    main.set_capture(neural.capture_options()).unwrap();
+    main.prefill(&[3; 12]).unwrap();
+    reference.prefill(&[3; 12]).unwrap();
+    assert_eq!(main.captured_rows(), reference.captured_rows());
+    assert!(main.session_memory().capture_bytes >= 8 * 2 * 512 * 4);
+    assert!(main.snapshot().unwrap().capture_bytes() >= 8 * 2 * 512 * 4);
+    let prefix = neural.snapshot_session(&mut main).unwrap();
+    assert_eq!(main.session_memory().capture_bytes, 0);
+    assert_eq!(main.snapshot().unwrap().capture_bytes(), 0);
+    main.prefill(&[7; 17]).unwrap();
+    reference.prefill(&[7; 17]).unwrap();
+    assert_eq!(main.captured_rows(), reference.captured_rows());
+    neural.synchronize(&mut main).unwrap();
+    assert_eq!(neural.draft().position(), 29);
+    assert_eq!(main.session_memory().capture_bytes, 0);
+    neural.restore_session(&mut main, &prefix).unwrap();
+    assert_eq!(main.snapshot().unwrap().capture_bytes(), 0);
+    let main_only = main.snapshot().unwrap();
+    main.prefill(&[11; 3]).unwrap();
+    neural.synchronize(&mut main).unwrap();
+    main.restore(&main_only).unwrap();
+    main.prefill(&[13; 5]).unwrap();
+    assert!(neural.synchronize(&mut main).is_err());
+    neural.reset();
+    main.reset().unwrap();
+    main.prefill(&[3; 3]).unwrap();
+    neural.synchronize(&mut main).unwrap();
+    main.reset().unwrap();
+    main.prefill(&[7; 5]).unwrap();
+    assert!(neural.synchronize(&mut main).is_err());
 }

@@ -11,6 +11,7 @@ use std::rc::Rc;
 #[derive(Clone, Debug)]
 pub struct DraftProposerSnapshot {
     ring: DraftSnapshot,
+    context_identity: Option<std::sync::Arc<()>>,
     owner: Rc<()>,
 }
 
@@ -24,6 +25,7 @@ pub struct DraftProposer {
     draft: Draft,
     k: usize,
     choice: DraftChoice,
+    context_identity: Option<std::sync::Arc<()>>,
     owner: Rc<()>,
 }
 impl DraftProposer {
@@ -35,6 +37,7 @@ impl DraftProposer {
             draft,
             k,
             choice,
+            context_identity: None,
             owner: Rc::new(()),
         })
     }
@@ -56,6 +59,7 @@ impl DraftProposer {
     pub fn snapshot(&self) -> DraftProposerSnapshot {
         DraftProposerSnapshot {
             ring: self.draft.snapshot(),
+            context_identity: self.context_identity.clone(),
             owner: Rc::clone(&self.owner),
         }
     }
@@ -65,15 +69,18 @@ impl DraftProposer {
                 "draft checkpoint belongs to another proposer or reset".into(),
             ));
         }
-        self.draft.restore(&snapshot.ring)
+        self.draft.restore(&snapshot.ring)?;
+        self.context_identity = snapshot.context_identity.clone();
+        Ok(())
     }
     pub fn reset(&mut self) {
         self.draft.reset();
+        self.context_identity = None;
         self.owner = Rc::new(());
     }
     pub fn snapshot_session<V: CheckpointVerifier>(
         &mut self,
-        verifier: &V,
+        verifier: &mut V,
     ) -> std::result::Result<SessionSnapshot<V::Snapshot>, GenerationError<V::Error>> {
         self.synchronize(verifier)
             .map_err(GenerationError::Proposer)?;
@@ -97,9 +104,11 @@ impl DraftProposer {
             .restore(&snapshot.verifier)
             .map_err(GenerationError::Verifier)?;
         self.restore(&snapshot.proposer)
-            .map_err(GenerationError::Proposer)
+            .map_err(GenerationError::Proposer)?;
+        self.context_identity = verifier.context_identity();
+        Ok(())
     }
-    pub fn synchronize<V: Verifier>(&mut self, verifier: &V) -> Result<()> {
+    pub fn synchronize<V: Verifier>(&mut self, verifier: &mut V) -> Result<()> {
         let d = self.draft.dimensions();
         let main = verifier
             .dimensions()
@@ -117,15 +126,31 @@ impl DraftProposer {
                 "incompatible main/draft dimensions or captures".into(),
             ));
         }
+        let identity = verifier
+            .context_identity()
+            .ok_or_else(|| Error::InvalidInput("draft needs main context identity".into()))?;
+        if self
+            .context_identity
+            .as_ref()
+            .is_some_and(|old| !std::sync::Arc::ptr_eq(old, &identity))
+        {
+            return Err(Error::InvalidInput(
+                "main context restored or reset without the draft".into(),
+            ));
+        }
         if self.draft.position() > verifier.position() {
             return Err(Error::InvalidInput(
                 "restore the draft checkpoint with the main checkpoint".into(),
             ));
         }
         let rows = verifier.captured_rows();
-        if self.draft.position() == 0 && rows.first().is_some_and(|row| row.position > 0) {
+        if rows
+            .first()
+            .is_some_and(|row| row.position > self.draft.position())
+        {
             let first = rows[0].position;
-            // Older prompt rows have been overwritten; seed only a complete suffix.
+            // Upstream overwrites every older slot: projecting this complete suffix
+            // yields the identical ring even when an already-used draft lags behind.
             if rows.len() < d.window || first + rows.len() != verifier.position() {
                 return Err(Error::InvalidInput(
                     "incomplete draft prompt capture suffix".into(),
@@ -143,6 +168,8 @@ impl DraftProposer {
                 "draft context has missing committed rows".into(),
             ));
         }
+        self.context_identity = Some(identity);
+        drop(verifier.take_captured_rows());
         Ok(())
     }
     fn push(&mut self, row: &CapturedRow) -> Result<()> {
@@ -159,10 +186,18 @@ impl Proposer for DraftProposer {
     fn propose(&mut self, _history: &[u32], _last: u32, _max: usize) -> Vec<u32> {
         Vec::new()
     }
-    fn synchronize<V: Verifier>(&mut self, verifier: &V) -> Result<()> {
+    fn synchronize<V: Verifier>(&mut self, verifier: &mut V) -> Result<()> {
         DraftProposer::synchronize(self, verifier)
     }
     fn observe_committed(&mut self, rows: &[CapturedRow]) -> Result<()> {
+        if rows
+            .first()
+            .is_some_and(|row| row.position > self.draft.position())
+            && rows.len() >= self.draft.dimensions().window
+        {
+            // A bounded hand-over may cover a whole ring after a wide commit.
+            self.draft.reset_at(rows[0].position);
+        }
         for row in rows {
             self.push(row)?;
         }
@@ -170,7 +205,7 @@ impl Proposer for DraftProposer {
     }
     fn propose_with<V: Verifier>(
         &mut self,
-        verifier: &V,
+        verifier: &mut V,
         _history: &[u32],
         last: u32,
         max: usize,
@@ -217,7 +252,7 @@ impl CombinedProposer {
     }
     pub fn snapshot_session<V: CheckpointVerifier>(
         &mut self,
-        verifier: &V,
+        verifier: &mut V,
     ) -> std::result::Result<SessionSnapshot<V::Snapshot>, GenerationError<V::Error>> {
         self.draft.snapshot_session(verifier)
     }
@@ -239,7 +274,7 @@ impl Proposer for CombinedProposer {
     fn propose(&mut self, history: &[u32], last: u32, max: usize) -> Vec<u32> {
         self.ngram.propose(history, last, max)
     }
-    fn synchronize<V: Verifier>(&mut self, verifier: &V) -> Result<()> {
+    fn synchronize<V: Verifier>(&mut self, verifier: &mut V) -> Result<()> {
         self.draft.synchronize(verifier)
     }
     fn observe_committed(&mut self, rows: &[CapturedRow]) -> Result<()> {
@@ -247,7 +282,7 @@ impl Proposer for CombinedProposer {
     }
     fn propose_with<V: Verifier>(
         &mut self,
-        verifier: &V,
+        verifier: &mut V,
         history: &[u32],
         last: u32,
         max: usize,

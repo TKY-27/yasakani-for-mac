@@ -30,6 +30,8 @@ fn features(position: usize, token: u32) -> CapturedRow {
 // Independent scripted verifier: row p always selects token p+1, while features
 // encode both the position AND input token to distinguish rejected candidates.
 struct Main {
+    identity: std::sync::Arc<()>,
+    handed: usize,
     committed: Vec<CapturedRow>,
     pending: Vec<CapturedRow>,
     logits: Vec<Vec<f32>>,
@@ -38,6 +40,14 @@ struct Main {
 }
 impl Verifier for Main {
     type Error = Error;
+    fn context_identity(&self) -> Option<std::sync::Arc<()>> {
+        Some(self.identity.clone())
+    }
+    fn take_captured_rows(&mut self) -> Vec<CapturedRow> {
+        let rows = self.committed[self.handed..].to_vec();
+        self.handed = self.committed.len();
+        rows
+    }
     fn position(&self) -> usize {
         self.committed.len()
     }
@@ -45,7 +55,7 @@ impl Verifier for Main {
         32
     }
     fn captured_rows(&self) -> &[CapturedRow] {
-        &self.committed
+        &self.committed[self.handed..]
     }
     fn provisional_captures(&self) -> &[CapturedRow] {
         &self.pending
@@ -102,12 +112,12 @@ impl Proposer for ScriptedDraft {
     fn propose(&mut self, _: &[u32], _: u32, _: usize) -> Vec<u32> {
         unreachable!()
     }
-    fn synchronize<V: Verifier>(&mut self, verifier: &V) -> Result<()> {
+    fn synchronize<V: Verifier>(&mut self, verifier: &mut V) -> Result<()> {
         self.inner.synchronize(verifier)
     }
     fn propose_with<V: Verifier>(
         &mut self,
-        verifier: &V,
+        verifier: &mut V,
         _: &[u32],
         last: u32,
         max: usize,
@@ -151,6 +161,8 @@ impl Proposer for ScriptedDraft {
 fn ring_before_each_proposal_excludes_rejections_and_frontier_and_flushes_at_stop() {
     let inner = DraftProposer::new(draft(), 3, DraftChoice::Greedy).unwrap();
     let mut main = Main {
+        identity: std::sync::Arc::new(()),
+        handed: 0,
         committed: vec![features(0, 0), features(1, 1)],
         pending: vec![],
         logits: vec![],
@@ -213,6 +225,8 @@ fn long_prefill_ring_matches_every_prompt_row_pushed_and_snapshot_reset_ownershi
             .unwrap();
     }
     let main = Main {
+        identity: std::sync::Arc::new(()),
+        handed: 0,
         committed: (11..19).map(|p| features(p, p as u32)).collect(),
         pending: vec![],
         logits: vec![],
@@ -232,6 +246,9 @@ fn long_prefill_ring_matches_every_prompt_row_pushed_and_snapshot_reset_ownershi
     struct Suffix<'a>(&'a Main);
     impl Verifier for Suffix<'_> {
         type Error = Error;
+        fn context_identity(&self) -> Option<std::sync::Arc<()>> {
+            self.0.context_identity()
+        }
         fn position(&self) -> usize {
             19
         }
@@ -261,9 +278,25 @@ fn long_prefill_ring_matches_every_prompt_row_pushed_and_snapshot_reset_ownershi
         }
         fn discard(&mut self) {}
     }
-    inner.synchronize(&Suffix(&main)).unwrap();
+    inner.synchronize(&mut Suffix(&main)).unwrap();
     assert_eq!(inner.draft().snapshot(), expected.snapshot());
     assert_eq!(inner.ring_positions(), 11..19);
+    // A wide accepted pass hands over only its retained window, just as prefill does.
+    for position in 19..30 {
+        let row = features(position, position as u32);
+        expected
+            .push_context(
+                position,
+                ContextFeatures {
+                    values: &row.values,
+                },
+            )
+            .unwrap();
+    }
+    inner
+        .observe_committed(&(22..30).map(|p| features(p, p as u32)).collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(inner.draft().snapshot(), expected.snapshot());
     let saved = inner.snapshot();
     inner.reset();
     assert!(inner.restore(&saved).is_err());
@@ -273,7 +306,9 @@ fn long_prefill_ring_matches_every_prompt_row_pushed_and_snapshot_reset_ownershi
 fn combined_policy_uses_first_nonempty_source_and_keeps_neural_context_current() {
     use yskn_ref::speculation::{CombinedProposer, NgramProposer, ProposalOrder};
     let mut neural = DraftProposer::new(draft(), 3, DraftChoice::Greedy).unwrap();
-    let main = Main {
+    let mut main = Main {
+        identity: std::sync::Arc::new(()),
+        handed: 0,
         committed: vec![features(0, 0), features(1, 1)],
         pending: vec![],
         logits: vec![],
@@ -289,21 +324,26 @@ fn combined_policy_uses_first_nonempty_source_and_keeps_neural_context_current()
             epsilon: 1e-6,
         },
     };
-    let expected = neural.propose_with(&main, &[1, 2, 1], 2, 3).unwrap();
+    let expected = neural.propose_with(&mut main, &[1, 2, 1], 2, 3).unwrap();
     let mut ngram_first = CombinedProposer::new(
         NgramProposer::new(2, 3).unwrap(),
         neural,
         ProposalOrder::NgramFirst,
     );
     assert_eq!(
-        ngram_first.propose_with(&main, &[1, 2, 1], 2, 3).unwrap(),
+        ngram_first
+            .propose_with(&mut main, &[1, 2, 1], 2, 3)
+            .unwrap(),
         [1, 2]
     );
     assert_eq!(ngram_first.draft().draft().position(), 2);
     assert_eq!(
-        ngram_first.propose_with(&main, &[3, 4, 5], 2, 3).unwrap(),
+        ngram_first
+            .propose_with(&mut main, &[3, 4, 5], 2, 3)
+            .unwrap(),
         expected
     );
+    main.handed = 0; // An independent verifier copy supplies its prompt to the new draft.
     let neural = DraftProposer::new(draft(), 3, DraftChoice::Greedy).unwrap();
     let mut draft_first = CombinedProposer::new(
         NgramProposer::new(2, 3).unwrap(),
@@ -311,7 +351,9 @@ fn combined_policy_uses_first_nonempty_source_and_keeps_neural_context_current()
         ProposalOrder::DraftFirst,
     );
     assert_eq!(
-        draft_first.propose_with(&main, &[1, 2, 1], 2, 3).unwrap(),
+        draft_first
+            .propose_with(&mut main, &[1, 2, 1], 2, 3)
+            .unwrap(),
         expected
     );
 }

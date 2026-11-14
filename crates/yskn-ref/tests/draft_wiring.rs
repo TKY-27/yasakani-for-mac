@@ -236,8 +236,10 @@ fn synthetic_teacher_accepts_correct_captures_and_rejects_lagged_or_swapped_slot
         .collect();
     main.discard_provisional();
     assert_eq!(teacher, vec![0; 8]);
+    let prompt_checkpoint = main.snapshot().unwrap();
     let mut acceptance = Vec::new();
     for (wiring, state) in states.iter().enumerate() {
+        main.restore(&prompt_checkpoint).unwrap();
         let mut draft = draft_from(base_bytes.clone(), blank_head());
         // Correct wiring is exercised through the production capture hook.
         // Deliberately corrupted rings start at the same committed position.
@@ -245,9 +247,11 @@ fn synthetic_teacher_accepts_correct_captures_and_rejects_lagged_or_swapped_slot
             draft.restore(state).unwrap();
         }
         let mut proposer = DraftProposer::new(draft, 7, DraftChoice::Greedy).unwrap();
-        proposer.synchronize(&main).unwrap();
+        proposer.synchronize(&mut main).unwrap();
         assert_eq!(proposer.draft().snapshot(), *state);
-        let proposal = proposer.propose_with(&main, &[3, 7, 11, 0], 0, 7).unwrap();
+        let proposal = proposer
+            .propose_with(&mut main, &[3, 7, 11, 0], 0, 7)
+            .unwrap();
         acceptance.push(
             proposal
                 .iter()
@@ -259,6 +263,7 @@ fn synthetic_teacher_accepts_correct_captures_and_rejects_lagged_or_swapped_slot
     }
     eprintln!("teacher accepted prefix correct/lag-one/swapped = {acceptance:?} / 7");
     assert_eq!(acceptance, [7, 0, 0]);
+    main.restore(&prompt_checkpoint).unwrap();
     let mut proposer =
         DraftProposer::new(draft_from(base_bytes, blank_head()), 7, DraftChoice::Greedy).unwrap();
     let mut limits = GenerationLimits::new(8, main.context_capacity());
@@ -332,10 +337,10 @@ fn reference_neural_generation_matches_k0_across_joint_restore_and_reused_prefix
             let mut main = base.new_session().unwrap();
             main.set_capture(proposer.capture_options()).unwrap();
             main.prefill(&prompt[..3]).unwrap();
-            let prefix = proposer.snapshot_session(&main).unwrap();
+            let prefix = proposer.snapshot_session(&mut main).unwrap();
             assert_eq!(
                 proposer
-                    .propose_with(&main, &prompt[..3], prompt[3], k)
+                    .propose_with(&mut main, &prompt[..3], prompt[3], k)
                     .unwrap()
                     .len(),
                 k
@@ -345,7 +350,7 @@ fn reference_neural_generation_matches_k0_across_joint_restore_and_reused_prefix
                 first_expected,
                 "seed={seed:?} K={k} first request"
             );
-            let checkpoint = proposer.snapshot_session(&main).unwrap();
+            let checkpoint = proposer.snapshot_session(&mut main).unwrap();
             let ring = proposer.draft().snapshot();
             assert_eq!(
                 decode(&mut main, &mut proposer, &sampler, &[last], k, 8),
@@ -370,4 +375,233 @@ fn reference_neural_generation_matches_k0_across_joint_restore_and_reused_prefix
             assert_eq!(proposer.draft().position(), main.position());
         }
     }
+}
+
+#[test]
+fn reused_and_restored_sessions_reseed_after_a_long_new_prompt() {
+    for restore in [false, true] {
+        let mut main = model(main_bytes());
+        let mut proposer = DraftProposer::new(
+            draft_from(draft_bytes(), blank_head()),
+            3,
+            DraftChoice::Greedy,
+        )
+        .unwrap();
+        main.set_capture(proposer.capture_options()).unwrap();
+        main.prefill(&[3, 7, 11]).unwrap();
+        let prefix = proposer.snapshot_session(&mut main).unwrap();
+        decode(&mut main, &mut proposer, &Sampler::Greedy, &[9], 3, 2);
+        if restore {
+            proposer.restore_session(&mut main, &prefix).unwrap();
+        }
+        let mut expected = draft_from(draft_bytes(), blank_head());
+        main.prefill(&[13; 12]).unwrap();
+        // A fresh ring built from the retained suffix is bit-identical to the
+        // upstream ring after every row older than the window is overwritten.
+        let rows = main.captured_rows().to_vec();
+        for position in 0..main.position() {
+            let values = rows
+                .iter()
+                .find(|r| r.position == position)
+                .map_or_else(|| vec![0.0; 1024], |r| r.values.clone());
+            expected
+                .push_context(position, ContextFeatures { values: &values })
+                .unwrap();
+        }
+        proposer.synchronize(&mut main).unwrap();
+        assert_eq!(proposer.draft().snapshot(), expected.snapshot());
+        decode(&mut main, &mut proposer, &Sampler::Greedy, &[17], 3, 2);
+    }
+}
+
+#[test]
+fn main_only_restore_or_reset_is_detected_even_after_advancing_past_the_draft() {
+    for reset in [false, true] {
+        let mut main = model(main_bytes());
+        let mut proposer = DraftProposer::new(
+            draft_from(draft_bytes(), blank_head()),
+            3,
+            DraftChoice::Greedy,
+        )
+        .unwrap();
+        main.set_capture(proposer.capture_options()).unwrap();
+        main.prefill(&[3; 3]).unwrap();
+        let prefix = main.snapshot().unwrap();
+        main.prefill(&[7; 3]).unwrap();
+        proposer.synchronize(&mut main).unwrap();
+        if reset {
+            main.reset().unwrap();
+        } else {
+            main.restore(&prefix).unwrap();
+        }
+        main.prefill(&[11; 7]).unwrap();
+        assert!(
+            proposer.synchronize(&mut main).is_err(),
+            "main-only reset={reset} must invalidate the old draft context"
+        );
+    }
+}
+
+#[test]
+fn delivered_captures_are_released_and_joint_snapshots_do_not_retain_them() {
+    let mut main = model(main_bytes());
+    let mut proposer = DraftProposer::new(
+        draft_from(draft_bytes(), blank_head()),
+        3,
+        DraftChoice::Greedy,
+    )
+    .unwrap();
+    main.set_capture(proposer.capture_options()).unwrap();
+    main.prefill(&[3; 12]).unwrap();
+    assert_eq!(main.captured_rows().len(), 8);
+    let checkpoint = proposer.snapshot_session(&mut main).unwrap();
+    assert!(main.captured_rows().is_empty());
+    assert_eq!(main.capture_bytes(), 0);
+    assert_eq!(main.snapshot().unwrap().capture_bytes(), 0);
+    decode(&mut main, &mut proposer, &Sampler::Greedy, &[9], 3, 2);
+    assert!(main.captured_rows().is_empty());
+    proposer.restore_session(&mut main, &checkpoint).unwrap();
+    assert!(main.captured_rows().is_empty());
+    assert_eq!(main.snapshot().unwrap().capture_bytes(), 0);
+}
+
+#[test]
+fn depth_dependent_teacher_uses_block_successors_and_the_distinct_frontier() {
+    let mut main = model(main_bytes());
+    main.set_capture(capture_options()).unwrap();
+    main.prefill(&[3, 7, 11, 0]).unwrap();
+    let mut artifact = draft_bytes();
+    zero_corrections(&mut artifact);
+    let mut draft = draft_from(artifact.clone(), blank_head());
+    for row in main.captured_rows() {
+        draft
+            .push_context(
+                row.position,
+                ContextFeatures {
+                    values: &row.values,
+                },
+            )
+            .unwrap();
+    }
+    // The teacher is next(input) = input + 1. History ends in 0, frontier is 5,
+    // so the seven independently specified targets are 6..=12.
+    let hidden: Vec<_> = [5, 0]
+        .into_iter()
+        .map(|frontier| {
+            let embeddings: Vec<_> = (0..8)
+                .map(|j| main.embedding(if j == 0 { frontier } else { 31 }).unwrap())
+                .collect();
+            draft.block_hidden(&embeddings).unwrap()
+        })
+        .collect();
+    for depth in 0..7 {
+        let examples: Vec<_> = hidden
+            .iter()
+            .enumerate()
+            .flat_map(|(wiring, hidden)| {
+                hidden.chunks_exact(512).enumerate().map(move |(row, x)| {
+                    (
+                        x.to_vec(),
+                        if wiring == 0 && row == depth {
+                            1.0
+                        } else {
+                            -1.0
+                        },
+                    )
+                })
+            })
+            .collect();
+        for (channel, weight) in separator(&examples).into_iter().enumerate() {
+            write_vector(
+                &mut artifact,
+                "bdraft2.sel.hp",
+                depth * 512 + channel,
+                weight * 32.0,
+            );
+        }
+        for token in 0..32 {
+            write_vector(&mut artifact, "bdraft2.sel.pred", token * 32 + depth, 1.0);
+        }
+        write_vector(
+            &mut artifact,
+            "bdraft2.sel.succ",
+            (6 + depth) * 32 + depth,
+            1.0,
+        );
+    }
+    let mut proposer =
+        DraftProposer::new(draft_from(artifact, blank_head()), 7, DraftChoice::Greedy).unwrap();
+    let expected: Vec<_> = (6..=12).collect();
+    assert_eq!(
+        proposer
+            .propose_with(&mut main, &[3, 7, 11, 0], 5, 7)
+            .unwrap(),
+        expected
+    );
+    assert_ne!(
+        proposer
+            .propose_with(&mut main, &[3, 7, 11, 0], 0, 7)
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn sampled_hook_matches_direct_draft_with_frontier_seed_and_absolute_positions() {
+    let mut main = model(main_bytes());
+    main.set_capture(capture_options()).unwrap();
+    main.prefill(&[3, 7, 11, 0, 9]).unwrap();
+    let mut direct = draft_from(draft_bytes(), support::draft::shead(37));
+    for row in main.captured_rows() {
+        direct
+            .push_context(
+                row.position,
+                ContextFeatures {
+                    values: &row.values,
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(direct.position(), 5);
+    let checkpoint = main.snapshot().unwrap();
+    let mut expected_runs = Vec::new();
+    let greedy = direct
+        .propose(13, |token| main.embedding(token), DraftChoice::Greedy)
+        .unwrap()
+        .tokens;
+    for seed in [17, 0xabcdef] {
+        main.restore(&checkpoint).unwrap();
+        let choice = DraftChoice::sampled(seed);
+        let direct_proposal = direct
+            .propose(13, |token| main.embedding(token), choice)
+            .unwrap();
+        let expected = direct_proposal.tokens;
+        let positioned: Vec<_> = direct_proposal
+            .corrected
+            .iter()
+            .enumerate()
+            .map(|(depth, candidates)| {
+                yskn_ref::draft_head::choose(candidates, choice, 6 + depth as u64).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            expected, positioned,
+            "frontier 5 predicts at absolute positions 6..=12"
+        );
+        let mut proposer = DraftProposer::new(
+            draft_from(draft_bytes(), support::draft::shead(37)),
+            7,
+            choice,
+        )
+        .unwrap();
+        assert_eq!(
+            proposer
+                .propose_with(&mut main, &[3, 7, 11, 0, 9], 13, 7)
+                .unwrap(),
+            expected
+        );
+        expected_runs.push(expected);
+    }
+    assert_ne!(expected_runs[0], greedy);
+    assert_ne!(expected_runs[0], expected_runs[1]);
 }

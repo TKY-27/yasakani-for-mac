@@ -1062,9 +1062,15 @@ frontier input at position F, the live ring covers
 verification, feed the old frontier and accepted consumed successors, but no
 rejected row and no new unconsumed frontier. Ring overwrite discards old
 positions; a long prefill therefore retains only its last ring-capacity rows.
+This also applies to a reused session or a restored prefix followed by a long
+new prompt: whenever the retained suffix starts beyond the draft position,
+a complete contiguous window ending at the main position reseeds the ring.
+All earlier slots would have been overwritten upstream, so projecting this
+suffix yields the same ring bits as inserting every prompt row.
 Committed captures and pending-pass captures are exposed separately. Successful
-commits forward captured rows to the proposer; failed/discarded passes never
-advance its ring. Synchronization before proposing checks the committed tail.
+commits hand over owned rows; failed/discarded passes never advance the ring.
+Synchronization and direct proposals require a mutable verifier so delivered
+captures can be consumed, rather than retained in the model or its snapshots.
 
 `DraftProposer` proposes the first K tokens of the existing eight-row block,
 K=1..7. The block still computes all eight noncausal rows; this work does not
@@ -1072,8 +1078,19 @@ optimize it. The main model remains the sole selector/acceptance authority.
 The separate proposer owns its draft ring. `snapshot_session(&model)` captures
 both owners and `restore_session(&mut model, &checkpoint)` validates ownership
 and restores the matching main state and ring. Reset invalidates that owner's
-checkpoints; callers resetting the main model must also reset its proposer.
-A main-model-only checkpoint cannot restore the separately owned drafter.
+checkpoints. Each main model also supplies a context identity, changed after
+every successful restore or reset. A bound proposer rejects an identity mismatch
+even if a new branch has advanced past its previous position. Joint restore
+rebinds the restored ring to the new identity; main-only restore/reset cannot
+silently mix contexts. A verifier without identity support is rejected.
+
+The owners remain separate because the shared generation API supports main-only,
+n-gram and combined use, and existing model callers already own the verifier.
+Forcing all of those through a new owning session would expand the public API
+change substantially. Identity validation detects misuse at the common boundary
+without hashing the full growing prefix or keeping delivered features alive.
+After a main reset callers must reset the proposer too; after a main-only
+restore they must use a matching joint checkpoint or rebuild the session.
 
 ### Sampling and proposal policy boundary
 
@@ -1087,15 +1104,20 @@ thousandths by default), 16 candidates and fixed top-p 0.95
 main version 3 and the same seed for `--seed`, otherwise greedy draft choice.
 
 `CombinedProposer` chooses a fixed order (`NgramFirst` or `DraftFirst`) and
-falls back only when the first proposal is empty. Draft context still advances
-when n-gram wins. This does not port upstream's match-length gate, acceptance
+falls back only when the first proposal is empty. With a positive guess budget,
+`DraftFirst` never falls back: the neural draft always supplies guesses (errors
+propagate, rather than trying n-gram). Draft context still advances when n-gram wins. This does not port upstream's match-length gate, acceptance
 EMA comparison, periodic neural probes, next-token-table extensions, HCAP or
 8/16-row width adaptation (`src/specx.cpp:216-265,441-447`). Chapter 08 §5
 records those upstream rules separately from this deliberately fixed policy.
 
-`draft_acceptance` measures teacher-forced leading-prefix agreement with main
-greedy selections for neural, n-gram and fixed n-gram-first combination. Missing
-guesses count as unaccepted at later depths. Defaults are one window and two
+`draft_acceptance` prints two separately labeled greedy measurements for neural,
+n-gram and fixed n-gram-first combination. `teacher_forced_agreement` compares
+with main choices conditioned on the window text. `verified_acceptance` instead
+runs a provisional `[frontier, guesses...]` pass for each source and counts only
+the matching leading prefix. Every probe is discarded; only the window frontier
+is committed before continuing teacher-forced. Missing guesses count as misses
+at later depths in both measurements. Defaults are one window and two
 positions because the real scalar draft may need about 90 seconds per proposal.
 No released-model acceptance or speed claim follows from the synthetic checks;
 real-model commands are documented in README for the orchestrator.
@@ -1124,3 +1146,54 @@ Temporarily deleting the provisional-failure truncation makes the new
 later-layer-failure test fail at its following probe; the truncation is restored.
 Metal cases explicitly skip when there is no device. No released model is
 opened by these synthetic tests.
+
+### Capture storage and draft failure (brief 05i)
+
+The main model retains a bounded queue of **undelivered** committed rows, plus
+pending provisional captures. After synchronization/commit observation the
+committed queue is moved out and released; joint snapshots synchronize first,
+so they contain no delivered main captures. A main-only snapshot taken before
+hand-over still owns its undelivered rows, as required for faithful restoration.
+Reference and engine deliver the same row positions and FP32 bits. Engine long
+prefill captures only the final window across all chunks, avoiding allocation
+of rows that would immediately be evicted. Existing undelivered rows are kept
+until atomic prefill succeeds; only then are overwritten rows dropped.
+`SessionMemory.capture_bytes` includes both committed and provisional allocated
+FP32 payloads and row descriptors; main `Snapshot::capture_bytes` and reference
+`Model::capture_bytes` expose the corresponding storage. Empty retained Vec
+capacity is counted too.
+
+For real dimensions, one feature row is `5*5120*4 = 102,400` bytes. Previously
+each populated session retained `2048*102,400 = 209,715,200` bytes (200 MiB), and
+each main or joint snapshot copied another 209,715,200 capture bytes. After
+hand-over each session and each snapshot retains **0 capture payload bytes**.
+Before hand-over the bounded queue can still hold 209,715,200 payload bytes;
+a W-row provisional pass holds at most `W*102,400` (1,638,400 at W=16).
+Row descriptors add `capacity*size_of::<CapturedRow>()` (32 bytes each on a
+64-bit host), as reported, rather than being hidden in payload estimates.
+Atomic prefill with an undelivered old queue can transiently retain both that
+queue and the new suffix; neither is a copy of an already delivered ring.
+
+The necessary draft KV ring is unchanged:
+`2*5*8*2048*128*2 = 41,943,040` bytes (40 MiB) per session and joint snapshot.
+Thus steady capture-plus-ring payload falls from 251,658,240 to 41,943,040
+bytes per session and per joint snapshot; other main state, weights, attention,
+logits and operator scratch are additional (D16). These are dimension-derived
+counts; no released model was opened or measured.
+
+If a proposer fails before the first successful generation commit, `generate`
+returns its error. Once outputs have been committed, an observation or subsequent
+proposal error disables drafting for the rest of that call and continues normal
+one-row verification. Returned tokens, callbacks, stop boundaries and main
+state therefore remain lossless, including tokens from earlier passes. A draft
+failure cannot undo the main commit, so returning only an error would lose
+output; the main model can instead finish the request independently. The failed
+proposer is no longer synchronized and must be rebuilt/restored before reuse.
+
+New depth-dependent teacher targets are `6..=12` for frontier 5 with history
+tail 0. They distinguish every block successor row and the frontier embedding;
+the existing capture-lag/slot-swap teacher and K=0 losslessness checks remain.
+Sampled hook proposals are compared with direct `Draft::propose` at frontier
+position 5, two seeds and explicit prediction positions `6..=12`. Temporary
+reversal, permutation, history-tail frontier, greedy substitution, wrong-seed
+and wrong-position mutations each fail these tests and are removed afterwards.

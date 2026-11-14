@@ -283,6 +283,15 @@ pub struct CapturedRow {
     pub values: Vec<f32>,
 }
 
+/// Allocated capture storage, including row descriptors and FP32 payloads.
+pub fn capture_allocated_bytes(rows: &[CapturedRow], capacity: usize) -> usize {
+    capacity * std::mem::size_of::<CapturedRow>()
+        + rows
+            .iter()
+            .map(|row| row.values.capacity() * 4)
+            .sum::<usize>()
+}
+
 /// An owned committed checkpoint. Attention rows stay in the originating session.
 ///
 /// A checkpoint can only restore its own session, before reset, while its exact
@@ -297,6 +306,12 @@ pub struct Snapshot {
     captures: Vec<CapturedRow>,
 }
 
+impl Snapshot {
+    pub fn capture_bytes(&self) -> usize {
+        capture_allocated_bytes(&self.captures, self.captures.capacity())
+    }
+}
+
 /// A single sequence. Immutable weights are shared only through a single-threaded Rc.
 pub struct Model {
     weights: Rc<Weights>,
@@ -308,6 +323,7 @@ pub struct Model {
     pending_tokens: Option<Vec<u32>>,
     committed_tokens: Vec<u32>,
     session: Rc<()>,
+    context_identity: Arc<()>,
     capture_options: CaptureOptions,
     captures: Vec<CapturedRow>,
     provisional_captures: Vec<CapturedRow>,
@@ -372,6 +388,7 @@ impl Model {
             pending_tokens: None,
             committed_tokens: Vec::new(),
             session: Rc::new(()),
+            context_identity: Arc::new(()),
             capture_options: CaptureOptions::default(),
             captures: Vec::new(),
             provisional_captures: Vec::new(),
@@ -413,6 +430,20 @@ impl Model {
     pub fn capture_options(&self) -> &CaptureOptions {
         &self.capture_options
     }
+    pub fn context_identity(&self) -> Arc<()> {
+        Arc::clone(&self.context_identity)
+    }
+    /// Move undelivered rows to the consumer; snapshots now omit delivered rows.
+    pub fn take_captured_rows(&mut self) -> Vec<CapturedRow> {
+        std::mem::take(&mut self.captures)
+    }
+    pub fn capture_bytes(&self) -> usize {
+        capture_allocated_bytes(&self.captures, self.captures.capacity())
+            + capture_allocated_bytes(
+                &self.provisional_captures,
+                self.provisional_captures.capacity(),
+            )
+    }
     pub fn captured_rows(&self) -> &[CapturedRow] {
         &self.captures
     }
@@ -423,12 +454,10 @@ impl Model {
         self.weights.embeddings.row(token)
     }
     fn retain_captures(&mut self, rows: Vec<CapturedRow>) {
+        let excess =
+            (self.captures.len() + rows.len()).saturating_sub(self.capture_options.max_rows);
+        self.captures.drain(..excess.min(self.captures.len()));
         self.captures.extend(rows);
-        let excess = self
-            .captures
-            .len()
-            .saturating_sub(self.capture_options.max_rows);
-        self.captures.drain(..excess);
     }
 
     pub fn new_session(&self) -> Result<Self> {
@@ -447,6 +476,7 @@ impl Model {
             pending_tokens: None,
             committed_tokens: Vec::new(),
             session: Rc::new(()),
+            context_identity: Arc::new(()),
             capture_options: self.capture_options.clone(),
             captures: Vec::new(),
             provisional_captures: Vec::new(),
@@ -469,6 +499,7 @@ impl Model {
         self.captures.clear();
         self.provisional_captures.clear();
         self.session = Rc::new(());
+        self.context_identity = Arc::new(());
         Ok(())
     }
 
@@ -604,6 +635,7 @@ impl Model {
                 _ => unreachable!("checkpoint layer kinds are fixed within a session"),
             }
         }
+        self.context_identity = Arc::new(());
         self.captures.clone_from(&snapshot.captures);
         self.provisional_captures.clear();
         self.position = snapshot.position;

@@ -28,6 +28,13 @@ pub trait Verifier {
     fn logits(&self) -> Option<&[f32]>;
     fn commit(&mut self, rows: usize) -> std::result::Result<(), Self::Error>;
     fn discard(&mut self);
+    /// Changes on every successful main-only restore/reset. Drafts require it.
+    fn context_identity(&self) -> Option<std::sync::Arc<()>> {
+        None
+    }
+    fn take_captured_rows(&mut self) -> Vec<CapturedRow> {
+        Vec::new()
+    }
     fn captured_rows(&self) -> &[CapturedRow] {
         &[]
     }
@@ -49,6 +56,12 @@ pub trait Verifier {
 
 impl Verifier for Model {
     type Error = Error;
+    fn context_identity(&self) -> Option<std::sync::Arc<()>> {
+        Some(self.context_identity())
+    }
+    fn take_captured_rows(&mut self) -> Vec<CapturedRow> {
+        self.take_captured_rows()
+    }
     fn position(&self) -> usize {
         self.position()
     }
@@ -134,17 +147,17 @@ pub trait Proposer {
         max_guesses: usize,
     ) -> Vec<u32>;
     /// Observe the retained prompt suffix before generation or a direct proposal.
-    fn synchronize<V: Verifier>(&mut self, _verifier: &V) -> Result<()> {
+    fn synchronize<V: Verifier>(&mut self, _verifier: &mut V) -> Result<()> {
         Ok(())
     }
-    /// Called only after commit succeeds, with exactly the consumed input rows.
+    /// Called after commit with its undelivered captures (bounded to the capture window).
     fn observe_committed(&mut self, _rows: &[CapturedRow]) -> Result<()> {
         Ok(())
     }
     /// Fallible, verifier-aware entry point; token-only proposers keep their API.
     fn propose_with<V: Verifier>(
         &mut self,
-        verifier: &V,
+        verifier: &mut V,
         history: &[u32],
         last: u32,
         max: usize,
@@ -334,6 +347,7 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
     proposer
         .synchronize(verifier)
         .map_err(GenerationError::Proposer)?;
+    let mut drafting = true;
     while result.tokens.len() < limits.max_new_tokens {
         let position = verifier.position();
         let room = capacity.saturating_sub(position);
@@ -343,14 +357,25 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
         }
         let remaining = limits.max_new_tokens - result.tokens.len();
         let width = room.min(remaining).min(verifier.max_pass_width());
-        let guesses = proposer
-            .propose_with(
+        let guesses = if drafting {
+            match proposer.propose_with(
                 verifier,
                 &history,
                 pending,
                 limits.max_draft_tokens.min(width - 1),
-            )
-            .map_err(GenerationError::Proposer)?;
+            ) {
+                Ok(guesses) => guesses,
+                Err(error) if result.tokens.is_empty() => {
+                    return Err(GenerationError::Proposer(error));
+                }
+                Err(_) => {
+                    drafting = false;
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         if guesses.len() > limits.max_draft_tokens.min(width - 1) {
             return Err(GenerationError::InvalidInput(
                 "proposer exceeded the requested guess limit",
@@ -417,14 +442,15 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
                 "verifier omitted captured rows",
             ));
         }
-        let committed_captures = captures.iter().take(confirmed).cloned().collect::<Vec<_>>();
         if let Err(error) = verifier.commit(confirmed) {
             verifier.discard();
             return Err(GenerationError::Verifier(error));
         }
-        proposer
-            .observe_committed(&committed_captures)
-            .map_err(GenerationError::Proposer)?;
+        let committed_captures = verifier.take_captured_rows();
+        if drafting && proposer.observe_committed(&committed_captures).is_err() {
+            // A committed output cannot be rolled back or lost to a draft failure.
+            drafting = false;
+        }
         result.statistics.tokens_confirmed_per_pass.push(confirmed);
         result.statistics.pass_durations.push(started.elapsed());
         history.push(pending);
@@ -520,6 +546,45 @@ mod tests {
             self.pending = None;
             self.rows.clear();
         }
+    }
+
+    #[test]
+    fn observation_failure_keeps_committed_outputs_and_continues_without_drafting() {
+        struct FailsOnObservation {
+            calls: usize,
+        }
+        impl Proposer for FailsOnObservation {
+            fn propose(&mut self, _: &[u32], _: u32, _: usize) -> Vec<u32> {
+                vec![]
+            }
+            fn observe_committed(&mut self, _: &[CapturedRow]) -> Result<()> {
+                self.calls += 1;
+                if self.calls == 2 {
+                    Err(Error::InvalidInput("observation failed".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut expected = SequenceVerifier::new(&[1, 2], 32, 4);
+        let mut actual = expected.clone();
+        let mut limits = GenerationLimits::new(7, 32);
+        limits.max_draft_tokens = 3;
+        let baseline = generate(
+            &mut expected,
+            &mut NoProposer,
+            &mut Greedy,
+            &[1, 2, 3],
+            GenerationLimits::new(7, 32),
+        )
+        .unwrap();
+        let mut proposer = FailsOnObservation { calls: 0 };
+        let generated =
+            generate(&mut actual, &mut proposer, &mut Greedy, &[1, 2, 3], limits).unwrap();
+        assert_eq!(generated.tokens, baseline.tokens);
+        assert_eq!(actual.committed, expected.committed);
+        assert_eq!(actual.last, expected.last);
+        assert_eq!(proposer.calls, 2);
     }
 
     struct GuidedProposer {

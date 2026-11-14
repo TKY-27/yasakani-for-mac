@@ -67,9 +67,16 @@ pub struct Snapshot {
     capture_options: CaptureOptions,
 }
 
+impl Snapshot {
+    pub fn capture_bytes(&self) -> usize {
+        yskn_ref::model::capture_allocated_bytes(&self.captures, self.captures.capacity())
+    }
+}
+
 /// Persistent storage only; transient projection/attention work is not included.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionMemory {
+    pub capture_bytes: usize,
     pub recurrent_state_bytes: usize,
     pub replay_bytes: usize,
     pub replay_capacity_rows: usize,
@@ -87,6 +94,7 @@ pub struct Model {
     pending_tokens: Vec<u32>,
     pending: bool,
     working_complete: bool,
+    context_identity: Arc<()>,
     capture_options: CaptureOptions,
     captures: Vec<CapturedRow>,
     pending_captures: Vec<CapturedRow>,
@@ -218,6 +226,7 @@ impl Model {
             pending_tokens: Vec::with_capacity(rows_per_pass),
             pending: false,
             working_complete: false,
+            context_identity: Arc::new(()),
             capture_options: CaptureOptions::default(),
             captures: Vec::new(),
             pending_captures: Vec::new(),
@@ -292,6 +301,12 @@ impl Model {
     pub fn capture_options(&self) -> &CaptureOptions {
         &self.capture_options
     }
+    pub fn context_identity(&self) -> Arc<()> {
+        Arc::clone(&self.context_identity)
+    }
+    pub fn take_captured_rows(&mut self) -> Vec<CapturedRow> {
+        std::mem::take(&mut self.captures)
+    }
     pub fn captured_rows(&self) -> &[CapturedRow] {
         &self.captures
     }
@@ -301,17 +316,22 @@ impl Model {
     pub fn embedding(&self, token: u32) -> Result<Vec<f32>> {
         self.weights.embeddings.row(token)
     }
-    fn retain_captures(&mut self, rows: impl IntoIterator<Item = CapturedRow>) {
+    fn retain_captures(&mut self, rows: Vec<CapturedRow>) {
+        let excess =
+            (self.captures.len() + rows.len()).saturating_sub(self.capture_options.max_rows);
+        self.captures.drain(..excess.min(self.captures.len()));
         self.captures.extend(rows);
-        let excess = self
-            .captures
-            .len()
-            .saturating_sub(self.capture_options.max_rows);
-        self.captures.drain(..excess);
     }
 
     pub fn session_memory(&self) -> SessionMemory {
         SessionMemory {
+            capture_bytes: yskn_ref::model::capture_allocated_bytes(
+                &self.captures,
+                self.captures.capacity(),
+            ) + yskn_ref::model::capture_allocated_bytes(
+                &self.pending_captures,
+                self.pending_captures.capacity(),
+            ),
             recurrent_state_bytes: self
                 .states
                 .iter()
@@ -385,6 +405,7 @@ impl Model {
         self.logits.clear();
         self.timings.clear();
         self.owner = Arc::new(());
+        self.context_identity = Arc::new(());
         Ok(())
     }
 
@@ -440,6 +461,7 @@ impl Model {
                 _ => unreachable!("snapshot belongs to the same model"),
             }
         }
+        self.context_identity = Arc::new(());
         self.captures.clone_from(&snapshot.captures);
         self.position = snapshot.position;
         self.tokens.truncate(snapshot.position);
@@ -532,7 +554,13 @@ impl Model {
                     }
                     rows => rows,
                 };
-                let (head, timing, captured) = self.compute_pass(chunk, position, rows, false)?;
+                let (head, timing, captured) = self.compute_pass(
+                    chunk,
+                    position,
+                    rows,
+                    false,
+                    (self.position + tokens.len()).saturating_sub(self.capture_options.max_rows),
+                )?;
                 captures.extend(captured);
                 let excess = captures.len().saturating_sub(self.capture_options.max_rows);
                 captures.drain(..excess);
@@ -570,7 +598,7 @@ impl Model {
         }
         self.validate_tokens(tokens)?;
         self.prepare_working();
-        match self.compute_pass(tokens, self.position, LogitRows::All, true) {
+        match self.compute_pass(tokens, self.position, LogitRows::All, true, 0) {
             Ok((logits, timing, captures)) => {
                 self.pending_captures = captures;
                 self.working_complete = true;
@@ -652,6 +680,7 @@ impl Model {
         position: usize,
         requested: LogitRows,
         cache_replay: bool,
+        capture_from: usize,
     ) -> Result<(Vec<Vec<f32>>, PassTiming, Vec<CapturedRow>)> {
         let start = Instant::now();
         let mut timing = PassTiming {
@@ -666,7 +695,8 @@ impl Model {
             0
         } else {
             tokens.len().saturating_sub(self.capture_options.max_rows)
-        };
+        }
+        .max(capture_from.saturating_sub(position).min(tokens.len()));
         let mut captures = if self.capture_options.layers.is_empty() {
             Vec::new()
         } else {
@@ -1059,6 +1089,13 @@ impl yskn_ref::quality::ScoringModel for Model {
 
 impl yskn_ref::speculation::Verifier for Model {
     type Error = Error;
+    fn context_identity(&self) -> Option<Arc<()>> {
+        Some(self.context_identity())
+    }
+    fn take_captured_rows(&mut self) -> Vec<CapturedRow> {
+        self.take_captured_rows()
+    }
+
     fn dimensions(&self) -> Option<&ModelDimensions> {
         Some(self.dimensions())
     }
