@@ -191,6 +191,11 @@ fn observe(
     let start = Instant::now();
     let usage = runner.run(p, &mut |_| Ok(()))?;
     let c = capture.take();
+    if c.stages.is_empty() || c.ids.is_empty() {
+        return Err(Error::engine(
+            "generation not exercised: no generation stage or empty token ids",
+        ));
+    }
     let mut digest = Sha256::new();
     for id in &c.ids {
         digest.update(id.to_le_bytes());
@@ -225,6 +230,14 @@ fn compare(
     kind: &str,
     failures: &mut Vec<Value>,
 ) {
+    if expected.stages.is_empty()
+        || actual.stages.is_empty()
+        || expected.ids.is_empty()
+        || actual.ids.is_empty()
+    {
+        failures.push(json!({"kind":"generation not exercised","comparison":kind,"run":label}));
+        return;
+    }
     let position = expected
         .ids
         .iter()
@@ -389,6 +402,20 @@ pub fn load_prompts(path: Option<&Path>) -> Result<Vec<Prompt>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_empty_generations_are_not_a_lossless_pass() {
+        for stages in [vec![], vec![0]] {
+            let empty = Observation {
+                ids: vec![],
+                stages,
+                finish: "length".into(),
+            };
+            let mut failures = vec![];
+            compare(&empty, &empty, &json!({}), "repeat_mismatch", &mut failures);
+            assert_eq!(failures[0]["kind"], "generation not exercised");
+        }
+    }
 
     #[test]
     fn explicit_sampling_overrides_greedy_and_single_choice_defaults() {
