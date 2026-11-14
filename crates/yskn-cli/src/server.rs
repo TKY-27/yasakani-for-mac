@@ -24,7 +24,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -46,6 +46,10 @@ pub struct Limits {
     pub body_timeout: Duration,
     pub idle_timeout: Duration,
     pub stream_timeout: Duration,
+    /// Ending a connection after a response half-closes first, then discards
+    /// at most `linger_bytes` from the peer for at most `linger_timeout`.
+    pub linger_bytes: usize,
+    pub linger_timeout: Duration,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -58,6 +62,8 @@ impl Default for Limits {
             body_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(300),
             stream_timeout: Duration::from_secs(30),
+            linger_bytes: 256 * 1024,
+            linger_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -411,7 +417,7 @@ impl Server {
                     connections.spawn(async move {
                         let _permit=permit;
                         let limits=&api.shared.cfg.limits;
-                        let io=TokioIo::new(IdleIo::new(socket,limits.idle_timeout));
+                        let io=TokioIo::new(IdleIo::new(socket,limits));
                         let mut builder=http1::Builder::new();
                         builder.timer(TokioTimer::new()).header_read_timeout(limits.header_timeout).max_headers(limits.max_headers).max_buf_size(limits.header_bytes);
                         let service=service_fn(move |r|{let api=api.clone();async move {Ok::<_,Infallible>(api.call(r).await)}});
@@ -742,13 +748,20 @@ struct IdleIo {
     socket: TcpStream,
     sleep: Pin<Box<Sleep>>,
     timeout: Duration,
+    linger_bytes: usize,
+    linger_timeout: Duration,
+    // Some once shutdown has half-closed: the bytes still allowed to discard.
+    linger_left: Option<usize>,
 }
 impl IdleIo {
-    fn new(socket: TcpStream, timeout: Duration) -> Self {
+    fn new(socket: TcpStream, limits: &Limits) -> Self {
         Self {
             socket,
-            sleep: Box::pin(tokio::time::sleep(timeout)),
-            timeout,
+            sleep: Box::pin(tokio::time::sleep(limits.idle_timeout)),
+            timeout: limits.idle_timeout,
+            linger_bytes: limits.linger_bytes,
+            linger_timeout: limits.linger_timeout,
+            linger_left: None,
         }
     }
     fn expired(&mut self, cx: &mut Context<'_>) -> bool {
@@ -799,7 +812,35 @@ impl AsyncWrite for IdleIo {
         }
         Pin::new(&mut this.socket).poll_flush(cx)
     }
+    // Hyper calls this after flushing every response it ends a connection with,
+    // including its own 400/431 parse-error responses. Closing a socket with
+    // unread received bytes makes the kernel send RST, which can destroy the
+    // response before the peer reads it; so half-close, then drain until the
+    // peer's EOF, a byte budget or a deadline, whichever comes first.
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().socket).poll_shutdown(cx)
+        let this = self.get_mut();
+        if this.linger_left.is_none() {
+            ready!(Pin::new(&mut this.socket).poll_shutdown(cx))?;
+            this.sleep
+                .as_mut()
+                .reset(Instant::now() + this.linger_timeout);
+            this.linger_left = Some(this.linger_bytes);
+        }
+        let mut scratch = [0_u8; 4096];
+        while let Some(left) = this.linger_left.filter(|&n| n > 0) {
+            if this.expired(cx) {
+                break;
+            }
+            let mut buf = ReadBuf::new(&mut scratch[..left.min(4096)]);
+            match Pin::new(&mut this.socket).poll_read(cx, &mut buf) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(())) if !buf.filled().is_empty() => {
+                    this.linger_left = Some(left - buf.filled().len());
+                }
+                // EOF or a reset: nothing is left to protect.
+                Poll::Ready(_) => break,
+            }
+        }
+        Poll::Ready(Ok(()))
     }
 }
