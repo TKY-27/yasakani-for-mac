@@ -101,23 +101,44 @@ or none. As upstream does, a keyed remote bind bypasses Host/Origin/Fetch checks
 and still requires the key. API-key comparison hashes both byte strings with
 SHA-256 and reduces all 32 digest bytes without prefix-dependent branches.
 
-| Limit (`Limits` field) | Default |
-|---|---:|
-| Actual request-body bytes, before JSON parsing (`max_body`) | 32 MiB |
-| Concurrent connections (`max_connections`, 1..1024) | 64; excess connections are closed unserved |
-| Queued engine jobs | 64 (bounded by active HTTP connections) |
-| Buffered events per response | 8 |
-| Header read buffer (`header_bytes`, at least 8192) | 32 KiB |
-| Header count (`max_headers`) | 100 |
-| Complete header deadline (`header_timeout`) | 10 s |
-| Complete body deadline (`body_timeout`) | 30 s |
-| Idle socket read/write deadline (`idle_timeout`) | 300 s |
-| Full event-channel backpressure deadline (`stream_timeout`) | 30 s |
-| Bytes discarded while closing (`linger_bytes`) | 256 KiB |
-| Closing deadline (`linger_timeout`) | 2 s |
-| Context reserve | 64 tokens |
-| Stop strings per request | 4 |
-| Loop guard: longest period, repeat run in thinking / answer, digit run in thinking | 16 tokens; 256 / 1024 tokens; 1000 tokens |
+| Limit (`Limits` field) | Default | Why this number |
+|---|---:|---|
+| Actual request-body bytes, before JSON parsing (`max_body`) | 8 MiB | Upstream's `MAX_BODY` is 32 MiB. Lowered: by our estimate a full 262,144-token context is about 1 to 2.4 MiB of JSON (3 to 9 bytes per token, ASCII-escaped CJK at the top), so 8 MiB leaves 32 bytes per token. Tokenizing costs about 64 bytes of memory per prompt byte, so the body size bounds the engine thread's work. A client resending megabytes of old `reasoning_content` that the template drops could exceed it where upstream accepted it |
+| Bytes held by all requests together (`max_pending_bytes`) | 512 MiB | Charged as body bytes arrive, raised to the decode estimate (body bytes + 640 per JSON value) before parsing, and held while the request waits and generates. Over budget: 503 with `Retry-After: 5`. Must hold one largest request (8 MiB + 2^19 x 640 = 328 MiB) |
+| JSON values per request, counted before parsing (`max_json_values`) | 524,288 | Bounds the parsed body and its cleaned copy (measured worst case about 590 bytes per value, for tool schemas of one-member objects). Covers 65,536 messages at 4 values each with room for tools; tool-call argument strings count too |
+| Messages (`max_messages`) | 65,536 | Even an empty message renders as 5 template tokens, so more than 262,144 / 5 = 52,429 can never fit |
+| Content parts per message (`max_content_parts`) | 1,024 | Clients send a handful of text parts per message |
+| Tool calls per assistant message (`max_tool_calls`) | 1,024 | Each call renders as at least about 10 tokens of tags; parallel calls come in single digits |
+| Tools (`max_tools`) | 1,024 | OpenAI documents at most 128 functions; 8 times that |
+| Text bytes of the cleaned messages and tools, keys included (`max_text_bytes`) | 8 MiB | Equal to the body limit, since unescaping only shrinks text; it bounds what Python-style `str()` of non-string text parts and parsed tool arguments can add |
+| Concurrent connections (`max_connections`, 1..1024) | 64; excess connections are closed unserved | One engine serves one request at a time |
+| Queued engine jobs | 64 (bounded by active HTTP connections) | One per connection |
+| Buffered events per response | 8 | Backpressure reaches the engine quickly |
+| Header read buffer (`header_bytes`, at least 8192) | 32 KiB | Browser and SDK headers are a few KiB |
+| Header count (`max_headers`) | 100 | As common HTTP servers |
+| Complete header deadline (`header_timeout`) | 10 s | Slow-header clients cannot hold connections |
+| Complete body deadline (`body_timeout`) | 30 s | 8 MiB at loopback speed takes milliseconds |
+| Idle socket read/write deadline (`idle_timeout`) | 300 s | Long enough for a keep-alive client between requests |
+| Full event-channel backpressure deadline (`stream_timeout`) | 30 s | A stream that is not read stops the engine |
+| Bytes discarded while closing (`linger_bytes`) | 256 KiB | See closing below |
+| Closing deadline (`linger_timeout`) | 2 s | See closing below |
+| Context reserve | 64 tokens | As upstream |
+| Stop strings per request | 4 | As upstream and OpenAI |
+| Loop guard: longest period, repeat run in thinking / answer, digit run in thinking | 16 tokens; 256 / 1024 tokens; 1000 tokens | As upstream |
+
+A prompt is also refused with `context_length_exceeded` between template
+rendering and tokenization when its rendered bytes exceed context capacity x
+the longest vocabulary entry in bytes x 4 (normalization such as NFC shrinks
+text at most 3x): no tokenization could then fit it. The exact token check
+after tokenization stays. With a real vocabulary whose longest entry is long,
+this early check triggers only well beyond the body limit at the full context,
+so it mainly helps small `--max-ctx` values; the body limit bounds the rest.
+
+Not covered by the budget: the one request on the engine thread renders and
+tokenizes its prompt (measured about 64 bytes per prompt byte for
+tokenization, plus the template's copy of the messages), bounded through the
+body limit. Embedders running `Api` on a multi-thread runtime can decode
+several bodies at once; each is still charged before it is parsed.
 
 Default bind is 127.0.0.1:8765 and the default `max_tokens` is 32768.
 
@@ -149,6 +170,10 @@ with the bounded linger above instead of reading a potentially slow body;
 chunked requests are explicitly rejected (413), where Python never implemented
 their decoding. Hyper rejects malformed framing before the handler, using its
 own 400/414/431 responses and closing the connection.
+
+The body limit is 8 MiB instead of upstream's 32 MiB, and the request shape,
+text and global budget limits in the table above have no upstream equivalent;
+upstream parses any body within its limit and tokenizes it in full.
 
 Duplicate Host/Origin/Sec-Fetch-Site/Authorization headers are rejected to
 avoid intermediary ambiguity. Added header/body/connection/event limits defend

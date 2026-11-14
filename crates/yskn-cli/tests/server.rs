@@ -1012,3 +1012,174 @@ async fn exact_streaming_golden() {
     assert_eq!(normalize(&r.text), include_str!("data/stream.sse"));
     h.stop().await;
 }
+fn error_message(r: &Reply) -> String {
+    r.json()["error"]["message"].as_str().unwrap().to_owned()
+}
+// Review finding: a small body could expand into a huge parsed and cleaned
+// request. Shape limits refuse it before anything is copied.
+#[tokio::test]
+async fn request_shape_limits_refuse_expanding_bodies() {
+    let h = Harness::start(Config::default()).await;
+    // The default body limit is 8 MiB (upstream: 32 MiB).
+    let r = raw(
+        h.addr,
+        &format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n\r\n",
+            h.addr,
+            8 * 1024 * 1024 + 1
+        ),
+    )
+    .await;
+    assert!(r.starts_with("HTTP/1.1 413"), "{r}");
+    let msgs = vec![r#"{"role":"user"}"#; 65537].join(",");
+    let r = h
+        .raw_request(
+            "POST",
+            "/v1/chat/completions",
+            format!(r#"{{"messages":[{msgs}]}}"#),
+            &[],
+        )
+        .await;
+    assert_eq!(r.status, 400, "{}", r.text);
+    assert_eq!(error_message(&r), "messages: at most 65536 are accepted");
+    assert_eq!(r.json()["error"]["type"], "invalid_request_error");
+    assert_eq!(r.json()["error"]["code"], 400);
+    // 2^19 values is the default cap; the root and "messages" make 2 more.
+    let zeros = vec!["0"; 1 << 19].join(",");
+    let r = h
+        .raw_request(
+            "POST",
+            "/v1/chat/completions",
+            format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"x":[{zeros}]}}"#),
+            &[],
+        )
+        .await;
+    assert_eq!(r.status, 400, "{}", r.text);
+    assert_eq!(
+        error_message(&r),
+        "the request holds more than 524288 JSON values"
+    );
+    assert_eq!(h.control.observation().calls, 0);
+    h.stop().await;
+
+    let mut cfg = Config::default();
+    let l = &mut cfg.limits;
+    (
+        l.max_messages,
+        l.max_content_parts,
+        l.max_tool_calls,
+        l.max_tools,
+    ) = (2, 2, 2, 2);
+    l.max_text_bytes = 512;
+    let h = Harness::start(cfg).await;
+    let part = json!({"type":"text","text":"a"});
+    let call = json!({"function":{"name":"f","arguments":"{\"x\":[1,2,3]}"}});
+    let tool = json!({"type":"function","function":{"name":"f"}});
+    let user = json!({"role":"user","content":"hi"});
+    for (b, message) in [
+        (
+            json!({"messages":[user, user, user]}),
+            "messages: at most 2 are accepted",
+        ),
+        (
+            json!({"messages":[{"role":"user","content":[part, part, part]}]}),
+            "messages[0]: content parts: at most 2 are accepted",
+        ),
+        (
+            json!({"messages":[user, {"role":"assistant","tool_calls":[call, call, call]}]}),
+            "messages[1]: tool calls: at most 2 are accepted",
+        ),
+        (
+            json!({"messages":[user],"tools":[tool, tool, tool]}),
+            "tools: at most 2 are accepted",
+        ),
+        (
+            json!({"messages":[{"role":"user","content":"x".repeat(498)}]}),
+            "the request holds more than 512 bytes of text",
+        ),
+    ] {
+        let r = h
+            .request("POST", "/v1/chat/completions", Some(b.clone()), &[])
+            .await;
+        assert_eq!(r.status, 400, "{b}: {}", r.text);
+        assert_eq!(error_message(&r), message, "{b}");
+    }
+    // Exactly at each limit is accepted.
+    for b in [
+        json!({"messages":[{"role":"user","content":[part, part]}, {"role":"assistant","tool_calls":[call, call]}],"tools":[tool, tool],"max_tokens":4}),
+        // Text counts keys too: "role", "user" and "content" are 15 bytes.
+        json!({"messages":[{"role":"user","content":"x".repeat(512 - 15)}],"max_tokens":4}),
+    ] {
+        let r = h
+            .request("POST", "/v1/chat/completions", Some(b.clone()), &[])
+            .await;
+        assert_eq!(r.status, 200, "{b}: {}", r.text);
+    }
+    assert_eq!(h.control.observation().calls, 2);
+    h.stop().await;
+}
+// A prompt far beyond what the context could hold is refused between template
+// rendering and tokenization; the exact token check stays for the rest.
+#[tokio::test]
+async fn far_too_long_input_is_refused_before_tokenization() {
+    let h = Harness::start(Config::default()).await;
+    let r = h
+        .chat(json!({"messages":[{"role":"user","content":"a".repeat(2 << 20)}],"stream":true}))
+        .await;
+    assert_eq!(r.status, 400, "{}", r.text);
+    assert_eq!(r.json()["error"]["code"], "context_length_exceeded");
+    let message = error_message(&r);
+    assert!(
+        message.contains("bytes of prompt text cannot fit"),
+        "{message}"
+    );
+    assert!(
+        message.contains("maximum context length of 20000 tokens"),
+        "{message}"
+    );
+    assert_eq!(h.control.observation().calls, 0);
+    h.stop().await;
+}
+// All requests together are bounded: one that would push the bytes held by
+// received, queued and running requests past the budget gets 503 with
+// Retry-After, and the budget is returned when a request finishes.
+#[tokio::test]
+async fn global_budget_refuses_with_retry_after_and_recovers() {
+    let mut cfg = Config::default();
+    cfg.limits.max_body = 64 * 1024;
+    cfg.limits.max_json_values = 16;
+    cfg.limits.max_pending_bytes = 64 * 1024 + 16 * yskn::server::VALUE_COST;
+    // The budget must hold one largest request by itself.
+    let mut small = cfg.clone();
+    small.limits.max_pending_bytes -= 1;
+    assert!(small.validate().is_err());
+    let h = Harness::start(cfg).await;
+    h.control.delay(Duration::from_millis(2));
+    h.control.push(Script {
+        ids: ids("busy "),
+        loop_from: Some(0),
+    });
+    let pad = "x".repeat(40 * 1024);
+    let b = json!({"messages":user(),"stream":true,"max_tokens":1000000,"enable_thinking":false,"loop_guard":false,"pad":pad});
+    let (sender, mut body, task) = open_stream(&h, b).await;
+    body.frame().await.unwrap().unwrap();
+    // Fits alone, but not beside the running request.
+    let big = json!({"messages":user(),"max_tokens":4,"pad":pad});
+    let r = h
+        .request("POST", "/v1/chat/completions", Some(big.clone()), &[])
+        .await;
+    assert_eq!(r.status, 503, "{}", r.text);
+    assert_eq!(r.headers["retry-after"], "5");
+    assert_eq!(r.json()["error"]["type"], "unavailable");
+    task.abort();
+    drop((sender, body));
+    // Served only after the cancelled request has left the engine thread,
+    // which releases its charge.
+    h.script("</think>small");
+    assert_eq!(h.chat(json!({"max_tokens":20})).await.status, 200);
+    let r = h
+        .request("POST", "/v1/chat/completions", Some(big), &[])
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    h.stop().await;
+}

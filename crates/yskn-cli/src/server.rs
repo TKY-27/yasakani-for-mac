@@ -2,10 +2,13 @@
 use crate::{
     Error, Result,
     chat::{ChatRunner, Event, Usage},
-    request::{RequestDefaults, parse_chat_request, truthy},
+    request::{
+        RequestDefaults, check_size, check_values, json_values, parse_chat_request, text_bytes,
+        truthy,
+    },
 };
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited, combinators::BoxBody};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Body, Frame},
@@ -35,10 +38,24 @@ use tokio::{
     time::{Instant, Sleep},
 };
 
-pub const MAX_BODY: usize = 32 * 1024 * 1024;
+pub const MAX_BODY: usize = 8 * 1024 * 1024;
+/// Heap bytes charged per counted JSON value of a request, on top of its body
+/// bytes: an upper estimate for the parsed body and the cleaned copy that
+/// exist together while it is decoded. Measured worst case: about 590 bytes
+/// per value, for tool schemas made of one-member objects.
+pub const VALUE_COST: usize = 640;
 #[derive(Debug, Clone)]
 pub struct Limits {
     pub max_body: usize,
+    /// Global budget for request bytes being received, decoded, queued or
+    /// generating; a request that would exceed it gets 503 and Retry-After.
+    pub max_pending_bytes: usize,
+    pub max_json_values: usize,
+    pub max_messages: usize,
+    pub max_content_parts: usize,
+    pub max_tool_calls: usize,
+    pub max_tools: usize,
+    pub max_text_bytes: usize,
     pub max_connections: usize,
     pub max_headers: usize,
     pub header_bytes: usize,
@@ -55,6 +72,13 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_body: MAX_BODY,
+            max_pending_bytes: 512 * 1024 * 1024,
+            max_json_values: 1 << 19,
+            max_messages: 65536,
+            max_content_parts: 1024,
+            max_tool_calls: 1024,
+            max_tools: 1024,
+            max_text_bytes: MAX_BODY,
             max_connections: 64,
             max_headers: 100,
             header_bytes: 32768,
@@ -98,6 +122,14 @@ impl Config {
                 "refusing to listen on {} without --api-key: anyone who can reach this computer could use the engine",
                 self.host
             )));
+        }
+        let l = &self.limits;
+        // A single largest request must fit the budget when nothing else runs.
+        let largest = l
+            .max_body
+            .saturating_add(l.max_json_values.saturating_mul(VALUE_COST));
+        if l.max_pending_bytes < largest || l.max_pending_bytes > Semaphore::MAX_PERMITS {
+            return Err(Error::request("invalid server limits"));
         }
         if self.limits.max_connections == 0
             || self.limits.max_connections > 1024
@@ -250,9 +282,37 @@ struct Job {
     params: crate::chat::ChatParams,
     ready: oneshot::Sender<Result<mpsc::Receiver<Result<Event>>>>,
     cancel: Arc<AtomicBool>,
+    // Released when the engine thread drops the job, after its generation.
+    _charge: Charge,
+}
+/// A request's share of `Limits::max_pending_bytes`.
+struct Charge {
+    budget: Arc<Semaphore>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+impl Charge {
+    fn new(budget: &Arc<Semaphore>) -> Option<Self> {
+        Some(Self {
+            budget: budget.clone(),
+            permit: budget.clone().try_acquire_many_owned(0).ok()?,
+        })
+    }
+    /// Grows or shrinks the charge to `n` bytes; false if the budget lacks room.
+    fn resize(&mut self, n: usize) -> bool {
+        let have = self.permit.num_permits();
+        if n <= have {
+            drop(self.permit.split(have - n));
+            return true;
+        }
+        let more = u32::try_from(n - have)
+            .ok()
+            .and_then(|k| self.budget.clone().try_acquire_many_owned(k).ok());
+        more.map(|p| self.permit.merge(p)).is_some()
+    }
 }
 struct Shared {
     cfg: Config,
+    budget: Arc<Semaphore>,
     loaded: AtomicBool,
     capacity: AtomicUsize,
     shutdown: AtomicBool,
@@ -275,6 +335,7 @@ impl Api {
         cfg.validate()?;
         let (jobs, mut queue) = mpsc::channel::<Job>(cfg.limits.max_connections);
         let shared = Arc::new(Shared {
+            budget: Arc::new(Semaphore::new(cfg.limits.max_pending_bytes)),
             cfg,
             loaded: AtomicBool::new(false),
             capacity: AtomicUsize::new(0),
@@ -497,6 +558,96 @@ fn authorized<B>(r: &Request<B>, key: &str) -> bool {
     }
     std::hint::black_box(diff) == 0
 }
+fn busy_error() -> Error {
+    http_error(
+        503,
+        "the server is busy with other requests; retry later",
+        "unavailable",
+    )
+}
+fn busy(e: Error) -> Response<HttpBody> {
+    let mut r = error_response(e);
+    r.headers_mut().insert(
+        "retry-after",
+        hyper::header::HeaderValue::from_static(RETRY_AFTER),
+    );
+    r
+}
+const RETRY_AFTER: &str = "5";
+enum BodyError {
+    TooLarge,
+    Busy,
+}
+/// Reads the body, charging every received byte to the global budget first.
+async fn read_body<B>(
+    body: &mut B,
+    declared: usize,
+    limit: usize,
+    charge: &mut Charge,
+) -> std::result::Result<Vec<u8>, BodyError>
+where
+    B: Body<Data = Bytes> + Unpin,
+{
+    // Sized once so the resident buffer matches the bytes charged (pages are
+    // only touched as they are written).
+    let mut out = Vec::with_capacity(declared.min(limit));
+    while let Some(frame) = body.frame().await {
+        let Ok(data) = frame.map_err(|_| BodyError::TooLarge)?.into_data() else {
+            continue; // trailers
+        };
+        let len = out.len() + data.len();
+        if len > limit {
+            return Err(BodyError::TooLarge);
+        }
+        if !charge.resize(len) {
+            return Err(BodyError::Busy);
+        }
+        out.extend_from_slice(&data);
+    }
+    Ok(out)
+}
+struct Decoded {
+    params: crate::chat::ChatParams,
+    stream: bool,
+    include_usage: bool,
+}
+/// Validates and cleans a body. The charge grows to the estimated size of the
+/// parsed and cleaned request before parsing, so a request the budget cannot
+/// hold is never built. Synchronous: the parsed JSON never lives across an
+/// await, and only one body is decoded at a time on a current-thread runtime.
+fn decode(bytes: &[u8], cfg: &Config, charge: &mut Charge) -> Result<Decoded> {
+    let limits = &cfg.limits;
+    let estimate = |values: usize| {
+        bytes
+            .len()
+            .saturating_add(values.saturating_mul(VALUE_COST))
+    };
+    let values = json_values(bytes);
+    check_values(values, limits)?;
+    if !charge.resize(estimate(values)) {
+        return Err(busy_error());
+    }
+    let body: Value = serde_json::from_slice(if bytes.is_empty() { b"{}" } else { bytes })
+        .map_err(|_| Error::request("the request body is not valid JSON"))?;
+    // Adds the values that tool-call argument strings expand to.
+    let values = check_size(&body, limits, values)?;
+    if !charge.resize(estimate(values)) {
+        return Err(busy_error());
+    }
+    let params = parse_chat_request(&body, &cfg.defaults)?;
+    let text = text_bytes(&params.messages) + params.tools.as_ref().map_or(0, text_bytes);
+    if text > limits.max_text_bytes {
+        return Err(Error::request(format!(
+            "the request holds more than {} bytes of text",
+            limits.max_text_bytes
+        )));
+    }
+    Ok(Decoded {
+        params,
+        stream: truthy(&body["stream"]),
+        include_usage: truthy(&body["stream_options"]["include_usage"]),
+    })
+}
 async fn handle<B>(mut r: Request<B>, api: &Api) -> Response<HttpBody>
 where
     B: Body<Data = Bytes> + Unpin,
@@ -568,9 +719,17 @@ where
             "invalid_request_error",
         )));
     }
+    let Some(mut charge) = Charge::new(&shared.budget) else {
+        return close(busy(busy_error()));
+    };
     let bytes = match tokio::time::timeout(
         cfg.limits.body_timeout,
-        Limited::new(r.body_mut(), cfg.limits.max_body).collect(),
+        read_body(
+            r.body_mut(),
+            len.unwrap_or(0),
+            cfg.limits.max_body,
+            &mut charge,
+        ),
     )
     .await
     {
@@ -581,21 +740,22 @@ where
                 "invalid_request_error",
             )));
         }
-        Ok(Err(_)) => {
+        Ok(Err(BodyError::Busy)) => return close(busy(busy_error())),
+        Ok(Err(BodyError::TooLarge)) => {
             return close(error_response(http_error(
                 413,
                 "request body too large or length missing",
                 "invalid_request_error",
             )));
         }
-        Ok(Ok(b)) => b.to_bytes(),
+        Ok(Ok(b)) => b,
     };
-    let body: Value = match serde_json::from_slice(if bytes.is_empty() { b"{}" } else { &bytes }) {
-        Ok(b) => b,
-        Err(_) => return error_response(Error::request("the request body is not valid JSON")),
-    };
-    let params = match parse_chat_request(&body, &cfg.defaults) {
-        Ok(p) => p,
+    // The raw body and the parsed JSON are gone once the cleaned request exists.
+    let decoded = decode(&bytes, cfg, &mut charge);
+    drop(bytes);
+    let decoded = match decoded {
+        Ok(d) => d,
+        Err(e) if e.status == 503 => return busy(e),
         Err(e) => return error_response(e),
     };
     let envelope = Envelope::new(&cfg.model_id);
@@ -606,9 +766,10 @@ where
     };
     if jobs
         .send(Job {
-            params,
+            params: decoded.params,
             ready,
             cancel: cancel.0.clone(),
+            _charge: charge,
         })
         .await
         .is_err()
@@ -620,12 +781,12 @@ where
         Ok(Err(e)) => return error_response(e),
         Err(_) => return error_response(Error::engine("engine worker is unavailable")),
     };
-    if truthy(&body["stream"]) {
+    if decoded.stream {
         let stream = EventBody {
             events,
             cancel,
             envelope,
-            include_usage: truthy(&body["stream_options"]["include_usage"]),
+            include_usage: decoded.include_usage,
             calls: 0,
             pending: std::collections::VecDeque::new(),
             ended: false,
