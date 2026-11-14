@@ -26,14 +26,21 @@ commands: serve, chat, info, bench, selfcheck
   --model-dir FOLDER  published model folder (or YASAKANI_MODEL_DIR)
   --engine real|stub  real is the default; stub is a deterministic demo
   --kv int8|int8-profile|kv5  default kv5
-  --backend metal|cpu  default follows Model::load
   --draft none|ngram|neural|both  default both (n-gram on long matches, else neural)
   --k N              most guesses per pass (neural/both 1..7), default 7
   --depth adaptive|fixed  adaptive (default) picks 0..K neural guesses per pass;
                      fixed always offers K
   --ctx N            context capacity, default 32768; --max-ctx is an alias
-  --threads N        CPU worker count
   --prefill-width N  cancellable prefill pass width, default 16
+switches (exact: none changes the output, only speed); an option overrides
+its environment variable, an invalid value in either is an error:
+  --backend metal|cpu        YSKN_BACKEND; default Metal when it works, else CPU
+  --kernel dotprod|neon|portable  YSKN_KERNEL; default the fastest detected
+  --cpu-stages auto|reference     YSKN_CPU_STAGES; default auto (NEON fast paths)
+  --metal-mac float|integer       YSKN_METAL_MAC; default float
+  --cpu-share auto|off|F          YSKN_METAL_CPU_SHARE; F in 0..=0.9; default auto
+                     (the calibrated table on an Apple M5 with 10 workers, else off)
+  --threads N        CPU workers; default one per physical core
   --seed0 N          first automatic request seed, default 1
 serve:
   --host HOST --port PORT  default 127.0.0.1:8765
@@ -132,17 +139,28 @@ impl Args {
                 ));
             }
         };
+        let float_mac = self.switch("metal-mac", "YSKN_METAL_MAC", |value| match value {
+            "float" => Ok(true),
+            "integer" => Ok(false),
+            _ => Err("expected float or integer".into()),
+        })?;
         Ok(RealEngineConfig {
             model_dir: self.model_dir()?,
             kv: yskn_ref::quality::parse_kv_mode(std::ffi::OsStr::new(
                 self.value("kv").unwrap_or("kv5"),
             ))
             .map_err(Error::engine)?,
-            backend: self
-                .value("backend")
-                .map(str::parse::<yskn_engine::Backend>)
-                .transpose()
-                .map_err(Error::engine)?,
+            backend: self.switch("backend", "YSKN_BACKEND", parse)?,
+            kernel: self.switch("kernel", "YSKN_KERNEL", parse)?,
+            cpu_stages: self
+                .switch("cpu-stages", "YSKN_CPU_STAGES", parse)?
+                .unwrap_or(defaults.cpu_stages),
+            metal: yskn_engine::MetalOptions {
+                float_mac: float_mac.unwrap_or(defaults.metal.float_mac),
+                cpu_share: self
+                    .switch("cpu-share", "YSKN_METAL_CPU_SHARE", parse)?
+                    .unwrap_or(defaults.metal.cpu_share),
+            },
             draft,
             k: self.parse("k", defaults.k)?,
             depth: self.value("depth").map_or(Ok(defaults.depth), str::parse)?,
@@ -153,6 +171,29 @@ impl Args {
                 .transpose()?,
             prefill_width: self.parse("prefill-width", 16)?,
         })
+    }
+    /// `--key VALUE`, else the environment variable `env`, else `None`. Both
+    /// are parsed, so an invalid value is an error wherever it comes from.
+    fn switch<T>(
+        &self,
+        key: &str,
+        env: &str,
+        parse: impl Fn(&str) -> std::result::Result<T, String>,
+    ) -> Result<Option<T>> {
+        let checked = |value: &str, source: &str| {
+            parse(value).map_err(|e| Error::request(format!("{source}={value}: {e}")))
+        };
+        let from_env = match std::env::var(env) {
+            Ok(value) => Some(checked(&value, env)?),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(Error::request(format!("{env} is not valid UTF-8")));
+            }
+        };
+        match self.value(key) {
+            Some(value) => checked(value, &format!("--{key}")).map(Some),
+            None => Ok(from_env),
+        }
     }
     fn defaults(&self) -> Result<RequestDefaults> {
         let mut defaults = RequestDefaults::default();
@@ -174,11 +215,19 @@ impl Args {
             )
         } else {
             let config = self.real_config()?;
+            // Start-up checks before the tokenizer, the weights or anything large.
+            config.validate()?;
             let fmt = yskn_text::ChatFormatter::load(&config.model_dir)?;
             (Box::new(RealEngine::load(config)?), fmt)
         };
         ChatRunner::new(engine, fmt, self.parse("seed0", 1)?)
     }
+}
+/// `FromStr` for the engine's switch values, with its message.
+fn parse<T: std::str::FromStr<Err = yskn_engine::Error>>(
+    value: &str,
+) -> std::result::Result<T, String> {
+    value.parse().map_err(|e: yskn_engine::Error| e.to_string())
 }
 fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut it = argv.into_iter();
@@ -204,6 +253,10 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         "depth",
         "threads",
         "prefill-width",
+        "kernel",
+        "cpu-stages",
+        "metal-mac",
+        "cpu-share",
     ];
     let serve = [
         "host",

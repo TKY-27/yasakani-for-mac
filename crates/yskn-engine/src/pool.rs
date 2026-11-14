@@ -45,9 +45,11 @@ impl Engine {
         Self::new(kernel, Self::default_threads())
     }
 
-    /// Measured on the 4P+6E M5: cap at ten, respecting smaller available CPU counts.
+    /// One worker per physical core of every performance level, read from this
+    /// machine ([`crate::Machine::default_threads`]; 10 on the 4P+6E M5, D10).
     pub fn default_threads() -> usize {
-        thread::available_parallelism().map_or(1, |n| n.get().min(10))
+        static THREADS: OnceLock<usize> = OnceLock::new();
+        *THREADS.get_or_init(|| crate::Machine::detect().default_threads())
     }
 
     pub fn new(kernel: Kernel, threads: usize) -> Result<Self> {

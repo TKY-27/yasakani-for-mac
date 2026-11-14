@@ -3,7 +3,10 @@
 use std::{fs, path::PathBuf, str::FromStr, time::Instant};
 
 use serde_json::{Value, json};
-use yskn_engine::{Backend, FastDraft, KvMode, LogitRows, Model, SessionMemory, Snapshot};
+use yskn_engine::{
+    Backend, CpuStages, FastDraft, Kernel, KvMode, LogitRows, MetalOptions, Model, SessionMemory,
+    Snapshot,
+};
 use yskn_ref::{
     Sampler, SamplingParameters, SamplingVersion,
     draft::DraftOptions,
@@ -88,7 +91,12 @@ impl FromStr for DepthMode {
 pub struct RealEngineConfig {
     pub model_dir: PathBuf,
     pub kv: KvMode,
+    /// `None`: Metal when it works on this machine, else the CPU (D23).
     pub backend: Option<Backend>,
+    /// `None`: the fastest kernel this CPU supports.
+    pub kernel: Option<Kernel>,
+    pub cpu_stages: CpuStages,
+    pub metal: MetalOptions,
     pub draft: DraftMode,
     /// Maximum guesses per pass; every pass with `DepthMode::Fixed`.
     pub k: usize,
@@ -103,6 +111,9 @@ impl Default for RealEngineConfig {
             model_dir: PathBuf::new(),
             kv: KvMode::Kv5,
             backend: None,
+            kernel: None,
+            cpu_stages: CpuStages::Auto,
+            metal: MetalOptions::default(),
             // Fastest measured across the four bench tasks (D21).
             draft: DraftMode::Both,
             k: 7,
@@ -114,7 +125,11 @@ impl Default for RealEngineConfig {
     }
 }
 impl RealEngineConfig {
+    /// Start-up checks (D23): Apple silicon, macOS 26 or later, the option
+    /// values and every model file this configuration reads, before anything
+    /// is opened or mapped.
     pub(crate) fn validate(&self) -> Result<()> {
+        crate::platform::check_this_platform()?;
         if !self.model_dir.is_dir() {
             return Err(Error::engine("--model-dir must name a model folder"));
         }
@@ -129,7 +144,7 @@ impl RealEngineConfig {
         if self.draft.neural() && !(1..8).contains(&self.k) {
             return Err(Error::engine("neural --k must be in 1..8"));
         }
-        Ok(())
+        crate::platform::check_folder(self)
     }
     pub(crate) fn kv_name(&self) -> &'static str {
         match self.kv {
@@ -206,9 +221,18 @@ pub struct ModelInfo {
     pub k: usize,
     pub depth: String,
     pub memory: MemoryEstimate,
+    /// Effective backend, kernel, CPU stages, Metal options and threads.
+    pub run: crate::platform::RunChoice,
 }
 impl ModelInfo {
     pub fn to_json(&self) -> Value {
+        let mut value = self.json_fields();
+        if let (Some(value), Value::Object(run)) = (value.as_object_mut(), self.run.to_json()) {
+            value.extend(run);
+        }
+        value
+    }
+    fn json_fields(&self) -> Value {
         json!({"model_file":self.model_file,"model_bytes":self.model_bytes,"code_bytes_per_pass":self.code_bytes_per_pass,"draft_proposal_code_bytes":self.draft_proposal_code_bytes,"draft_update_code_bytes":self.draft_update_code_bytes,"layers":self.layers,"hidden_width":self.hidden_width,"feed_forward_width":self.feed_forward_width,"vocabulary":self.vocabulary,"context":self.context,"model_max_context":self.model_max_context,"threads":self.threads,"kv":self.kv,"backend":self.backend,"device":self.device,"draft":self.draft,"k":self.k,"depth":self.depth,"memory":self.memory.to_json(),"file_stability":MODEL_FILE_STABILITY})
     }
 }
@@ -384,16 +408,7 @@ impl RealEngine {
         let mut info = config.inspect()?;
         info.memory.enforce(info.memory.physical_bytes)?;
         let defaults = config.sampling_defaults()?;
-        let backend = config
-            .backend
-            .map_or_else(Backend::from_env, Ok)
-            .map_err(Error::engine)?;
-        let threads = config
-            .threads
-            .unwrap_or_else(yskn_engine::Engine::default_threads);
-        let kernel = std::env::var("YSKN_KERNEL")
-            .map_or_else(|_| Ok(yskn_engine::Kernel::fastest()), |s| s.parse())
-            .map_err(Error::engine)?;
+        let (backend, kernel, threads) = (info.run.backend, info.run.kernel, info.run.threads);
         let pool = yskn_engine::Engine::new(kernel, threads).map_err(Error::engine)?;
         let width = config.prefill_width.max(
             config
@@ -408,7 +423,15 @@ impl RealEngine {
         } else {
             None
         };
-        let (mut model, draft) = map_files(&config, pool, draft_pool, backend, width, options)?;
+        let (mut model, mut draft) = map_files(&config, pool, draft_pool, backend, width, options)?;
+        // Explicit choices; the library reads no environment variable here.
+        model
+            .set_cpu_stages(config.cpu_stages)
+            .map_err(Error::engine)?;
+        model.set_metal_options(config.metal);
+        if let Some(draft) = &mut draft {
+            draft.set_metal_options(config.metal);
+        }
         let mut proposer = match (config.draft, draft) {
             (DraftMode::None, _) => Drafts::None(NoProposer),
             (DraftMode::Ngram, _) => {

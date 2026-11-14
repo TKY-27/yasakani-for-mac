@@ -325,6 +325,10 @@ impl FastDraft {
     pub fn backend(&self) -> Backend {
         self.compute.backend()
     }
+    /// Explicit Metal arithmetic and CPU share, as `Model::set_metal_options`.
+    pub fn set_metal_options(&mut self, options: crate::MetalOptions) {
+        self.compute.set_metal_options(options);
+    }
     /// The projection device: Metal device name, or CPU kernel and threads.
     pub fn device(&self) -> String {
         self.compute.device()

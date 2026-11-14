@@ -33,8 +33,9 @@ pub(super) fn selfcheck(args: &Args) -> Result<()> {
         .value("reference")
         .map(std::path::PathBuf::from)
         .unwrap_or(args.model_dir()?.join("selfcheck.json"));
-    let reference: Value = serde_json::from_slice(&std::fs::read(&path).map_err(Error::engine)?)
-        .map_err(Error::engine)?;
+    let named = |e: &dyn std::fmt::Display| Error::engine(format!("{}: {e}", path.display()));
+    let reference: Value = serde_json::from_slice(&std::fs::read(&path).map_err(|e| named(&e))?)
+        .map_err(|e| named(&e))?;
     if reference["format"] != json!(1) {
         return Err(Error::request("selfcheck reference has an unknown format"));
     }

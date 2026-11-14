@@ -904,6 +904,527 @@ fn selfcheck_cli_accepts_scalar_reference_and_reports_mismatching_token_ids() {
     );
 }
 
+/// D23: every forced-off switch the product honours gives the tokens of the
+/// default configuration (detected backend, kernel, CPU stages, binary32 Metal
+/// arithmetic, automatic CPU share, one worker per core), greedy and seeded,
+/// with the fast draft and the adaptive depth running; `info` shows each choice.
+#[test]
+fn forced_off_switches_give_the_default_tokens_greedy_and_seeded() {
+    use yskn::real_engine::{RealEngine, RealEngineConfig};
+    use yskn_engine::{Backend, CpuShare, CpuStages, Kernel, MetalOptions};
+    let folder = Folder::new();
+    let prompt = [1, 2, 1, 2, 1, 2, 3];
+    let base = || RealEngineConfig {
+        backend: None,
+        threads: None,
+        k: 7,
+        ..folder.config(DraftMode::Both)
+    };
+    let load = |config: RealEngineConfig| {
+        let mut options = product_support::model::draft::options();
+        options.capture_layers = vec![0];
+        RealEngine::load_with_draft_options(config, options).unwrap()
+    };
+    let metal = |share| MetalOptions {
+        float_mac: true,
+        cpu_share: share,
+    };
+    let cases = [
+        (
+            "CPU backend",
+            RealEngineConfig {
+                backend: Some(Backend::Cpu),
+                ..base()
+            },
+            ("backend", "cpu"),
+        ),
+        (
+            "portable kernel",
+            RealEngineConfig {
+                kernel: Some(Kernel::Portable),
+                ..base()
+            },
+            ("kernel", "portable"),
+        ),
+        (
+            "reference CPU stages",
+            RealEngineConfig {
+                cpu_stages: CpuStages::Reference,
+                ..base()
+            },
+            ("cpu_stages", "reference"),
+        ),
+        (
+            "integer Metal arithmetic",
+            RealEngineConfig {
+                metal: MetalOptions {
+                    float_mac: false,
+                    cpu_share: CpuShare::Auto,
+                },
+                ..base()
+            },
+            ("metal_mac", "integer"),
+        ),
+        (
+            "CPU share off",
+            RealEngineConfig {
+                metal: metal(CpuShare::Off),
+                ..base()
+            },
+            ("cpu_share", "off"),
+        ),
+        (
+            // Gives the CPU rows of every 512-row matrix on any Metal device.
+            "CPU share 0.5",
+            RealEngineConfig {
+                metal: metal(CpuShare::Fixed(0.5)),
+                ..base()
+            },
+            ("cpu_share", "fixed 0.5"),
+        ),
+        (
+            "one thread",
+            RealEngineConfig {
+                threads: Some(1),
+                ..base()
+            },
+            ("threads", "1"),
+        ),
+    ];
+    let default = load(base());
+    let on_metal = default.info().backend == "metal";
+    let facts = default.info().to_json();
+    assert_eq!(facts["cpu_stages"], "auto (NEON fast paths)");
+    assert_eq!(facts["threads"], yskn_engine::Engine::default_threads());
+    if !on_metal {
+        println!("no Metal device: the Metal switches ran on the CPU backend");
+    }
+    for sampling in [greedy(), sampled()] {
+        let expected = run(&mut load(base()), &prompt, 24, &sampling).ids;
+        assert_eq!(expected, scalar(&folder, &prompt, 24, &sampling));
+        for (name, config, (key, shown)) in &cases {
+            let mut engine = load(config.clone());
+            let info = engine.info().to_json();
+            let metal_only = matches!(*key, "metal_mac" | "cpu_share");
+            if !metal_only || on_metal {
+                assert_eq!(
+                    info[key].to_string().trim_matches('"'),
+                    *shown,
+                    "{name}: {info}"
+                );
+            }
+            let ids = run(&mut engine, &prompt, 24, &sampling).ids;
+            assert_eq!(ids, expected, "{name} {sampling:?}");
+        }
+    }
+}
+
+/// D23 start-up checks: Apple silicon and macOS 26 or later, failing closed
+/// with the requirement and the value found.
+#[test]
+fn platform_check_requires_apple_silicon_and_macos_26_and_names_the_value_found() {
+    use yskn::platform::check_platform;
+    for version in ["26.0", "26.4.1", "27.2.1", "30.1"] {
+        check_platform("aarch64", "macos", Some(version)).unwrap();
+    }
+    // macOS 26 can report 16.x to programs built with an older SDK.
+    check_platform("aarch64", "macos", Some("16.0")).unwrap();
+    for (arch, os, version, expected) in [
+        (
+            "aarch64",
+            "macos",
+            Some("15.7.1"),
+            "macOS 26 or later; this Mac runs macOS 15.7.1",
+        ),
+        ("aarch64", "macos", Some("14.0"), "this Mac runs macOS 14.0"),
+        ("aarch64", "macos", None, "cannot read this Mac's version"),
+        (
+            "aarch64",
+            "macos",
+            Some("unknown"),
+            "cannot read the version \"unknown\"",
+        ),
+        (
+            "x86_64",
+            "macos",
+            Some("27.0"),
+            "Apple silicon (macOS on aarch64); this program runs on macos x86_64",
+        ),
+        (
+            "aarch64",
+            "linux",
+            Some("27.0"),
+            "this program runs on linux aarch64",
+        ),
+    ] {
+        let error = check_platform(arch, os, version).unwrap_err().to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+    yskn::platform::check_this_platform().unwrap();
+}
+
+/// D23: before anything is opened, a missing model file is reported by name,
+/// with the option that needs it; files a configuration does not read are
+/// not required.
+#[test]
+fn incomplete_model_folder_lists_every_missing_file_and_the_option_needing_it() {
+    let folder = Folder::new();
+    std::fs::remove_file(folder.0.join("tokenizer.json")).unwrap();
+    std::fs::remove_file(folder.0.join("draft.shead")).unwrap();
+    std::fs::remove_file(folder.0.join("profile.bin")).unwrap();
+    let error = folder
+        .config(DraftMode::Both)
+        .inspect()
+        .unwrap_err()
+        .to_string();
+    for expected in [
+        "is incomplete: missing",
+        "profile.bin (files.kv_profile, for --kv kv5; --kv int8 runs without it)",
+        "draft.shead (files.draft_head, the draft head, for --draft both; --draft ngram or none runs without it)",
+        "tokenizer.json (the tokenizer)",
+    ] {
+        assert!(error.contains(expected), "{expected}: {error}");
+    }
+    assert!(
+        !error.contains("weights.yskn") && !error.contains("draft.yskn"),
+        "{error}"
+    );
+    let mut config = folder.config(DraftMode::None);
+    config.kv = yskn_engine::KvMode::Int8;
+    let error = config.inspect().unwrap_err().to_string();
+    assert!(
+        error.ends_with("missing tokenizer.json (the tokenizer)"),
+        "{error}"
+    );
+    let output = product_command(&folder, "info")
+        .args(["--draft", "none", "--kv", "int8"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing tokenizer.json"));
+}
+
+/// Header facts of the published model (`yskn info --model-dir ~/models/qwen38-speed`,
+/// memory.facts, D23), so the README's memory table is tested without it.
+fn published_model() -> yskn::memory::MemoryFacts {
+    yskn::memory::MemoryFacts {
+        weights_bytes: 10_311_344_128,
+        recurrent_bytes: 156_893_184,
+        replay_bytes_per_row: 5_916_672,
+        cache_bytes_per_token: 89_600,
+        int8_cache_bytes_per_token: 37_632,
+        dense_bytes: 104_953_856,
+        hidden: 5120,
+        feed_forward: 17_408,
+        vocabulary: 248_320,
+        draft: Some(yskn::memory::DraftFacts {
+            bytes: 2_721_905_176,
+            ring_bytes: 41_943_040,
+            features: 25_600,
+        }),
+    }
+}
+
+/// The README table "What a smaller Mac can run": needed bytes per context
+/// for kv5/int8 with and without the draft (pass width 16, the defaults), the
+/// largest context each memory size accepts, and what the check prints.
+#[test]
+fn published_model_memory_table_matches_the_readme() {
+    use yskn::memory::MemoryFacts;
+    const GIB: u64 = 1 << 30;
+    let kv5 = published_model();
+    let variants = [
+        kv5.clone(),
+        MemoryFacts {
+            draft: None,
+            ..kv5.clone()
+        },
+        MemoryFacts {
+            cache_bytes_per_token: kv5.int8_cache_bytes_per_token,
+            ..kv5.clone()
+        },
+        MemoryFacts {
+            cache_bytes_per_token: kv5.int8_cache_bytes_per_token,
+            draft: None,
+            ..kv5.clone()
+        },
+    ];
+    // --ctx: kv5 both, kv5 none, int8 both, int8 none.
+    let needed: [(usize, [u64; 4]); 7] = [
+        (
+            4096,
+            [
+                17_480_703_900,
+                14_250_275_636,
+                17_235_913_833,
+                14_005_485_568,
+            ],
+        ),
+        (
+            8192,
+            [
+                17_902_812_265,
+                14_672_384_000,
+                17_413_232_130,
+                14_182_803_866,
+            ],
+        ),
+        (
+            16384,
+            [
+                18_747_028_994,
+                15_516_600_730,
+                17_767_868_726,
+                14_537_440_461,
+            ],
+        ),
+        (
+            32768,
+            [
+                20_435_462_454,
+                17_205_034_189,
+                18_477_141_916,
+                15_246_713_652,
+            ],
+        ),
+        (
+            65536,
+            [
+                23_812_329_372,
+                20_581_901_108,
+                19_895_688_297,
+                16_665_260_032,
+            ],
+        ),
+        (
+            131072,
+            [
+                30_566_063_209,
+                27_335_634_944,
+                22_732_781_058,
+                19_502_352_794,
+            ],
+        ),
+        (
+            262144,
+            [
+                44_073_530_882,
+                40_843_102_618,
+                28_406_966_582,
+                25_176_538_317,
+            ],
+        ),
+    ];
+    for (context, row) in needed {
+        for (facts, bytes) in variants.iter().zip(row) {
+            assert_eq!(
+                facts.estimate(context, 16, 0).unwrap().needed_bytes,
+                bytes,
+                "{context}"
+            );
+        }
+    }
+    // Largest power-of-two --ctx that fits (0: none from 4096 up).
+    let largest: [(u64, [usize; 4]); 4] = [
+        (16, [0, 16384, 0, 65536]),
+        (24, [65536, 65536, 131072, 262144]),
+        (32, [131072, 131072, 262144, 262144]),
+        (48, [262144, 262144, 262144, 262144]),
+    ];
+    for (gib, row) in largest {
+        for (facts, expected) in variants.iter().zip(row) {
+            let fits = needed
+                .iter()
+                .map(|&(context, _)| context)
+                .filter(|&context| {
+                    facts
+                        .estimate(context, 16, gib * GIB)
+                        .unwrap()
+                        .fits(gib * GIB)
+                })
+                .max()
+                .unwrap_or(0);
+            assert_eq!(fits, expected, "{gib} GB");
+        }
+    }
+    // What a 16 GB Mac prints for the defaults (README).
+    let message = kv5
+        .estimate(32768, 16, 16 * GIB)
+        .unwrap()
+        .enforce(16 * GIB)
+        .unwrap_err()
+        .to_string();
+    for line in [
+        "this configuration needs 20435462454 bytes (19.03 GiB), including 3599183646 bytes margin; physical memory is 17179869184 bytes (16.00 GiB), 3255593270 bytes short.",
+        "needed: model weights 10311344128, draft 2721905176, KV cache for --ctx 32768 2936012800, recurrent state 156893184, prompt checkpoint 199960576, working memory 510162944, margin 3599183646.",
+        "  --draft none: saves 3230428265 bytes, needs 17205034189 bytes (16.02 GiB)",
+        "  --ctx 16384: saves 1688433460 bytes, needs 18747028994 bytes (17.46 GiB)",
+        "  --ctx 4096: saves 2954758554 bytes, needs 17480703900 bytes (16.28 GiB)",
+        "  --kv int8: saves 1958320538 bytes, needs 18477141916 bytes (17.21 GiB)",
+        "largest that fits: --ctx 16384 --draft none; --ctx 32768 --draft none --kv int8",
+    ] {
+        assert!(message.lines().any(|l| l == line), "{line}\n{message}");
+    }
+    let message = kv5
+        .estimate(32768, 16, 8 * GIB)
+        .unwrap()
+        .enforce(8 * GIB)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.ends_with("nothing listed fits: even --ctx 4096 --draft none --kv int8 needs 14005485568 bytes (13.04 GiB), so this Mac does not have enough memory for this model."),
+        "{message}"
+    );
+    kv5.estimate(32768, 16, 24 * GIB)
+        .unwrap()
+        .enforce(24 * GIB)
+        .unwrap();
+}
+
+/// D23: the product's switches, as options or environment variables (an
+/// option wins; an invalid value from either is an error naming its source),
+/// and `yskn info` shows the effective choices.
+#[test]
+fn product_switches_are_validated_and_info_shows_the_effective_choices() {
+    let folder = Folder::new();
+    let info = |args: &[&str], env: &[(&str, &str)]| {
+        let mut command = product_command(&folder, "info");
+        for key in [
+            "YSKN_BACKEND",
+            "YSKN_KERNEL",
+            "YSKN_CPU_STAGES",
+            "YSKN_METAL_MAC",
+            "YSKN_METAL_CPU_SHARE",
+        ] {
+            command.env_remove(key);
+        }
+        command
+            .args(["--draft", "none"])
+            .args(args)
+            .envs(env.iter().copied());
+        command.output().unwrap()
+    };
+    let facts = |output: &std::process::Output| -> Value {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::Deserializer::from_slice(&output.stdout)
+            .into_iter::<Value>()
+            .next()
+            .unwrap()
+            .unwrap()
+    };
+    // product_command passes --backend cpu --threads 1.
+    let cpu = facts(&info(
+        &["--kernel", "portable", "--cpu-stages", "reference"],
+        &[],
+    ));
+    assert_eq!(cpu["backend"], "cpu");
+    assert_eq!(cpu["device"], "portable x1");
+    assert_eq!(cpu["kernel"], "portable");
+    assert_eq!(cpu["threads"], 1);
+    assert_eq!(cpu["cpu_stages"], "reference");
+    assert_eq!(cpu["metal_mac"], "unused (CPU backend)");
+    assert_eq!(cpu["cpu_share"], "unused (CPU backend)");
+    assert!(cpu["machine"]["macos"].is_string(), "{cpu}");
+    // The environment applies when the option is absent; the option wins.
+    let env = facts(&info(
+        &[],
+        &[
+            ("YSKN_KERNEL", "portable"),
+            ("YSKN_CPU_STAGES", "reference"),
+        ],
+    ));
+    assert_eq!(
+        (env["kernel"].as_str(), env["cpu_stages"].as_str()),
+        (Some("portable"), Some("reference"))
+    );
+    let both = facts(&info(
+        &["--cpu-stages", "auto"],
+        &[("YSKN_CPU_STAGES", "reference")],
+    ));
+    assert_eq!(both["cpu_stages"], "auto (NEON fast paths)");
+    for (args, env, expected) in [
+        (&["--kernel", "fast"][..], &[][..], "--kernel=fast"),
+        (&["--cpu-stages", "on"], &[], "--cpu-stages=on"),
+        (
+            &["--metal-mac", "half"],
+            &[],
+            "--metal-mac=half: expected float or integer",
+        ),
+        (&["--cpu-share", "0.95"], &[], "--cpu-share=0.95"),
+        (&["--cpu-share", "-1"], &[], "--cpu-share=-1"),
+        (
+            &[],
+            &[("YSKN_METAL_CPU_SHARE", "most")],
+            "YSKN_METAL_CPU_SHARE=most",
+        ),
+        // An invalid environment value is an error even when an option overrides it.
+        (
+            &["--kernel", "portable"],
+            &[("YSKN_KERNEL", "fast")],
+            "YSKN_KERNEL=fast",
+        ),
+        (&[], &[("YSKN_BACKEND", "gpu")], "YSKN_BACKEND=gpu"),
+    ] {
+        let output = info(args, env);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?} {env:?}");
+        assert!(stderr.contains(expected), "{expected}: {stderr}");
+    }
+    let mut command = product_command(&folder, "info");
+    command.env_remove("YSKN_BACKEND");
+    let metal = command
+        .args([
+            "--draft",
+            "none",
+            "--backend",
+            "metal",
+            "--metal-mac",
+            "integer",
+            "--cpu-share",
+            "off",
+        ])
+        .output()
+        .unwrap();
+    #[cfg(target_os = "macos")]
+    let device = yskn_engine::MetalEngine::device_exists();
+    #[cfg(not(target_os = "macos"))]
+    let device = false;
+    if device {
+        let metal = facts(&metal);
+        assert_eq!(metal["backend"], "metal");
+        assert_eq!(metal["metal_mac"], "integer");
+        assert_eq!(metal["cpu_share"], "off");
+        assert!(
+            metal["machine"]["metal_max_buffer_length"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    } else {
+        assert!(!metal.status.success());
+        assert!(String::from_utf8_lossy(&metal.stderr).contains("--backend metal was requested"));
+    }
+    let help = Command::new(env!("CARGO_BIN_EXE_yskn"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    for switch in [
+        "--backend metal|cpu",
+        "YSKN_KERNEL",
+        "--cpu-stages auto|reference",
+        "--metal-mac float|integer",
+        "--cpu-share auto|off|F",
+        "--threads N",
+    ] {
+        assert!(help.contains(switch), "{switch}");
+    }
+}
+
 mod sockets {
     use super::*;
     use bytes::Bytes;

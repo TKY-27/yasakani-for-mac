@@ -16,11 +16,12 @@ cargo run -p yskn -- chat --engine stub
 `--model-dir` (or `YASAKANI_MODEL_DIR`) names the published model folder.
 Model files must remain unchanged until the engine exits: its weights are
 mapped read only. The real defaults are `--kv kv5`, `--draft both`, `--k 7`,
-`--depth adaptive`, `--ctx 32768`, `--prefill-width 16`; `--backend cpu|metal`
-follows `Model::load` selection when omitted, and `--threads N` selects CPU
-workers (the fast draft gets its own pool with the same kernel, worker count
-and backend). `--max-ctx` remains an alias for `--ctx`; giving both is an
-error. Context cannot exceed the folder's `max_ctx`. `--seed0` defaults to 1.
+`--depth adaptive`, `--ctx 32768`, `--prefill-width 16`; the backend, kernel,
+CPU stages, Metal arithmetic, CPU share and worker count are the switches
+below (the fast draft gets its own pool with the same kernel, worker count,
+backend and Metal options). `--max-ctx` remains an alias for `--ctx`; giving
+both is an error. Context cannot exceed the folder's `max_ctx`. `--seed0`
+defaults to 1.
 
 Drafting never changes the output, only its speed. `--draft none|ngram|neural|both`:
 `neural` and `both` use the fast block draft (D18, bit-identical to the scalar
@@ -37,9 +38,10 @@ Measurements and the policy are in `docs/port/DECISIONS.md` D21.
 The stub alone can omit a folder and use its synthetic byte tokenizer.
 
 `info` inspects model architecture, context, selected cache/backend/device,
-model file and memory estimates. Before loading, real commands compare the
-estimate with physical memory with a stated reserve and refuse configurations
-that cannot fit. `--ctx`, `--kv` and `--draft` control that estimate; no system
+the effective switches, the machine, model file and memory estimates. Before
+loading, real commands compare the estimate with physical memory with a
+stated reserve and refuse configurations that cannot fit (see "Other Macs"
+below). `--ctx`, `--kv` and `--draft` control that estimate; no system
 setting is changed. Fast-draft files are counted once as mappings; owned data
 adds the repacked int8 approximate head, f32 head projection/scales, draft
 norms/layer vectors and selector hp. Selector pred/succ remain mapped BF16.
@@ -49,6 +51,87 @@ Sampling request defaults come from the folder's optional
 `generation_config.json`, falling back to upstream's 1.0 / 0.95 / 20 / 0.0
 (temperature / top-p / top-k / min-p). Explicit request values keep the existing
 validation and override those defaults.
+
+## Other Macs: switches, start-up checks, memory
+
+Every fast path is bit-identical to the scalar reference, so a switch can
+only change speed, never output (D23 in `docs/port/DECISIONS.md`). Each switch
+is an option of every real command with an environment variable of the same
+meaning; the option wins, and an invalid value from either is an error that
+names its source (`--cpu-share=0.95: ...`, `YSKN_KERNEL=fast: ...`). `yskn info`
+shows the effective value of each.
+
+| Option | Environment | Values | Default |
+|---|---|---|---|
+| `--backend` | `YSKN_BACKEND` | `metal`, `cpu` | Metal when the device, the shader and its required features work; otherwise the CPU, with one line on stderr saying why and that the projections take about 6 times as long. An explicit `metal` that does not work is an error. |
+| `--kernel` | `YSKN_KERNEL` | `dotprod`, `neon`, `portable` | the fastest this CPU reports (`is_aarch64_feature_detected!`); an unavailable one is an error |
+| `--cpu-stages` | `YSKN_CPU_STAGES` | `auto`, `reference` | `auto`: the NEON fast paths when NEON is detected (D20) |
+| `--metal-mac` | `YSKN_METAL_MAC` | `float`, `integer` | `float` (exact binary32, D22) |
+| `--cpu-share` | `YSKN_METAL_CPU_SHARE` | `auto`, `off`, a fraction in 0..=0.9 | `auto`: the calibrated table on an Apple M5 with 10 CPU workers, the only machine it was measured on; off on every other machine |
+| `--threads` | (none) | N > 0 | one worker per physical core of every performance level (`hw.perflevel*.physicalcpu`; 10 on the M5), else `hw.physicalcpu`, else the CPUs available |
+
+The adaptive draft depth's cost table (D21) was also measured on the M5
+only. It stays on other chips, since it can only change speed; `info`
+(`draft_cost_table`) says so. To calibrate the CPU share on another Mac, run
+`cargo run --release -p yskn-engine --example bench_metal -- MODEL.yskn --m 1,4,16 --shares 0,0.05,0.1,0.15`
+on a quiet machine and pass the fastest share as `--cpu-share`.
+
+Start-up checks run before the tokenizer, the weights or anything large is
+opened, in this order, and fail closed (a fact that cannot be read is an
+error); none changes a system setting:
+
+1. Architecture: macOS on Apple silicon (aarch64), else "yskn requires a Mac
+   with Apple silicon (macOS on aarch64); this program runs on OS ARCH".
+2. macOS 26 or later, from `kern.osproductversion`: "yskn requires macOS 26 or
+   later; this Mac runs macOS 15.7.1" (16.x, which macOS 26 can report to
+   programs built with an older SDK, counts as 26).
+3. Model folder completeness: every file this configuration reads, listed
+   together with the option that needs it, e.g. "missing bdraft2_k8.shead
+   (files.draft_head, the draft head, for --draft both; --draft ngram or none
+   runs without it)".
+4. Memory: the estimate (D19) against physical memory. The message names
+   the shortfall, every part of the estimate, and what each option saves.
+
+**What a smaller Mac can run** (published model, `--k 7` and
+`--prefill-width 16`, from `yskn info`'s accounting; tested by
+`published_model_memory_table_matches_the_readme`). Needed bytes (GiB):
+
+| `--ctx` | kv5, draft both (default) | kv5, `--draft none` | `--kv int8`, draft both | `--kv int8 --draft none` |
+|---:|---:|---:|---:|---:|
+| 4096 | 17,480,703,900 (16.28) | 14,250,275,636 (13.27) | 17,235,913,833 (16.05) | 14,005,485,568 (13.04) |
+| 8192 | 17,902,812,265 (16.67) | 14,672,384,000 (13.66) | 17,413,232,130 (16.22) | 14,182,803,866 (13.21) |
+| 16384 | 18,747,028,994 (17.46) | 15,516,600,730 (14.45) | 17,767,868,726 (16.55) | 14,537,440,461 (13.54) |
+| 32768 (default) | 20,435,462,454 (19.03) | 17,205,034,189 (16.02) | 18,477,141,916 (17.21) | 15,246,713,652 (14.20) |
+| 65536 | 23,812,329,372 (22.18) | 20,581,901,108 (19.17) | 19,895,688,297 (18.53) | 16,665,260,032 (15.52) |
+| 131072 | 30,566,063,209 (28.47) | 27,335,634,944 (25.46) | 22,732,781,058 (21.17) | 19,502,352,794 (18.16) |
+| 262144 | 44,073,530,882 (41.05) | 40,843,102,618 (38.04) | 28,406,966,582 (26.46) | 25,176,538,317 (23.45) |
+
+Largest power-of-two `--ctx` the check accepts ("none": not even 4096):
+
+| Physical memory | kv5, draft both | kv5, `--draft none` | `--kv int8`, draft both | `--kv int8 --draft none` |
+|---|---:|---:|---:|---:|
+| 16 GB | none | 16384 | none | 65536 |
+| 24 GB | 65536 | 65536 | 131072 | 262144 |
+| 32 GB | 131072 | 131072 | 262144 | 262144 |
+| 48 GB | 262144 | 262144 | 262144 | 262144 |
+
+So a 16 GB Mac cannot run the neural draft at all, and runs the default
+context only with `--draft none --kv int8`. With the defaults it prints:
+
+```text
+this configuration needs 20435462454 bytes (19.03 GiB), including 3599183646 bytes margin; physical memory is 17179869184 bytes (16.00 GiB), 3255593270 bytes short.
+needed: model weights 10311344128, draft 2721905176, KV cache for --ctx 32768 2936012800, recurrent state 156893184, prompt checkpoint 199960576, working memory 510162944, margin 3599183646.
+options that lower the need (bytes saved, bytes then needed):
+  --draft none: saves 3230428265 bytes, needs 17205034189 bytes (16.02 GiB)
+  --ctx 16384: saves 1688433460 bytes, needs 18747028994 bytes (17.46 GiB)
+  --ctx 8192: saves 2532650189 bytes, needs 17902812265 bytes (16.67 GiB)
+  --ctx 4096: saves 2954758554 bytes, needs 17480703900 bytes (16.28 GiB)
+  --kv int8: saves 1958320538 bytes, needs 18477141916 bytes (17.21 GiB)
+largest that fits: --ctx 16384 --draft none; --ctx 32768 --draft none --kv int8
+```
+
+The estimate includes a margin of 15 % plus 1 GiB (D19) and is not measured
+peak memory; these numbers were not run on a 16, 32 or 48 GB Mac.
 
 `serve`: `--host` (127.0.0.1), `--port` (8765; 0 = ephemeral), `--api-key`
 (or `YASAKANI_API_KEY`), `--default-max-tokens` (32768), `--max-tokens-cap`,
