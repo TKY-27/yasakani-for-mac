@@ -22,6 +22,7 @@ enum Fault {
     Configuration,
     Repeat,
     NoAcceptance,
+    LaterError,
 }
 struct TestEngine {
     inner: RealEngine,
@@ -49,6 +50,9 @@ impl Engine for TestEngine {
         stops: Option<&[u32]>,
         emit: &mut dyn FnMut(&[u32]) -> Result<bool>,
     ) -> Result<Generation> {
+        if self.fault == Fault::LaterError && prompt.first() == Some(&13) && n > 1 {
+            return Err(yskn::Error::engine("injected later generation error"));
+        }
         let mut result = self.inner.generate(prompt, n, sampling, stops, emit)?;
         let original = prompt.first() == Some(&1) && n > 1;
         let count = self
@@ -59,7 +63,8 @@ impl Engine for TestEngine {
             *count += 1;
         }
         if original
-            && (self.fault == Fault::Configuration || (self.fault == Fault::Repeat && *count == 2))
+            && (matches!(self.fault, Fault::Configuration | Fault::LaterError)
+                || (self.fault == Fault::Repeat && *count == 2))
         {
             result.ids[2] = (result.ids[2] + 1) % 32;
         }
@@ -198,6 +203,26 @@ fn actual_synthetic_engine_matches_ids_but_rejects_unexercised_draft_cells() {
             );
         }
     }
+}
+
+#[test]
+fn later_error_preserves_the_mismatch_and_completed_rows() {
+    let report = exercise(Fault::LaterError, false);
+    assert_eq!(report["passed"], false);
+    let failures = report["failures"].as_array().unwrap();
+    assert!(
+        failures
+            .iter()
+            .any(|f| f["kind"] == "configuration_mismatch")
+    );
+    assert!(failures.iter().any(|f| {
+        f["kind"] == "error"
+            && f["message"]
+                .as_str()
+                .unwrap()
+                .contains("injected later generation error")
+    }));
+    assert!(report["runs"].as_array().unwrap().len() > 1);
 }
 
 // The fault is injected only in this test executable; the actual example has no

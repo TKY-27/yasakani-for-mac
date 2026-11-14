@@ -211,13 +211,24 @@ fn observe_controlled(
     *capture.borrow_mut() = Capture::default();
     let start = Instant::now();
     let prepared = runner.prepare_checked(p)?;
-    let usage = runner.run_prepared(
+    let usage_result = runner.run_prepared(
         p,
         prepared,
         &|| cancel && capture.borrow().saw_tokens,
         &mut |_| Ok(()),
-    )?;
+    );
     let c = capture.take();
+    let usage = match usage_result {
+        Ok(usage) => usage,
+        Err(e) => {
+            let mut row = label;
+            row["error"] = json!(e.to_string());
+            row["token_count"] = json!(c.ids.len());
+            row["stage_token_counts"] = json!(c.stages);
+            rows.push(row);
+            return Err(e);
+        }
+    };
     if c.stages.is_empty() || c.ids.is_empty() {
         return Err(Error::engine(
             "generation not exercised: no generation stage or empty token ids",
@@ -483,100 +494,106 @@ pub fn check(
     let mut rows = Vec::new();
     let mut failures = Vec::new();
     let mut baseline = Vec::new();
-    for name in names {
-        eprintln!("loading {name}");
-        let capture = Rc::new(RefCell::new(Capture::default()));
-        let engine = factory(name)?;
-        let mut runner = ChatRunner::new(
-            Box::new(Recorder {
-                inner: engine,
-                capture: capture.clone(),
-            }),
-            formatter.clone(),
-            0,
-        )?;
-        let config_start = rows.len();
-        let mut sampled_outputs: Vec<Vec<Vec<u32>>> = Vec::new();
-        for (sampler, sampler_name) in SAMPLERS.iter().enumerate() {
-            let mut first = Vec::new();
-            // Full first sweep: each repeat has unrelated requests in between.
-            for prompt in prompts {
-                let p = parameters(prompt, defaults, sampler, max_tokens)?;
-                let label = json!({"configuration":name,"sampler":sampler_name,"prompt":prompt.id,"run":"first"});
-                let result = observe(&mut runner, &capture, &p, &mut rows, label.clone())
-                    .map_err(|e| Error::engine(format!("{}: {label}: {e}", prompt.location)))?;
-                if name != "none" {
-                    compare(
-                        &baseline[sampler * prompts.len() + first.len()],
-                        &result,
-                        &label,
-                        "configuration_mismatch",
-                        &mut failures,
+    let outcome = (|| -> Result<()> {
+        for name in names {
+            eprintln!("loading {name}");
+            let capture = Rc::new(RefCell::new(Capture::default()));
+            let engine = factory(name)?;
+            let mut runner = ChatRunner::new(
+                Box::new(Recorder {
+                    inner: engine,
+                    capture: capture.clone(),
+                }),
+                formatter.clone(),
+                0,
+            )?;
+            let config_start = rows.len();
+            let mut sampled_outputs: Vec<Vec<Vec<u32>>> = Vec::new();
+            for (sampler, sampler_name) in SAMPLERS.iter().enumerate() {
+                let mut first = Vec::new();
+                // Full first sweep: each repeat has unrelated requests in between.
+                for prompt in prompts {
+                    let p = parameters(prompt, defaults, sampler, max_tokens)?;
+                    let label = json!({"configuration":name,"sampler":sampler_name,"prompt":prompt.id,"run":"first"});
+                    let result = observe(&mut runner, &capture, &p, &mut rows, label.clone())
+                        .map_err(|e| Error::engine(format!("{}: {label}: {e}", prompt.location)))?;
+                    if name != "none" {
+                        compare(
+                            &baseline[sampler * prompts.len() + first.len()],
+                            &result,
+                            &label,
+                            "configuration_mismatch",
+                            &mut failures,
+                        );
+                    }
+                    first.push(result);
+                }
+                for (i, prompt) in prompts.iter().enumerate() {
+                    let p = parameters(prompt, defaults, sampler, max_tokens)?;
+                    let reset = i + 1 == prompts.len();
+                    if reset {
+                        runner.engine.reset()?;
+                    } else {
+                        let unrelated =
+                            parameters(&prompts[(i + 1) % prompts.len()], defaults, sampler, 1)?;
+                        observe(
+                            &mut runner,
+                            &capture,
+                            &unrelated,
+                            &mut rows,
+                            json!({"configuration":name,"sampler":sampler_name,"run":"unrelated_probe","probe":true}),
+                        )?;
+                    }
+                    let label = json!({"configuration":name,"sampler":sampler_name,"prompt":prompt.id,"run":"repeat","reset_before":reset});
+                    let result = observe(&mut runner, &capture, &p, &mut rows, label.clone())
+                        .map_err(|e| Error::engine(format!("{}: {label}: {e}", prompt.location)))?;
+                    compare(&first[i], &result, &label, "repeat_mismatch", &mut failures);
+                    if name != "none" {
+                        compare(
+                            &baseline[sampler * prompts.len() + i],
+                            &result,
+                            &label,
+                            "configuration_mismatch",
+                            &mut failures,
+                        );
+                    }
+                }
+                sampled_outputs.push(first.iter().map(|o| o.ids.clone()).collect());
+                if name == "none" {
+                    baseline.extend(first);
+                }
+            }
+            reuse_probes(
+                &mut runner,
+                &capture,
+                defaults,
+                name,
+                &mut rows,
+                &mut failures,
+            )?;
+            let modes: HashSet<u64> = rows[config_start..]
+                .iter()
+                .flat_map(|r| r["snapshot_modes"].as_array().into_iter().flatten())
+                .filter_map(Value::as_u64)
+                .collect();
+            for mode in 0..=2 {
+                if !modes.contains(&mode) {
+                    failures.push(
+                        json!({"kind":"reuse mode not exercised","configuration":name,"mode":mode}),
                     );
                 }
-                first.push(result);
             }
-            for (i, prompt) in prompts.iter().enumerate() {
-                let p = parameters(prompt, defaults, sampler, max_tokens)?;
-                let reset = i + 1 == prompts.len();
-                if reset {
-                    runner.engine.reset()?;
-                } else {
-                    let unrelated =
-                        parameters(&prompts[(i + 1) % prompts.len()], defaults, sampler, 1)?;
-                    observe(
-                        &mut runner,
-                        &capture,
-                        &unrelated,
-                        &mut rows,
-                        json!({"configuration":name,"sampler":sampler_name,"run":"unrelated_probe","probe":true}),
-                    )?;
-                }
-                let label = json!({"configuration":name,"sampler":sampler_name,"prompt":prompt.id,"run":"repeat","reset_before":reset});
-                let result = observe(&mut runner, &capture, &p, &mut rows, label.clone())
-                    .map_err(|e| Error::engine(format!("{}: {label}: {e}", prompt.location)))?;
-                compare(&first[i], &result, &label, "repeat_mismatch", &mut failures);
-                if name != "none" {
-                    compare(
-                        &baseline[sampler * prompts.len() + i],
-                        &result,
-                        &label,
-                        "configuration_mismatch",
-                        &mut failures,
-                    );
-                }
-            }
-            sampled_outputs.push(first.iter().map(|o| o.ids.clone()).collect());
-            if name == "none" {
-                baseline.extend(first);
-            }
+            sampling_exercised(name, &sampled_outputs, &mut failures);
+            speculation_exercised(name, &rows[config_start..], &mut failures);
+            drop(runner);
         }
-        reuse_probes(
-            &mut runner,
-            &capture,
-            defaults,
-            name,
-            &mut rows,
-            &mut failures,
-        )?;
-        let modes: HashSet<u64> = rows[config_start..]
-            .iter()
-            .flat_map(|r| r["snapshot_modes"].as_array().into_iter().flatten())
-            .filter_map(Value::as_u64)
-            .collect();
-        for mode in 0..=2 {
-            if !modes.contains(&mode) {
-                failures.push(
-                    json!({"kind":"reuse mode not exercised","configuration":name,"mode":mode}),
-                );
-            }
-        }
-        sampling_exercised(name, &sampled_outputs, &mut failures);
-        speculation_exercised(name, &rows[config_start..], &mut failures);
-        drop(runner);
+        Ok(())
+    })();
+    if let Err(e) = outcome {
+        failures.push(json!({"kind":"error","message":e.to_string()}));
     }
     Ok(
-        json!({"schema_version":1,"passed":failures.is_empty(),"max_tokens":max_tokens,"sampling_defaults":{"temperature":defaults.sampling.temperature,"top_p":defaults.sampling.top_p,"top_k":defaults.sampling.top_k,"min_p":defaults.sampling.min_p},"id_encoding":"concatenated engine stage ids, u32 little endian; stage boundaries recorded; bridge input ids excluded","runs":rows,"failures":failures}),
+        json!({"schema_version":2,"passed":failures.is_empty(),"max_tokens":max_tokens,"sampling_defaults":{"temperature":defaults.sampling.temperature,"top_p":defaults.sampling.top_p,"top_k":defaults.sampling.top_k,"min_p":defaults.sampling.min_p},"id_encoding":"concatenated engine stage ids, u32 little endian; stage boundaries recorded; bridge input ids excluded","runs":rows,"failures":failures}),
     )
 }
 
