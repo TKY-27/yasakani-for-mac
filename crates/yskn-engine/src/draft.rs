@@ -45,6 +45,8 @@ pub struct DraftTiming {
     pub total: Duration,
     /// Activation quantization, compressed kernel and restoration (45 matrices).
     pub projections: Duration,
+    /// The compressed kernel calls alone (Metal command buffers or CPU pool), included above.
+    pub projection_kernel: Duration,
     pub attention: Duration,
     /// Norms, RoPE, dynamic filters, GLU and residual adds.
     pub block_other: Duration,
@@ -143,6 +145,14 @@ impl Head {
         let projection = floats(&layout.arrays[0])?;
         let approximate_scale = floats(&layout.arrays[2])?;
         let rescore_scale = floats(&layout.arrays[4])?;
+        // Touch every page of the mapped rescoring rows once, so proposals do not
+        // pay first-access page faults for newly shortlisted tokens.
+        let r = &layout.arrays[3];
+        let touched = mapping[r.start as usize..r.end as usize]
+            .iter()
+            .step_by(4096)
+            .fold(0_u8, |acc, &b| acc ^ b);
+        std::hint::black_box(touched);
         let a = &layout.arrays[1];
         let approximate = draft_math::pack_approximate(
             &mapping[a.start as usize..a.end as usize],
@@ -504,7 +514,13 @@ impl FastDraft {
             let l = &self.layers[i];
             let normalized = reference::norm_rows(&hidden, &l.ln1, eps)?;
             self.timing.block_other += lap(&mut clock);
-            let [dynamic] = project(&mut self.compute, [&l.akp], &normalized, &self.signs)?;
+            let [dynamic] = project(
+                &mut self.compute,
+                [&l.akp],
+                &normalized,
+                &self.signs,
+                &mut self.timing.projection_kernel,
+            )?;
             self.timing.projections += lap(&mut clock);
             let filtered = reference::dynamic_filter(&normalized, &dynamic, &l.abase, h, 0);
             self.timing.block_other += lap(&mut clock);
@@ -513,6 +529,7 @@ impl FastDraft {
                 [&l.q, &l.k, &l.v],
                 &filtered,
                 &self.signs,
+                &mut self.timing.projection_kernel,
             )?;
             self.timing.projections += lap(&mut clock);
             rope_rows(
@@ -536,7 +553,13 @@ impl FastDraft {
                 self.simd,
             )?;
             self.timing.attention += lap(&mut clock);
-            let [projected] = project(&mut self.compute, [&l.o], &attended, &self.signs)?;
+            let [projected] = project(
+                &mut self.compute,
+                [&l.o],
+                &attended,
+                &self.signs,
+                &mut self.timing.projection_kernel,
+            )?;
             self.timing.projections += lap(&mut clock);
             reference::add(
                 &mut hidden,
@@ -544,11 +567,23 @@ impl FastDraft {
             )?;
             let normalized = reference::norm_rows(&hidden, &l.ln2, eps)?;
             self.timing.block_other += lap(&mut clock);
-            let [dynamic] = project(&mut self.compute, [&l.mkp], &normalized, &self.signs)?;
+            let [dynamic] = project(
+                &mut self.compute,
+                [&l.mkp],
+                &normalized,
+                &self.signs,
+                &mut self.timing.projection_kernel,
+            )?;
             self.timing.projections += lap(&mut clock);
             let filtered = reference::dynamic_filter(&normalized, &dynamic, &l.mbase, h, 0);
             self.timing.block_other += lap(&mut clock);
-            let [gate, up] = project(&mut self.compute, [&l.gate, &l.up], &filtered, &self.signs)?;
+            let [gate, up] = project(
+                &mut self.compute,
+                [&l.gate, &l.up],
+                &filtered,
+                &self.signs,
+                &mut self.timing.projection_kernel,
+            )?;
             self.timing.projections += lap(&mut clock);
             let width = d.feed_forward;
             let glu: Vec<f32> = self
@@ -561,7 +596,13 @@ impl FastDraft {
                 })?
                 .concat();
             self.timing.block_other += lap(&mut clock);
-            let [projected] = project(&mut self.compute, [&l.down], &glu, &self.signs)?;
+            let [projected] = project(
+                &mut self.compute,
+                [&l.down],
+                &glu,
+                &self.signs,
+                &mut self.timing.projection_kernel,
+            )?;
             self.timing.projections += lap(&mut clock);
             reference::add(
                 &mut hidden,
@@ -979,13 +1020,16 @@ fn project<const N: usize>(
     matrices: [&Matrix; N],
     input: &[f32],
     signs: &[i8],
+    kernel: &mut Duration,
 ) -> Result<[Vec<f32>; N]> {
     let cols = matrices[0].descriptor().cols;
     let m = input.len() / cols;
     let prepared = compute.map_range(0..m, |i| {
         quantize_activation(&input[i * cols..(i + 1) * cols], &signs[..cols])
     })?;
+    let start = Instant::now();
     let sums = weighted_sums(compute, matrices, &prepared)?;
+    *kernel += start.elapsed();
     let rows = compute.map_range(0..N * m, |index| {
         let (j, i) = (index / m, index % m);
         restore(matrices[j], &sums[j], i, &prepared[i])
