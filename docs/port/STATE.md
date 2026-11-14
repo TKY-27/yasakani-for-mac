@@ -4,7 +4,7 @@ This file is the single resumable record of the port. It is written so the
 orchestrator can continue from it alone. Update it at every merge, decision
 and measurement.
 
-Last updated: 2026-11-14 10:10 JST (steps 1, 2, 4 done; main model validated with the plain int8 cache; the two real gate runs are in progress; step 5 units B, C, D, I merged; generation machinery and product layer in progress).
+Last updated: 2026-11-14 12:30 JST (gate 1 of 2 passed: profile-int8 perplexity 2.075597; KV5 gate blocked on a reference speed fix; generation machinery merged; server and draft connection in review).
 
 ## Goal and release criteria
 
@@ -49,14 +49,20 @@ Release criteria (all must hold):
      expected sign (no 5-bit quantization of keys and values).
    - The engine equals the scalar reference on real weights for the first
      2 rows, and six CPU and Metal configurations agree over 24 rows (M6).
-   - **Running since 2026-11-14 10:05 JST** (`.work/runs/gate_kv.sh`,
-     binaries `.work/runs/05b/` built from 18dd49a = main 0f91f2e):
-     `verify_model --kv int8-profile`, `verify_model --kv kv5`, then
-     `score_windows --kv int8-profile --backend metal --rows-per-pass 16`
-     and the same with `--kv kv5`. Outputs
-     `.work/runs/verify_{int8-profile,kv5}.log` and
-     `.work/runs/score_{int8-profile,kv5}_metal.{out,err,json,exit}`.
-     Gate: 2.075900 and 2.0759369, each within 0.001.
+   - **Gate 1 passed (M8):** `Int8Profile`, all 20 windows, perplexity
+     **2.075597** against upstream's 2.075900 (difference 0.000303).
+   - `verify_model --kv int8-profile` and `--kv kv5`: 24 rows bit-identical
+     across four CPU and two Metal configurations each.
+   - **Gate 2 (`Kv5` against 2.0759369) is open.** The run was stopped
+     after 18 minutes: in `Kv5` the reference attention took 32 to 36 s
+     per 16-row pass at context 190 (0.22 s in `Int8Profile`), because
+     `CacheRow::key_base` validates and decodes a packed row again for
+     every channel of every key on every read. This is a speed defect, not
+     a correctness one. Brief `05j` (Sol, worktree `.work/wt/05j`, branch
+     `feat/05j-kv5-read-speed`) decodes each packed row once. After it
+     merges: rebuild, then
+     `score_windows MODEL_FOLDER tools/quality/windows_own_thinking.json --kv kv5 --backend metal --rows-per-pass 16 --json score_kv5_metal.json`
+     from `.work/runs/` under `nohup`.
 4. Backend decision by measurement (NEON vs Metal at 1, 2, 4, 8, 16 rows).
    **Done: D12, Metal** (PR #8). The engine's `Model` runs on it (PR #13,
    D14); the Metal code now lives in `crates/yskn-engine/src/metal.rs`.
@@ -69,6 +75,17 @@ Release criteria (all must hold):
    `.work/wt/06d`, branch `feat/06d-cli`, crate `crates/yskn-cli`, binary
    `yskn`): chat logic and the hyper-based API server ported from
    upstream's Python and its tests, against an engine trait with a stub.
+   It is PR #18. Sol's sandbox cannot open sockets, so Opus ran and fixed
+   the socket tests (bounded lingering close). Astra's security review
+   found a memory-exhaustion blocker and five other issues; Opus fixed
+   them (limits table in `crates/yskn-cli/README.md`; default body limit
+   8 MiB, upstream 32 MiB); Astra's re-review found six more (error
+   responses echoing request data outside the budget, budget undercount
+   for large strings, uncancellable prompt preparation, an unsound early
+   context check, `chat_template_kwargs.tools` bypass, unescaped
+   top-level errors); a second Opus fix round (brief `06g`) is in
+   progress. Still to do after it merges: connect the real engine to the
+   crate's `Engine` trait, prompt reuse, `bench`, `selfcheck`.
 7. Optimization to the machine limit (stop after five attempts under 2%).
 8. Other Macs: feature detection, forced fallbacks, memory check at start.
 9. SwiftUI chat app (only after the engine passes every criterion; tag first).
@@ -126,11 +143,11 @@ Units (B, C, I can run in parallel; F before D because both touch `model.rs`):
 | C | `yskn-ref/src/kv_codec.rs`: row codec ported from the source | merged, PR #11 |
 | D | Cache modes `Int8`, `Int8Profile`, `Kv5` in the reference attention, model load and the engine | merged, PR #14 (Sol; Astra reviewed the reference against the source, Opus the engine wiring); real scoring running |
 | E | KV codec fast path | not started; the codec runs inside the engine's parallel row preparation, measure first |
-| F | Main-model hooks: residual capture after layers 5, 19, 33, 47, 61; snapshot/restore; head rows | snapshot and head rows are in brief `05e`; residual capture is the next brief |
-| G | Speculation loop over Verifier and Proposer traits, lossless tests | brief `05e` (Sol), worktree `.work/wt/05e`, branch `feat/05e-speculation`, in progress |
-| H | Engine `run_provisional`/`commit` without cloning the attention cache | brief `05e`, in progress |
+| F | Main-model hooks: residual capture after layers 5, 19, 33, 47, 61; snapshot/restore; head rows | snapshot and head rows merged (PR #17); residual capture and the draft proposer in PR #19 (D17; Sol; Opus requested changes, fix commit b61c516 under re-review) |
+| G | Speculation loop over Verifier and Proposer traits, lossless tests | merged, PR #17, D16 (Sol; Opus review) |
+| H | Engine `run_provisional`/`commit` without cloning the attention cache | merged, PR #17 |
 | I | Draft model reference (chapter 07) and `.shead` | merged, PR #15, D15 (Sol; Astra review against the source) |
-| J | Draft fast path | after F and I |
+| J | Draft fast path (one scalar proposal takes about 90 s on the real files) | after PR #19; brief not written yet; goes to Opus |
 | K | Prompt reuse modes (reset, live prefix, snapshot) | after `05e` |
 | L | Long-prompt prefill: bounded memory, head on last row only, large-M kernel | after `05e` |
 
@@ -299,7 +316,18 @@ Orchestrator decisions:
 | 2026-11-14 | 5 I | PR #15: draft model reference and reduced head (Sol; Astra review against the source: approve, two test gaps carried forward). | `YSKN_MODEL_DIR=MODEL_FOLDER cargo test -p yskn-ref --release draft`; one scalar `propose` on the real files takes about 90 s |
 | 2026-11-14 | 3 | Plain int8 perplexity 2.075440 (M4): main model validated. | M4 below |
 
+| 2026-11-14 | 5 G/H | PR #17: provisional passes, commit, snapshots in the engine; generic lossless speculation loop (Sol; Opus review approve). | `cargo test --workspace --release` (randomized partial commits equal the reference in every KV mode and backend; generation identical with and without speculation) |
+| 2026-11-14 | 3 | Gate 1 passed: profile-int8 perplexity 2.075597 (M8). | M8 below |
+
 ## Known debts
+
+- The reference's `Kv5` read path is about 150 times slower than
+  `Int8Profile` (brief `05j`).
+- `generate` copies the whole recurrent state (about 157 MB) at the start
+  of every provisional pass and again on a partial commit (D16); step 7.
+- Row encoding (`kv_encode`, 45 ms at one row) runs the scalar codec for
+  128 side-rows sequentially within a row; it can run in parallel across
+  heads and sides without changing bits; step 7.
 
 - Draft tests (from Astra's review of PR #15): a rank-projection test with
   off-diagonal entries and rank different from hidden width; a synthetic
@@ -409,6 +437,44 @@ PR #13 (CPU kernel, sequential recurrent heads, M3): 2.86, 1.20, 1.39,
   `./verify_model ... --reference reference-2.json`: the first 2 logit rows
   equal the scalar reference.
 
+### M7: whole-model pass on the real model, quiet machine (2026-11-14)
+
+Command, for N in 1, 2, 4, 8 (binary of main 0b7bd5d, nothing else running):
+`./bench_model ~/models/qwen38-speed --backend metal --kv int8-profile --rows-per-pass N --passes 9`
+(`cargo run --release -p yskn-engine --example bench_model`). Minimum
+seconds per pass over 9 passes at short context:
+
+| Rows | Total | Kernel | Recurrence | Attention | Row encoding | Rest |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.264 | 0.146 | 0.040 | 0.002 | 0.045 | 0.029 |
+| 2 | 0.298 | 0.159 | 0.050 | 0.002 | 0.046 | 0.036 |
+| 4 | 0.390 | 0.224 | 0.067 | 0.005 | 0.048 | 0.045 |
+| 8 | 0.671 | 0.385 | 0.119 | 0.012 | 0.080 | 0.073 |
+
+Reading: about 3.8 tokens per second without speculation and before any
+optimization of the CPU-side stages. The kernel at one row is 146 ms,
+of which about 111 ms is the GPU pass measured alone (M2) and the rest
+is 257 dispatch round trips. Each added row costs about 40 to 60 ms.
+Output saved in `.work/runs/bench_model_int8profile_0b7bd5d.txt`.
+
+### M8: perplexity, profile-requantized int8 cache (gate 1) (2026-11-14)
+
+Command (run alone on the model, binaries of 18dd49a whose content is
+main 0f91f2e):
+`./score_windows ~/models/qwen38-speed tools/quality/windows_own_thinking.json --kv int8-profile --backend metal --rows-per-pass 16 --json score_int8-profile_metal.json`
+
+Result: scored_positions 20460, mean negative log-likelihood
+0.730248869401, **perplexity 2.075597096008**, 6,308 s. Upstream's record
+`tools/quality/records/score_fastest_int8_table_reference.json`:
+2.075899908604469. Difference 0.000303 (tolerance 0.001). The result file
+records kv_mode, backend, device, kernel, threads and rows per pass.
+A 16-row pass at context 190 took 1.44 s (kernel 0.72, attention 0.22,
+row encoding 0.15, recurrence 0.23, rest 0.11) with other work running.
+
 ## Blocked on the owner
 
-Nothing.
+Nothing blocks the work. One event to know about: on 2026-11-14 at about
+11:55 JST the account's 5-hour usage limit stopped both Opus subagents
+mid-task; it reset at 12:10 and both were resumed from their transcripts.
+If Opus work stalls again for this reason, Codex-routed work (Sol, Astra,
+Luna) continues, and anything that needs the GPU or sockets waits.
