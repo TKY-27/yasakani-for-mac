@@ -119,6 +119,7 @@ SHA-256 and reduces all 32 digest bytes without prefix-dependent branches.
 | Tool calls per assistant message (`max_tool_calls`) | 1,024 | Each call renders as at least about 10 tokens of tags; parallel calls come in single digits |
 | Tools (`max_tools`) | 1,024 | OpenAI documents at most 128 functions; 8 times that |
 | Text bytes of the cleaned messages and tools, keys included (`max_text_bytes`) | 8 MiB | Equal to the body limit, since unescaping only shrinks text; it bounds what Python-style `str()` of non-string text parts and parsed tool arguments can add |
+| Wait for the engine, from queueing until generation starts (`queue_timeout`) | 600 s | The OpenAI Python SDK's default request timeout is 600 s, so a client would give up by then anyway. Exceeded: 503 with `Retry-After: 5`, and the request never reaches the engine |
 | Concurrent connections (`max_connections`, 1..1024) | 64; excess connections are closed unserved | One engine serves one request at a time |
 | Queued engine jobs | 64 (bounded by active HTTP connections) | One per connection |
 | Buffered events per response | 8 | Backpressure reaches the engine quickly |
@@ -134,6 +135,11 @@ SHA-256 and reduces all 32 digest bytes without prefix-dependent branches.
 | Stop strings per request | 4 | As upstream; OpenAI documents "up to 4 sequences" |
 | Bytes per stop string (`max_stop_bytes`) | 1,024 | OpenAI documents no length and upstream has none; stop markers are short. The stop filter's work per output piece is bounded by the text it holds back, as upstream's `StopFilter` is |
 | Loop guard: longest period, repeat run in thinking / answer, digit run in thinking | 16 tokens; 256 / 1024 tokens; 1000 tokens | As upstream |
+
+Generation itself has no deadline: it is bounded by `max_tokens` (and the
+context room), and it stops when the client disconnects or stops reading a
+stream (`stream_timeout`). A client that disconnects while its request waits
+in the queue is skipped by the engine thread.
 
 A prompt is also refused with `context_length_exceeded` between template
 rendering and tokenization when its rendered bytes exceed context capacity x

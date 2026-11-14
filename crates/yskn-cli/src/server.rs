@@ -57,6 +57,10 @@ pub struct Limits {
     pub max_tools: usize,
     pub max_text_bytes: usize,
     pub max_stop_bytes: usize,
+    /// Longest wait for the engine, from queueing until generation starts;
+    /// exceeded: 503 with Retry-After. Generation itself is bounded by
+    /// `max_tokens` and ends when the client disconnects.
+    pub queue_timeout: Duration,
     pub max_connections: usize,
     pub max_headers: usize,
     pub header_bytes: usize,
@@ -81,6 +85,7 @@ impl Default for Limits {
             max_tools: 1024,
             max_text_bytes: MAX_BODY,
             max_stop_bytes: 1024,
+            queue_timeout: Duration::from_secs(600),
             max_connections: 64,
             max_headers: 100,
             header_bytes: 32768,
@@ -766,22 +771,30 @@ where
     let Some(jobs) = api.jobs.as_ref() else {
         return error_response(Error::engine("engine worker is unavailable"));
     };
-    if jobs
-        .send(Job {
-            params: decoded.params,
-            ready,
-            cancel: cancel.0.clone(),
-            _charge: charge,
-        })
-        .await
-        .is_err()
-    {
-        return error_response(Error::engine("engine worker is unavailable"));
-    }
-    let events = match rx.await {
-        Ok(Ok(rx)) => rx,
-        Ok(Err(e)) => return error_response(e),
-        Err(_) => return error_response(Error::engine("engine worker is unavailable")),
+    let job = Job {
+        params: decoded.params,
+        ready,
+        cancel: cancel.0.clone(),
+        _charge: charge,
+    };
+    // On timeout or disconnect `cancel` drops, and the engine thread skips
+    // the job when it reaches it.
+    let waited = tokio::time::timeout(cfg.limits.queue_timeout, async {
+        jobs.send(job).await.ok()?;
+        rx.await.ok()
+    })
+    .await;
+    let events = match waited {
+        Err(_) => {
+            return busy(http_error(
+                503,
+                "the request waited too long for the engine; retry later",
+                "unavailable",
+            ));
+        }
+        Ok(Some(Ok(rx))) => rx,
+        Ok(Some(Err(e))) => return error_response(e),
+        Ok(None) => return error_response(Error::engine("engine worker is unavailable")),
     };
     if decoded.stream {
         let stream = EventBody {

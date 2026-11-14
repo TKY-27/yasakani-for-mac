@@ -1189,3 +1189,132 @@ async fn global_budget_refuses_with_retry_after_and_recovers() {
     assert_eq!(r.status, 200, "{}", r.text);
     h.stop().await;
 }
+fn raw_post(h: &Harness, b: &Value) -> String {
+    let b = b.to_string();
+    format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n\r\n{b}",
+        h.addr,
+        b.len()
+    )
+}
+/// Holds the engine with an endless streamed answer until the stream is dropped.
+async fn hold_engine(
+    h: &Harness,
+) -> (
+    hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+    Incoming,
+    JoinHandle<()>,
+) {
+    h.control.delay(Duration::from_millis(2));
+    h.control.push(Script {
+        ids: ids("busy "),
+        loop_from: Some(0),
+    });
+    let b = json!({"messages":user(),"stream":true,"max_tokens":1000000,"enable_thinking":false,"loop_guard":false});
+    let (sender, mut body, task) = open_stream(h, b).await;
+    body.frame().await.unwrap().unwrap();
+    (sender, body, task)
+}
+/// Polls until a new connection is served, which with every other permit held
+/// means a connection that was closed has been fully dropped by the server.
+async fn until_a_connection_is_free(h: &Harness) {
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        h.addr
+    );
+    let deadline = std::time::Instant::now() + common::PATIENCE;
+    loop {
+        let mut s = TcpStream::connect(h.addr).await.unwrap();
+        let _ = s.write_all(request.as_bytes()).await; // may be closed unserved
+        let mut out = vec![];
+        let _ = tokio::time::timeout(common::PATIENCE, s.read_to_end(&mut out)).await;
+        if out.starts_with(b"HTTP/1.1 200") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no connection was freed"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await; // polling only
+    }
+}
+// Review finding: waiting for the engine had no overall bound. A request that
+// waits longer than `queue_timeout` gets 503 with Retry-After and never
+// reaches the engine.
+#[tokio::test]
+async fn queue_wait_is_bounded() {
+    let mut cfg = Config::default();
+    cfg.limits.queue_timeout = Duration::from_millis(300);
+    let h = Harness::start(cfg).await;
+    let (sender, body, task) = hold_engine(&h).await;
+    let r = h.chat(json!({"max_tokens":20})).await;
+    assert_eq!(r.status, 503, "{}", r.text);
+    assert_eq!(r.headers["retry-after"], "5");
+    assert!(error_message(&r).contains("waited too long"), "{}", r.text);
+    task.abort();
+    drop((sender, body));
+    h.script("</think>next");
+    let r = h.chat(json!({"max_tokens":20})).await;
+    assert_eq!(r.json()["choices"][0]["message"]["content"], "next");
+    let seen = h.control.observation();
+    assert_eq!((seen.calls, seen.stops), (2, 1));
+    h.stop().await;
+}
+// A client that disconnects while its request waits in the queue never
+// reaches the engine.
+#[tokio::test]
+async fn client_disconnect_while_queued_never_reaches_the_engine() {
+    let mut cfg = Config::default();
+    cfg.limits.max_connections = 2;
+    let h = Harness::start(cfg).await;
+    let (sender, body, task) = hold_engine(&h).await;
+    let mut queued = TcpStream::connect(h.addr).await.unwrap();
+    queued
+        .write_all(raw_post(&h, &json!({"messages":user(),"max_tokens":20})).as_bytes())
+        .await
+        .unwrap();
+    // The request is not answered while the engine is held.
+    let mut byte = [0_u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), queued.read(&mut byte))
+            .await
+            .is_err()
+    );
+    drop(queued);
+    until_a_connection_is_free(&h).await;
+    task.abort();
+    drop((sender, body));
+    h.script("</think>next");
+    let r = h.chat(json!({"max_tokens":20})).await;
+    assert_eq!(r.json()["choices"][0]["message"]["content"], "next");
+    let seen = h.control.observation();
+    assert_eq!((seen.calls, seen.stops), (2, 1));
+    h.stop().await;
+}
+// A non-streaming client that disconnects during generation stops the engine.
+#[tokio::test]
+async fn client_disconnect_during_a_non_streaming_request_stops_the_engine() {
+    let h = Harness::start(Config::default()).await;
+    h.control.delay(Duration::from_millis(2));
+    h.control.push(Script {
+        ids: ids("busy "),
+        loop_from: Some(0),
+    });
+    let mut s = TcpStream::connect(h.addr).await.unwrap();
+    let b =
+        json!({"messages":user(),"max_tokens":1000000,"enable_thinking":false,"loop_guard":false});
+    s.write_all(raw_post(&h, &b).as_bytes()).await.unwrap();
+    let control = h.control.clone();
+    common::until("generation to start", || {
+        control.observation().generated > 0
+    })
+    .await;
+    drop(s);
+    // Served only once the endless job has been cancelled.
+    h.script("</think>next");
+    let r = h.chat(json!({"max_tokens":20})).await;
+    assert_eq!(r.json()["choices"][0]["message"]["content"], "next");
+    let seen = h.control.observation();
+    assert_eq!((seen.calls, seen.stops), (2, 1));
+    h.stop().await;
+}
