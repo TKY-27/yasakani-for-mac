@@ -1,6 +1,8 @@
 //! Small seeded containers written directly from docs/FORMAT.md and spec/01.
 
 #[allow(dead_code)]
+pub mod draft;
+#[allow(dead_code)]
 pub mod kv_profile;
 
 use serde_json::{Value, json};

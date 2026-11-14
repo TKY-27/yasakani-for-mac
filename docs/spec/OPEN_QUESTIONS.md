@@ -140,20 +140,20 @@ at `src/q35_sample.cu:195-197` and `src/q35_bdraft.cu:401-402`.
 
 Full algorithm: [07_DRAFT_MODEL.md](07_DRAFT_MODEL.md).
 
-**UNCERTAIN [DRF-02]: Draft container invariants.** The caller assumes the
-common sign vector is long enough and appropriate for all those matrices,
-and ignores their output rotation metadata in draft postprocessing. The
-released draft container is not present in this source checkout, so its
-actual rotation/sign descriptors and compatibility with those assumptions
-cannot be established here. Checked `src/engine35.cpp:136-166,1624-1638`,
-`src/engine35.cpp:1755-1782`, and `src/q35_bdraft.cu:55-62,474`.
+**RESOLVED [DRF-02] (brief 05d):** Read-only inspection of the released
+`bdraft2_k8.yskn` finds 46 eight-bit warp tensors, all with no output
+rotation and input H512 / Mulberry32 seed 7 / offset 0. Every input sign
+vector equals the appropriate prefix of fc's 25,600 signs. Its 35 vector
+parameters are BF16, including dense correction weights. `draft_info`
+checks these facts; chapter 07 and D15 record dimensions and boundaries.
 
 **UNCERTAIN [DRF-01]: Cutoff-bucket membership is scheduling-dependent.**
 Items in the cutoff bucket claim slots by `atomicAdd`; there is no token-ID
 or low-11-mantissa-bit tiebreaker. When more items share the bucket than fit,
 the source determines only the admissible subset, not its exact membership
-without a GPU execution schedule. A scalar reference must expose this
-boundary ambiguity instead of silently imposing ascending token ID.
+without a GPU execution schedule. D15 explicitly resolves this
+port boundary by filling the cutoff bucket in ascending token ID order;
+this does not claim to reproduce a particular CUDA schedule.
 Checked `src/q35_bdraft.cu:882-896` and the fixed collection launch in
 `src/q35_bdraft.cu:971-974`. The score grid itself is chosen from device
 occupancy (`src/q35_bdraft.cu:958-962`).
@@ -162,8 +162,9 @@ occupancy (`src/q35_bdraft.cu:958-962`).
 attention call `rsqrtf`, `exp2f`, `sincosf` and `__expf`; coupled selection
 also calls binary64 `exp` even when the main portable-math flag is enabled.
 The source fixes their arguments and the reduction orders above but does
-not provide the shipping CUDA implementations. Do not substitute the main
-model's numerically different math helpers by assumption. Checked
+not provide the shipping CUDA implementations. D15 chooses the port's
+portable functions explicitly, preserving the source's FMA sites; CUDA bit
+equality remains unverified. Checked
 `src/q35_bdraft.cu:145-148,190,463-487,525-536,579,615,426`.
 
 **UNCERTAIN [DRF-04]: Equality to a full compressed head.** No relationship
