@@ -1034,3 +1034,93 @@ For the real dimensions the memory ratio is about 26.5x per retained row;
 that bound motivates replay despite its measured extra CPU work. Full
 acceptance avoids replay entirely. These timings do not predict real-model
 speed or the optimal draft width, and no Metal timing is claimed.
+
+
+## D17 — Captured main residuals feed the scalar draft proposer
+
+Capture is opt-in on both main-model implementations. The loaded draft supplies
+the ordered layer list and the maximum retained row count; shipping defaults
+are zero-based layers `[5,19,33,47,61]` and the draft ring capacity. Capture
+off preserves the existing path and digests. Capture only observes the main
+layer result and changes neither logits nor committed numeric state.
+
+The capture contract was checked directly against the unchanged upstream
+sources:
+
+| Contract | Verified source lines and result |
+|---|---|
+| Tap | `src/engine35.cpp:798-799` applies the MLP down residual projection; `830-833` copies `h_` immediately after each layer, and `1650` installs the five layers. Held: capture the post-MLP residual, not the normalized projection input. |
+| Rounding | `src/q35_kernels.cu:1437-1444` writes `rbf(old + rbf(down))` to the residual array. Held: BF16 rounding before the add and again afterwards, expanded to f32; reference `residual_add` already uses this formula. |
+| Slot order | `src/q35_bdraft.cu:249-252` gathers each capture slot into `[row,slot,channel]`; `490-499` reads the equivalent slot-major values directly for A8. Held: one row is `[slot,channel]`, five hidden-width vectors in capture-list order. |
+| Prompt | `src/engine35.cpp:1248-1261` runs committed prefill, feeds its captures, then advances position. Held: prompt rows enter the ring as context. |
+| Accepted rows | `src/specx.cpp:435-437` queues `n_commit+1` rows starting at the old frontier, reflecting upstream's +1 commit ABI. `src/engine35.cpp:1851` inserts context before proposing. Held: only committed input rows enter, once in ascending position. Rust's `commit(k)` already counts row zero, so it forwards k rows. |
+| Terminal flush | `src/specx.cpp:464` inserts pending context after the loop. Held: final committed rows must reach the ring even without a subsequent proposal. |
+
+Use half-open positions to avoid an off-by-one reading: before a proposal with
+frontier input at position F, the live ring covers
+`[max(0,F-ring_capacity),F)`. The token at F is selected but unconsumed. After
+verification, feed the old frontier and accepted consumed successors, but no
+rejected row and no new unconsumed frontier. Ring overwrite discards old
+positions; a long prefill therefore retains only its last ring-capacity rows.
+Committed captures and pending-pass captures are exposed separately. Successful
+commits forward captured rows to the proposer; failed/discarded passes never
+advance its ring. Synchronization before proposing checks the committed tail.
+
+`DraftProposer` proposes the first K tokens of the existing eight-row block,
+K=1..7. The block still computes all eight noncausal rows; this work does not
+optimize it. The main model remains the sole selector/acceptance authority.
+The separate proposer owns its draft ring. `snapshot_session(&model)` captures
+both owners and `restore_session(&mut model, &checkpoint)` validates ownership
+and restores the matching main state and ring. Reset invalidates that owner's
+checkpoints; callers resetting the main model must also reset its proposer.
+A main-model-only checkpoint cannot restore the separately owned drafter.
+
+### Sampling and proposal policy boundary
+
+`src/engine35.cpp:1845-1850` enables draft coupling only when main sampling is
+on and version is 3; otherwise draft selection is greedy. The seed and
+absolute prediction position feed token-keyed Gumbel noise at
+`src/q35_bdraft.cu:401-404`. The draft uses its own temperature (850
+thousandths by default), 16 candidates and fixed top-p 0.95
+(`src/q35_bdraft.cu:404-430`), not the main request's temperature/top-p/top-k.
+`DraftChoice` makes this caller choice explicit. The generate example uses
+main version 3 and the same seed for `--seed`, otherwise greedy draft choice.
+
+`CombinedProposer` chooses a fixed order (`NgramFirst` or `DraftFirst`) and
+falls back only when the first proposal is empty. Draft context still advances
+when n-gram wins. This does not port upstream's match-length gate, acceptance
+EMA comparison, periodic neural probes, next-token-table extensions, HCAP or
+8/16-row width adaptation (`src/specx.cpp:216-265,441-447`). Chapter 08 §5
+records those upstream rules separately from this deliberately fixed policy.
+
+`draft_acceptance` measures teacher-forced leading-prefix agreement with main
+greedy selections for neural, n-gram and fixed n-gram-first combination. Missing
+guesses count as unaccepted at later depths. Defaults are one window and two
+positions because the real scalar draft may need about 90 seconds per proposal.
+No released-model acceptance or speed claim follows from the synthetic checks;
+real-model commands are documented in README for the orchestrator.
+
+
+### Synthetic connection evidence and session fixes
+
+The teacher is an actual two-layer main model with an all-zero output head
+(greedy token 0), and an actual one-layer draft with BF16 correction weights
+constructed to read its context-dependent hidden rows. Correct captures give
+an accepted prefix of 7/7; one-row-lagged features and swapped capture slots
+each give 0/7. The correct pair also accepts all seven guesses in one actual
+`generate` verification pass. This deliberately constructed task detects a
+wrong connection; it does not estimate released-model acceptance quality.
+An independent two-layer residual calculation checks both BF16 boundaries,
+and scripted acceptance counts check the exact ring contents before proposals
+and after the terminal flush. End-to-end cases compare K=1/3/7 with K=0 for
+greedy and two seeds, including joint restore and a reused prefix.
+
+The carried D16 review findings are fixed in the engine: failure after an
+attention layer truncates its appended suffix; partial-replay failure retains
+the pending pass, matching the reference, and a later full retry replays from
+committed recurrence. Restore validates every attention prefix before mutation.
+A checkpoint after partial commit is checked against a fresh reference.
+Temporarily deleting the provisional-failure truncation makes the new
+later-layer-failure test fail at its following probe; the truncation is restored.
+Metal cases explicitly skip when there is no device. No released model is
+opened by these synthetic tests.

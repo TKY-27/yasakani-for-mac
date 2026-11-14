@@ -284,6 +284,18 @@ up. Cancellation is checked at the next loop boundary; it does not
 interrupt a partial state commit.
 (`src/specx.cpp:203,212-215,246,269-270,344-374,435-440`)
 
+### Rust source-order option (D17)
+
+`CombinedProposer` offers a fixed `ProposalOrder::NgramFirst` or `DraftFirst`.
+It uses the first source's nonempty proposal, falling back to the other only
+when the first abstains; it does not append one source's guesses to another.
+The neural ring still receives every committed row when copy wins. This is a
+small port policy, not upstream's adaptive selection: upstream considers match
+length and acceptance EMAs, breaks equal EMAs in favor of neural, periodically
+probes the unchosen neural source and can extend copied proposals using its
+next-token table (`src/specx.cpp:216-265,441-447`). None of those estimators,
+probes, table extensions, HCAP leaves or adaptive 16-row blocks are ported.
+
 ## 6. Adaptive 8-row versus 16-row neural blocks
 
 The default environment leaves the width-controller variables unset, so
@@ -494,9 +506,10 @@ the same table keys. Leaves that did not match are not recorded.
 (`src/specx.cpp:427-431`)
 
 After commit, pending draft context comprises `accepted_argument+1` rows
-starting at the old frontier position; insert their captured features
-before the next draft. The newly emitted final frontier is not yet part
-of that context. Always flush pending context after exiting the loop,
+starting at the old frontier position `F`; insert their captured features
+before the next draft. Before a proposal, the live ring positions are
+`[max(0,F-ring_capacity),F)` (end excluded). The newly emitted final frontier
+is not yet part of that context. Always flush pending context after exiting the loop,
 including EOS, token-limit and cancellation exits.
 (`src/specx.cpp:435-440,464-465`)
 
@@ -646,5 +659,13 @@ at the same absolute prediction position. It ignores all later rows after a
 mismatch/EOS/cancellation and commits only predecessors of the last returned
 token. Induction over selected tokens therefore gives the same tokens and
 committed state as K=0 for greedy and the existing position-keyed sampler.
-HCAP, adaptive 8/16-row blocks, the next-token table and cost/source selection
-remain upstream policy and are outside this Rust mechanism.
+D17 supplies `DraftProposer` and fixed-order `CombinedProposer` to this same
+loop. Capture observes each chosen layer's post-MLP BF16 residual without
+changing logits; synchronized context contains committed input rows only.
+The loop forwards accepted captured rows after successful commit, including
+its final flush on termination. Use the proposer's
+`snapshot_session` / `restore_session` for a joint checkpoint; main snapshots
+do not implicitly snapshot separately owned proposers. Reset both owners
+together before reusing an empty session.
+HCAP, adaptive 8/16-row blocks, the next-token table and adaptive cost/source
+selection remain upstream policy and are outside this Rust mechanism.

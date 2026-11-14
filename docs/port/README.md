@@ -362,7 +362,7 @@ ContextFeatures { values })`, or row-major `[row,slot,channel]` through
 `push_context_rows`. The hook is precisely defined in
 [D15](DECISIONS.md#d15--scalar-block-draft-and-reduced-head): post-MLP residual
 BF16 expanded to FP32, five captures in layer order, no additional norm.
-The main model does not expose these captures yet.
+D17 exposes these captures and connects them through `DraftProposer`.
 
 `propose(frontier_token, embedding_provider, DraftChoice::Greedy)` returns
 seven token IDs plus each position's top16 with raw and corrected scores.
@@ -387,8 +387,9 @@ The info example reads headers only, lists every tensor/vector and SHEAD
 array extent, and checks released shape/sign/rotation assumptions. Synthetic
 tests need no artifact files or network. On the real files one scalar
 `propose` takes about 90 seconds and about 1.6 GB resident.
-The scalar reference intentionally remains slow; no main capture wiring,
-speculation loop, 16-row option or HCAP side policy is included.
+The scalar reference intentionally remains slow. D17 adds main capture wiring
+and the shared speculation loop; 16-row blocks and HCAP side policy remain
+outside the port.
 
 
 ## Lossless generation and prompt reuse (D16)
@@ -405,8 +406,9 @@ only its consumed predecessors. `max_draft_tokens`, remaining output room,
 context capacity and verifier pass width jointly bound every proposal.
 
 `NoProposer`, `ScriptProposer` and `NgramProposer::new(n,k)` are supplied.
-N-grams copy only known continuation from the most recent earlier exact match;
-there is no neural model or upstream adaptive-width/source policy in this loop.
+N-grams copy only known continuation from the most recent earlier exact match.
+D17 adds `DraftProposer` and `CombinedProposer` with fixed n-gram-first or
+neural-first fallback; upstream adaptive-width/source policy is not ported.
 Statistics report verified rows, passes, matching guesses, confirmed tokens per
 pass and elapsed time including commit/callbacks. A terminal matching guess
 counts as accepted even though the final selected token stays pending.
@@ -466,3 +468,61 @@ them before mapping the engine. Use `--backend cpu` too. `bench_speculation`
 reports widths 1/2/4/8, full and half-prefix commit costs and a checkpoint-copy
 cost proxy for the rejected per-row snapshot design. See D16 for measured
 memory, timings and verification boundaries.
+
+
+## Main-model capture and neural proposals (D17)
+
+`CaptureOptions { layers, max_rows }` enables observational post-MLP residual
+capture on either model before prefill. Defaults capture nothing. Use
+`DraftProposer::capture_options()` for the loaded draft's layer order and
+ring capacity. `captured_rows()` exposes the retained committed tail, and
+`provisional_captures()` exposes pending rows separately. Each row stores its
+absolute position and slot-major features. Configure capture before consuming
+a prompt; features of already-consumed rows cannot be reconstructed from KV.
+Long prefills retain only the required tail. See D17 for the exact BF16 tap.
+
+`DraftProposer::new(draft, k, choice)` supports K=1..7 using the scalar draft.
+The shared `generate` loop synchronizes prompt context, observes committed
+rows after successful commits and leaves rejected/new-frontier rows out of
+the draft ring. `DraftChoice::sampled(seed)` uses independent temperature
+850 thousandths and top-p 0.95. Use the main seed only when main sampling is
+version 3; main version 2 uses greedy draft choice, as upstream does.
+`CombinedProposer::new(ngram, draft, ProposalOrder::NgramFirst)` falls back to
+neural when copying abstains; `DraftFirst` reverses that fixed order.
+
+Use `proposer.snapshot_session(&model)?` to checkpoint main state and its
+matching draft ring together, then
+`proposer.restore_session(&mut model, &checkpoint)?` before continuing.
+Reset both owners together (`model.reset()?; proposer.reset()`). A main snapshot
+alone does not capture the separately owned draft ring. Captured features remain
+an observation and do not contribute to the committed numerical-state digest.
+
+The following real-model commands are for the orchestrator and run serially.
+The scalar neural draft can take about 90 seconds **per proposal**; this
+integration provides correctness and acceptance diagnostics, not a fast path.
+No released model was opened for brief 05g.
+
+```sh
+export CARGO_NET_OFFLINE=true
+MODEL_FOLDER=/path/to/model-folder
+cargo run --release -p yskn-engine --example generate -- \
+  "$MODEL_FOLDER" --tokens 1,2,3,1,2,3,1 --max-new 8 --draft neural --k 3 --greedy --backend metal --kv kv5
+# Compare the first stdout line with --draft none, then --draft ngram and --draft both.
+# Repeat with --seed 17 and --seed 11259375 instead of --greedy; use K=1,3,7.
+cargo run --release -p yskn-engine --example draft_acceptance -- \
+  "$MODEL_FOLDER" tools/quality/windows_own_thinking.json \
+  --windows 0..1 --positions 2 --k 3 --kv kv5 --backend metal
+```
+
+`generate --draft neural|ngram|both|none` defaults to none. Both uses fixed
+n-gram-first fallback. `draft_acceptance` defaults to window 0, two positions
+per window and K=3; a position is an input row beginning at the window's first
+scored position (1024). It teacher-forces the known window tokens and compares
+proposals with the main model's greedy choices on the following positions.
+It counts the matching **leading prefix**, stopping at the first mismatch.
+Each depth reports the fraction of all tested positions reaching that depth;
+missing guesses count as unaccepted. The mean accepted prefix uses the same
+position denominator. Neural and n-gram candidates are evaluated at the same
+frontier; the fixed n-gram-first combined metric reuses those candidates to
+avoid computing the expensive neural block twice. These are teacher-forced
+acceptance diagnostics, not a free-running quality or throughput measurement.
