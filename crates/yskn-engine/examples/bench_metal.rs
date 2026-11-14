@@ -227,6 +227,8 @@ mod macos {
         }
         let mut metal = MetalEngine::new()?
             .ok_or_else(|| Error::InvalidInput("no Metal device in this process".into()))?;
+        // YSKN_METAL_MAC and YSKN_METAL_CPU_SHARE apply here as in Model::load.
+        metal.configure_from_env()?;
         if let Some(splits) = splits {
             metal.set_splits(splits)?;
         }

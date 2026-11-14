@@ -142,8 +142,9 @@ fn cpu_share_from_env() -> Result<CpuShare> {
         Ok("off") => Ok(CpuShare::Off),
         Ok(value) => value
             .parse::<f64>()
-            .map_err(|_| invalid("YSKN_METAL_CPU_SHARE must be auto, off or 0..=0.9"))
-            .and_then(parse_share),
+            .ok()
+            .and_then(|share| parse_share(share).ok())
+            .ok_or_else(|| invalid("YSKN_METAL_CPU_SHARE must be auto, off or 0..=0.9")),
         Err(_) => Err(invalid("YSKN_METAL_CPU_SHARE must be auto, off or 0..=0.9")),
     }
 }
@@ -458,7 +459,8 @@ pub struct MetalEngine {
 }
 
 impl MetalEngine {
-    /// `Ok(None)` when this process has no Metal device.
+    /// `Ok(None)` when this process has no Metal device. Binary32 arithmetic and
+    /// the calibrated CPU share; reads no environment variable (D14).
     pub fn new() -> Result<Option<Self>> {
         let Some(device) = MTLCreateSystemDefaultDevice() else {
             return Ok(None);
@@ -492,8 +494,8 @@ impl MetalEngine {
             // Measured on the M5 (DESIGN.md): 4 beats 8 by 3-4% for M <= 8 and ties
             // at 16; 1-2 and 16-32 are slower.
             splits: 4,
-            float_mac: float_mac_from_env()?,
-            cpu_share: cpu_share_from_env()?,
+            float_mac: true,
+            cpu_share: CpuShare::Calibrated,
             scratch_activation: None,
             scratch_scales: None,
             scratch_outputs: Vec::new(),
@@ -529,8 +531,18 @@ impl MetalEngine {
         Ok(())
     }
 
+    /// Apply `YSKN_METAL_MAC` and `YSKN_METAL_CPU_SHARE` (unset = the defaults of
+    /// [`Self::new`]); unknown values are errors. Only the loading paths
+    /// (`Model::load`, `FastDraft::load`) and benchmarks call this.
+    pub fn configure_from_env(&mut self) -> Result<()> {
+        let (float_mac, cpu_share) = (float_mac_from_env()?, cpu_share_from_env()?);
+        self.float_mac = float_mac;
+        self.cpu_share = cpu_share;
+        Ok(())
+    }
+
     /// Whether jobs created afterwards multiply in binary32 (exact, METAL.md) rather
-    /// than in 16/32-bit integers. Default from `YSKN_METAL_MAC` (`float` | `integer`).
+    /// than in 16/32-bit integers (default binary32).
     pub fn float_mac(&self) -> bool {
         self.float_mac
     }

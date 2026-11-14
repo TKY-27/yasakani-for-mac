@@ -1675,7 +1675,13 @@ cache bytes are proposed as an unapproved shortcut.
 
 Every change keeps the kernel's result identical, as signed 64-bit integers,
 to the CPU kernel (D10) for every input. Each has a forced-off environment
-switch and a test that compares it on and off. Design notes, rejected
+switch and a test that compares it on and off. As D14 requires, only the
+loading paths read the switches (`Model::load` and `FastDraft::load` through
+`Model::configure_metal_from_env` / `MetalEngine::configure_from_env`, which
+`bench_model` and `bench_metal` also call); unknown values are errors there.
+Explicit constructors and `MetalEngine::new` read no environment variable and
+use binary32 and the calibrated share (test
+`metal_options_come_from_the_environment_only_when_loading`). Design notes, rejected
 variants and limits are in `crates/yskn-engine/METAL.md` ("Round 2").
 Real-model numbers come from a shared machine (other workers' builds and
 GPU jobs ran at the same time; `uptime` load given with each run), so only

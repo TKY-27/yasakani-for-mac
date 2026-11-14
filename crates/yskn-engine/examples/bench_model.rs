@@ -40,6 +40,8 @@ fn main() -> Result<()> {
     // SAFETY: this read-only benchmark requires the weights to stay unchanged until exit.
     let mut model =
         unsafe { Model::with_options(&path, Engine::from_env()?, backend, rows, mode)? };
+    // As Model::load: YSKN_METAL_MAC and YSKN_METAL_CPU_SHARE select the Metal modes.
+    model.configure_metal_from_env()?;
     println!(
         "backend={} device={} kv={mode:?} cpu_stages={}",
         model.backend().name(),
