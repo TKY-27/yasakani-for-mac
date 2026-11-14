@@ -67,19 +67,19 @@ impl Folder {
         folder.json("yasakani.json", json!({"model_id":"synthetic-product", "max_ctx":CONTEXT,"files":{"weights":"weights.yskn","kv_profile":"profile.bin","draft":"draft.yskn","draft_head":"draft.shead"}}));
         // WordLevel permits the real fixed special IDs while keeping every
         // ordinary prompt and generated ID inside the 32-entry model head.
+        // IDs 0-9 are the digits the formatter requires. One word per ID:
+        // WordLevel inverts the vocab through a randomly seeded map, so an ID
+        // with two words would decode differently on each load.
         let mut vocab = serde_json::Map::new();
         for id in 0..32 {
             vocab.insert(
-                if id == 31 {
-                    "[UNK]".into()
-                } else {
-                    format!("t{id}")
+                match id {
+                    0..10 => id.to_string(),
+                    31 => "[UNK]".into(),
+                    _ => format!("t{id}"),
                 },
                 json!(id),
             );
-        }
-        for id in 0..10 {
-            vocab.insert(id.to_string(), json!(id));
         }
         let specials = [
             (248044, "<|endoftext|>"),

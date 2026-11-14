@@ -278,6 +278,31 @@ fn model_generation_defaults_reach_request_sampling_without_overriding_explicit_
     );
 }
 
+#[test]
+fn synthetic_tokenizer_streams_and_decodes_every_model_id_the_same_on_every_load() {
+    // The socket tests compare server text with a separately loaded decoder;
+    // that holds only if the tokenizer, like the real one, is deterministic.
+    let folder = Folder::new();
+    let ids: Vec<u32> = (0..32).collect();
+    let first = yskn_text::ChatFormatter::load(&folder.0)
+        .unwrap()
+        .decode(&ids)
+        .unwrap();
+    for _ in 0..4 {
+        let formatter = yskn_text::ChatFormatter::load(&folder.0).unwrap();
+        assert_eq!(formatter.decode(&ids).unwrap(), first);
+        let mut stream = yskn_text::OutputStream::new(&formatter, false);
+        let mut text = String::new();
+        for n in 1..=ids.len() {
+            for (kind, piece) in stream.feed(&ids[..n], n == ids.len()).unwrap() {
+                assert_eq!(kind, "content");
+                text += &piece;
+            }
+        }
+        assert_eq!(text, first);
+    }
+}
+
 fn digest(ids: &[u32]) -> String {
     let mut hash = Sha256::new();
     for token in ids {
@@ -429,7 +454,7 @@ fn synthetic_product_cli_info_bench_comparison_json_and_terminal_chat_work() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    chat.stdin.take().unwrap().write_all(b"t1 t2\n").unwrap();
+    chat.stdin.take().unwrap().write_all(b"1 2\n").unwrap();
     let chat = chat.wait_with_output().unwrap();
     assert!(
         chat.status.success(),
@@ -607,7 +632,7 @@ mod sockets {
     async fn real_socket_streaming_and_nonstreaming_use_scalar_tokens_and_exact_usage() {
         let folder = Folder::new();
         let formatter = yskn_text::ChatFormatter::load(&folder.0).unwrap();
-        let messages = json!([{"role":"user","content":"t1 t2"}]);
+        let messages = json!([{"role":"user","content":"1 2"}]);
         let prompt = formatter
             .prompt(&messages, None, &json!({"enable_thinking":false}))
             .unwrap()
@@ -656,7 +681,7 @@ mod sockets {
         let folder = Folder::new();
         let observation = Arc::new(Observation::default());
         let (addr, shutdown, task) = start(&folder, observation.clone()).await;
-        let body=json!({"messages":[{"role":"user","content":"t1 ".repeat(256)}],"stream":true,"max_tokens":4,"temperature":0,"enable_thinking":false}).to_string();
+        let body=json!({"messages":[{"role":"user","content":"1 ".repeat(256)}],"stream":true,"max_tokens":4,"temperature":0,"enable_thinking":false}).to_string();
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(format!("POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
         let deadline = tokio::time::Instant::now() + PATIENCE;
@@ -668,7 +693,7 @@ mod sockets {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         drop(client);
-        let (status,text)=request(addr,json!({"messages":[{"role":"user","content":"t2"}],"max_tokens":2,"temperature":0,"enable_thinking":false})).await;
+        let (status,text)=request(addr,json!({"messages":[{"role":"user","content":"2"}],"max_tokens":2,"temperature":0,"enable_thinking":false})).await;
         assert_eq!(status, 200, "next request did not acquire engine: {text}");
         assert!(
             observation.cancelled.load(Ordering::Acquire),
