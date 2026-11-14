@@ -55,6 +55,15 @@ impl PreparedActivation {
 }
 
 pub fn quantize_activation(input: &[f32], input_signs: &[i8]) -> Result<PreparedActivation> {
+    quantize_activation_with_transform(input, input_signs, hadamard512)
+}
+
+/// Engine transform hook; every scale, conversion and validation stays scalar.
+pub fn quantize_activation_with_transform(
+    input: &[f32],
+    input_signs: &[i8],
+    transform: impl Fn(&mut [f32; ROTATION_BLOCK]),
+) -> Result<PreparedActivation> {
     if input.is_empty() || input.len() % ROTATION_BLOCK != 0 || input_signs.len() != input.len() {
         return Err(Error::InvalidModel(
             "activation and input signs must have matching, nonzero multiples of 512 elements"
@@ -76,7 +85,7 @@ pub fn quantize_activation(input: &[f32], input_signs: &[i8]) -> Result<Prepared
         for (channel, value) in rotated.iter_mut().enumerate() {
             *value = input[start + channel] * f32::from(input_signs[start + channel]);
         }
-        hadamard512(&mut rotated);
+        transform(&mut rotated);
         for value in &mut rotated {
             // FP16 rounding precedes the maximum and int8 quantization.
             *value = half(*value * HADAMARD_NORMALIZATION);
@@ -277,6 +286,27 @@ pub fn restore_projection(
     output_signs: Option<&[i8]>,
     rows: usize,
 ) -> Result<Vec<f32>> {
+    restore_projection_with_transform(
+        weighted_sums,
+        prepared,
+        inverse_rms,
+        effective_row_scale,
+        output_signs,
+        rows,
+        hadamard512,
+    )
+}
+
+/// Engine inverse-transform hook with the reference scale and conversion order.
+pub fn restore_projection_with_transform(
+    weighted_sums: &[i64],
+    prepared: &PreparedActivation,
+    inverse_rms: Option<f32>,
+    effective_row_scale: &[f32],
+    output_signs: Option<&[i8]>,
+    rows: usize,
+    transform: impl Fn(&mut [f32; ROTATION_BLOCK]),
+) -> Result<Vec<f32>> {
     if weighted_sums.len() != effective_row_scale.len()
         || rows > weighted_sums.len()
         || output_signs.is_some_and(|s| {
@@ -304,17 +334,25 @@ pub fn restore_projection(
     }
     require_finite(&output, "scaled compressed projection")?;
     if let Some(signs) = output_signs {
-        inverse_rotation(&mut output, signs)?;
+        inverse_rotation_with_transform(&mut output, signs, transform)?;
     }
     output.truncate(rows);
     Ok(output)
 }
 
 fn inverse_rotation(values: &mut [f32], signs: &[i8]) -> Result<()> {
+    inverse_rotation_with_transform(values, signs, hadamard512)
+}
+
+fn inverse_rotation_with_transform(
+    values: &mut [f32],
+    signs: &[i8],
+    transform: impl Fn(&mut [f32; ROTATION_BLOCK]),
+) -> Result<()> {
     for (block_index, block) in values.chunks_exact_mut(ROTATION_BLOCK).enumerate() {
         let mut rotated = [0.0; ROTATION_BLOCK];
         rotated.copy_from_slice(block);
-        hadamard512(&mut rotated);
+        transform(&mut rotated);
         for (channel, value) in block.iter_mut().enumerate() {
             // Inverse rotation applies the signs after the normalized transform.
             *value = (rotated[channel] * HADAMARD_NORMALIZATION)

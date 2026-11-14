@@ -41,9 +41,10 @@ fn main() -> Result<()> {
     let mut model =
         unsafe { Model::with_options(&path, Engine::from_env()?, backend, rows, mode)? };
     println!(
-        "backend={} device={} kv={mode:?}",
+        "backend={} device={} kv={mode:?} cpu_stages={}",
         model.backend().name(),
-        model.device()
+        model.device(),
+        std::env::var("YSKN_CPU_STAGES").unwrap_or_else(|_| "auto".into())
     );
     let vocabulary = model.dimensions().vocabulary_size;
     let tokens = |count| -> Vec<u32> {
@@ -71,8 +72,13 @@ fn main() -> Result<()> {
                 .clone();
             assert_eq!((timing.position, timing.rows), (context, rows));
             println!(
-                "sample={sample} context={context} attention_s={:.9}",
-                timing.attention.as_secs_f64()
+                "sample={sample} context={context} total_s={:.9} kernel_s={:.9} recurrence_s={:.9} attention_s={:.9} kv_encode_s={:.9} rest_s={:.9}",
+                timing.total.as_secs_f64(),
+                timing.kernel.as_secs_f64(),
+                timing.recurrence.as_secs_f64(),
+                timing.attention.as_secs_f64(),
+                timing.kv_encode.as_secs_f64(),
+                timing.rest().as_secs_f64()
             );
             timings.push(timing);
         }
