@@ -481,3 +481,13 @@ the file and entry. Execution errors preserve completed rows and earlier
 failures in the report and exit nonzero. Exit status is zero only when all
 comparisons and exercise gates pass. Real-model duration, acceptance, long
 output lengths and real-template reuse must be verified on the host.
+
+For a synthetic fixture with a smaller context, `--ctx N` selects the engine
+context (the normal loader still enforces the model's maximum). To test the
+example's own failure exit and saved report, build it first with
+`CARGO_NET_OFFLINE=true cargo build --release -p yskn --example lossless`.
+`YSKN_LOSSLESS_INJECT_MISMATCH=1` flips the first returned token once per
+engine load, so the repeat comparison must fail. This diagnostic environment
+variable exists only in the example and must be unset for real measurements.
+The integration test launches this binary on authored synthetic weights,
+checks a clean exit/report, then an injected nonzero exit/report.

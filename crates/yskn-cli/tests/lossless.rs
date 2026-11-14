@@ -226,8 +226,6 @@ fn later_error_preserves_the_mismatch_and_completed_rows() {
     assert!(report["runs"].as_array().unwrap().len() > 1);
 }
 
-// The fault is injected only in this test executable; the actual example has no
-// hidden switch or test-only production seam. Child exit status is observable.
 #[test]
 fn fault_child() {
     let Ok(mode) = std::env::var("YSKN_LOSSLESS_TEST_FAULT") else {
@@ -340,4 +338,65 @@ fn malformed_prompt_files_name_the_file_and_entry_instead_of_panicking() {
         ["none", "neural-k7-fixed"]
     );
     assert!(lossless_support::configs("none,none").is_err());
+}
+
+#[test]
+fn real_example_binary_saves_report_and_exits_nonzero_for_an_injected_mismatch() {
+    let folder = Folder::new();
+    folder.write("chat_template.jinja", "{% if enable_thinking %}t13 {% endif %}{% for m in messages %}{% if m.role == 'assistant' %}t10 {% endif %}{{ m.content }} {% endfor %}t10");
+    folder.json("prompts.json", json!([
+        {"id":"a","request":{"messages":[{"role":"user","content":"1 2 1 2 1 2"}],"enable_thinking":false,"max_tokens":12}},
+        {"id":"b","request":{"messages":[{"role":"user","content":"3 4 5 6"}],"enable_thinking":false,"max_tokens":12}}
+    ]));
+    // Cargo's test --all-targets build also builds the actual example binary.
+    let exe = std::env::current_exe().unwrap();
+    let mut root = exe.parent().unwrap();
+    while root.file_name().is_some_and(|n| n != "release") {
+        root = root.parent().expect("release target root");
+    }
+    let binary = root.join("examples/lossless");
+    assert!(
+        binary.is_file(),
+        "build with cargo build -p yskn --release --example lossless first: {}",
+        binary.display()
+    );
+    for inject in [false, true] {
+        let report_path = folder.0.join(if inject { "bad.json" } else { "good.json" });
+        let mut command = Command::new(&binary);
+        command
+            .args(["--profile", "full", "--configs", "none", "--ctx", "512"])
+            .arg("--model-dir")
+            .arg(&folder.0)
+            .arg("--prompts")
+            .arg(folder.0.join("prompts.json"))
+            .arg("--report")
+            .arg(&report_path)
+            .env("YSKN_BACKEND", "cpu")
+            .env_remove("YSKN_LOSSLESS_INJECT_MISMATCH");
+        if inject {
+            command.env("YSKN_LOSSLESS_INJECT_MISMATCH", "1");
+        }
+        let child = command.output().unwrap();
+        let report: Value = serde_json::from_slice(
+            &std::fs::read(&report_path)
+                .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&child.stderr))),
+        )
+        .unwrap();
+        assert_eq!(
+            child.status.success(),
+            !inject,
+            "{} {report}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(report["passed"], !inject);
+        if inject {
+            assert!(
+                report["failures"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| f["kind"] == "repeat_mismatch" && f["position"] == 0)
+            );
+        }
+    }
 }
