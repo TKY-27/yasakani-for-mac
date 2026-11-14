@@ -884,3 +884,41 @@ fn a_prompt_that_normalizes_to_fit_is_not_refused() {
         .unwrap_err();
     assert_eq!(e.code, Some("context_length_exceeded"));
 }
+// Review finding: once preparation had started on the engine thread it ran to
+// the end even after the deadline, a disconnect or shutdown. The server's check
+// runs before rendering, after rendering and after tokenization, and its
+// error ends the preparation there.
+#[test]
+fn preparation_stops_between_its_steps() {
+    use std::cell::Cell;
+    let (r, c) = runner();
+    let prepare = |p: &ChatParams, stop_at: usize| {
+        let calls = Cell::new(0);
+        let result = r.prepare_interruptible(p, &|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == stop_at {
+                Err(yskn::Error::engine("stopped"))
+            } else {
+                Ok(())
+            }
+        });
+        (result.map(|_| ()).map_err(|e| e.message), calls.get())
+    };
+    assert_eq!(prepare(&ChatParams::new(user()), 0), (Ok(()), 3));
+    // A template that fails shows where rendering happens: after call 1.
+    let bad = ChatParams::new(json!([{"role":"assistant","content":"",
+        "tool_calls":[{"function":{"name":"f","arguments":"x"}}]}]));
+    assert_eq!(prepare(&bad, 1), (Err("stopped".into()), 1));
+    let (rendered, calls) = prepare(&bad, 2);
+    assert!(rendered.unwrap_err().contains("template"), "rendering ran");
+    assert_eq!(calls, 1);
+    // A prompt longer than the context shows where tokenization happens:
+    // after call 2, and the token check after call 3.
+    let long = ChatParams::new(json!([{"role":"user","content":"a".repeat(30000)}]));
+    assert_eq!(prepare(&long, 2), (Err("stopped".into()), 2));
+    assert_eq!(prepare(&long, 3), (Err("stopped".into()), 3));
+    let (counted, calls) = prepare(&long, 0);
+    assert!(counted.unwrap_err().contains("tokens exceeds"));
+    assert_eq!(calls, 3);
+    assert_eq!(c.observation().calls, 0);
+}

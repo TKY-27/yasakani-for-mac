@@ -145,6 +145,17 @@ impl ChatRunner {
         })
     }
     pub fn prepare_checked(&self, p: &ChatParams) -> Result<(Vec<u32>, bool)> {
+        self.prepare_interruptible(p, &|| Ok(()))
+    }
+    /// [`Self::prepare_checked`], calling `go_on` before rendering, after
+    /// rendering and after tokenization; its error ends the preparation there.
+    /// Rendering and tokenization themselves cannot be interrupted.
+    pub fn prepare_interruptible(
+        &self,
+        p: &ChatParams,
+        go_on: &dyn Fn() -> Result<()>,
+    ) -> Result<(Vec<u32>, bool)> {
+        go_on()?;
         // A template or tokenizer error may quote request text: capped at the
         // 500 characters upstream keeps of a generation error.
         let rejected = |e: yskn_text::Error| {
@@ -165,7 +176,10 @@ impl ChatRunner {
             .formatter
             .render(&p.messages, p.tools.as_ref(), &options)
             .map_err(rejected)?;
+        drop(options);
+        go_on()?;
         let ids = self.formatter.encode(&text).map_err(rejected)?;
+        go_on()?;
         if ids.len() >= capacity.saturating_sub(CONTEXT_MARGIN) {
             return Err(too_long(format!(
                 "the input is too long: {} tokens exceeds the model's maximum context length of {capacity} tokens (input, thinking and answer together)",

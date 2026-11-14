@@ -113,7 +113,7 @@ SHA-256 and reduces all 32 digest bytes without prefix-dependent branches.
 
 | Limit (`Limits` field) | Default | Why this number |
 |---|---:|---|
-| Actual request-body bytes, before JSON parsing (`max_body`) | 8 MiB | Upstream's `MAX_BODY` is 32 MiB. Lowered: by our estimate a full 262,144-token context is about 1 to 2.4 MiB of JSON (3 to 9 bytes per token, ASCII-escaped CJK at the top), so 8 MiB leaves 32 bytes per token. Tokenizing costs about 64 bytes of memory per prompt byte, so the body size bounds the engine thread's work. A client resending megabytes of old `reasoning_content` that the template drops could exceed it where upstream accepted it |
+| Actual request-body bytes, before JSON parsing (`max_body`) | 8 MiB | Upstream's `MAX_BODY` is 32 MiB. Lowered: by our estimate a full 262,144-token context is about 1 to 2.4 MiB of JSON (3 to 9 bytes per token, ASCII-escaped CJK at the top), so 8 MiB leaves 32 bytes per token. The body size also bounds the engine thread's uncharged work of preparing the prompt (measured below). A client resending megabytes of old `reasoning_content` that the template drops could exceed it where upstream accepted it |
 | Bytes held by all requests together (`max_pending_bytes`) | 512 MiB | Charged as body bytes arrive; raised before parsing to what decoding can hold at most, 5 x the body bytes + 640 per JSON value (see below); lowered after decoding to the cleaned request's text bytes + 640 per value, which it holds while it waits and generates. Over budget: 503 with `Retry-After: 5`. Must hold one largest request (5 x 8 MiB + 2^19 x 640 = 360 MiB) |
 | JSON values per request, counted before parsing (`max_json_values`) | 524,288 | Bounds the parsed body and its cleaned copy (measured worst case about 590 bytes per value, for tool schemas of one-member objects). Covers 65,536 messages at 4 values each with room for tools; tool-call argument strings count too |
 | Messages (`max_messages`) | 65,536 | Even an empty message renders as 5 template tokens, so more than 262,144 / 5 = 52,429 can never fit |
@@ -141,7 +141,12 @@ SHA-256 and reduces all 32 digest bytes without prefix-dependent branches.
 Generation itself has no deadline: it is bounded by `max_tokens` (and the
 context room), and it stops when the client disconnects or stops reading a
 stream (`stream_timeout`). A client that disconnects while its request waits
-in the queue is skipped by the engine thread.
+in the queue is skipped by the engine thread. `queue_timeout` also covers
+preparing the prompt: the engine thread checks for a disconnect, the deadline
+and shutdown before rendering the template, after rendering and after
+tokenizing, and stops there (past the deadline: 503 with `Retry-After`).
+Rendering and tokenizing themselves cannot be interrupted; see below for what
+the longest of them costs.
 
 A prompt is refused with `context_length_exceeded` only by the exact token
 check after tokenization, as upstream. There is no cheaper check on the
@@ -178,10 +183,18 @@ for the text part, where the allocator keeps the freed raw body resident, and
 template are the larger part (not charged, see below).
 
 Not covered by the budget: the one request on the engine thread renders and
-tokenizes its prompt (measured about 64 bytes per prompt byte for
-tokenization, plus the template's copy of the messages), bounded through the
-body limit. Embedders running `Api` on a multi-thread runtime can decode
-several bodies at once; each is still charged before it is parsed.
+tokenizes its prompt, which only the body and text limits bound. With the
+synthetic byte tokenizer (one token per byte, the most tokens a prompt byte
+can make), a request of 8 MiB of plain text renders an 8.4 million token
+prompt; preparing it took 0.6 s and the server peaked at 1.8 GiB resident
+(about 230 bytes per token, for CJK, emoji or DEL text; ASCII 1.4 GiB). The most tokens per body byte we
+found come from many short tool-call arguments, each rendered with its
+`<parameter=...>` tags: an 8.3 MB body of 250,000 arguments renders 13.5
+million tokens, taking 1.3 s and peaking at 2.5 GiB. These are measurements of
+constructed cases, not a proven bound; other templates add other tags. A
+real tokenizer makes fewer tokens per byte; it has not been measured here.
+Embedders running `Api` on a multi-thread runtime can decode several bodies at
+once; each is still charged before it is parsed.
 
 Error messages never quote more than a short excerpt of a request value: at
 most 64 characters of its Python repr followed by `…` (`response_format`, the

@@ -296,6 +296,9 @@ struct Job {
     params: crate::chat::ChatParams,
     ready: oneshot::Sender<Result<mpsc::Receiver<Result<Event>>>>,
     cancel: Arc<AtomicBool>,
+    /// End of the wait for the engine (`Limits::queue_timeout`), which lasts
+    /// until the prompt is prepared and generation starts.
+    deadline: std::time::Instant,
     // Released when the engine thread drops the job, after its generation.
     _charge: Charge,
 }
@@ -385,7 +388,18 @@ impl Api {
                     if cancelled() || job.ready.is_closed() {
                         continue;
                     }
-                    let prepared = match runner.prepare_checked(&job.params) {
+                    // Between the preparation steps: a request whose client
+                    // left, or whose wait has run out, is not prepared further.
+                    let go_on = || {
+                        if cancelled() || job.ready.is_closed() {
+                            Err(Error::engine("the request was cancelled"))
+                        } else if std::time::Instant::now() >= job.deadline {
+                            Err(waited_too_long())
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    let prepared = match runner.prepare_interruptible(&job.params, &go_on) {
                         Ok(p) => p,
                         Err(e) => {
                             let _ = job.ready.send(Err(e));
@@ -587,6 +601,13 @@ fn busy_error() -> Error {
     http_error(
         503,
         "the server is busy with other requests; retry later",
+        "unavailable",
+    )
+}
+fn waited_too_long() -> Error {
+    http_error(
+        503,
+        "the request waited too long for the engine; retry later",
         "unavailable",
     )
 }
@@ -802,24 +823,20 @@ where
         params: decoded.params,
         ready,
         cancel: cancel.0.clone(),
+        deadline: std::time::Instant::now() + cfg.limits.queue_timeout,
         _charge: charge,
     };
     // On timeout or disconnect `cancel` drops, and the engine thread skips
-    // the job when it reaches it.
+    // the job when it reaches it, or stops preparing it.
     let waited = tokio::time::timeout(cfg.limits.queue_timeout, async {
         jobs.send(job).await.ok()?;
         rx.await.ok()
     })
     .await;
     let events = match waited {
-        Err(_) => {
-            return busy(http_error(
-                503,
-                "the request waited too long for the engine; retry later",
-                "unavailable",
-            ));
-        }
+        Err(_) => return busy(waited_too_long()),
         Ok(Some(Ok(rx))) => rx,
+        Ok(Some(Err(e))) if e.status == 503 => return busy(e),
         Ok(Some(Err(e))) => return error_response(e),
         Ok(None) => return error_response(Error::engine("engine worker is unavailable")),
     };
