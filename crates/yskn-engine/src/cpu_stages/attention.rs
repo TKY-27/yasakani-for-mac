@@ -9,20 +9,6 @@ use yskn_ref::{
 const LOG2_E: f32 = std::f32::consts::LOG2_E;
 const EMPTY_MAXIMUM: f32 = -1.0e30;
 
-pub(crate) fn output_head(
-    layer: &Attention,
-    state: &AttentionState,
-    position: usize,
-    prepared: &PreparedRow,
-    head: usize,
-) -> Result<Vec<f32>> {
-    if super::enabled() {
-        layer.output_head_with(state, position, prepared, head, attend_head)
-    } else {
-        layer.output_head(state, position, prepared, head)
-    }
-}
-
 struct AttentionSplit {
     maximum: f32,
     denominator: f32,
@@ -30,6 +16,7 @@ struct AttentionSplit {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 struct SplitPlan {
     tiles: Vec<(usize, std::ops::Range<usize>)>,
     include_self: bool,
@@ -37,6 +24,7 @@ struct SplitPlan {
 
 /// Chapter 04's 31/42 splits with D9's absolute, per-row prefix tiles.
 /// `length` includes self and is therefore positive.
+#[cfg(test)]
 fn prefix_schedule(length: usize) -> Vec<SplitPlan> {
     let split_count = if length < 4096 { 31 } else { 42 };
     let per_split = length.div_ceil(split_count);
@@ -64,6 +52,7 @@ fn prefix_schedule(length: usize) -> Vec<SplitPlan> {
         .collect()
 }
 
+#[cfg(test)]
 fn attend_head(operands: AttentionOperands<'_>) -> Result<Vec<f32>> {
     let AttentionOperands {
         query,
@@ -86,14 +75,20 @@ fn attend_head(operands: AttentionOperands<'_>) -> Result<Vec<f32>> {
             numerator: vec![0.0; 256],
         };
         for (tile_start, visible) in plan.tiles {
-            prefix_tile(&mut split, query, tile_start, visible, |position, side| {
-                let row = if side == 0 {
-                    prefix[position].key(kv_head)
-                } else {
-                    prefix[position].value(kv_head)
-                };
-                (row.bases(), row.scale())
-            })?;
+            prefix_tile(
+                &mut split,
+                query,
+                tile_start,
+                visible,
+                |position| {
+                    let row = prefix[position].key(kv_head);
+                    (row.bases(), row.scale())
+                },
+                |position, output, probability| {
+                    let row = prefix[position].value(kv_head);
+                    add_cache_value(output, row, bfloat(probability * row.scale()));
+                },
+            )?;
         }
         if plan.include_self {
             add_self(
@@ -111,12 +106,16 @@ fn attend_head(operands: AttentionOperands<'_>) -> Result<Vec<f32>> {
         denominator: 0.0,
         numerator: vec![0.0; 256],
     });
+    combine_splits(&splits)
+}
+
+fn combine_splits(splits: &[AttentionSplit]) -> Result<Vec<f32>> {
     let largest_maximum = splits
         .iter()
         .map(|split| split.maximum)
         .fold(EMPTY_MAXIMUM, f32::max);
     let mut scales = Vec::with_capacity(splits.len());
-    for split in &splits {
+    for split in splits {
         if split.maximum > -1.0e29 {
             let difference = split.maximum - largest_maximum;
             finite(&[difference], "attention split maximum difference")?;
@@ -127,7 +126,7 @@ fn attend_head(operands: AttentionOperands<'_>) -> Result<Vec<f32>> {
     }
     let mut denominator = 0.0;
     // Splits, including zero padding, combine in ascending order with separate products.
-    for (scale, split) in scales.iter().zip(&splits) {
+    for (scale, split) in scales.iter().zip(splits) {
         denominator += *scale * split.denominator;
     }
     finite(&[denominator], "attention combined denominator")?;
@@ -137,7 +136,7 @@ fn attend_head(operands: AttentionOperands<'_>) -> Result<Vec<f32>> {
         ));
     }
     let mut attended = vec![0.0; 256];
-    for (scale, split) in scales.iter().zip(&splits) {
+    for (scale, split) in scales.iter().zip(splits) {
         add_scaled(&mut attended, &split.numerator, *scale);
     }
     for value in &mut attended {
@@ -147,28 +146,42 @@ fn attend_head(operands: AttentionOperands<'_>) -> Result<Vec<f32>> {
     Ok(attended)
 }
 
+#[cfg(test)]
 fn prefix_tile(
     split: &mut AttentionSplit,
     query: &[f32],
     tile_start: usize,
     visible: std::ops::Range<usize>,
-    row: impl Fn(usize, usize) -> ([f32; 256], f32),
+    key: impl Fn(usize) -> ([f32; 256], f32),
+    add_value: impl Fn(usize, &mut [f32], f32),
 ) -> Result<()> {
     let mut scores = [f32::NEG_INFINITY; 32];
-    for first in (visible.start..visible.end).step_by(4) {
-        let count = (visible.end - first).min(4);
-        let mut bases = [[0.0; 256]; 4];
-        let mut scales = [0.0; 4];
-        for lane in 0..count {
-            (bases[lane], scales[lane]) = row(first + lane, 0);
-        }
-        let dots = dots4(query, &bases);
-        for lane in 0..count {
-            let score = dots[lane] * (scales[lane] * 0.0625);
-            finite(&[score], "attention prefix score")?;
-            scores[first + lane - tile_start] = score;
-        }
+    let count = visible.len();
+    let mut bases = [[0.0; 256]; 32];
+    let mut scales = [0.0; 32];
+    for lane in 0..count {
+        (bases[lane], scales[lane]) = key(visible.start + lane);
     }
+    let dots = dots32(query, &bases, count);
+    for lane in 0..count {
+        let score = dots[lane] * (scales[lane] * 0.0625);
+        finite(&[score], "attention prefix score")?;
+        scores[visible.start + lane - tile_start] = score;
+    }
+    let probabilities = prefix_probabilities(split, &scores)?;
+    // Only visible rows are read. Each channel still consumes ascending tile keys.
+    for position in visible {
+        add_value(
+            position,
+            &mut split.numerator,
+            probabilities[position - tile_start],
+        );
+    }
+    finite(&[split.denominator], "attention prefix denominator")?;
+    finite(&split.numerator, "attention prefix numerator")
+}
+
+fn prefix_probabilities(split: &mut AttentionSplit, scores: &[f32; 32]) -> Result<[f32; 32]> {
     let new_maximum = scores.iter().copied().fold(split.maximum, f32::max);
     let rescale_argument = (split.maximum - new_maximum) * LOG2_E;
     let scaled_maximum = new_maximum * LOG2_E;
@@ -184,9 +197,15 @@ fn prefix_tile(
             // The score and maximum are multiplied separately before subtraction.
             let argument = scores[index] * LOG2_E - scaled_maximum;
             finite(&[argument], "attention prefix probability argument")?;
-            *probability = exp2(argument);
+            *probability = argument;
         }
         // The causal mask denotes an exact zero probability, not a model activation.
+    }
+    super::math::exp2(&mut probabilities);
+    for (index, probability) in probabilities.iter_mut().enumerate() {
+        if scores[index] == f32::NEG_INFINITY {
+            *probability = 0.0;
+        }
     }
     finite(&probabilities, "attention prefix probability")?;
     let mut partial = [0.0; 4];
@@ -202,14 +221,7 @@ fn prefix_tile(
     for value in &mut split.numerator {
         *value *= rescale;
     }
-    // Only visible rows are read. Each channel still consumes ascending tile keys.
-    for position in visible {
-        let (bases, scale) = row(position, 1);
-        let weight = bfloat(probabilities[position - tile_start] * scale);
-        add_scaled(&mut split.numerator, &bases, weight);
-    }
-    finite(&[split.denominator], "attention prefix denominator")?;
-    finite(&split.numerator, "attention prefix numerator")
+    Ok(probabilities)
 }
 
 fn add_self(
@@ -285,47 +297,125 @@ fn finite(values: &[f32], context: &'static str) -> Result<()> {
     }
 }
 
-fn dots4(query: &[f32], bases: &[[f32; 256]; 4]) -> [f32; 4] {
+#[cfg(test)]
+fn dots32(query: &[f32], bases: &[[f32; 256]; 32], _count: usize) -> [f32; 32] {
     assert_eq!(query.len(), 256);
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: output_head checks enabled() (runtime NEON detection); direct kernel
-        // tests check neon_available() before calling.
-        // query and every base row have exactly 256 channels.
-        unsafe { dots4_neon(query, bases) }
+        // SAFETY: this retained baseline kernel is test-only and tests require NEON;
+        // query and every cache row contain exactly 256 elements.
+        unsafe {
+            match _count {
+                0..=4 => dots32_neon::<1>(query, bases),
+                5..=8 => dots32_neon::<2>(query, bases),
+                9..=16 => dots32_neon::<4>(query, bases),
+                _ => dots32_neon::<8>(query, bases),
+            }
+        }
     }
     #[cfg(not(target_arch = "aarch64"))]
-    {
-        std::array::from_fn(|lane| {
-            let mut sum = 0.0;
-            for i in 0..256 {
-                sum += query[i] * bases[lane][i];
-            }
-            sum
-        })
-    }
+    std::array::from_fn(|lane| {
+        let mut sum = 0.0;
+        for i in 0..256 {
+            sum += query[i] * bases[lane][i];
+        }
+        sum
+    })
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn dots4_neon(query: &[f32], bases: &[[f32; 256]; 4]) -> [f32; 4] {
+#[cfg(test)]
+unsafe fn dots32_neon<const GROUPS: usize>(query: &[f32], bases: &[[f32; 256]; 32]) -> [f32; 32] {
     use std::arch::aarch64::*;
-    // Transpose four rows into channel-major scratch. Each key's chain keeps D3 order.
-    let transposed: [[f32; 4]; 256] =
-        std::array::from_fn(|i| std::array::from_fn(|lane| bases[lane][i]));
-    let mut out = [0.0; 4];
-    // SAFETY: each transposed row and out hold four f32 values, all indices are in range.
+    let mut sums = [vdupq_n_f32(0.0); GROUPS];
+    let mut out = [0.0; 32];
+    // SAFETY: four channels per load, eight disjoint groups of four keys.
+    // Transpose in registers; no second channel-major scratch copy is written.
     unsafe {
-        let mut sum = vdupq_n_f32(0.0);
-        for i in 0..256 {
-            sum = vaddq_f32(
-                sum,
-                vmulq_n_f32(vld1q_f32(transposed[i].as_ptr()), query[i]),
-            );
+        for channel in (0..256).step_by(4) {
+            for (group, sum) in sums.iter_mut().enumerate() {
+                let a = vld1q_f32(bases[group * 4].as_ptr().add(channel));
+                let b = vld1q_f32(bases[group * 4 + 1].as_ptr().add(channel));
+                let c = vld1q_f32(bases[group * 4 + 2].as_ptr().add(channel));
+                let d = vld1q_f32(bases[group * 4 + 3].as_ptr().add(channel));
+                let ab0 = vtrn1q_f32(a, b);
+                let ab1 = vtrn2q_f32(a, b);
+                let cd0 = vtrn1q_f32(c, d);
+                let cd1 = vtrn2q_f32(c, d);
+                let columns = [
+                    vcombine_f32(vget_low_f32(ab0), vget_low_f32(cd0)),
+                    vcombine_f32(vget_low_f32(ab1), vget_low_f32(cd1)),
+                    vcombine_f32(vget_high_f32(ab0), vget_high_f32(cd0)),
+                    vcombine_f32(vget_high_f32(ab1), vget_high_f32(cd1)),
+                ];
+                for element in 0..4 {
+                    *sum = vaddq_f32(
+                        *sum,
+                        vmulq_n_f32(columns[element], query[channel + element]),
+                    );
+                }
+            }
         }
-        vst1q_f32(out.as_mut_ptr(), sum);
+        for (group, sum) in sums.into_iter().enumerate() {
+            vst1q_f32(out.as_mut_ptr().add(4 * group), sum);
+        }
     }
     out
+}
+
+#[cfg(test)]
+fn add_cache_value(output: &mut [f32], row: &CacheRow, weight: f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: output is a validated 256-channel split, cache rows own 256 bases;
+        // direct baseline tests require runtime NEON. Widen directly in registers.
+        unsafe {
+            add_cache_value_neon(output, row, weight);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    add_scaled(output, &row.bases(), weight);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[cfg(test)]
+unsafe fn add_cache_value_neon(output: &mut [f32], row: &CacheRow, weight: f32) {
+    use std::arch::aarch64::*;
+    use yskn_ref::kv_codec::BaseView;
+    // SAFETY: eight base operands and two four-channel output vectors per iteration.
+    // Every mutable load/store derives from the exclusive output pointer.
+    unsafe {
+        let ptr = output.as_mut_ptr();
+        match row.base_view() {
+            BaseView::Bfloat16(base) => {
+                for i in (0..256).step_by(4) {
+                    let value =
+                        vreinterpretq_f32_u32(vshll_n_u16::<16>(vld1_u16(base.as_ptr().add(i))));
+                    vst1q_f32(
+                        ptr.add(i),
+                        vaddq_f32(vld1q_f32(ptr.add(i)), vmulq_n_f32(value, weight)),
+                    );
+                }
+            }
+            BaseView::Int8(base) => {
+                for i in (0..256).step_by(8) {
+                    let wide = vmovl_s8(vld1_s8(base.as_ptr().add(i)));
+                    let a = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wide)));
+                    let b = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wide)));
+                    vst1q_f32(
+                        ptr.add(i),
+                        vaddq_f32(vld1q_f32(ptr.add(i)), vmulq_n_f32(a, weight)),
+                    );
+                    vst1q_f32(
+                        ptr.add(i + 4),
+                        vaddq_f32(vld1q_f32(ptr.add(i + 4)), vmulq_n_f32(b, weight)),
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn add_scaled(output: &mut [f32], bases: &[f32], weight: f32) {
@@ -333,7 +423,7 @@ fn add_scaled(output: &mut [f32], bases: &[f32], weight: f32) {
     assert_eq!(bases.len(), 256);
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: output_head checks enabled() (runtime NEON detection); direct kernel
+        // SAFETY: output_rows checks enabled() (runtime NEON detection); direct kernel
         // tests check neon_available(). Both checked slices have 256 elements.
         unsafe {
             add_scaled_neon(output, bases, weight);
@@ -375,10 +465,25 @@ mod tests {
 
     #[test]
     fn attention_matches_reference_at_tile_and_split_boundaries_with_mixed_sides() {
+        check_attention_at_boundaries(
+            &profile_fixture::mixed_profile(),
+            &[(true, true), (true, false)],
+        );
+    }
+
+    #[test]
+    fn attention_matches_reference_at_tile_and_split_boundaries_with_int8_keys_packed_values() {
+        check_attention_at_boundaries(
+            &profile_fixture::int8_keys_packed_values_profile(),
+            &[(false, true)],
+        );
+    }
+
+    fn check_attention_at_boundaries(profile: &[u8], packed_sides: &[(bool, bool)]) {
         if !super::super::neon_available() {
             return;
         }
-        let profile = Arc::new(KvProfile::parse(&profile_fixture::mixed_profile()).unwrap());
+        let profile = Arc::new(KvProfile::parse(profile).unwrap());
         let mut seed = 7919u32;
         let mut sample = || {
             seed ^= seed << 13;
@@ -394,7 +499,7 @@ mod tests {
             }
         };
         for mode in [KvMode::Int8, KvMode::Int8Profile, KvMode::Kv5] {
-            for ordinal in 0..2 {
+            for (ordinal, &packed_sides) in packed_sides.iter().enumerate() {
                 let layer = Attention::new(
                     AttentionDimensions {
                         query_heads: 4,
@@ -420,6 +525,92 @@ mod tests {
                     ]
                     .contains(&position)
                     {
+                        // Four causal rows share the cache, including passes crossing
+                        // tile edges and the 31 -> 42 split-schedule threshold.
+                        let mut pass_state = state.clone();
+                        let mut prepared = Vec::new();
+                        for offset in 0..4 {
+                            let q: Vec<_> = (0..2048).map(|_| sample()).collect();
+                            let k: Vec<_> = (0..512).map(|_| sample()).collect();
+                            let v: Vec<_> = (0..512).map(|_| sample()).collect();
+                            let p = layer.prepare_row(position + offset, &q, &k, &v).unwrap();
+                            layer
+                                .append_prepared(&mut pass_state, position + offset, &p)
+                                .unwrap();
+                            prepared.push(p);
+                        }
+                        // Inspect the stored prefix and final current row for both KV heads:
+                        // fixture changes must not silently remove either mixed direction.
+                        for head in [0, 2] {
+                            let operands = layer
+                                .head_operands(&pass_state, position + 3, &prepared[3], head)
+                                .unwrap();
+                            let expected_sides = if mode == KvMode::Kv5 {
+                                packed_sides
+                            } else {
+                                (false, false)
+                            };
+                            for (cached_position, token) in operands
+                                .prefix
+                                .iter()
+                                .chain(std::iter::once(operands.current))
+                                .enumerate()
+                            {
+                                assert_eq!(
+                                    (
+                                        matches!(token.key(operands.kv_head), CacheRow::Packed(_)),
+                                        matches!(
+                                            token.value(operands.kv_head),
+                                            CacheRow::Packed(_)
+                                        ),
+                                    ),
+                                    expected_sides,
+                                    "cache {mode:?} ordinal={ordinal} position={cached_position} kv_head={}",
+                                    operands.kv_head
+                                );
+                            }
+                        }
+                        let operands = prepared
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(i, p)| {
+                                let layer = &layer;
+                                let pass_state = &pass_state;
+                                (0..4).map(move |head| {
+                                    layer
+                                        .head_operands(pass_state, position + i, p, head)
+                                        .unwrap()
+                                })
+                            })
+                            .collect();
+                        let batch = grouped::Batch::new(operands, 2);
+                        // Reverse task completion order must not change split combination.
+                        let parts = (0..batch.tasks())
+                            .rev()
+                            .map(|task| batch.run(task).unwrap())
+                            .collect();
+                        let actual = batch.finish(parts).unwrap();
+                        for (i, attended) in actual.into_iter().enumerate() {
+                            let expected = layer
+                                .output_head(&pass_state, position + i / 4, &prepared[i / 4], i % 4)
+                                .unwrap();
+                            let actual = layer
+                                .output_head_with(
+                                    &pass_state,
+                                    position + i / 4,
+                                    &prepared[i / 4],
+                                    i % 4,
+                                    |_| Ok(attended),
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                bits(&actual),
+                                bits(&expected),
+                                "grouped {mode:?} ordinal={ordinal} position={} head={}",
+                                position + i / 4,
+                                i % 4
+                            );
+                        }
                         for head in 0..4 {
                             let expected = layer.output_head(&state, position, &row, head).unwrap();
                             let actual = layer
@@ -479,7 +670,11 @@ mod tests {
                         &[0.0; 256],
                         32,
                         visible.clone(),
-                        |position, side| rows[2 * position + side],
+                        |position| rows[2 * position],
+                        |position, output, probability| {
+                            let (bases, scale) = rows[2 * position + 1];
+                            add_scaled(output, &bases, bfloat(probability * scale));
+                        },
                     )
                     .unwrap();
                     assert_eq!(split.maximum.to_bits(), 0.0_f32.to_bits());
@@ -513,13 +708,23 @@ mod tests {
         let bases = std::array::from_fn(|lane| {
             std::array::from_fn(|i| ((i + lane * 31) as u8 as i8) as f32)
         });
-        let actual = dots4(&query, &bases);
-        for lane in 0..4 {
-            let mut expected = 0.0;
-            for i in 0..256 {
-                expected += query[i] * bases[lane][i];
+        for count in [1, 4, 5, 8, 9, 16, 17, 31, 32] {
+            let actual = dots32(&query, &bases, count);
+            for lane in 0..count {
+                let mut expected = 0.0;
+                for i in 0..256 {
+                    expected += query[i] * bases[lane][i];
+                }
+                assert_eq!(actual[lane].to_bits(), expected.to_bits());
             }
-            assert_eq!(actual[lane].to_bits(), expected.to_bits());
         }
     }
 }
+
+#[cfg(test)]
+#[path = "attention_bench.rs"]
+mod bench;
+
+#[path = "attention_grouped.rs"]
+mod grouped;
+pub(crate) use grouped::output_rows;

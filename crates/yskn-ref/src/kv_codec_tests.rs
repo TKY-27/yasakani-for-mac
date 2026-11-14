@@ -306,7 +306,7 @@ fn kv_packing_roundtrip_and_selected_reconstruction() {
         let p = KvProfile::parse(&fixture(1, 1, bits)).unwrap();
         for _ in 0..4 {
             let x = row(&mut seed);
-            let s = select(&p, 0, 0, &x).unwrap();
+            let s = select(&p, 0, 0, &x, search_chain).unwrap();
             let encoded = encode_packed(&p, 0, 0, &x).unwrap();
             let CacheRow::Packed(ref pk) = encoded else {
                 panic!()
@@ -476,7 +476,7 @@ fn kv_first_strict_scale_minimum_and_bfloat_decode_boundary() {
         put16(&mut b, to + 12 + 2 * i, 0);
     }
     let p = KvProfile::parse(&b).unwrap();
-    let selected = select(&p, 0, 0, &[0.0; 256]).unwrap();
+    let selected = select(&p, 0, 0, &[0.0; 256], search_chain).unwrap();
     assert_eq!(selected.scale.to_bits(), half(0.9).to_bits());
     assert_eq!(selected.states, [0; 256]);
     let mut b = fixture(1, 1, 4);
@@ -643,8 +643,8 @@ fn kv_real_profile_facts_quality_and_overflow() {
     let mut e4 = 0.0f64;
     for group in 0..128 {
         let x = row(&mut seed);
-        let five = select(&p, group, 100, &x).unwrap();
-        let four = select(&flat, group, 100, &x).unwrap();
+        let five = select(&p, group, 100, &x, search_chain).unwrap();
+        let four = select(&flat, group, 100, &x, search_chain).unwrap();
         let mse = |r: &[f32; 256]| {
             x.iter()
                 .zip(r)
@@ -690,7 +690,7 @@ fn kv_initial_int8_rounding_and_packed_mean_stay_separate() {
     assert!(p.packable(0, 0));
     let mut seed = 123;
     let x = row(&mut seed);
-    let selected = select(&p, 0, 0, &x).unwrap();
+    let selected = select(&p, 0, 0, &x, search_chain).unwrap();
     let encoded = encode_packed(&p, 0, 0, &x).unwrap();
     let mean = p.groups()[0].mean.unwrap();
     for (i, &m) in mean.iter().enumerate() {
@@ -712,7 +712,7 @@ fn kv_zero_and_negative_multipliers_follow_source_scale_rules() {
     put32(&mut bytes, 104, (-1.0_f32).to_bits());
     let p = KvProfile::parse(&bytes).unwrap();
     let mut seed = 42;
-    let selected = select(&p, 0, 0, &row(&mut seed)).unwrap();
+    let selected = select(&p, 0, 0, &row(&mut seed), search_chain).unwrap();
     assert!(selected.scale.is_finite());
     // Zero RMS is replaced by one, then zero candidate scale by one.
     let to = u32_at(&bytes, 112);
@@ -720,5 +720,8 @@ fn kv_zero_and_negative_multipliers_follow_source_scale_rules() {
         put16(&mut bytes, to + 12 + 2 * i, 0);
     }
     let p = KvProfile::parse(&bytes).unwrap();
-    assert_eq!(select(&p, 0, 0, &[0.0; 256]).unwrap().scale, 1.0);
+    assert_eq!(
+        select(&p, 0, 0, &[0.0; 256], search_chain).unwrap().scale,
+        1.0
+    );
 }

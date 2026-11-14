@@ -42,13 +42,26 @@ pub enum CacheRow {
     Int8(Int8Row),
     Packed(Box<PackedRow>),
 }
+/// Borrowed validated attention operands, before applying the row scale.
+pub enum BaseView<'a> {
+    Int8(&'a [i8]),
+    Bfloat16(&'a [u16; 256]),
+}
+
 impl CacheRow {
     /// Attention reads only validated, immutable operands. Int8 conversion is
     /// exact; packed operands were BF16-rounded once when the row was encoded.
-    pub fn bases(&self) -> [f32; 256] {
+    pub fn base_view(&self) -> BaseView<'_> {
         match self {
-            Self::Int8(row) => std::array::from_fn(|i| f32::from(row.integers[i])),
-            Self::Packed(row) => row.bases.map(|bits| f32::from_bits(u32::from(bits) << 16)),
+            Self::Int8(row) => BaseView::Int8(&row.integers),
+            Self::Packed(row) => BaseView::Bfloat16(&row.bases),
+        }
+    }
+
+    pub fn bases(&self) -> [f32; 256] {
+        match self.base_view() {
+            BaseView::Int8(integers) => std::array::from_fn(|i| f32::from(integers[i])),
+            BaseView::Bfloat16(bases) => bases.map(|bits| f32::from_bits(u32::from(bits) << 16)),
         }
     }
 
@@ -197,6 +210,20 @@ fn vit2_chain(target: &[i32; 64], table: &CodeTable, bits: u8) -> Result<[u8; 64
     Ok(path)
 }
 
+/// Scalar trellis oracle, also the fallback for engine search implementations.
+pub fn search_chain(
+    target: &[i32; 64],
+    table: &CodeTable,
+    bits: u8,
+    vit2: bool,
+) -> Result<[u8; 64]> {
+    if vit2 {
+        vit2_chain(target, table, bits)
+    } else {
+        general_chain(target, table, bits)
+    }
+}
+
 /// Warp XOR reductions descend 16,8,4,2,1; eight warp sums fold from +0
 /// (src/kvq_fast.cuh:33-41). This is also the scale-search error fold.
 fn warp_sum(mut v: [f32; 32]) -> f32 {
@@ -245,6 +272,7 @@ fn select(
     group: usize,
     position: usize,
     row: &[f32; 256],
+    search: impl Fn(&[i32; 64], &CodeTable, u8, bool) -> Result<[u8; 64]>,
 ) -> Result<Selection> {
     let g = profile.group(group)?;
     let initial = initial_int8(row)?;
@@ -307,11 +335,7 @@ fn select(
                 let mut states = [0; 256];
                 for c in 0..4 {
                     let target = targets[c * 64..c * 64 + 64].try_into().unwrap();
-                    let path = if vit2 {
-                        vit2_chain(target, table, g.bits)?
-                    } else {
-                        general_chain(target, table, g.bits)?
-                    };
+                    let path = search(target, table, g.bits, vit2)?;
                     states[c * 64..c * 64 + 64].copy_from_slice(&path);
                 }
                 let rec = states.map(|s| table.reconstruction(s) * scale);
@@ -366,7 +390,18 @@ pub fn requantize_int8(
     position: usize,
     row: &[f32; 256],
 ) -> Result<Int8Row> {
-    initial_int8(&select(profile, group, position, row)?.reconstruction)
+    requantize_int8_with_search(profile, group, position, row, search_chain)
+}
+
+/// Shared codec body with an independent trellis implementation.
+pub fn requantize_int8_with_search(
+    profile: &KvProfile,
+    group: usize,
+    position: usize,
+    row: &[f32; 256],
+    search: impl Fn(&[i32; 64], &CodeTable, u8, bool) -> Result<[u8; 64]>,
+) -> Result<Int8Row> {
+    initial_int8(&select(profile, group, position, row, search)?.reconstruction)
 }
 
 /// Upstream TB_CAP=1: a whole layer/side must be packable; otherwise int8.
@@ -376,8 +411,19 @@ pub fn encode_packed(
     position: usize,
     row: &[f32; 256],
 ) -> Result<CacheRow> {
+    encode_packed_with_search(profile, group, position, row, search_chain)
+}
+
+/// Shared scale selection, reconstruction and packing with independent trellis work.
+pub fn encode_packed_with_search(
+    profile: &KvProfile,
+    group: usize,
+    position: usize,
+    row: &[f32; 256],
+    search: impl Fn(&[i32; 64], &CodeTable, u8, bool) -> Result<[u8; 64]>,
+) -> Result<CacheRow> {
     let g = profile.group(group)?;
-    let selected = select(profile, group, position, row)?;
+    let selected = select(profile, group, position, row, search)?;
     if !profile.packable(group / (profile.kv_heads() * 2), group % 2) {
         return Ok(CacheRow::Int8(initial_int8(&selected.reconstruction)?));
     }
