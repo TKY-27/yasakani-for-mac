@@ -3,15 +3,16 @@
 use std::{fs, path::PathBuf, str::FromStr, time::Instant};
 
 use serde_json::{Value, json};
-use yskn_engine::{Backend, KvMode, LogitRows, Model, SessionMemory, Snapshot};
+use yskn_engine::{Backend, FastDraft, KvMode, LogitRows, Model, SessionMemory, Snapshot};
 use yskn_ref::{
     Sampler, SamplingParameters, SamplingVersion,
-    draft::{Draft, DraftOptions},
+    draft::DraftOptions,
     draft_head::DraftChoice,
     model::CapturedRow,
     speculation::{
-        self, CombinedProposer, DraftProposer, GenerationLimits, NgramProposer, NoProposer,
-        ProposalOrder, Proposer, SessionSnapshot, StopReason, Verifier,
+        self, AdaptiveDepth, CombinedProposer, DepthPolicy, DraftProposer, DraftWork,
+        GenerationLimits, NgramProposer, NoProposer, ProposalOrder, Proposer, SessionSnapshot,
+        StopReason, Verifier,
     },
 };
 
@@ -20,6 +21,10 @@ use crate::{
     Error, Result,
     engine::{CONTEXT_MARGIN, Engine, Finish, Generation, Sampling},
 };
+
+/// `--draft both` copies an n-gram continuation only when the match spans at
+/// least this many tokens; shorter matches lose to the neural draft (D21).
+pub const LONG_NGRAM_MATCH: usize = 6;
 
 pub const MODEL_FILE_STABILITY: &str = "Model files must not change while yskn is running.";
 
@@ -55,13 +60,39 @@ impl FromStr for DraftMode {
         }
     }
 }
+/// How many guesses each pass requests: an adaptive choice up to `k`, or `k`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepthMode {
+    Adaptive,
+    Fixed,
+}
+impl DepthMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Adaptive => "adaptive",
+            Self::Fixed => "fixed",
+        }
+    }
+}
+impl FromStr for DepthMode {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "adaptive" => Ok(Self::Adaptive),
+            "fixed" => Ok(Self::Fixed),
+            _ => Err(Error::request("--depth must be adaptive or fixed")),
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub struct RealEngineConfig {
     pub model_dir: PathBuf,
     pub kv: KvMode,
     pub backend: Option<Backend>,
     pub draft: DraftMode,
+    /// Maximum guesses per pass; every pass with `DepthMode::Fixed`.
     pub k: usize,
+    pub depth: DepthMode,
     pub context: usize,
     pub threads: Option<usize>,
     pub prefill_width: usize,
@@ -72,8 +103,10 @@ impl Default for RealEngineConfig {
             model_dir: PathBuf::new(),
             kv: KvMode::Kv5,
             backend: None,
-            draft: DraftMode::Ngram,
-            k: 3,
+            // Fastest measured across the four bench tasks (D21).
+            draft: DraftMode::Both,
+            k: 7,
+            depth: DepthMode::Adaptive,
             context: 32_768,
             threads: None,
             prefill_width: 16,
@@ -103,6 +136,17 @@ impl RealEngineConfig {
             KvMode::Int8 => "int8",
             KvMode::Int8Profile => "int8-profile",
             KvMode::Kv5 => "kv5",
+        }
+    }
+    /// The adaptive policy decides when and how deep to run the neural draft;
+    /// n-gram guesses cost nothing to make and are always offered up to `k`.
+    /// Its cost model is a fixed table measured on an Apple M5 (D21), so the
+    /// depths never depend on wall-clock time and repeat for a given input.
+    pub fn depth_policy(&self) -> DepthPolicy {
+        if self.depth == DepthMode::Adaptive && self.draft.neural() {
+            DepthPolicy::Adaptive(AdaptiveDepth::neural())
+        } else {
+            DepthPolicy::Fixed
         }
     }
     pub fn inspect(&self) -> Result<ModelInfo> {
@@ -145,7 +189,9 @@ pub struct ModelInfo {
     pub model_file: PathBuf,
     pub model_bytes: u64,
     pub code_bytes_per_pass: u64,
-    pub draft_code_bytes_per_pass: u64,
+    /// Logical draft code read by one block proposal / one history update.
+    pub draft_proposal_code_bytes: u64,
+    pub draft_update_code_bytes: u64,
     pub layers: usize,
     pub hidden_width: usize,
     pub feed_forward_width: usize,
@@ -158,11 +204,12 @@ pub struct ModelInfo {
     pub device: String,
     pub draft: String,
     pub k: usize,
+    pub depth: String,
     pub memory: MemoryEstimate,
 }
 impl ModelInfo {
     pub fn to_json(&self) -> Value {
-        json!({"model_file":self.model_file,"model_bytes":self.model_bytes,"code_bytes_per_pass":self.code_bytes_per_pass,"draft_code_bytes_per_pass":self.draft_code_bytes_per_pass,"layers":self.layers,"hidden_width":self.hidden_width,"feed_forward_width":self.feed_forward_width,"vocabulary":self.vocabulary,"context":self.context,"model_max_context":self.model_max_context,"threads":self.threads,"kv":self.kv,"backend":self.backend,"device":self.device,"draft":self.draft,"k":self.k,"memory":self.memory.to_json(),"file_stability":MODEL_FILE_STABILITY})
+        json!({"model_file":self.model_file,"model_bytes":self.model_bytes,"code_bytes_per_pass":self.code_bytes_per_pass,"draft_proposal_code_bytes":self.draft_proposal_code_bytes,"draft_update_code_bytes":self.draft_update_code_bytes,"layers":self.layers,"hidden_width":self.hidden_width,"feed_forward_width":self.feed_forward_width,"vocabulary":self.vocabulary,"context":self.context,"model_max_context":self.model_max_context,"threads":self.threads,"kv":self.kv,"backend":self.backend,"device":self.device,"draft":self.draft,"k":self.k,"depth":self.depth,"memory":self.memory.to_json(),"file_stability":MODEL_FILE_STABILITY})
     }
 }
 
@@ -201,46 +248,42 @@ pub fn sampler(sampling: &Sampling, vocabulary: usize) -> Result<Sampler> {
     Ok(Sampler::Sampled(p))
 }
 
+type Neural = DraftProposer<FastDraft>;
 enum Drafts {
     None(NoProposer),
     Ngram(NgramProposer),
-    Neural(Box<DraftProposer>, usize),
-    Both(Box<CombinedProposer>, usize),
+    Neural(Box<Neural>),
+    Both(Box<CombinedProposer<FastDraft>>),
 }
 impl Drafts {
-    fn clear_count(&mut self) {
+    fn work(&self) -> DraftWork {
         match self {
-            Self::Neural(_, count) | Self::Both(_, count) => *count = 0,
-            _ => {}
-        }
-    }
-    fn count(&self) -> usize {
-        match self {
-            Self::Neural(_, count) | Self::Both(_, count) => *count,
-            _ => 0,
+            Self::Neural(p) => p.work(),
+            Self::Both(p) => p.draft().work(),
+            _ => DraftWork::default(),
         }
     }
     fn reset(&mut self) {
         match self {
-            Self::Neural(p, _) => p.reset(),
-            Self::Both(p, _) => p.reset(),
+            Self::Neural(p) => p.reset(),
+            Self::Both(p) => p.reset(),
             _ => {}
         }
     }
     fn choice(&mut self, choice: DraftChoice) {
         match self {
-            Self::Neural(p, _) => p.set_choice(choice),
-            Self::Both(p, _) => p.set_choice(choice),
+            Self::Neural(p) => p.set_choice(choice),
+            Self::Both(p) => p.set_choice(choice),
             _ => {}
         }
     }
     fn snapshot(&mut self, main: &mut Model) -> Result<Checkpoint> {
         match self {
-            Self::Neural(p, _) => p
+            Self::Neural(p) => p
                 .snapshot_session(main)
                 .map(Checkpoint::Joint)
                 .map_err(Error::engine),
-            Self::Both(p, _) => p
+            Self::Both(p) => p
                 .snapshot_session(main)
                 .map(Checkpoint::Joint)
                 .map_err(Error::engine),
@@ -249,10 +292,10 @@ impl Drafts {
     }
     fn restore(&mut self, main: &mut Model, snapshot: &Checkpoint) -> Result<()> {
         match (self, snapshot) {
-            (Self::Neural(p, _), Checkpoint::Joint(s)) => {
+            (Self::Neural(p), Checkpoint::Joint(s)) => {
                 p.restore_session(main, s).map_err(Error::engine)
             }
-            (Self::Both(p, _), Checkpoint::Joint(s)) => {
+            (Self::Both(p), Checkpoint::Joint(s)) => {
                 p.restore_session(main, s).map_err(Error::engine)
             }
             (Self::None(_) | Self::Ngram(_), Checkpoint::Main(s)) => {
@@ -267,24 +310,32 @@ impl Proposer for Drafts {
         match self {
             Self::None(p) => p.propose(h, last, max),
             Self::Ngram(p) => p.propose(h, last, max),
-            Self::Neural(p, _) => p.propose(h, last, max),
-            Self::Both(p, _) => p.propose(h, last, max),
+            Self::Neural(p) => p.propose(h, last, max),
+            Self::Both(p) => p.propose(h, last, max),
+        }
+    }
+    fn free_guesses(&mut self, h: &[u32], last: u32, max: usize) -> Vec<u32> {
+        match self {
+            Self::None(p) => p.free_guesses(h, last, max),
+            Self::Ngram(p) => p.free_guesses(h, last, max),
+            Self::Neural(p) => p.free_guesses(h, last, max),
+            Self::Both(p) => p.free_guesses(h, last, max),
         }
     }
     fn synchronize<V: Verifier>(&mut self, v: &mut V) -> yskn_ref::Result<()> {
         match self {
             Self::None(p) => p.synchronize(v),
             Self::Ngram(p) => p.synchronize(v),
-            Self::Neural(p, _) => p.synchronize(v),
-            Self::Both(p, _) => p.synchronize(v),
+            Self::Neural(p) => p.synchronize(v),
+            Self::Both(p) => p.synchronize(v),
         }
     }
     fn observe_committed(&mut self, rows: &[CapturedRow]) -> yskn_ref::Result<()> {
         match self {
             Self::None(p) => p.observe_committed(rows),
             Self::Ngram(p) => p.observe_committed(rows),
-            Self::Neural(p, _) => p.observe_committed(rows),
-            Self::Both(p, _) => p.observe_committed(rows),
+            Self::Neural(p) => p.observe_committed(rows),
+            Self::Both(p) => p.observe_committed(rows),
         }
     }
     fn propose_with<V: Verifier>(
@@ -297,18 +348,8 @@ impl Proposer for Drafts {
         match self {
             Self::None(p) => p.propose_with(v, h, last, max),
             Self::Ngram(p) => p.propose_with(v, h, last, max),
-            Self::Neural(p, count) => {
-                if max > 0 {
-                    *count += 1;
-                }
-                p.propose_with(v, h, last, max)
-            }
-            Self::Both(p, count) => {
-                if max > 0 && p.propose(h, last, max).is_empty() {
-                    *count += 1;
-                }
-                p.propose_with(v, h, last, max)
-            }
+            Self::Neural(p) => p.propose_with(v, h, last, max),
+            Self::Both(p) => p.propose_with(v, h, last, max),
         }
     }
 }
@@ -360,15 +401,20 @@ impl RealEngine {
                 .checked_add(1)
                 .ok_or_else(|| Error::engine("pass width overflow"))?,
         );
-        let mut model = map_model(&config, pool, backend, width)?;
-        let mut proposer = match config.draft {
-            DraftMode::None => Drafts::None(NoProposer),
-            DraftMode::Ngram => {
+        // The fast draft (D18) gets its own pool with the main model's kernel,
+        // worker count and projection backend; the two never run concurrently.
+        let draft_pool = if config.draft.neural() {
+            Some(yskn_engine::Engine::new(kernel, threads).map_err(Error::engine)?)
+        } else {
+            None
+        };
+        let (mut model, draft) = map_files(&config, pool, draft_pool, backend, width, options)?;
+        let mut proposer = match (config.draft, draft) {
+            (DraftMode::None, _) => Drafts::None(NoProposer),
+            (DraftMode::Ngram, _) => {
                 Drafts::Ngram(NgramProposer::new(3, config.k).map_err(Error::engine)?)
             }
-            DraftMode::Neural | DraftMode::Both => {
-                let draft =
-                    Draft::load_with_options(&config.model_dir, options).map_err(Error::engine)?;
+            (DraftMode::Neural | DraftMode::Both, Some(draft)) => {
                 // A caller may select a smaller shortlist/capture set for a
                 // compatible model. Report the actual configured head reads.
                 let (_, head_path) =
@@ -381,8 +427,8 @@ impl RealEngine {
                     crate::memory::reduced_head_code_reads(&layout, 512.min(layout.vocabulary))?;
                 let actual_head =
                     crate::memory::reduced_head_code_reads(&layout, draft.options().shortlist)?;
-                info.draft_code_bytes_per_pass = info
-                    .draft_code_bytes_per_pass
+                info.draft_proposal_code_bytes = info
+                    .draft_proposal_code_bytes
                     .checked_sub(default_head)
                     .and_then(|n| n.checked_add(actual_head))
                     .ok_or_else(|| Error::engine("draft code byte accounting overflow"))?;
@@ -392,17 +438,17 @@ impl RealEngine {
                     .set_capture(neural.capture_options())
                     .map_err(Error::engine)?;
                 if config.draft == DraftMode::Both {
-                    Drafts::Both(
-                        Box::new(CombinedProposer::new(
-                            NgramProposer::new(3, config.k).map_err(Error::engine)?,
-                            neural,
-                            ProposalOrder::NgramFirst,
-                        )),
-                        0,
-                    )
+                    Drafts::Both(Box::new(CombinedProposer::new(
+                        NgramProposer::new(3, config.k).map_err(Error::engine)?,
+                        neural,
+                        ProposalOrder::LongNgramFirst(LONG_NGRAM_MATCH),
+                    )))
                 } else {
-                    Drafts::Neural(Box::new(neural), 0)
+                    Drafts::Neural(Box::new(neural))
                 }
+            }
+            (DraftMode::Neural | DraftMode::Both, None) => {
+                return Err(Error::engine("neural draft was not loaded"));
             }
         };
         proposer.synchronize(&mut model).map_err(Error::engine)?;
@@ -423,9 +469,6 @@ impl RealEngine {
     }
     pub fn default_sampling(&self) -> &Sampling {
         &self.defaults
-    }
-    pub fn last_neural_proposals(&self) -> usize {
-        self.proposer.count()
     }
     pub fn session_memory(&self) -> SessionMemory {
         self.model.session_memory()
@@ -448,23 +491,35 @@ impl RealEngine {
             rows_verified: 0,
             guesses_offered: 0,
             guesses_accepted: 0,
+            draft_proposals: 0,
+            draft_updates: 0,
             prefill_ms: start.elapsed().as_secs_f64() * 1000.0,
             gen_ms: 0.0,
         }
     }
 }
-/// The single mapping boundary in this crate.
+/// The single mapping boundary in this crate: main weights and the fast draft.
 #[allow(unsafe_code)]
-fn map_model(
+fn map_files(
     config: &RealEngineConfig,
     pool: yskn_engine::Engine,
+    draft_pool: Option<yskn_engine::Engine>,
     backend: Backend,
     width: usize,
-) -> Result<Model> {
+    options: DraftOptions,
+) -> Result<(Model, Option<FastDraft>)> {
     // SAFETY: the product's documented file-stability contract requires all
     // model files to remain unmodified and untruncated until this engine drops.
-    unsafe { Model::with_options(&config.model_dir, pool, backend, width, config.kv) }
-        .map_err(Error::engine)
+    let model = unsafe { Model::with_options(&config.model_dir, pool, backend, width, config.kv) }
+        .map_err(Error::engine)?;
+    let draft = draft_pool
+        .map(|pool| {
+            // SAFETY: as above, for both draft files.
+            unsafe { FastDraft::with_options(&config.model_dir, pool, backend, options) }
+                .map_err(Error::engine)
+        })
+        .transpose()?;
+    Ok((model, draft))
 }
 fn strict_prefix(prefix: &[u32], tokens: &[u32]) -> bool {
     !prefix.is_empty() && prefix.len() < tokens.len() && tokens.starts_with(prefix)
@@ -509,7 +564,6 @@ impl Engine for RealEngine {
             Sampler::Sampled(p) => DraftChoice::sampled(p.seed),
         };
         self.proposer.choice(choice);
-        self.proposer.clear_count();
         let begin = Instant::now();
         if !on_tokens(&[])? {
             return Ok(self.empty_generation(0, 0, begin));
@@ -594,8 +648,10 @@ impl Engine for RealEngine {
         } else {
             self.config.k
         };
+        limits.depth = self.config.depth_policy();
         limits.eos_ids = stop_ids.unwrap_or(&[]);
         limits.on_token = Some(&mut callback);
+        let work = self.proposer.work();
         let result = speculation::generate(
             &mut self.model,
             &mut self.proposer,
@@ -604,6 +660,7 @@ impl Engine for RealEngine {
             limits,
         );
         let gen_ms = generation_start.elapsed().as_secs_f64() * 1000.0;
+        let after = self.proposer.work();
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -633,6 +690,8 @@ impl Engine for RealEngine {
             rows_verified: result.statistics.rows_verified,
             guesses_offered: result.statistics.guesses_offered,
             guesses_accepted: result.statistics.guesses_accepted,
+            draft_proposals: after.proposals - work.proposals,
+            draft_updates: after.updates - work.updates,
             prefill_ms,
             gen_ms,
         })

@@ -7,7 +7,7 @@ selects deterministic demo output for chat/server development.
 ```sh
 CARGO_NET_OFFLINE=true cargo run --release -p yskn -- info --model-dir MODEL
 CARGO_NET_OFFLINE=true cargo run --release -p yskn -- selfcheck --model-dir MODEL
-CARGO_NET_OFFLINE=true cargo run --release -p yskn -- bench --model-dir MODEL --draft none --draft ngram --k 3 --json bench.json
+CARGO_NET_OFFLINE=true cargo run --release -p yskn -- bench --model-dir MODEL --draft none --draft both --k 7 --json bench.json
 printf 'Say hello.\n/exit\n' | cargo run --release -p yskn -- chat --model-dir MODEL --no-think --temperature 0 --max-tokens 48
 cargo run --release -p yskn -- serve --model-dir MODEL --port 8765
 cargo run -p yskn -- chat --engine stub
@@ -15,19 +15,37 @@ cargo run -p yskn -- chat --engine stub
 
 `--model-dir` (or `YASAKANI_MODEL_DIR`) names the published model folder.
 Model files must remain unchanged until the engine exits: its weights are
-mapped read only. The real defaults are `--kv kv5`, `--draft ngram`, `--k 3`,
-`--ctx 32768`, `--prefill-width 16`; `--backend cpu|metal` follows
-`Model::load` selection when omitted, and `--threads N` selects CPU workers.
-`--max-ctx` remains an alias for `--ctx`; giving both is an error. Context
-cannot exceed the folder's `max_ctx`. `--seed0` defaults to 1. Neural draft
-modes currently use the scalar reference drafter and can be very slow.
+mapped read only. The real defaults are `--kv kv5`, `--draft both`, `--k 7`,
+`--depth adaptive`, `--ctx 32768`, `--prefill-width 16`; `--backend cpu|metal`
+follows `Model::load` selection when omitted, and `--threads N` selects CPU
+workers (the fast draft gets its own pool with the same kernel, worker count
+and backend). `--max-ctx` remains an alias for `--ctx`; giving both is an
+error. Context cannot exceed the folder's `max_ctx`. `--seed0` defaults to 1.
+
+Drafting never changes the output, only its speed. `--draft none|ngram|neural|both`:
+`neural` and `both` use the fast block draft (D18, bit-identical to the scalar
+reference); `both` copies an n-gram continuation when the most recent match of
+the last three tokens spans at least six tokens, and otherwise asks the neural
+draft. `--k` is the most guesses per pass (1..7 for neural/both). With
+`--depth adaptive` the neural draft runs only when the expected tokens per
+second say so, at the depth (0..K) that maximizes them, learned from how its
+earlier proposals fared in this request and a fixed cost table of this
+machine; long n-gram copies are offered in full without running it. The depth
+sequence is deterministic for a given input. `--depth fixed` offers K guesses
+on every pass (for tests and comparison). N-gram mode always offers up to K.
+Measurements and the policy are in `docs/port/DECISIONS.md` D21.
 The stub alone can omit a folder and use its synthetic byte tokenizer.
 
 `info` inspects model architecture, context, selected cache/backend/device,
 model file and memory estimates. Before loading, real commands compare the
 estimate with physical memory with a stated reserve and refuse configurations
 that cannot fit. `--ctx`, `--kv` and `--draft` control that estimate; no system
-setting is changed. Sampling request defaults come from the folder's optional
+setting is changed. Fast-draft files are counted once as mappings; owned data
+adds the repacked int8 approximate head, f32 head projection/scales, draft
+norms/layer vectors and selector hp. Selector pred/succ remain mapped BF16.
+For the published default configuration, draft bytes are 2,721,905,176 and
+total needed bytes including margin are 20,435,462,454 (19.03 GiB; D19/D21).
+Sampling request defaults come from the folder's optional
 `generation_config.json`, falling back to upstream's 1.0 / 0.95 / 20 / 0.0
 (temperature / top-p / top-k / min-p). Explicit request values keep the existing
 validation and override those defaults.
@@ -68,17 +86,22 @@ says so. An optional full `ids` array permits exact later diagnostics.
 
 `bench` runs fixed prose/code/CSV-to-JSON/thinking tasks greedily with EOS
 ignored. `--n N` defaults to 512 and must fit every prompt plus the 64-token
-reserve. Repeat `--draft` and `--k` for their Cartesian product; `--json OUT`
+reserve. Repeat `--draft`, `--k` and `--depth` for their Cartesian product; `--json OUT`
 writes the same per-task metrics with architecture and run configuration.
 Prefill rate counts the processed prompt rows (all but the final pending row),
 which match the reported prefill time; the final prompt row is timed in the
 first generation pass. It reports prompt/prefill rate, generated tokens, verification passes and rows,
 ms/pass, tokens/pass and tokens/s, guesses offered/accepted and logical code
-bytes/pass. The byte model counts main body/head code streams once per pass
-and draft projection/head reads when neural proposals run. A neural proposal
-counts the draft compressed streams plus seven head evaluations, each reading
-`vocabulary*rank + shortlist*hidden` int8 bytes (shortlist 512 by default);
-untouched rescore rows are excluded. It excludes
+bytes/pass. The byte model counts main body/head code streams once per pass,
+plus the draft work counted inside the timed generation: each neural proposal
+reads the draft block streams (every layer matrix except the FC input
+projection) plus seven head evaluations, each reading
+`vocabulary*rank + shortlist*hidden` int8 bytes (shortlist 512 by default;
+untouched rescore rows are excluded), and each draft history update (one push
+of the consecutive rows a pass commits) reads the FC and every layer's
+key/value streams. Updates run after every commit even when no proposal ran
+(`--n 1`, or an adaptive pass that skipped the draft). JSON reports
+`neural_proposals`, `draft_updates` and both per-call byte counts. It excludes
 embedding row reads, vectors/tables/scales and cache traffic. It is a logical
 code-read estimate, not a measured DRAM bandwidth counter.
 
@@ -137,7 +160,8 @@ pub trait Engine {
 - `Sampling` carries temperature, top_p, top_k, min_p and seed; greedy
   defaults and the top_k range (1..20) follow upstream. `Generation` returns
   the ids, finish (`Stop`, `Length`, `Cancelled`), cached tokens, snapshot
-  mode, passes, prefill and generation milliseconds.
+  mode, passes, rows, guesses, neural proposals and draft history updates,
+  prefill and generation milliseconds.
 - `ChatRunner` turns this into `Reasoning`, `Content`, `ToolCall` and
   `Done(Usage)` events.
 

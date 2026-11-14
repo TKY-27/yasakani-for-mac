@@ -2,7 +2,7 @@
 
 use yskn_format::Tensor;
 
-use crate::portable_math::{bfloat, half};
+use crate::portable_math::bfloat;
 use crate::{Error, Result, require_finite};
 
 pub const ROTATION_BLOCK: usize = 512;
@@ -64,13 +64,22 @@ pub fn quantize_activation_with_transform(
     input_signs: &[i8],
     transform: impl Fn(&mut [f32; ROTATION_BLOCK]),
 ) -> Result<PreparedActivation> {
+    quantize_activation_with_math::<crate::portable_math::ScalarMath>(input, input_signs, transform)
+}
+
+/// Shared quantizer with independent transform and elementwise conversion kernels.
+pub fn quantize_activation_with_math<M: crate::portable_math::Elementwise>(
+    input: &[f32],
+    input_signs: &[i8],
+    transform: impl Fn(&mut [f32; ROTATION_BLOCK]),
+) -> Result<PreparedActivation> {
     if input.is_empty() || input.len() % ROTATION_BLOCK != 0 || input_signs.len() != input.len() {
         return Err(Error::InvalidModel(
             "activation and input signs must have matching, nonzero multiples of 512 elements"
                 .into(),
         ));
     }
-    require_finite(input, "pre-rotation activation")?;
+    M::finite(input, "pre-rotation activation")?;
     if input_signs.iter().any(|&sign| sign != -1 && sign != 1) {
         return Err(Error::InvalidModel(
             "rotation signs must be -1 or +1".into(),
@@ -86,11 +95,9 @@ pub fn quantize_activation_with_transform(
             *value = input[start + channel] * f32::from(input_signs[start + channel]);
         }
         transform(&mut rotated);
-        for value in &mut rotated {
-            // FP16 rounding precedes the maximum and int8 quantization.
-            *value = half(*value * HADAMARD_NORMALIZATION);
-        }
-        require_finite(&rotated, "FP16-rounded rotated activation")?;
+        // FP16 rounding precedes the finite check, maximum and int8 quantization.
+        M::scale_half(&mut rotated, HADAMARD_NORMALIZATION);
+        M::finite(&rotated, "FP16-rounded rotated activation")?;
         let maximum = rotated
             .iter()
             .fold(0.0_f32, |maximum, value| maximum.max(value.abs()));
@@ -469,6 +476,42 @@ impl<T: EmbeddingTensor> Embedding<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_quantization_uses_half_hook_before_finite_check() {
+        use crate::portable_math::{Elementwise, ScalarMath};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        struct CountingMath;
+        impl Elementwise for CountingMath {
+            fn scale_half(values: &mut [f32], scale: f32) {
+                CALLS.fetch_add(1, Ordering::Relaxed);
+                ScalarMath::scale_half(values, scale);
+            }
+        }
+        let input: Vec<_> = (0..1024).map(|i| (i % 17) as f32 - 8.0).collect();
+        let actual =
+            quantize_activation_with_math::<CountingMath>(&input, &[1; 1024], hadamard512).unwrap();
+        let expected = quantize_activation(&input, &[1; 1024]).unwrap();
+        assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(actual.activation8, expected.activation8);
+        assert_eq!(actual.integer_scale, expected.integer_scale);
+        assert_eq!(actual.activation_scale, expected.activation_scale);
+        assert_eq!(actual.row_quantum.to_bits(), expected.row_quantum.to_bits());
+
+        // Input validation must precede the hook; overflow must stop before the next block.
+        for (value, context, calls) in [
+            (f32::NAN, "pre-rotation activation", 2),
+            (f32::MAX, "FP16-rounded rotated activation", 3),
+        ] {
+            let mut input = vec![0.0; 1024];
+            input[0] = value;
+            let result =
+                quantize_activation_with_math::<CountingMath>(&input, &[1; 1024], hadamard512);
+            assert!(matches!(result, Err(Error::NonFinite(actual)) if actual == context));
+            assert_eq!(CALLS.load(Ordering::Relaxed), calls);
+        }
+    }
 
     #[test]
     fn hadamard_inverse_is_exact_for_small_integer_inputs() {

@@ -1,3 +1,6 @@
+#[path = "../../yskn-ref/tests/support/proposals.rs"]
+mod proposals;
+
 #[allow(dead_code, clippy::manual_is_multiple_of)]
 #[path = "../../yskn-ref/tests/support/mod.rs"]
 mod support;
@@ -120,7 +123,14 @@ where
 {
     let mut limits = GenerationLimits::new(count, main.context_capacity());
     limits.max_draft_tokens = k;
-    let result = generate(main, proposer, &mut sampler.clone(), prompt, limits).unwrap();
+    let mut observed = proposals::Observed::new(proposer);
+    let result = generate(main, &mut observed, &mut sampler.clone(), prompt, limits).unwrap();
+    if k >= 3 && count == 5 {
+        assert!(
+            observed.max_offered > 1,
+            "request must offer multiple guesses in one pass"
+        );
+    }
     assert_eq!(result.tokens.len(), count);
     if k != 0 {
         assert!(result.statistics.guesses_offered > 0);
@@ -141,125 +151,177 @@ fn engine_decode(
     (tokens, main.state_digest())
 }
 
-fn check_backend(backend: Backend) {
+fn check_backend(backend: Backend, mode: KvMode, seed: Option<u64>) {
     let fixture = Fixture::new();
     let artifact = draft_artifact();
     let head = support::draft::shead(37);
     let prompt = [3, 7, 11, 9];
     let second_prompt = [3, 7, 11, 13, 5, 17];
-    for mode in [KvMode::Int8, KvMode::Int8Profile, KvMode::Kv5] {
-        for seed in [None, Some(17), Some(0xabcdef)] {
-            let sampler = seed.map_or(Sampler::Greedy, |seed| {
-                Sampler::Sampled(SamplingParameters {
-                    seed,
-                    ..SamplingParameters::default()
-                })
-            });
-            let choice = seed.map_or(DraftChoice::Greedy, DraftChoice::sampled);
-            let mut reference = fixture.reference(mode);
-            reference.prefill(&prompt[..3]).unwrap();
-            let first_tokens = decode(&mut reference, &mut NoProposer, &sampler, &prompt, 0, 5);
-            let last = *first_tokens.last().unwrap();
-            let first_expected = (first_tokens, reference.state_digest());
-            let continued_tokens = decode(&mut reference, &mut NoProposer, &sampler, &[last], 0, 8);
-            let continued_expected = (continued_tokens, reference.state_digest());
-            let mut fresh_reference = fixture.reference(mode);
-            fresh_reference
-                .prefill(&second_prompt[..second_prompt.len() - 1])
-                .unwrap();
-            let second_tokens = decode(
-                &mut fresh_reference,
-                &mut NoProposer,
-                &sampler,
-                &second_prompt,
-                0,
-                5,
-            );
-            let second_expected = (second_tokens, fresh_reference.state_digest());
 
-            // Establish engine K=0 against the scalar baseline on this backend/KV mode.
-            let mut sequential = fixture.engine(backend, mode);
-            sequential.prefill(&prompt[..3]).unwrap();
-            let prefix = sequential.snapshot().unwrap();
-            assert_eq!(
-                engine_decode(&mut sequential, &mut NoProposer, &sampler, &prompt, 0, 5),
-                first_expected
-            );
-            assert_eq!(
-                engine_decode(&mut sequential, &mut NoProposer, &sampler, &[last], 0, 8),
-                continued_expected
-            );
-            sequential.restore(&prefix).unwrap();
-            sequential
-                .prefill(&second_prompt[3..second_prompt.len() - 1])
-                .unwrap();
-            assert_eq!(
-                engine_decode(
-                    &mut sequential,
-                    &mut NoProposer,
-                    &sampler,
-                    &second_prompt,
-                    0,
-                    5,
-                ),
-                second_expected
-            );
+    let sampler = seed.map_or(Sampler::Greedy, |seed| {
+        Sampler::Sampled(SamplingParameters {
+            seed,
+            ..SamplingParameters::default()
+        })
+    });
+    let choice = seed.map_or(DraftChoice::Greedy, DraftChoice::sampled);
+    let mut reference = fixture.reference(mode);
+    reference.prefill(&prompt[..3]).unwrap();
+    let first_tokens = decode(&mut reference, &mut NoProposer, &sampler, &prompt, 0, 5);
+    let last = *first_tokens.last().unwrap();
+    let first_expected = (first_tokens, reference.state_digest());
+    let continued_tokens = decode(&mut reference, &mut NoProposer, &sampler, &[last], 0, 8);
+    let continued_expected = (continued_tokens, reference.state_digest());
+    let mut fresh_reference = fixture.reference(mode);
+    fresh_reference
+        .prefill(&second_prompt[..second_prompt.len() - 1])
+        .unwrap();
+    let second_tokens = decode(
+        &mut fresh_reference,
+        &mut NoProposer,
+        &sampler,
+        &second_prompt,
+        0,
+        5,
+    );
+    let second_expected = (second_tokens, fresh_reference.state_digest());
 
-            for k in [1, 3, 7] {
-                let mut proposer = proposer(&artifact, &head, k, choice);
-                let mut main = fixture.engine(backend, mode);
-                main.set_capture(proposer.capture_options()).unwrap();
-                main.prefill(&prompt[..3]).unwrap();
-                let prefix = proposer.snapshot_session(&mut main).unwrap();
-                assert_eq!(
-                    engine_decode(&mut main, &mut proposer, &sampler, &prompt, k, 5),
-                    first_expected,
-                    "{backend:?} {mode:?} seed={seed:?} K={k} first request"
-                );
-                let checkpoint = proposer.snapshot_session(&mut main).unwrap();
-                let ring = proposer.draft().snapshot();
-                assert_eq!(
-                    engine_decode(&mut main, &mut proposer, &sampler, &[last], k, 8),
-                    continued_expected,
-                    "{backend:?} {mode:?} seed={seed:?} K={k} continuation"
-                );
-                proposer.restore_session(&mut main, &checkpoint).unwrap();
-                assert_eq!(proposer.draft().snapshot(), ring);
-                assert_eq!(
-                    engine_decode(&mut main, &mut proposer, &sampler, &[last], k, 8),
-                    continued_expected,
-                    "{backend:?} {mode:?} seed={seed:?} K={k} restored continuation"
-                );
-                proposer.restore_session(&mut main, &prefix).unwrap();
-                main.prefill(&second_prompt[3..second_prompt.len() - 1])
-                    .unwrap();
-                assert_eq!(
-                    engine_decode(&mut main, &mut proposer, &sampler, &second_prompt, k, 5),
-                    second_expected,
-                    "{backend:?} {mode:?} seed={seed:?} K={k} reused prefix"
-                );
-                // generate flushes every final committed capture into the ring.
-                assert_eq!(proposer.draft().position(), main.position());
+    // Establish engine K=0 against the scalar baseline on this backend/KV mode.
+    let mut sequential = fixture.engine(backend, mode);
+    sequential.prefill(&prompt[..3]).unwrap();
+    let prefix = sequential.snapshot().unwrap();
+    assert_eq!(
+        engine_decode(&mut sequential, &mut NoProposer, &sampler, &prompt, 0, 5),
+        first_expected
+    );
+    assert_eq!(
+        engine_decode(&mut sequential, &mut NoProposer, &sampler, &[last], 0, 8),
+        continued_expected
+    );
+    sequential.restore(&prefix).unwrap();
+    sequential
+        .prefill(&second_prompt[3..second_prompt.len() - 1])
+        .unwrap();
+    assert_eq!(
+        engine_decode(
+            &mut sequential,
+            &mut NoProposer,
+            &sampler,
+            &second_prompt,
+            0,
+            5,
+        ),
+        second_expected
+    );
+
+    for k in [1, 3, 7] {
+        let mut proposer = proposer(&artifact, &head, k, choice);
+        let mut main = fixture.engine(backend, mode);
+        main.set_capture(proposer.capture_options()).unwrap();
+        main.prefill(&prompt[..3]).unwrap();
+        let prefix = proposer.snapshot_session(&mut main).unwrap();
+        assert_eq!(
+            engine_decode(&mut main, &mut proposer, &sampler, &prompt, k, 5),
+            first_expected,
+            "{backend:?} {mode:?} seed={seed:?} K={k} first request"
+        );
+        let checkpoint = proposer.snapshot_session(&mut main).unwrap();
+        let ring = proposer.draft().snapshot();
+        assert_eq!(main.position(), 8);
+        assert_eq!(ring.position(), proposer.draft().dimensions().window);
+        assert_eq!(
+            engine_decode(&mut main, &mut proposer, &sampler, &[last], k, 8),
+            continued_expected,
+            "{backend:?} {mode:?} seed={seed:?} K={k} continuation"
+        );
+        assert!(
+            main.position() > proposer.draft().dimensions().window,
+            "continuation must wrap the ring"
+        );
+        assert_eq!(main.position(), 16);
+        proposer.restore_session(&mut main, &checkpoint).unwrap();
+        assert_eq!(proposer.draft().snapshot(), ring);
+        assert_eq!(
+            engine_decode(&mut main, &mut proposer, &sampler, &[last], k, 8),
+            continued_expected,
+            "{backend:?} {mode:?} seed={seed:?} K={k} restored continuation"
+        );
+        proposer.restore_session(&mut main, &prefix).unwrap();
+        main.prefill(&second_prompt[3..second_prompt.len() - 1])
+            .unwrap();
+        assert_eq!(
+            engine_decode(&mut main, &mut proposer, &sampler, &second_prompt, k, 5),
+            second_expected,
+            "{backend:?} {mode:?} seed={seed:?} K={k} reused prefix"
+        );
+        assert_eq!(main.position(), 10);
+        assert!(
+            proposer.draft().position() > proposer.draft().dimensions().window,
+            "reused prefix must wrap the ring"
+        );
+        assert_eq!(proposer.draft().position(), main.position());
+    }
+}
+
+macro_rules! generation_case {
+    ($name:ident, $mode:expr, $seed:expr) => {
+        #[test]
+        fn $name() {
+            check_backend(Backend::Cpu, $mode, $seed);
+            #[cfg(target_os = "macos")]
+            if yskn_engine::MetalEngine::device_exists() {
+                check_backend(Backend::Metal, $mode, $seed);
+                return;
             }
+            println!("skipped: no Metal device");
         }
-        eprintln!("neural generation {backend:?} {mode:?}: greedy + 2 seeds, K=0/1/3/7 passed");
-    }
+    };
 }
-
-#[test]
-fn cpu_neural_generation_is_lossless_across_joint_restore_and_reused_prefix() {
-    check_backend(Backend::Cpu);
-}
-
-#[test]
-fn metal_neural_generation_is_lossless_across_joint_restore_and_reused_prefix() {
-    #[cfg(target_os = "macos")]
-    if yskn_engine::MetalEngine::device_exists() {
-        check_backend(Backend::Metal);
-        return;
-    }
-    println!("skipped: no Metal device");
-}
+generation_case!(
+    neural_int8_greedy_is_lossless_across_joint_restore_and_reused_prefix,
+    KvMode::Int8,
+    None
+);
+generation_case!(
+    neural_int8_seed17_is_lossless_across_joint_restore_and_reused_prefix,
+    KvMode::Int8,
+    Some(17)
+);
+generation_case!(
+    neural_int8_seedabcdef_is_lossless_across_joint_restore_and_reused_prefix,
+    KvMode::Int8,
+    Some(0xabcdef)
+);
+generation_case!(
+    neural_int8_profile_greedy_is_lossless_across_joint_restore_and_reused_prefix,
+    KvMode::Int8Profile,
+    None
+);
+generation_case!(
+    neural_int8_profile_seed17_is_lossless_across_joint_restore_and_reused_prefix,
+    KvMode::Int8Profile,
+    Some(17)
+);
+generation_case!(
+    neural_int8_profile_seedabcdef_is_lossless_across_joint_restore_and_reused_prefix,
+    KvMode::Int8Profile,
+    Some(0xabcdef)
+);
+generation_case!(
+    neural_kv5_greedy_is_lossless_across_joint_restore_and_reused_prefix,
+    KvMode::Kv5,
+    None
+);
+generation_case!(
+    neural_kv5_seed17_is_lossless_across_joint_restore_and_reused_prefix,
+    KvMode::Kv5,
+    Some(17)
+);
+generation_case!(
+    neural_kv5_seedabcdef_is_lossless_across_joint_restore_and_reused_prefix,
+    KvMode::Kv5,
+    Some(0xabcdef)
+);
 
 #[test]
 fn engine_handover_counts_memory_reseeds_long_suffix_and_detects_main_only_restore() {
