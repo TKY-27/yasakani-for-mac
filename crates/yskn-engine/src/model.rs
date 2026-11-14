@@ -1472,6 +1472,107 @@ mod session_tests {
     }
 
     #[test]
+    fn dense_gate_errors_follow_scalar_row_order_with_different_failures() {
+        use yskn_ref::gated_deltanet::{GatedDeltaNetDimensions, GatedDeltaNetWeights};
+        let mut a = vec![0.0; 1024];
+        a[0] = f32::from_bits(0x7f00_0000);
+        a[513] = f32::from_bits(0x7f00_0000);
+        let layer = GatedDeltaNet::new(
+            GatedDeltaNetDimensions {
+                hidden_width: 512,
+                query_key_heads: 1,
+                value_heads: 2,
+                head_dim: 128,
+                convolution_width: 4,
+            },
+            GatedDeltaNetWeights {
+                projection_a: a,
+                projection_b: vec![0.0; 1024],
+                convolution_weight: vec![0.0; 2048],
+                log_decay_weight: vec![0.0; 2],
+                time_bias: vec![0.0; 2],
+                normalization_weight: vec![1.0; 128],
+            },
+            1e-6,
+        )
+        .unwrap();
+        let mut input: Vec<_> = [[1.0, 0.0], [0.0, 4.0]]
+            .into_iter()
+            .map(|first_two| {
+                let mut hidden = vec![0.0; 512];
+                hidden[..2].copy_from_slice(&first_two);
+                NormalizedInput {
+                    prepared: quantize_activation(&hidden, &[1; 512]).unwrap(),
+                    inverse_rms: 4.0,
+                    weighted_hidden_bf16: hidden,
+                }
+            })
+            .collect();
+        let qkv = vec![vec![0.0; 512]; 2];
+        let z = vec![vec![0.0; 256]; 2];
+        // Prove each distinct error with the scalar reference before comparing passes.
+        for (row, expected) in input
+            .iter()
+            .zip(["DeltaNet dense gates", "DeltaNet dense gate partial"])
+        {
+            let error = layer
+                .step(
+                    &mut layer.new_state().unwrap(),
+                    &qkv[0],
+                    &z[0],
+                    &row.weighted_hidden_bf16,
+                    row.inverse_rms,
+                )
+                .unwrap_err();
+            assert!(matches!(error, Error::NonFinite(context) if context == expected));
+        }
+        for reversed in [false, true] {
+            if reversed {
+                input.reverse();
+            }
+            for threads in [1, 4] {
+                let mut engine = Compute::new(
+                    Engine::new(Kernel::Portable, threads).unwrap(),
+                    Backend::Cpu,
+                )
+                .unwrap();
+                let mut reference_state = layer.new_state().unwrap();
+                let expected = input
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| {
+                        layer.step(
+                            &mut reference_state,
+                            &qkv[i],
+                            &z[i],
+                            &row.weighted_hidden_bf16,
+                            row.inverse_rms,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap_err();
+                let actual = recurrence(
+                    &mut engine,
+                    &layer,
+                    &mut layer.new_state().unwrap(),
+                    None,
+                    &qkv,
+                    &z,
+                    &input,
+                    None,
+                    &mut PassTiming::default(),
+                )
+                .unwrap_err();
+                assert_eq!(
+                    actual.to_string(),
+                    expected.to_string(),
+                    "threads={threads} reversed={reversed}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn attention_pass_errors_follow_scalar_row_and_stage_order() {
         use yskn_ref::attention::{Attention, AttentionDimensions};
         let layer = Attention::new(

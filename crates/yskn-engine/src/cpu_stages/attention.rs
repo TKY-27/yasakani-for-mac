@@ -465,10 +465,25 @@ mod tests {
 
     #[test]
     fn attention_matches_reference_at_tile_and_split_boundaries_with_mixed_sides() {
+        check_attention_at_boundaries(
+            &profile_fixture::mixed_profile(),
+            &[(true, true), (true, false)],
+        );
+    }
+
+    #[test]
+    fn attention_matches_reference_at_tile_and_split_boundaries_with_int8_keys_packed_values() {
+        check_attention_at_boundaries(
+            &profile_fixture::int8_keys_packed_values_profile(),
+            &[(false, true)],
+        );
+    }
+
+    fn check_attention_at_boundaries(profile: &[u8], packed_sides: &[(bool, bool)]) {
         if !super::super::neon_available() {
             return;
         }
-        let profile = Arc::new(KvProfile::parse(&profile_fixture::mixed_profile()).unwrap());
+        let profile = Arc::new(KvProfile::parse(profile).unwrap());
         let mut seed = 7919u32;
         let mut sample = || {
             seed ^= seed << 13;
@@ -484,7 +499,7 @@ mod tests {
             }
         };
         for mode in [KvMode::Int8, KvMode::Int8Profile, KvMode::Kv5] {
-            for ordinal in 0..2 {
+            for (ordinal, &packed_sides) in packed_sides.iter().enumerate() {
                 let layer = Attention::new(
                     AttentionDimensions {
                         query_heads: 4,
@@ -523,6 +538,37 @@ mod tests {
                                 .append_prepared(&mut pass_state, position + offset, &p)
                                 .unwrap();
                             prepared.push(p);
+                        }
+                        // Inspect the stored prefix and final current row for both KV heads:
+                        // fixture changes must not silently remove either mixed direction.
+                        for head in [0, 2] {
+                            let operands = layer
+                                .head_operands(&pass_state, position + 3, &prepared[3], head)
+                                .unwrap();
+                            let expected_sides = if mode == KvMode::Kv5 {
+                                packed_sides
+                            } else {
+                                (false, false)
+                            };
+                            for (cached_position, token) in operands
+                                .prefix
+                                .iter()
+                                .chain(std::iter::once(operands.current))
+                                .enumerate()
+                            {
+                                assert_eq!(
+                                    (
+                                        matches!(token.key(operands.kv_head), CacheRow::Packed(_)),
+                                        matches!(
+                                            token.value(operands.kv_head),
+                                            CacheRow::Packed(_)
+                                        ),
+                                    ),
+                                    expected_sides,
+                                    "cache {mode:?} ordinal={ordinal} position={cached_position} kv_head={}",
+                                    operands.kv_head
+                                );
+                            }
                         }
                         let operands = prepared
                             .iter()

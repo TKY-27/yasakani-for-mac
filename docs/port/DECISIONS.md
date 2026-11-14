@@ -2173,8 +2173,13 @@ softmax, checks, self and split combination.
 
 The scalar-oracle attention test now also runs four grouped rows at every
 listed boundary (0, 1, 30..33, 61..64, 2000, 4094..4096, 4106), with multiple
-queries per KV head, all three modes, both mixed packed/int8 directions and
-reverse task completion. It crosses the 31/42 transition within one pass.
+queries per KV head, all three modes and reverse task completion.
+`attention_matches_reference_at_tile_and_split_boundaries_with_mixed_sides`
+covers packed/packed and packed-key/int8-value rows;
+`attention_matches_reference_at_tile_and_split_boundaries_with_int8_keys_packed_values`
+adds int8-key/packed-value rows. Both tests assert the stored cache row variants,
+so both mixed packed/int8 directions are exercised. Each crosses the 31/42
+transition within one pass.
 New direct grouped score tests cover signed zero, subnormals, BF16 ties and
 extreme int8 values; masked-tile tests poison invisible scales with NaN and
 require exact negative-zero numerators. The model failure test places a bad
