@@ -477,7 +477,11 @@ intentionally fails some of these coverage gates even though its IDs match.
 
 `--prompts FILE` accepts an array of `{"id":"unique name","request":{...}}`
 entries (at least two). Sampling fields belong to the harness. Errors name
-the file and entry. Execution errors preserve completed rows and earlier
+the file and entry. Decision: prompt files intentionally accept a superset
+of server inputs: the example applies semantic request validation but not
+HTTP body/JSON-value/message/tool/text size limits or queue limits. It still
+uses `ChatRunner`'s rendered-byte and model-context checks. Consequently a
+file entry that passes here can be refused by the server's size policy. Execution errors preserve completed rows and earlier
 failures in the report and exit nonzero. Exit status is zero only when all
 comparisons and exercise gates pass. Real-model duration, acceptance, long
 output lengths and real-template reuse must be verified on the host.
