@@ -3,6 +3,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod cpu_stages;
+mod draft;
+mod draft_math;
 mod kernel;
 mod mapped;
 #[cfg(target_os = "macos")]
@@ -10,6 +12,7 @@ mod metal;
 mod model;
 mod pool;
 
+pub use draft::{DraftTiming, FastDraft};
 pub use kernel::Kernel;
 pub use mapped::{MappedModel, Matrix};
 #[cfg(target_os = "macos")]

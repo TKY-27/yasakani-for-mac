@@ -1263,6 +1263,180 @@ position 5, two seeds and explicit prediction positions `6..=12`. Temporary
 reversal, permutation, history-tail frontier, greedy substitution, wrong-seed
 and wrong-position mutations each fail these tests and are removed afterwards.
 
+## D18 — Fast block draft, bit-identical to the scalar reference
+
+Decision (2026-11-14, brief 05m): `yskn_engine::FastDraft` runs the D15 block
+draft with the reference's operation sequence for every output value, so its
+ring contents, proposals, per-position top-16 candidates and raw/corrected
+scores equal `yskn_ref::draft::Draft` bit for bit. `DraftProposer` and
+`CombinedProposer` are generic over the new `yskn_ref::draft::BlockDraft` trait
+(default `Draft`, so existing callers are unchanged); `generate --draft
+neural|both` and `draft_acceptance` use `DraftProposer<FastDraft>`.
+
+**Loading.** `FastDraft::load(folder)` (environment kernel/backend, as
+`Model::load`) or `with_options(folder, engine, backend, options)` resolves the
+files with the reference `model_paths`, validates the container with the
+format reader (`MappedModel::open`), dimensions with `DraftDimensions::read`,
+the SHEAD layout with `HeadLayout::read`, and options/signs with the shared
+`validate_options`/`validate_signs`. Matrix shapes, vector shapes/dtypes and
+finiteness are checked as in the reference loader. Opening is `unsafe` for the
+usual mapped-file stability contract. What stays mapped and what is owned:
+
+| Data | Storage |
+|---|---|
+| 46 compressed code streams (1.16 GB) | mapped, never copied (Metal no-copy buffer) |
+| SHEAD int8 rescoring rows (1.27 GB) | mapped; every page touched once at load |
+| `sel.pred`, `sel.succ` BF16 [248320, 256] | mapped; one row decoded per use (instead of 508 MB of f32) |
+| SHEAD approximate int8 rows (127 MB) | repacked once into 8-token tiles (owned) |
+| SHEAD projection/scales, BF16 vectors, ring (40 MB) | owned f32 / BF16 bits, as the reference |
+
+**What runs where.**
+
+| Stage | Where | How bits are preserved | Tested by |
+|---|---|---|---|
+| Activation quantization | CPU pool, one task per row | the reference `quantize_activation` itself | block/ring comparisons |
+| 46 compressed projections | Metal (default with a device) or CPU kernel; matrices sharing an input in one command buffer: `q,k,v`, `gate,up`, and all ten ring `k,v` | exact i64 sums (D10/D12), then the reference `restore_projection` per row | all comparisons, both backends |
+| Context push | batches of up to 256 rows per dispatch group | per-row stages in the reference order; earlier rows commit when a later row fails | ring snapshots after every chunk; failed-row tests |
+| Norms, dynamic filters, residual adds, final norm | calling thread | the reference functions (`norm_rows`, `dynamic_filter`, `add`) | block output bits |
+| RoPE | CPU pool, one task per (row, q or k) | the reference `rope` per row | block output bits |
+| GLU | CPU pool, one task per row | the reference `glu` | block output bits |
+| Attention history | CPU pool, one task per (kv head, 32 history splits) | per query and key the channel-ascending FMA chain; per query the reference max, `exp`, pair-XOR denominator and key-ascending value FMAs; NEON lanes hold queries (dots) or channels (values) | unit test vs reference `attention` (windows 8–2048, positions 0–2100, grouped heads, overflow error), block bits |
+| Attention block keys and 33-part combine | CPU pool, one task per (row, head) | the reference code for one (row, head) | same |
+| Head rank-512 projection | CPU pool, 16 rank chunks × 7 rows | per lane the t-then-component FMA chain (NEON `vld4` deinterleave puts lanes in vector lanes) and the reference XOR tree | unit test vs `ReducedHead::low_rank` |
+| Head approximate scores (all 248,320 tokens) | CPU pool, 2,048-token tasks | per (row, lane, token) the component-ascending FMA chain on exact int8→f32 weights; NEON lanes hold tokens; XOR tree applied to 8 tokens at once | unit test vs `ReducedHead::approximate_scores` incl. a partial last tile |
+| Shortlist | CPU pool, one task per row | the reference `shortlist` | candidates |
+| Rescoring + top 16 | CPU pool, 64-candidate tasks | as the rank projection, int8 weights; reference `top16` | unit test vs `ReducedHead::rescore`; candidates |
+| Correction feature | CPU pool, one task per row | each lane's chain unchanged, lane loop innermost (vectorizable) | unit test vs `correction_feature`; corrected scores |
+| Predecessor correction, choice | calling thread, sequential over rows | the reference `correct_candidates`, `choose` | tokens, corrected scores, sampled choice |
+
+No floating reduction is reordered or split: threads and vector lanes only
+decide which core or lane evaluates an independent output (a row, head,
+query, key, lane, token or channel). Vector code uses `vfmaq` exactly where
+the reference uses `mul_add` and plain `vmulq`/adds elsewhere; LLVM never
+contracts or reassociates without fast-math. Errors are reported for the
+first failing row in the reference's stage order; per-row head failures are
+resolved row by row before correction.
+
+The brief described the approximate scores and rescoring as integer stages.
+They are not, in the reference (or upstream `q35_bdraft.cu:839,920`): the
+rank-projected row and the hidden row are f32 and each product is an f32 FMA
+with an int8 weight converted to f32. No integer dot product reproduces those
+roundings, so they are vectorized float FMA chains, and `dotprod` is not used
+by the draft. Only the shortlist histogram is integer.
+
+**SIMD and fallback.** NEON is in the AArch64 baseline; the float kernels are
+selected when the engine kernel is `neon` or `dotprod` (runtime-detected by
+`Engine::new`), and the portable scalar loops (the reference loops) run with
+`Kernel::Portable` and on other architectures. Every `unsafe` block is a
+bounds-checked slice load/store or a call of a `#[target_feature(enable =
+"neon")]` kernel guarded by that detection, each with a `// SAFETY:` comment.
+The reference crate remains `#![forbid(unsafe_code)]`.
+
+**Reference changes (additive).** `BlockDraft`; public stage helpers in
+`draft.rs` (`norm`, `norm_rows`, `rope`, `dynamic_filter`, `add`, `glu`,
+`attention`, `xor_sum32`, `correction_feature`, `correct_candidates`,
+`validate_options`, `validate_signs`); `DraftSnapshot::{empty, shape, clear,
+push_row}`; `ReducedHead::{low_rank, approximate_scores, rescore}`, which
+`candidates` now calls. The proposer pushes runs of consecutive captured rows
+as one batch; a run not starting at the ring position fails exactly as a
+single-row push. All D15–D17 tests and frozen digests pass unchanged.
+
+**Tests (synthetic, no model files).** `tests/draft_fast.rs`: three shapes
+(4/4 heads, window 8, two layers; 8/2 heads, hidden 1024, window 16, vocabulary
+40, rank 64; 8/2 heads, window 256 with a largest 257-row batch), each
+wrapping its ring,
+pushed in uneven chunks through all three push APIs. After every chunk the
+ring equals the reference; at the empty, partial and final rings, greedy and
+two sampled proposals (tokens, top-16 and corrected scores) and an explicit
+block output equal the reference bits, on the CPU with the portable kernel
+and one worker, NEON with one and four workers, and Metal (printing
+`skipped: no Metal device` without one). Failed rows (NaN, non-BF16), wrong
+position/width, restore, reset and incompatible snapshots match the
+reference. `src/draft_math.rs` unit tests compare attention and every head
+stage with the reference stages for scalar and NEON paths; swapping two FMA
+steps in either NEON kernel makes them fail. `tests/draft_generation.rs`
+generates with the fast draft, the reference draft and no draft (greedy, two
+seeds, K=1/3/7, CPU and Metal): tokens, accepted guesses, main state digest
+and final ring are equal.
+
+**Real files.** `verify_draft MODEL_FOLDER` pushes 300 synthetic BF16 context
+rows of the draft's shape; the first three singly. It compares Metal (10
+workers) with CPU NEON (10 and 1 workers) and the portable kernel (4 workers),
+each with a different push chunking (ring and greedy and sampled proposals),
+then the scalar reference: ring after three rows, and one greedy proposal
+from the restored 300-row ring. Only one draft is alive at a time.
+
+### D18 measurements (2026-11-14, Apple M5 4P+6E, 10-core GPU)
+
+`cargo run --release -p yskn-engine --example bench_draft -- "$HOME/models/qwen38-speed"`
+(Metal projections, dotprod kernel, 10 workers; 11 proposals after two
+warm-ups, ring full at 2,048 synthetic rows; times in ms). Runs at 14:00–14:05
+overlapped another job using the CPU and GPU (proposal median 96–113, minimum
+80–92). The three runs at 14:18, after that job had ended, are below; the
+first of them was still disturbed (median 70.6) and is not used.
+
+| Stage | 14:18:15 median / min | 14:18:18 median / min |
+|---|---:|---:|
+| **Proposal total** | **49.22 / 48.08** | **47.18 / 46.89** |
+| Block projections (45 matrices) | — | 32.89 / 32.68 |
+| of which compressed kernel calls (30 command buffers) | 26.10 / 25.90 | 26.93 / 26.79 |
+| Block attention | 6.65 / 6.37 | 5.61 / 5.59 |
+| Block other (norms, RoPE, filters, GLU, adds) | — | 2.74 / 2.69 |
+| Head rank projection | — | 0.28 / 0.25 |
+| Head approximate scores | 4.81 / 4.31 | 4.06 / 4.05 |
+| Head shortlist | — | 0.74 / 0.69 |
+| Head rescoring + top 16 | — | 0.48 / 0.47 |
+| Head correction + choice | — | 0.21 / 0.20 |
+
+| Push batch | ms per row, median / min (14:18:18) |
+|---:|---:|
+| 1 | 1.458 / 1.339 |
+| 16 | 0.418 / 0.414 |
+| 256 | 0.387 / 0.385 |
+
+Filling the empty ring (2,048 rows in batches of 256) took 896 ms. Resident
+memory after the run was 2,152,218,624 bytes (mapped draft files touched,
+packed approximate rows, ring). `verify_draft` peaked at 3,088,695,296 bytes
+(`/usr/bin/time -l`), when the scalar reference was loaded after the fast
+drafts were dropped. With `--backend cpu` (14:20) a proposal took 97.05 /
+96.65 ms (kernel 74.65) and pushes 6.45 / 0.86 / 0.87 ms per row.
+
+**Result against the target.** Context feeding meets the target (under 10 ms
+per committed row at every batch size). A proposal takes about 47 ms on a
+quiet machine, above the 40 ms target and about 1,800 times faster than the
+scalar reference (84.6 s in `verify_draft`). One proposal is about 18% of a
+one-row main pass (about 264 ms).
+
+**What limits it.** (1) The compressed kernel at M = 8 on the GPU: 26.8 ms for
+about 830 MB of block codes (the fc matrix is used only by pushes), about 32 ms/GB,
+in 30 dependent command buffers (six per layer, because each group's input
+needs the CPU result of the previous one). At D14's measured 0.18 ms round
+trip, about 5 ms of this is submission and wait latency (an inference, not
+separately measured here). Split counts 2/4/8/16 gave 29.95/26.74/26.83/28.22
+ms; 4 stays. (2) CPU stages about 20 ms: activation quantization and
+restoration about 6 ms (30 groups, each 0.06–0.4 ms quantization plus
+restoration; pool dispatch is about 18 µs per call), attention 5.6 ms (history
+splits 1.4 ms per layer: 134 M FMAs and 0.5 M portable `exp` calls per layer;
+the 33-part combination 0.13 ms), approximate scores 4.1 ms (890 M FMAs and a
+127 MB read), other stages 4 ms. No stage is inherently sequential in the
+reference order except the per-row predecessor correction and choice (0.2 ms).
+
+**Next, in expected gain order.** (a) Overlap CPU and GPU: run the CPU kernel on
+a share of each group's output rows while the GPU computes the rest (needs an
+asynchronous Metal submission and a row offset in the kernel; D12 bounds this
+at about 25% of kernel time when the CPU is free). (b) A faster Metal kernel
+for M = 8 (rows per thread, or the GPU's matrix units; the kernel is
+compute-bound per added row, D12). (c) Fuse restoration, the following
+elementwise stage and the next quantization into one pool pass per row
+(about 2–3 ms). (d) A bit-exact vectorized port of the portable `exp` and
+reuse of per-row RoPE angles (about 1–2 ms). (e) Larger NEON tiles for the
+history dots/values and approximate scores. Whether drafting pays depends on
+acceptance, which `draft_acceptance` can now measure at this speed.
+
+No other heavy process ran at 14:18, but this task's own builds and runs had
+just ended; the orchestrator's quiet-machine re-measurement supersedes these
+numbers.
+
 ## D20 — Exact CPU stages around compressed projections (brief 07a)
 
 All new fast paths live in `yskn-engine`. `YSKN_CPU_STAGES=auto` (default)

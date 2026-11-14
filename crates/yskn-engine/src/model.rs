@@ -269,12 +269,7 @@ impl Model {
     }
     /// The projection device: the Metal device name, or the CPU kernel and threads.
     pub fn device(&self) -> String {
-        #[cfg(target_os = "macos")]
-        if let Some(metal) = &self.engine.metal {
-            return metal.device_name();
-        }
-        let cpu = &self.engine.engine;
-        format!("{} x{}", cpu.kernel().name(), cpu.threads())
+        self.engine.device()
     }
     pub fn row_logits(&self) -> &[Vec<f32>] {
         &self.logits
@@ -851,13 +846,13 @@ impl std::str::FromStr for Backend {
 }
 
 /// The CPU pool (all row/head work and the CPU kernel) plus the selected projector.
-struct Compute {
+pub(crate) struct Compute {
     engine: Engine,
     #[cfg(target_os = "macos")]
     metal: Option<MetalEngine>,
 }
 impl Compute {
-    fn new(engine: Engine, backend: Backend) -> Result<Self> {
+    pub(crate) fn new(engine: Engine, backend: Backend) -> Result<Self> {
         #[cfg(not(target_os = "macos"))]
         if backend == Backend::Metal {
             return Err(Error::InvalidInput(
@@ -876,14 +871,25 @@ impl Compute {
             engine,
         })
     }
-    fn backend(&self) -> Backend {
+    pub(crate) fn backend(&self) -> Backend {
         #[cfg(target_os = "macos")]
         if self.metal.is_some() {
             return Backend::Metal;
         }
         Backend::Cpu
     }
-    fn map_range<T: Send, F: Fn(usize) -> Result<T> + Sync>(
+    /// The projection device: the Metal device name, or the CPU kernel and threads.
+    pub(crate) fn device(&self) -> String {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = &self.metal {
+            return metal.device_name();
+        }
+        format!("{} x{}", self.engine.kernel().name(), self.engine.threads())
+    }
+    pub(crate) fn kernel(&self) -> crate::Kernel {
+        self.engine.kernel()
+    }
+    pub(crate) fn map_range<T: Send, F: Fn(usize) -> Result<T> + Sync>(
         &mut self,
         range: std::ops::Range<usize>,
         function: F,
@@ -892,7 +898,7 @@ impl Compute {
     }
     /// Each matrix's M×N sums for one shared input: one Metal command buffer,
     /// or one CPU kernel call per matrix.
-    fn weighted_sums(
+    pub(crate) fn weighted_sums(
         &mut self,
         matrices: &[&Matrix],
         activation: &[i8],
