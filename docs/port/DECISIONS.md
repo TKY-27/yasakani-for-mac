@@ -1752,8 +1752,13 @@ run is repeatable, and both devices return the same exact integers, so the
 split cannot change a bit. `YSKN_METAL_CPU_SHARE=off` restores GPU-only
 projections; a number in 0..=0.9 fixes the share for every M (calibration);
 `auto` or unset selects the table. Tests: the split at shares 0, 0.3, 0.9
-and the table, for three matrices per call (padded and partial tiles, row
-and warp, M = 1, 3, 16, 20), equals the CPU kernel and the GPU-only path;
+and the table, in both multiply-accumulate modes, for five matrices per
+call (padded and partial tiles, row and warp, physical N = 11, 32, 75, 104
+and 320, M = 1, 3, 16, 20), equals the CPU kernel and the GPU-only path; a
+matrix below 64 physical rows has no CPU rows (the GPU keeps at least one
+32-row tile), which a unit test asserts together with the row counts of
+other sizes. The split has no prefix (head slice) variant: it always
+covers every physical row, and no projection computes a prefix on Metal;
 CPU row ranges of several matrices (including an empty one) equal slices of
 whole-matrix sums for 1 and 4 workers. A unit test in `src/metal.rs`
 (`gpu_work_completes_before_a_failing_cpu_part_returns_and_the_engine_is_reused`)

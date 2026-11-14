@@ -277,7 +277,13 @@ mod macos {
     }
 
     /// Rows shared between the GPU and the CPU kernel (several matrices per call,
-    /// padded and partial tiles) equal the GPU-only and CPU-only sums.
+    /// padded and partial tiles) equal the GPU-only and CPU-only sums, in both
+    /// multiply-accumulate modes. Physical N = 11 and 32 are below the 64 rows
+    /// at which the CPU gets a whole 32-row tile, so the GPU must compute all of
+    /// them at every share (unit tests in `src/metal.rs` assert the zero CPU
+    /// rows and that a CPU part is then never called, and cover reuse after a
+    /// failing CPU part); 75 and 104 are not multiples of 32. There is no prefix
+    /// variant of the split: it always covers every physical row.
     #[test]
     fn cpu_and_gpu_row_split_matches_either_device_alone() {
         let Some(mut engine) = engine() else { return };
@@ -286,6 +292,8 @@ mod macos {
             (300, 320, "warp", 6),
             (70, 75, "row", 5),
             (17, 32, "row", 8),
+            (9, 11, "row", 4),
+            (100, 104, "warp", 7),
         ];
         let files: Vec<_> = shapes
             .iter()
@@ -308,18 +316,21 @@ mod macos {
                 .iter()
                 .map(|matrix| cpu.weighted_sums(matrix, &activation, &scales).unwrap())
                 .collect();
-            for share in [None, Some(0.0), Some(0.3), Some(0.9)] {
-                engine.set_cpu_share(share).unwrap();
-                let split = engine
-                    .weighted_sums_split(&mut cpu, &refs, &activation, &scales)
-                    .unwrap();
-                let gpu = engine
-                    .weighted_sums_shared(&refs, &activation, &scales)
-                    .unwrap();
-                for (i, expected) in expected.iter().enumerate() {
-                    let context = format!("matrix={i} M={m} share={share:?}");
-                    assert_sums(&split[i], expected, &format!("split {context}"));
-                    assert_sums(&gpu[i], expected, &format!("gpu {context}"));
+            for float_mac in [false, true] {
+                engine.set_float_mac(float_mac);
+                for share in [None, Some(0.0), Some(0.3), Some(0.9)] {
+                    engine.set_cpu_share(share).unwrap();
+                    let split = engine
+                        .weighted_sums_split(&mut cpu, &refs, &activation, &scales)
+                        .unwrap();
+                    let gpu = engine
+                        .weighted_sums_shared(&refs, &activation, &scales)
+                        .unwrap();
+                    for (i, expected) in expected.iter().enumerate() {
+                        let context = format!("matrix={i} M={m} share={share:?} float={float_mac}");
+                        assert_sums(&split[i], expected, &format!("split {context}"));
+                        assert_sums(&gpu[i], expected, &format!("gpu {context}"));
+                    }
                 }
             }
         }
