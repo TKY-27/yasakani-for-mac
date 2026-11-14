@@ -350,3 +350,41 @@ Python-produced text, ids, errors and stream events. With no `YSKN_MODEL_DIR`,
 the model-dependent suite prints `skipped: YSKN_MODEL_DIR is not set` and
 passes; an explicitly set unusable folder fails. Synthetic UTF-8, loading,
 JSON formatting and tool-processing tests always run without a model.
+
+## Scalar block draft reference (D15)
+
+`yskn_ref::draft::Draft::load(MODEL_FOLDER)` reads only the manifest's draft
+container and reduced head. `load_with_options` changes the mask ID, capture
+layer list or shortlist size (default 248070 / [5,19,33,47,61] / 512).
+Supply each committed main row through `push_context(position,
+ContextFeatures { values })`, or row-major `[row,slot,channel]` through
+`push_context_rows`. The hook is precisely defined in
+[D15](DECISIONS.md#d15--scalar-block-draft-and-reduced-head): post-MLP residual
+BF16 expanded to FP32, five captures in layer order, no additional norm.
+The main model does not expose these captures yet.
+
+`propose(frontier_token, embedding_provider, DraftChoice::Greedy)` returns
+seven token IDs plus each position's top16 with raw and corrected scores.
+The provider supplies BF16-expanded main embedding rows for frontier/mask,
+so the drafter never opens the main container. `DraftChoice::sampled(seed)`
+is used only for main sampler version 3; its independent temperature is
+850 thousandths and top-p 0.95. `block_hidden` accepts eight explicit
+embedding rows for fast-path conformance. Proposing does not commit context.
+`reset`, `snapshot`, `restore`, `position` and read-only snapshot ring bits
+cover the draft's own state; callers manage main/draft commits together.
+Batch failure retains earlier successful rows; a single failed row is atomic.
+
+```sh
+export CARGO_NET_OFFLINE=true
+cargo run --release -p yskn-ref --example draft_info -- "$HOME/models/qwen38-speed"
+YSKN_MODEL_DIR="$HOME/models/qwen38-speed" cargo test -p yskn-ref --release -- --nocapture draft
+```
+
+Without `YSKN_MODEL_DIR`, the real test prints
+`skipped: YSKN_MODEL_DIR is not set` and passes. An unusable set path fails.
+The info example reads headers only, lists every tensor/vector and SHEAD
+array extent, and checks released shape/sign/rotation assumptions. Synthetic
+tests need no artifact files or network. Proofs and scalar resource
+measurements: [DRAFT_REFERENCE_PROOF.md](DRAFT_REFERENCE_PROOF.md).
+The scalar reference intentionally remains slow; no main capture wiring,
+speculation loop, 16-row option or HCAP side policy is included.

@@ -3,6 +3,8 @@
 
 pub mod attention;
 pub mod compressed_linear;
+pub mod draft;
+pub mod draft_head;
 pub mod gated_deltanet;
 pub mod kv_codec;
 pub mod kv_profile;

@@ -212,3 +212,27 @@ The path operation is `root / value`; the loader does not enforce that the
 result remains inside `root`. This is observed parsing behavior, not a new
 path-validation requirement or a proposed change. Source:
 `python/yasakani/runtime.py:123-138`.
+
+## Scalar draft loader (D15)
+
+The byte layout above agrees with `src/engine35.cpp:1705–1734`; no format
+correction was needed. The port adds safe-reader validation: checked
+products/offsets and exact EOF before payload allocation, finite FP32
+projection/scales, and explicit little-endian interpretation. The fourth
+word remains uninterpreted (a synthetic nonzero value is accepted). Hidden
+width comes from the header (positive multiple of 512); rank 512 is kept
+because the approximate-score kernel assigns 16 components to each of 32
+lanes (`src/q35_bdraft.cu:808–839`).
+
+The inspected `bdraft2_k8.shead` is 1,411,010,584 bytes: V=248320, H=5120,
+R=512, fourth word 0. Its arrays, in order, have byte lengths
+10,485,760 / 127,139,840 / 993,280 / 1,271,398,400 / 993,280. These are
+artifact observations, not extra fixed format requirements.
+
+Unlike Python's unconstrained `root / value` operation
+(`python/yasakani/runtime.py:123–138`), the port resolves only `files.draft`
+and `files.draft_head`, checks relative components and canonical containment
+(including symlinks), and never opens main weights. The manifest remains
+optional with the defaults above. Tokenizer/main/KV files are not required
+for this draft-only API. This is an intentional port boundary, not a
+change to the observed upstream package-loader behavior.

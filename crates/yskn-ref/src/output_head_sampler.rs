@@ -218,7 +218,7 @@ fn mix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn gumbel(seed: u64, position: u64, token: u32) -> f64 {
+pub(crate) fn gumbel(seed: u64, position: u64, token: u32) -> f64 {
     let seed_hash = mix64(seed);
     let position_hash = mix64(seed_hash ^ position);
     let hash = mix64(position_hash ^ u64::from(token).wrapping_mul(0xd6e8_feb8_6659_fd93));

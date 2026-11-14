@@ -16,7 +16,8 @@ can depend on row count.
 
 Every input row follows one canonical scalar path in ascending token order,
 regardless of prefill chunk size or provisional pass width. Floating operations
-remain separate binary32 or binary64 operations; there are no FMA calls, SIMD
+remain separate binary32 or binary64 operations; D15 adds only the draft
+source's explicitly fused FMA sites. There are no SIMD
 intrinsics, threads, unsafe blocks, or calls to platform transcendental math.
 Compiler fast-math/reassociation flags are outside this reference contract.
 
@@ -798,3 +799,118 @@ shared NLL/position fold. A mapped-engine follow-up only needs to select a
 mode, call `model_location_with_kv` and `load_weights_with_kv`, and route
 its score CLI through these helpers. Its stage calls need no changes.
 No engine source, real weights or full quality run is part of brief 05b.
+
+verified by this codec-only brief.
+
+## D15 — Scalar block draft and reduced head
+
+Decision (2026-11-14, brief 05d): `yskn-ref::draft` and `draft_head` port
+`src/q35_bdraft.cu` §§1–8 of chapter 07 for the default eight-row block.
+This draft affects acceptance rate/speed, never the verified output text.
+The reference is single-threaded safe scalar Rust; compressed matrices
+retain their codes and reuse `CompressedLinear` with output rotation
+disabled. Every A8 input uses the appropriate prefix of `bdraft2.fc`'s
+signs (`src/engine35.cpp:1638,1770–1782,1801–1818`). Per-tensor input signs
+and output rotation metadata are not substituted at execution time.
+
+Math: use D2/D7 portable `rsqrt`, `exp`, `exp2`, `sincos`, `exp_d` and
+`log_d`, explicitly resolving the port side of DRF-03. Preserve the source's
+explicit `fmaf` via IEEE `f32::mul_add`. Other multiply/add operations stay
+separate with their original grouping and precision. No platform
+transcendentals, unsafe blocks, SIMD or threads are introduced.
+
+Every explicit FMA site in `src/q35_bdraft.cu` (line numbers are upstream):
+
+| Lines | Purpose / port handling |
+|---|---|
+| 34, 465 | 256-lane RMS squares (unfused/fused variants); one port norm |
+| 141 (three nested calls) | Four-channel block dot, scaled Q before dot |
+| 146, 148 | Block online denominator and numerator |
+| 175 (two nested calls) | Serial history dot, even then odd, scale after dot |
+| 205 | Ascending-key history numerator |
+| 226 (two), 579 (two) | Unfused/fused-output split combination; one port combiner |
+| 303 | Dense BF16 hidden-to-correction projection |
+| 334, 409 | Legacy/current predecessor correction; one port correction |
+| 786 (four) | Rank projection, block then u then channel |
+| 839 | Approximate score, contiguous 16 components per lane |
+| 920–921 (four) | Full-width int8 rescoring |
+
+`draft_kernels.cu` is the separate D3/MTP path, not bdraft2; none of that
+path is added. No explicit FMA is introduced by compressed restoration,
+head norm/RoPE, dynamic filters, residual adds or GLU. Gumbel reuse only
+changes `output_head_sampler::gumbel` visibility to `pub(crate)`; its body
+is unchanged. No helper visibility/accessors in the protected model,
+attention, GDN, KV or format modules were changed.
+
+Shortlist (DRF-01): preserve the two histograms and 21-bit prefix cutoff,
+include all tokens above it, fill its remaining slots in ascending ID
+order. This is one of upstream's scheduling-dependent admissible subsets
+(`src/q35_bdraft.cu:882–896`); it is not an exact float top-512 sort.
+Rescore top16 ties use smaller token ID. Correction stays autoregressive
+over the block: predecessor starts at frontier and becomes each selected
+token. Greedy corrected ties keep candidate index; sampled ties use
+corrected-score rank (token ID as its tiebreak). The draft temperature is
+`0.001_f64 * 850.0_f64`, independent of the main request, top-p is 0.95,
+and Gumbel is keyed by seed, frontier+1+j, and token ID
+(`src/q35_bdraft.cu:404–434`). API `DraftChoice::Sampled` means the caller
+has enabled main sampler version 3. All other main modes use `Greedy`.
+
+Dimensions are read from the container/SHEAD headers, not replaced by
+shipping constants. The operation shapes that are fixed are 128-channel
+Q/K heads, 32 reduction lanes, 256 norm lanes, 512-column A8/hidden blocks,
+16-channel dynamic sharing, rank-512 SHEAD, top16 and eight block rows.
+Hidden/FFN are multiples of 512; correction rank is a positive multiple of
+32; a power-of-two ring may be 2..2048. Counts and products are checked
+before use. Smaller model dimensions use the same zero-initialized lane
+arrays/order, with only in-range model indices visited. Mask ID and capture
+layers are parameters, default 248070 and [5,19,33,47,61]. Callers must
+check main/draft dimension and epsilon compatibility when wiring the hook.
+
+**Main-model capture contract:** for each committed input position p, take
+zero-based layers 5,19,33,47,61 in that order AFTER the MLP down-projection
+residual add and BEFORE the next/final normalization. The value is
+`bf(old_residual + bf(down_projection))`, widened exactly to FP32, without
+extra norm/gain/rotation. `old_residual` here includes that layer's attention
+or GDN residual branch. Copy from `h_` as in `src/engine35.cpp:798–799,830–833,1650`;
+rounding is `src/q35_kernels.cu:1437–1444`. One input row is `[5,5120]`
+(slot-major), flattened to 25,600 elements. The upstream capture buffer is
+`[slot,row,channel]`; gather its row, do not reinterpret it as row-major
+(`src/q35_bdraft.cu:249–252,490–499`). Prompt and accepted verification
+rows are supplied once in contiguous ascending positions; rejected rows
+are never inserted. The frontier token at p is still uncommitted and must
+not already appear in the history ring.
+
+All draft layers project the SAME normalized context. The ring is stored
+as BF16 bit arrays `[layer,head,slot,channel]`; only successful complete row
+updates publish. Batch push uses exactly the row path, commits completed
+rows if a later row fails, and does not change arithmetic. `propose` leaves
+the ring untouched; reset/snapshot/restore include the position and every
+ring bit. History visible to block row m is
+`max(0,p+m-(window-1))..p`; every row also sees ALL eight current block
+keys/values, including future masked rows. The 32 chronological history
+partials and one block partial use their separate source dot orders.
+
+SHEAD validates magic, signed dimensions, every derived region and exact
+EOF before allocating arrays, and rejects nonfinite projection/scales.
+Manifest paths are relative and canonically contained, including symlinks.
+Only draft files are opened; embeddings come from a caller-supplied provider
+of BF16-expanded main embedding rows. Main weight files are never touched.
+
+Read-only artifacts resolve DRF-02: 46 eight-bit warp matrices, no output
+rotations, H512/Mulberry32 seed 7/offset 0 everywhere, fc sign length 25,600
+and equal sign prefixes for every matrix. There are 35 BF16 vectors. SHEAD
+is V=248320/H=5120/R=512. Full `draft_info` output, proof tails, real timing
+and RSS are in [DRAFT_REFERENCE_PROOF.md](DRAFT_REFERENCE_PROOF.md).
+No contradictory equation/layout was found in chapter 07 §§1–8 or chapter
+10; docs clarify dense BF16 correction and feature rounding, record the
+artifact facts, and distinguish D15 choices from upstream uncertainty.
+
+Not implemented: main-model capture wiring, speculation/verification loop,
+16-row blocks, alternate compressed/subset heads, second/third candidate
+policy, margins and HCAP. Top16 and both raw/corrected scores are exposed.
+Tests include malformed readers/options, path containment, ring overwrite
+and batch identity, snapshot/reset, future-row perturbation, analytical
+attention/filter/sparse-head oracles, explicit shortlist/selection ties,
+common signs/ignored output rotations and frozen proposal/score digests.
+Digests freeze this port, not a CUDA golden capture. CUDA bit equality,
+acceptance quality and end-to-end text equality are not claimed.

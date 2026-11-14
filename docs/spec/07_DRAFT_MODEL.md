@@ -105,20 +105,34 @@ an inverse Hadamard. The caller can fuse these steps but preserves this
 value formula. (`src/engine35.cpp:1638`; `src/engine35.cpp:1755-1764`;
 `src/engine35.cpp:1799-1818`; `src/q35_bdraft.cu:474,512,552,613`)
 
-**UNCERTAIN [DRF-02]: Draft container invariants.** The caller assumes the
-common sign vector is long enough and appropriate for all those matrices,
-and ignores their output rotation metadata in draft postprocessing. The
-released draft container is not present in this source checkout, so its
-actual rotation/sign descriptors and compatibility with those assumptions
-cannot be established here. Checked `src/engine35.cpp:136-166,1624-1638`,
-`src/engine35.cpp:1755-1782`, and `src/q35_bdraft.cu:55-62,474`.
+**RESOLVED [DRF-02] (brief 05d, read-only released artifacts):**
+`bdraft2_k8.yskn` has 46 compressed tensors, all eight-bit, warp layout,
+with no output rotation. Every input rotation uses H512,
+`mulberry32_7919_13`, seed 7, sign offset 0; its signs equal the matching
+prefix of `bdraft2.fc`'s 25,600 signs (50 blocks). The input widths are
+exactly 25,600 (fc), 5,120, 4,096 and 17,408.
+There are **35** BF16 vector parameters. In particular, `sel.hp`,
+`sel.pred` and `sel.succ` are dense BF16 vectors reshaped as the table
+above, not compressed tensors (`src/engine35.cpp:1636–1637`;
+`src/q35_bdraft.cu:299–305,406–411`). `draft_info` prints every descriptor
+and checks the shape/sign/rotation invariants without reading payloads.
+The file is 1,164,969,472 bytes; its 21,809-byte JSON header starts at byte
+32, and payload at 8,388,608. No artifact bytes are stored in this repo.
 
 ## 2. Context features from the main model
 
 Capture the residual hidden vector **after** main-model layers 5, 19, 33,
 47, and 61, in that order and using zero-based layer indices. The storage
 order is `capture[feature_slot, row, hidden_element]`. Capturing does not
-rerun a layer or normalize its output again.
+rerun a layer or normalize its output again. The precise tap is after that
+layer's MLP down-projection residual update, before the next layer or final
+normalization. The FP32 array holds BF16-rounded residuals expanded exactly
+to FP32: `bf(old_residual + bf(down_projection))`; do not supply the
+normalized/gain-adjusted copy made for the next projection.
+(`src/engine35.cpp:798–799,830–833`; `src/q35_kernels.cu:1437–1444`.)
+For a single row, gather `[slot,hidden_channel]`, shape `[5,5120]`,
+flattened to 25,600 values. Batch capture is `[slot,row,hidden_channel]`,
+not the row-major shape used by the draft input API.
 (`src/engine35.cpp:1650`; `src/engine35.cpp:830-833`)
 
 For every newly committed context position `p`, including prompt positions:
@@ -394,15 +408,13 @@ of items whose prefix is greater. Include all items above the cutoff and
 fill the remaining `512-above` positions with items at the cutoff.
 (`src/q35_bdraft.cu:739-763,849-896`)
 
-**UNCERTAIN [DRF-01]: Cutoff-bucket membership is scheduling-dependent.**
-Items in the cutoff bucket claim slots by `atomicAdd`; there is no token-ID
-or low-11-mantissa-bit tiebreaker. When more items share the bucket than fit,
-the source determines only the admissible subset, not its exact membership
-without a GPU execution schedule. A scalar reference must expose this
-boundary ambiguity instead of silently imposing ascending token ID.
-Checked `src/q35_bdraft.cu:882-896` and the fixed collection launch in
-`src/q35_bdraft.cu:971-974`. The score grid itself is chosen from device
-occupancy (`src/q35_bdraft.cu:958-962`).
+**PORT DECISION [DRF-01], D15:** The source's cutoff membership is
+scheduling-dependent (`src/q35_bdraft.cu:882–896,958–962`): cutoff items
+claim slots using `atomicAdd`, without a token-ID or low-mantissa tiebreak.
+The port includes all prefixes above the cutoff, then fills the cutoff
+bucket in ascending token ID order. This is an explicit deterministic
+choice within upstream's possible subsets, not a recovered GPU schedule.
+It does not replace the histogram boundary with an exact float sort.
 
 ### 6.3 Full-width int8 rescoring and top 16
 
@@ -518,8 +530,10 @@ shortlist width to 512, so those output-head alternatives are inactive.
 attention call `rsqrtf`, `exp2f`, `sincosf` and `__expf`; coupled selection
 also calls binary64 `exp` even when the main portable-math flag is enabled.
 The source fixes their arguments and the reduction orders above but does
-not provide the shipping CUDA implementations. Do not substitute the main
-model's numerically different math helpers by assumption. Checked
+not provide the shipping CUDA implementations. D15 explicitly chooses the port's portable `rsqrt`, `exp2`, `sincos`,
+`exp`, and binary64 `exp_d`/`log_d` instead, while preserving every explicit
+source FMA as `f32::mul_add` and keeping other operations separate. This
+defines the port reference; CUDA bit equality remains unverified. Checked
 `src/q35_bdraft.cu:145-148,190,463-487,525-536,579,615,426`.
 
 **UNCERTAIN [DRF-04]: Equality to a full compressed head.** No relationship
@@ -528,3 +542,22 @@ head is validated by the loader. A claim of bit equality to that head is
 unsupported; the supplied files would be needed to test it. Checked
 `src/engine35.cpp:1700-1734,1819-1831` and
 `src/q35_bdraft.cu:900-924`.
+
+## Scalar-port scope (D15)
+
+The port implements §§1–8 for the default **eight input rows / seven
+proposals** (`src/engine35.cpp:1851`), using header dimensions and explicit
+mask/capture-layer parameters. It requires 128-channel heads, rank-512
+SHEAD, 16 candidates and 16-channel convolution sharing. Small synthetic
+models keep those operation shapes; hidden/FFN widths are multiples of
+512, correction rank is a multiple of 32, and a power-of-two history ring
+may be 2..2048. The same 32 history splits and one block split are retained.
+The source's 16-row option, inactive compressed/subset heads, second/third
+side-candidate policy and HCAP are outside this brief. Snapshot/reset and
+committed-row context updates are implemented; main-model capture and the
+verification/speculation loop are not wired yet.
+
+Source review found no contradictory equation in §§1–8 or the SHEAD byte
+layout in chapter 10. The added dense-vector/tap/rounding details above
+clarify omissions; DRF-01/03 are deliberate port decisions, and DRF-02 is
+resolved by artifact inspection.
