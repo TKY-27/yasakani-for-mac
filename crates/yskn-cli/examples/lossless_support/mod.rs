@@ -110,6 +110,7 @@ struct Capture {
     cached: usize,
     snapshots: Vec<u8>,
     sampling: Vec<Value>,
+    saw_tokens: bool,
 }
 struct Recorder {
     inner: Box<dyn Engine>,
@@ -132,7 +133,12 @@ impl Engine for Recorder {
     ) -> Result<Generation> {
         let g = self
             .inner
-            .generate(prompt, max_new, sampling, stops, emit)?;
+            .generate(prompt, max_new, sampling, stops, &mut |ids| {
+                if !ids.is_empty() {
+                    self.capture.borrow_mut().saw_tokens = true;
+                }
+                emit(ids)
+            })?;
         let mut c = self.capture.borrow_mut();
         let s = sampling.normalized();
         let fixed = |v: f64| (v * 1000.0).round_ties_even() / 1000.0;
@@ -187,9 +193,26 @@ fn observe(
     rows: &mut Vec<Value>,
     label: Value,
 ) -> Result<Observation> {
+    observe_controlled(runner, capture, p, rows, label, false)
+}
+
+fn observe_controlled(
+    runner: &mut ChatRunner,
+    capture: &RefCell<Capture>,
+    p: &ChatParams,
+    rows: &mut Vec<Value>,
+    label: Value,
+    cancel: bool,
+) -> Result<Observation> {
     *capture.borrow_mut() = Capture::default();
     let start = Instant::now();
-    let usage = runner.run(p, &mut |_| Ok(()))?;
+    let prepared = runner.prepare_checked(p)?;
+    let usage = runner.run_prepared(
+        p,
+        prepared,
+        &|| cancel && capture.borrow().saw_tokens,
+        &mut |_| Ok(()),
+    )?;
     let c = capture.take();
     if c.stages.is_empty() || c.ids.is_empty() {
         return Err(Error::engine(
@@ -201,6 +224,7 @@ fn observe(
         digest.update(id.to_le_bytes());
     }
     let mut row = label;
+    row["cancelled_after_commit"] = json!(cancel && c.saw_tokens);
     row["effective_sampling_by_stage"] = json!(c.sampling);
     row["token_count"] = json!(c.ids.len());
     row["sha256_ids_le_u32"] = json!(format!("{:x}", digest.finalize()));
@@ -260,6 +284,146 @@ fn compare(
         eprintln!("{failure}");
         failures.push(failure);
     }
+}
+
+fn common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+fn reuse_probes(
+    runner: &mut ChatRunner,
+    capture: &RefCell<Capture>,
+    defaults: &RequestDefaults,
+    name: &str,
+    rows: &mut Vec<Value>,
+    failures: &mut Vec<Value>,
+) -> Result<()> {
+    let system = "Keep the ledger in order. Each entry has a name, count, colour and shelf. Do not change existing entries. ".repeat(8);
+    let body = json!({"messages":[
+        {"role":"system","content":system},
+        {"role":"user","content":"Remember cedar."},
+        {"role":"assistant","content":"Cedar recorded."},
+        {"role":"user","content":"Name the entry 3"}],"enable_thinking":false,"max_tokens":1,"temperature":0,"seed":0});
+    let first = parse_chat_request(&body, defaults)?;
+    let mut extension = first.clone();
+    extension
+        .messages
+        .as_array_mut()
+        .ok_or_else(|| Error::request("probe messages"))?
+        .extend([
+            json!({"role":"assistant","content":"Cedar."}),
+            json!({"role":"user","content":"Name its shelf."}),
+        ]);
+    let mut sibling = first.clone();
+    sibling.messages[3]["content"] = json!("Name the colour 4");
+    let (a, _) = runner.prepare_checked(&first)?;
+    let (b, _) = runner.prepare_checked(&extension)?;
+    let (c, _) = runner.prepare_checked(&sibling)?;
+    if b.len() <= a.len() || !b.starts_with(&a) {
+        return Err(Error::request(format!(
+            "multi-turn extension does not preserve rendered generation prefix ({} of {} tokens)",
+            common_prefix(&a, &b),
+            a.len()
+        )));
+    }
+    let shared = common_prefix(&a, &c);
+    if a == c || shared < 32 {
+        return Err(Error::request(format!(
+            "system siblings need distinct rendered ids with at least 32 shared tokens, got {shared}"
+        )));
+    }
+    let label = |run: &str| {
+        json!({"configuration":name,"sampler":"greedy","run":run,"probe":true,
+        "extension_prefix_tokens":a.len(),"system_common_prefix_tokens":shared})
+    };
+    runner.engine.reset()?;
+    let original = observe(runner, capture, &first, rows, label("conversation_first"))?;
+    observe(
+        runner,
+        capture,
+        &extension,
+        rows,
+        label("conversation_extension"),
+    )?;
+    let again = observe(
+        runner,
+        capture,
+        &first,
+        rows,
+        label("conversation_first_again"),
+    )?;
+    compare(
+        &original,
+        &again,
+        &label("conversation_first_again"),
+        "repeat_mismatch",
+        failures,
+    );
+    observe(runner, capture, &sibling, rows, label("system_sibling"))?;
+    let again = observe(runner, capture, &first, rows, label("after_system_sibling"))?;
+    compare(
+        &original,
+        &again,
+        &label("after_system_sibling"),
+        "repeat_mismatch",
+        failures,
+    );
+    let mut unrelated = first.clone();
+    unrelated.messages = json!([{"role":"user","content":"Count blue lanterns 7 8 9"}]);
+    observe(runner, capture, &unrelated, rows, label("unrelated"))?;
+    let again = observe(runner, capture, &first, rows, label("after_unrelated"))?;
+    compare(
+        &original,
+        &again,
+        &label("after_unrelated"),
+        "repeat_mismatch",
+        failures,
+    );
+    runner.engine.reset()?;
+    let again = observe(runner, capture, &first, rows, label("after_reset"))?;
+    compare(
+        &original,
+        &again,
+        &label("after_reset"),
+        "repeat_mismatch",
+        failures,
+    );
+    observe_controlled(
+        runner,
+        capture,
+        &sibling,
+        rows,
+        label("cancelled_request"),
+        true,
+    )?;
+    let again = observe(runner, capture, &first, rows, label("after_cancelled"))?;
+    compare(
+        &original,
+        &again,
+        &label("after_cancelled"),
+        "repeat_mismatch",
+        failures,
+    );
+    let mut rejected = first.clone();
+    rejected.messages = json!([{"role":"user","content":"over capacity ".repeat(runner.engine.context_capacity())}]);
+    match runner.run(&rejected, &mut |_| Ok(())) {
+        Err(e) if e.code == Some("context_length_exceeded") => {
+            let mut row = label("failed_request");
+            row["expected_error"] = json!(e.to_string());
+            rows.push(row);
+        }
+        Err(e) => return Err(e),
+        Ok(_) => return Err(Error::engine("over-context probe unexpectedly succeeded")),
+    }
+    let again = observe(runner, capture, &first, rows, label("after_failed"))?;
+    compare(
+        &original,
+        &again,
+        &label("after_failed"),
+        "repeat_mismatch",
+        failures,
+    );
+    Ok(())
 }
 
 fn sampling_exercised(name: &str, outputs: &[Vec<Vec<u32>>], failures: &mut Vec<Value>) {
@@ -323,35 +487,21 @@ pub fn check(
             }
             for (i, prompt) in prompts.iter().enumerate() {
                 let p = parameters(prompt, defaults, sampler, max_tokens)?;
-                // A one-token sibling differs only in the template's thinking suffix:
-                // it primes the same saved prompt prefix immediately before the repeat.
-                let mut sibling = p.clone();
-                sibling.max_tokens = 1;
-                let thinking = p.template_kwargs["enable_thinking"]
-                    .as_bool()
-                    .unwrap_or(true);
-                sibling.template_kwargs["enable_thinking"] = json!(!thinking);
-                let (ids, _) = runner
-                    .prepare_checked(&p)
-                    .map_err(|e| Error::request(format!("{}: {e}", prompt.location)))?;
-                let (sibling_ids, _) = runner.prepare_checked(&sibling).map_err(|e| {
-                    Error::request(format!("{}: prefix probe: {e}", prompt.location))
-                })?;
-                if ids == sibling_ids {
-                    return Err(Error::request(format!(
-                        "{}: template ignores thinking toggle; cannot exercise a distinct prefix sibling",
-                        prompt.location
-                    )));
-                }
-                let label = json!({"configuration":name,"sampler":sampler_name,"prompt":prompt.id,"run":"prefix_probe"});
-                observe(&mut runner, &capture, &sibling, &mut rows, label).map_err(|e| {
-                    Error::engine(format!("{}: prefix probe: {e}", prompt.location))
-                })?;
                 let reset = i + 1 == prompts.len();
                 if reset {
                     runner.engine.reset()?;
+                } else {
+                    let unrelated =
+                        parameters(&prompts[(i + 1) % prompts.len()], defaults, sampler, 1)?;
+                    observe(
+                        &mut runner,
+                        &capture,
+                        &unrelated,
+                        &mut rows,
+                        json!({"configuration":name,"sampler":sampler_name,"run":"unrelated_probe","probe":true}),
+                    )?;
                 }
-                let label = json!({"configuration":name,"sampler":sampler_name,"prompt":prompt.id,"run":"repeat","reset_before":reset,"sibling_common_prefix_tokens":ids.iter().zip(&sibling_ids).take_while(|(a,b)| a == b).count()});
+                let label = json!({"configuration":name,"sampler":sampler_name,"prompt":prompt.id,"run":"repeat","reset_before":reset});
                 let result = observe(&mut runner, &capture, &p, &mut rows, label.clone())
                     .map_err(|e| Error::engine(format!("{}: {label}: {e}", prompt.location)))?;
                 compare(&first[i], &result, &label, "repeat_mismatch", &mut failures);
@@ -370,10 +520,30 @@ pub fn check(
                 baseline.extend(first);
             }
         }
+        reuse_probes(
+            &mut runner,
+            &capture,
+            defaults,
+            name,
+            &mut rows,
+            &mut failures,
+        )?;
+        let modes: HashSet<u64> = rows[config_start..]
+            .iter()
+            .flat_map(|r| r["snapshot_modes"].as_array().into_iter().flatten())
+            .filter_map(Value::as_u64)
+            .collect();
+        for mode in 0..=2 {
+            if !modes.contains(&mode) {
+                failures.push(
+                    json!({"kind":"reuse mode not exercised","configuration":name,"mode":mode}),
+                );
+            }
+        }
         sampling_exercised(name, &sampled_outputs, &mut failures);
         let accepted: u64 = rows[config_start..]
             .iter()
-            .filter(|r| r["run"] != "prefix_probe")
+            .filter(|r| r["probe"] != true)
             .filter_map(|r| r["guesses_accepted"].as_u64())
             .sum();
         if name != "none" && accepted == 0 {

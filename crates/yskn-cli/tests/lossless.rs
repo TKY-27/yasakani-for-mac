@@ -50,12 +50,14 @@ impl Engine for TestEngine {
         emit: &mut dyn FnMut(&[u32]) -> Result<bool>,
     ) -> Result<Generation> {
         let mut result = self.inner.generate(prompt, n, sampling, stops, emit)?;
+        let original = prompt.first() == Some(&1) && n > 1;
         let count = self
             .counts
             .entry((prompt.to_vec(), sampling.seed))
             .or_default();
-        *count += 1;
-        let original = prompt.first() == Some(&1) && n > 1;
+        if original {
+            *count += 1;
+        }
         if original
             && (self.fault == Fault::Configuration || (self.fault == Fault::Repeat && *count == 2))
         {
@@ -70,9 +72,9 @@ impl Engine for TestEngine {
 
 fn exercise(fault: Fault, all: bool) -> Value {
     let folder = Folder::new();
-    // Same fixture's vocabulary and weights, but make the thinking suffix visible
-    // in ordinary in-vocabulary tokens. Its final-token snapshot has a shared prefix.
-    folder.write("chat_template.jinja", "{% for m in messages %}{{ m.content }} {% endfor %}t10 {% if enable_thinking %}t11{% else %}t12{% endif %}");
+    // Generation headers are present on historical assistant turns too. The
+    // system setting changes the start, as it does in the real chat template.
+    folder.write("chat_template.jinja", "{% if enable_thinking %}t13 {% endif %}{% for m in messages %}{% if m.role == 'assistant' %}t10 {% endif %}{{ m.content }} {% endfor %}t10");
     let cases = prompts("synthetic.json", &json!([
         {"id":"refrain","request":{"messages":[{"role":"user","content":"1 2 1 2 1 2 1 2"}],"enable_thinking":false,"max_tokens":12}},
         {"id":"different","request":{"messages":[{"role":"user","content":"3 4 5 6"}],"enable_thinking":true,"max_tokens":12}}
@@ -127,21 +129,53 @@ fn actual_synthetic_engine_passes_every_configuration_and_sampler() {
     let report = exercise(Fault::None, true);
     assert_eq!(report["passed"], true, "{report}");
     let runs = report["runs"].as_array().unwrap();
-    assert_eq!(runs.len(), 5 * 4 * 2 * 3);
+    assert_eq!(
+        runs.iter().filter(|r| r["probe"] != true).count(),
+        5 * 4 * 2 * 2
+    );
+    for run in runs
+        .iter()
+        .filter(|r| r["configuration"] == "none" && r["probe"] == true)
+    {
+        eprintln!(
+            "reuse {}: modes={} cached={}",
+            run["run"], run["snapshot_modes"], run["cached_tokens"]
+        );
+    }
     for name in CONFIG_NAMES {
         let own: Vec<_> = runs.iter().filter(|r| r["configuration"] == name).collect();
-        assert!(own.iter().all(|r| r["passes"].as_u64().unwrap() > 0));
-        assert!(own.iter().any(|r| r["run"] == "repeat"
+        assert!(
+            own.iter()
+                .filter(|r| r["expected_error"].is_null())
+                .all(|r| r["passes"].as_u64().unwrap() > 0)
+        );
+        assert!(own.iter().any(|r| r["run"] == "after_failed"
             && r["snapshot_modes"] == json!([2])
             && r["cached_tokens"].as_u64().unwrap() > 0));
         assert!(
             own.iter()
                 .any(|r| r["reset_before"] == true && r["snapshot_modes"] == json!([0]))
         );
+        assert!(
+            own.iter()
+                .any(|r| r["run"] == "conversation_extension" && r["snapshot_modes"] == json!([1]))
+        );
+        for run in [
+            "after_system_sibling",
+            "after_unrelated",
+            "after_reset",
+            "after_cancelled",
+            "after_failed",
+        ] {
+            assert!(
+                own.iter().any(|r| r["run"] == run && r["token_count"] == 1),
+                "{report}"
+            );
+        }
         if name != "none" {
             assert!(
                 own.iter()
-                    .filter(|r| r["run"] != "prefix_probe")
+                    .filter(|r| r["probe"] != true)
                     .map(|r| r["guesses_accepted"].as_u64().unwrap())
                     .sum::<u64>()
                     > 0
