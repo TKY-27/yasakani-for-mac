@@ -4,14 +4,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use serde_json::{Value, json};
-use std::{
-    rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{rc::Rc, time::Duration};
 use yskn::{
     chat::ChatRunner,
     server::{Api, Config},
@@ -35,13 +28,8 @@ impl Service {
             )
         })
         .unwrap();
-        for _ in 0..200 {
-            if api.is_ready() {
-                return Self { api, control };
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        panic!("worker startup timed out")
+        common::until("the engine to load", || api.is_ready()).await;
+        Self { api, control }
     }
     fn script(&self, s: &str) {
         let mut ids = stub::formatter().unwrap().encode(s).unwrap();
@@ -322,7 +310,7 @@ async fn service_waits_for_first_request_and_cancels_on_body_drop() {
         );
         assert_eq!(s.control.observation().calls, 1);
         drop(body);
-        let (status, raw) = tokio::time::timeout(Duration::from_secs(2), &mut next)
+        let (status, raw) = tokio::time::timeout(common::PATIENCE, &mut next)
             .await
             .unwrap();
         assert_eq!(status, 200);
@@ -333,12 +321,9 @@ async fn service_waits_for_first_request_and_cancels_on_body_drop() {
 }
 #[tokio::test]
 async fn service_loading_status_and_backpressure_timeout() {
-    let release = Arc::new(AtomicBool::new(false));
-    let r = release.clone();
+    let (release, released) = std::sync::mpsc::channel::<()>();
     let api = Api::new(Config::default(), move || {
-        while !r.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        let _ = released.recv();
         ChatRunner::new(Box::new(StubEngine::new(20000)), stub::formatter()?, 1)
     })
     .unwrap();
@@ -348,7 +333,7 @@ async fn service_loading_status_and_backpressure_timeout() {
         .body(Full::new(Bytes::new()))
         .unwrap();
     assert_eq!(api.call(req).await.status(), 503);
-    release.store(true, Ordering::Release);
+    release.send(()).unwrap();
     drop(api);
     let mut cfg = Config::default();
     cfg.limits.stream_timeout = Duration::from_millis(40);
@@ -364,10 +349,14 @@ async fn service_loading_status_and_backpressure_timeout() {
         .header("host", "127.0.0.1:8765")
         .body(Full::new(Bytes::from(b)))
         .unwrap();
+    // The unread stream stays alive; only the backpressure deadline can end
+    // the endless job and free the one engine thread for the next request.
     let response = s.api.call(req).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (status, _) = tokio::time::timeout(common::PATIENCE, s.chat(json!({})))
+        .await
+        .expect("the stalled job was never stopped");
+    assert_eq!(status, 200);
     assert_eq!(s.control.observation().stops, 1);
-    assert!(s.control.observation().generated < 100);
     drop(response);
 }
 #[tokio::test]
@@ -410,12 +399,7 @@ async fn body_deadline_and_template_errors_are_http_errors() {
         ChatRunner::new(Box::new(StubEngine::new(20000)), fmt, 1)
     })
     .unwrap();
-    for _ in 0..100 {
-        if api.is_ready() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
+    common::until("the engine to load", || api.is_ready()).await;
     let text = json!({"messages":[{"role":"user","content":"hi"}],"stream":true}).to_string();
     let r = Request::builder()
         .method("POST")

@@ -3,6 +3,7 @@ use std::{
     process::{Command, Output, Stdio},
     time::Duration,
 };
+const PATIENCE: Duration = Duration::from_secs(30);
 fn command() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_yskn"));
     for key in [
@@ -199,7 +200,7 @@ impl Drop for Child {
 }
 fn http(addr: &str, request: &str) -> String {
     let mut s = std::net::TcpStream::connect(addr).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.set_read_timeout(Some(PATIENCE)).unwrap();
     s.write_all(request.as_bytes()).unwrap();
     let mut out = String::new();
     s.read_to_string(&mut out).unwrap();
@@ -234,19 +235,20 @@ fn serve_end_to_end() {
         .split_whitespace()
         .next()
         .unwrap();
-    let mut ready = false;
-    for _ in 0..100 {
-        let r = http(
-            addr,
-            &format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    // Another process: /health is the only readiness signal. Generous for a loaded machine.
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while !http(
+        addr,
+        &format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    )
+    .contains("\"status\":\"ok\"")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server never became ready"
         );
-        if r.contains("\"status\":\"ok\"") {
-            ready = true;
-            break;
-        }
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(ready);
     let body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8,\"enable_thinking\":false}";
     let r = http(
         addr,

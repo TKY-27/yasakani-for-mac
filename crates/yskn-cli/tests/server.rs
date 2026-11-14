@@ -4,15 +4,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Request, body::Incoming, client::conn::http1};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
-use std::{
-    net::SocketAddr,
-    rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{io::ErrorKind, net::SocketAddr, rc::Rc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -94,24 +86,20 @@ impl Harness {
         })
         .await
         .unwrap();
+        // Readiness is checked without a connection so none is left lingering
+        // on a connection permit when a test starts.
+        common::until("the engine to load", || server.is_ready()).await;
         let addr = server.local_addr().unwrap();
         let (tx, rx) = oneshot::channel();
         let task = tokio::spawn(server.run(async {
             let _ = rx.await;
         }));
-        let h = Self {
+        Self {
             addr,
             control,
             shutdown: Some(tx),
             task: Some(task),
-        };
-        for _ in 0..100 {
-            if h.request("GET", "/health", None, &[]).await.status == 200 {
-                return h;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!("server never became ready")
     }
     fn script(&self, s: &str) {
         let mut v = ids(s);
@@ -135,39 +123,40 @@ impl Harness {
         body: String,
         headers: &[(&str, &str)],
     ) -> Reply {
-        let stream = TcpStream::connect(self.addr).await.unwrap();
-        let (mut sender, conn) = http1::handshake(TokioIo::new(stream)).await.unwrap();
-        tokio::spawn(async {
-            let _ = conn.await;
-        });
-        let mut r = Request::builder()
-            .method(method)
-            .uri(path)
-            .header("host", self.addr.to_string())
-            .header("connection", "close")
-            .header("content-length", body.len());
-        for (k, v) in headers {
-            r.headers_mut().unwrap().insert(
-                hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                hyper::header::HeaderValue::from_str(v).unwrap(),
-            );
-        }
-        let r = sender
-            .send_request(r.body(Full::new(Bytes::from(body))).unwrap())
+        let exchange = async {
+            let stream = TcpStream::connect(self.addr).await.unwrap();
+            let (mut sender, conn) = http1::handshake(TokioIo::new(stream)).await.unwrap();
+            tokio::spawn(async {
+                let _ = conn.await;
+            });
+            let mut r = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", self.addr.to_string())
+                .header("connection", "close")
+                .header("content-length", body.len());
+            for (k, v) in headers {
+                r.headers_mut().unwrap().insert(
+                    hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    hyper::header::HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            let r = sender
+                .send_request(r.body(Full::new(Bytes::from(body))).unwrap())
+                .await
+                .unwrap();
+            let status = r.status().as_u16();
+            let headers = r.headers().clone();
+            let bytes = r.into_body().collect().await.unwrap().to_bytes();
+            Reply {
+                status,
+                headers,
+                text: String::from_utf8(bytes.to_vec()).unwrap(),
+            }
+        };
+        tokio::time::timeout(common::PATIENCE, exchange)
             .await
-            .unwrap();
-        let status = r.status().as_u16();
-        let headers = r.headers().clone();
-        let bytes = tokio::time::timeout(Duration::from_secs(10), r.into_body().collect())
-            .await
-            .unwrap()
-            .unwrap()
-            .to_bytes();
-        Reply {
-            status,
-            headers,
-            text: String::from_utf8(bytes.to_vec()).unwrap(),
-        }
+            .expect("request timed out")
     }
     async fn chat(&self, extra: Value) -> Reply {
         let mut b = body();
@@ -179,7 +168,7 @@ impl Harness {
     }
     async fn stop(mut self) {
         let _ = self.shutdown.take().unwrap().send(());
-        tokio::time::timeout(Duration::from_secs(3), self.task.take().unwrap())
+        tokio::time::timeout(common::PATIENCE, self.task.take().unwrap())
             .await
             .unwrap()
             .unwrap()
@@ -211,6 +200,19 @@ impl Reply {
             .map(|e| serde_json::from_str(e).unwrap())
             .collect()
     }
+}
+/// Writes raw bytes, then reads until the server closes. A reset fails the test.
+async fn raw(addr: SocketAddr, request: &str) -> String {
+    let exchange = async {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(request.as_bytes()).await.unwrap();
+        let mut out = vec![];
+        s.read_to_end(&mut out).await.unwrap();
+        String::from_utf8(out).unwrap()
+    };
+    tokio::time::timeout(common::PATIENCE, exchange)
+        .await
+        .expect("raw exchange timed out")
 }
 fn pieces(ev: &[Value], key: &str) -> String {
     ev.iter()
@@ -250,16 +252,13 @@ async fn health_and_models() {
 // Upstream test_server.ServerTests.test_loading_state
 #[tokio::test]
 async fn loading_state() {
-    let release = Arc::new(AtomicBool::new(false));
-    let ready = release.clone();
+    let (release, released) = std::sync::mpsc::channel::<()>();
     let cfg = Config {
         port: 0,
         ..Config::default()
     };
     let server = Server::bind(cfg, move || {
-        while !ready.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        let _ = released.recv();
         ChatRunner::new(Box::new(StubEngine::new(20000)), stub::formatter()?, 1)
     })
     .await
@@ -279,7 +278,7 @@ async fn loading_state() {
     assert_eq!(r.status, 503);
     assert_eq!(r.json()["status"], "loading");
     assert_eq!(h.chat(json!({})).await.status, 503);
-    release.store(true, Ordering::Release);
+    release.send(()).unwrap();
     h.stop().await;
 }
 // Upstream test_server.ServerTests.test_completion
@@ -371,19 +370,15 @@ async fn rejections() {
         r.json()["error"]["message"],
         "the request body must be a JSON object"
     );
-    let mut s = TcpStream::connect(h.addr).await.unwrap();
-    s.write_all(
-        format!(
+    let r = raw(
+        h.addr,
+        &format!(
             "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nContent-Length: 67108864\r\n\r\n",
             h.addr
-        )
-        .as_bytes(),
+        ),
     )
-    .await
-    .unwrap();
-    let mut raw = vec![];
-    s.read_to_end(&mut raw).await.unwrap();
-    assert!(String::from_utf8(raw).unwrap().starts_with("HTTP/1.1 413"));
+    .await;
+    assert!(r.starts_with("HTTP/1.1 413"), "{r}");
     assert_eq!(h.control.observation().calls, 0);
     h.stop().await;
 }
@@ -438,15 +433,12 @@ async fn host_and_origin_checks() {
         format!("localhost:{}", h.addr.port()),
         format!("[::1]:{}", h.addr.port()),
     ] {
-        let mut s = TcpStream::connect(h.addr).await.unwrap();
-        s.write_all(
-            format!("GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+        let r = raw(
+            h.addr,
+            &format!("GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
         )
-        .await
-        .unwrap();
-        let mut raw = String::new();
-        s.read_to_string(&mut raw).await.unwrap();
-        assert!(raw.starts_with("HTTP/1.1 200"));
+        .await;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
     }
     h.stop().await;
 }
@@ -554,18 +546,15 @@ async fn client_disconnect_stops_the_engine() {
     task.abort();
     drop(sender);
     drop(body);
-    for _ in 0..200 {
-        if h.control.observation().stops > 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    assert_eq!(h.control.observation().stops, 1);
-    assert!(h.control.observation().generated < 1000);
+    // The one engine thread serves this only after the endless job has ended,
+    // which it can do within the context room only by being cancelled.
     h.script("</think>next");
     let r = h.chat(json!({"max_tokens":20})).await;
     assert_eq!(r.status, 200);
     assert_eq!(r.json()["choices"][0]["message"]["content"], "next");
+    let seen = h.control.observation();
+    assert_eq!(seen.calls, 2);
+    assert_eq!(seen.stops, 1);
     h.stop().await;
 }
 // Upstream test_tools.ToolRunTests.test_server_answers_with_tool_calls
@@ -723,62 +712,78 @@ async fn wrong_method_and_path() {
     );
     h.stop().await;
 }
+// Each deadline is the only short one in its server: load can delay the
+// outcome but cannot change it.
 #[tokio::test]
-async fn slow_header_body_idle_limits_and_connection_cap() {
+async fn header_body_and_idle_deadlines() {
     let mut cfg = Config::default();
-    cfg.limits.header_timeout = Duration::from_millis(100);
-    cfg.limits.body_timeout = Duration::from_millis(100);
-    cfg.limits.idle_timeout = Duration::from_millis(200);
-    cfg.limits.max_connections = 1;
+    cfg.limits.header_timeout = Duration::from_millis(200);
     let h = Harness::start(cfg).await;
-    let mut slow = TcpStream::connect(h.addr).await.unwrap();
-    slow.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHo")
-        .await
-        .unwrap();
-    let mut buf = vec![];
-    tokio::time::timeout(Duration::from_secs(2), slow.read_to_end(&mut buf))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(buf.is_empty() || String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 408"));
-    let mut slow = TcpStream::connect(h.addr).await.unwrap();
-    slow.write_all(
-        format!(
+    // Hyper ends a header timeout without a response (proto/h1/conn.rs).
+    assert_eq!(
+        raw(h.addr, "POST /v1/chat/completions HTTP/1.1\r\nHo").await,
+        ""
+    );
+    h.stop().await;
+
+    let mut cfg = Config::default();
+    cfg.limits.body_timeout = Duration::from_millis(200);
+    let h = Harness::start(cfg).await;
+    let r = raw(
+        h.addr,
+        &format!(
             "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nContent-Length: 999\r\n\r\n{{",
             h.addr
-        )
-        .as_bytes(),
+        ),
     )
-    .await
-    .unwrap();
-    let mut buf = String::new();
-    tokio::time::timeout(Duration::from_secs(2), slow.read_to_string(&mut buf))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(buf.starts_with("HTTP/1.1 408"), "{buf}");
-    let mut idle = TcpStream::connect(h.addr).await.unwrap();
-    idle.write_all(format!("GET /health HTTP/1.1\r\nHost: {}\r\n\r\n", h.addr).as_bytes())
-        .await
-        .unwrap();
-    let mut buf = String::new();
-    tokio::time::timeout(Duration::from_secs(2), idle.read_to_string(&mut buf))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(buf.starts_with("HTTP/1.1 200"));
-    let mut held = TcpStream::connect(h.addr).await.unwrap();
-    held.write_all(b"GET /health HTTP/1.1\r\n").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    let mut excess = TcpStream::connect(h.addr).await.unwrap();
-    let mut b = [0; 1];
-    let result = tokio::time::timeout(Duration::from_secs(1), excess.read(&mut b))
-        .await
-        .unwrap();
-    assert!(matches!(result, Ok(0) | Err(_)));
-    drop(held);
+    .await;
+    assert!(r.starts_with("HTTP/1.1 408"), "{r}");
+    assert_eq!(h.control.observation().calls, 0);
+    h.stop().await;
+
+    let mut cfg = Config::default();
+    cfg.limits.idle_timeout = Duration::from_secs(1);
+    let h = Harness::start(cfg).await;
+    // A kept-alive connection: the idle deadline is what closes it.
+    let r = raw(
+        h.addr,
+        &format!("GET /health HTTP/1.1\r\nHost: {}\r\n\r\n", h.addr),
+    )
+    .await;
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
     h.stop().await;
 }
+#[tokio::test]
+async fn connection_cap_closes_excess_connections_unserved() {
+    let mut cfg = Config::default();
+    cfg.limits.max_connections = 1;
+    let h = Harness::start(cfg).await;
+    let mut held = TcpStream::connect(h.addr).await.unwrap();
+    held.write_all(b"GET /health HTTP/1.1\r\n").await.unwrap();
+    // The listener accepts in connect order, so `held` owns the only permit.
+    let mut excess = TcpStream::connect(h.addr).await.unwrap();
+    let request = format!("GET /health HTTP/1.1\r\nHost: {}\r\n\r\n", h.addr);
+    let _ = excess.write_all(request.as_bytes()).await; // may already be closed
+    let mut out = vec![];
+    let read = tokio::time::timeout(common::PATIENCE, excess.read_to_end(&mut out))
+        .await
+        .unwrap();
+    // Unserved: EOF, or a reset when the request arrived before the close.
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    assert!(matches!(&read, Ok(0)) || read.is_err_and(|e| e.kind() == ErrorKind::ConnectionReset));
+    held.write_all(format!("Host: {}\r\nConnection: close\r\n\r\n", h.addr).as_bytes())
+        .await
+        .unwrap();
+    let mut out = String::new();
+    tokio::time::timeout(common::PATIENCE, held.read_to_string(&mut out))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    h.stop().await;
+}
+// Early rejections leave request bytes unread; the response must still arrive
+// rather than be destroyed by a reset (`raw` fails on one).
 #[tokio::test]
 async fn header_and_actual_body_size_limits() {
     let mut cfg = Config::default();
@@ -792,60 +797,130 @@ async fn header_and_actual_body_size_limits() {
             .status,
         413
     );
+    // Hyper answers these itself, before the handler.
     for extra in [
         format!("X-Huge: {}\r\n", "a".repeat(9000)),
         (0..10).map(|i| format!("X-{i}: a\r\n")).collect(),
     ] {
-        let mut s = TcpStream::connect(h.addr).await.unwrap();
-        s.write_all(
-            format!(
+        let r = raw(
+            h.addr,
+            &format!(
                 "GET /health HTTP/1.1\r\nHost: {}\r\n{extra}Connection: close\r\n\r\n",
                 h.addr
-            )
-            .as_bytes(),
+            ),
         )
-        .await
-        .unwrap();
-        let mut b = String::new();
-        s.read_to_string(&mut b).await.unwrap();
-        assert!(b.starts_with("HTTP/1.1 431"), "{b}");
+        .await;
+        assert!(r.starts_with("HTTP/1.1 431"), "{r}");
     }
-    let mut s = TcpStream::connect(h.addr).await.unwrap();
-    s.write_all(format!("POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nTransfer-Encoding: chunked\r\n\r\n800\r\n",h.addr).as_bytes()).await.unwrap();
-    let mut b = String::new();
-    s.read_to_string(&mut b).await.unwrap();
-    assert!(b.starts_with("HTTP/1.1 413"));
+    let r = raw(
+        h.addr,
+        &format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nTransfer-Encoding: chunked\r\n\r\n800\r\n",
+            h.addr
+        ),
+    )
+    .await;
+    assert!(r.starts_with("HTTP/1.1 413"), "{r}");
+    // Rejected before the handler reads the body.
+    let unread = "x".repeat(32 * 1024);
+    for (host, status) in [("evil.example".to_owned(), 403), (h.addr.to_string(), 404)] {
+        let r = raw(
+            h.addr,
+            &format!(
+                "POST /wrong HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n{unread}",
+                unread.len()
+            ),
+        )
+        .await;
+        assert!(r.starts_with(&format!("HTTP/1.1 {status}")), "{r}");
+    }
+    assert_eq!(h.control.observation().calls, 0);
     h.stop().await;
+}
+// A peer that keeps sending after its rejection cannot hold the connection:
+// once by the discard budget alone, once by the deadline alone.
+#[tokio::test]
+async fn lingering_close_is_bounded() {
+    let mut cfg = Config::default();
+    cfg.limits.max_body = 1024;
+    cfg.limits.linger_bytes = 4096;
+    cfg.limits.linger_timeout = Duration::from_secs(3600);
+    let h = Harness::start(cfg).await;
+    cut_off_after_rejection(&h, 1024).await;
+    h.stop().await;
+
+    let mut cfg = Config::default();
+    cfg.limits.max_body = 1024;
+    cfg.limits.linger_timeout = Duration::from_millis(200);
+    cfg.limits.idle_timeout = Duration::from_secs(3600);
+    let h = Harness::start(cfg).await;
+    cut_off_after_rejection(&h, 1).await;
+    h.stop().await;
+}
+async fn cut_off_after_rejection(h: &Harness, chunk: usize) {
+    let mut s = TcpStream::connect(h.addr).await.unwrap();
+    s.write_all(
+        format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nContent-Length: 2048\r\n\r\n",
+            h.addr
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    // The whole response, then the server's half-close.
+    let mut out = vec![];
+    tokio::time::timeout(common::PATIENCE, s.read_to_end(&mut out))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 413"));
+    let junk = vec![b'x'; chunk];
+    let cut = tokio::time::timeout(common::PATIENCE, async {
+        // Writes fail once the server has fully closed and reset the stream.
+        while s.write_all(&junk).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(5)).await; // pacing only
+        }
+    })
+    .await;
+    assert!(
+        cut.is_ok(),
+        "the server never closed a lingering connection"
+    );
 }
 #[tokio::test]
 async fn two_overlapping_requests_wait_in_order() {
     let h = Harness::start(Config::default()).await;
-    h.control.delay(Duration::from_millis(3));
-    h.script(&format!("</think>{}", "first ".repeat(50)));
+    h.control.delay(Duration::from_millis(2));
+    // The first job never ends by itself, so the second cannot overtake it
+    // however long the window below takes on a loaded machine.
+    h.control.push(Script {
+        ids: ids("first "),
+        loop_from: Some(0),
+    });
     h.script("</think>second");
-    let (sender, mut body, task) = open_stream(
-        &h,
-        json!({"messages":user(),"stream":true,"max_tokens":1000}),
-    )
-    .await;
+    let b = json!({"messages":user(),"stream":true,"max_tokens":1000000,"enable_thinking":false,"loop_guard":false});
+    let (sender, mut body, task) = open_stream(&h, b).await;
     body.frame().await.unwrap().unwrap();
     {
         let waiting = h.chat(json!({"max_tokens":30}));
         tokio::pin!(waiting);
         assert!(
-            tokio::time::timeout(Duration::from_millis(30), &mut waiting)
+            tokio::time::timeout(Duration::from_millis(100), &mut waiting)
                 .await
                 .is_err()
         );
         assert_eq!(h.control.observation().calls, 1);
-        let bytes = body.collect().await.unwrap().to_bytes();
-        assert!(String::from_utf8_lossy(&bytes).contains("[DONE]"));
+        body.frame().await.unwrap().unwrap();
+        // Disconnecting the first client is what lets the second run.
+        task.abort();
+        drop((sender, body));
         let r = waiting.await;
         assert_eq!(r.status, 200);
         assert_eq!(r.json()["choices"][0]["message"]["content"], "second");
     }
-    drop(sender);
-    task.abort();
+    let seen = h.control.observation();
+    assert_eq!((seen.calls, seen.stops), (2, 1));
     h.stop().await;
 }
 #[tokio::test]

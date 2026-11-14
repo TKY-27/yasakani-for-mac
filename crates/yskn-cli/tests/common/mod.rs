@@ -1,4 +1,15 @@
 use serde_json::{Value, json};
+use std::time::{Duration, Instant};
+/// Generous bound for a loaded machine; reaching it fails the test.
+pub const PATIENCE: Duration = Duration::from_secs(30);
+/// Waits for another thread's progress, for which no event can be awaited.
+pub async fn until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + PATIENCE;
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
 pub fn bad_requests() -> Vec<(Value, &'static str)> {
     vec![
         (
