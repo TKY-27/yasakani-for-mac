@@ -26,7 +26,11 @@ for the stub; it makes no model-format fidelity claim.
 `--no-loop-guard`. Plain stdin/stdout supports pipes. Slash commands are
 `/exit`, `/quit`, `/q`, `/reset`, `/think on|off`, `/effort low|medium|xhigh`,
 `/help`. Thinking appears between `[thinking]` and `[/thinking]` when an answer
-follows. Ctrl+C stops the current generation or exits at the input prompt.
+follows. Ctrl+C stops the current generation or exits at the input prompt; the
+terminal thread does not hold the standard output lock while it waits for input.
+Tests cover the prompt case by sending SIGINT to a `yskn chat` process on pipes,
+and the generation case through `chat_loop` with an injected cancel flag; Ctrl+C
+typed at a real terminal (which sends the same SIGINT) is checked by hand only.
 `bench` and `selfcheck` are recognized and report `not available yet`.
 
 ## HTTP surface

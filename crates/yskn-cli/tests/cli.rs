@@ -278,3 +278,46 @@ fn serve_end_to_end() {
     assert!(rest.contains("stopping"));
     assert!(rest.contains("API key required"));
 }
+/// Waits for the child to exit; kills it and fails the test after PATIENCE.
+fn exits_within_patience(child: &mut Child) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + PATIENCE;
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the process did not exit after the interrupt"
+        );
+        std::thread::sleep(Duration::from_millis(10)); // polling the exit only
+    }
+}
+// Review finding: the terminal thread held the standard output lock while it
+// waited for input, and the interrupt handler then blocked on that lock.
+// Upstream exits on an interrupt at the prompt.
+#[test]
+fn interrupt_at_the_prompt_exits() {
+    let child = command()
+        .args(["chat", "--engine", "stub", "--max-ctx", "4096"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = Child(child);
+    // Kept open: the chat waits at its prompt for a line that never comes.
+    let _stdin = child.0.stdin.take().unwrap();
+    let mut out = child.0.stdout.take().unwrap();
+    let mut seen = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !seen.ends_with(b"\n> ") {
+        assert_eq!(out.read(&mut byte).unwrap(), 1, "no prompt appeared");
+        seen.push(byte[0]);
+    }
+    let status = Command::new("/bin/kill")
+        .args(["-INT", &child.0.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(exits_within_patience(&mut child).success());
+}

@@ -217,7 +217,9 @@ pub async fn main(argv: Vec<String>) -> Result<()> {
                             p,
                             hide,
                             io::stdin().lock(),
-                            io::stdout().lock(),
+                            // Not locked across the loop: the interrupt handler
+                            // writes too, while this thread waits for input.
+                            io::stdout(),
                             &worker_writing,
                             &worker_cancel,
                         )

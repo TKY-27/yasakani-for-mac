@@ -693,3 +693,46 @@ fn stop_filter_work_is_bounded_by_the_held_back_text() {
         assert!(f.hit);
     });
 }
+// The terminal's interrupt during generation, driven through the injected
+// reader, writer and cancel flag: the answer stops, is not kept in the
+// history, and the loop returns to the prompt (here: the end of input).
+#[test]
+fn terminal_interrupt_stops_the_answer_and_keeps_the_prompt() {
+    use std::sync::{Arc, atomic::Ordering};
+    let c = Control::default();
+    c.delay(std::time::Duration::from_millis(1));
+    c.push(Script {
+        ids: ids("on and on "),
+        loop_from: Some(0),
+    });
+    let writing = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (w, k, engine) = (writing.clone(), cancel.clone(), c.clone());
+    // The runner is not Send: it is built on the thread that uses it.
+    let chat = std::thread::spawn(move || {
+        let engine = Box::new(StubEngine::with_control(20000, engine));
+        let mut r = ChatRunner::new(engine, stub::formatter().unwrap(), 100).unwrap();
+        let mut p = ChatParams::new(json!([]));
+        p.max_tokens = 1_000_000;
+        p.loop_guard = false;
+        let mut output = vec![];
+        let result = yskn::cli::chat_loop(&mut r, p, false, "hi\n".as_bytes(), &mut output, &w, &k);
+        (result, String::from_utf8(output).unwrap())
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // Polls another thread's progress; the endless answer cannot end by itself
+    // before the context room, which the cancel must beat.
+    while !(writing.load(Ordering::Acquire) && c.observation().generated > 0) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "generation never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    cancel.store(true, Ordering::Release);
+    let (result, out) = chat.join().unwrap();
+    result.unwrap();
+    assert!(out.contains("[stopped]"), "{out}");
+    assert!(!out.contains("tokens/s"), "{out}");
+    assert_eq!(c.observation().stops, 1);
+}
