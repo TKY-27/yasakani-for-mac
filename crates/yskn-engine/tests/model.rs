@@ -600,7 +600,10 @@ fn explicit_cpu_stage_choice_overrides_the_process_default_with_identical_bits()
     let tokens = [3, 17, 42, 5, 99, 0, 7, 64, 11];
     let mut reference = yskn_ref::Model::load_folder(&fixture.0).unwrap();
     reference.prefill(&tokens).unwrap();
-    for stages in [yskn_engine::CpuStages::Reference, yskn_engine::CpuStages::Auto] {
+    for stages in [
+        yskn_engine::CpuStages::Reference,
+        yskn_engine::CpuStages::Auto,
+    ] {
         let mut model = fixture.model(Kernel::fastest(), 3, 4);
         model.set_cpu_stages(stages).unwrap();
         assert_eq!(model.cpu_stages(), stages.fast(), "{stages:?}");
