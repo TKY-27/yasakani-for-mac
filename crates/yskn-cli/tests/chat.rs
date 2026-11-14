@@ -803,3 +803,55 @@ fn terminal_shows_control_characters_visibly() {
         "{out:?}"
     );
 }
+// Review finding: validation errors quoted request values in full, so one
+// megabyte value became a multi-megabyte error response, built after the
+// request's budget charge was released. Messages quote a short excerpt.
+#[test]
+fn error_messages_quote_a_short_excerpt_of_request_values() {
+    let cfg = RequestDefaults::default();
+    let message = |extra: Value| {
+        let mut b = json!({"messages":user()});
+        b.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        parse_chat_request(&b, &cfg).unwrap_err().message
+    };
+    // Short values keep upstream's wording exactly.
+    assert_eq!(
+        message(json!({"response_format":{"type":"json_object"}})),
+        "response_format 'json_object' is not supported"
+    );
+    assert_eq!(
+        message(json!({"tool_choice":"required"})),
+        "tool_choice \"required\" is not supported; use \"auto\" or \"none\""
+    );
+    let long = "\u{7f}".repeat(7 << 20);
+    for (extra, prefix, room) in [
+        (
+            json!({"response_format":{"type":long}}),
+            "response_format '\\x7f\\x7f",
+            64 + 1,
+        ),
+        (
+            json!({"response_format":{"type":{"k":[long, long]}}}),
+            "response_format {'k': ['\\x7f",
+            64 + 1,
+        ),
+        // As upstream: the first 80 characters of the JSON text.
+        (json!({"tool_choice":long}), "tool_choice \"\\u007f", 80),
+    ] {
+        let m = message(extra);
+        assert!(m.starts_with(prefix), "{m}");
+        let fixed = if prefix.starts_with("tool") {
+            "tool_choice  is not supported; use \"auto\" or \"none\""
+        } else {
+            "response_format  is not supported"
+        };
+        assert!(m.chars().count() <= fixed.len() + room, "{}", m.len());
+        assert!(
+            !m.contains('\u{7f}'),
+            "control characters are shown visibly"
+        );
+    }
+    assert!(message(json!({"response_format":{"type":long}})).contains("…"));
+}

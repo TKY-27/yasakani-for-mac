@@ -3,8 +3,8 @@ use crate::{
     Error, Result,
     chat::{ChatRunner, Event, Usage},
     request::{
-        RequestDefaults, check_size, check_values, json_values, parse_chat_request, text_bytes,
-        truthy,
+        RequestDefaults, check_size, check_values, excerpt, json_values, parse_chat_request,
+        text_bytes, truthy,
     },
 };
 use bytes::Bytes;
@@ -713,7 +713,7 @@ where
     if !post {
         return close(error_response(http_error(
             501,
-            format!("Unsupported method ('{}')", r.method()),
+            format!("Unsupported method ('{}')", excerpt(r.method().as_str())),
             "invalid_request_error",
         )));
     }

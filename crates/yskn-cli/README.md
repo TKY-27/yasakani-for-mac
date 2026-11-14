@@ -157,6 +157,15 @@ tokenization, plus the template's copy of the messages), bounded through the
 body limit. Embedders running `Api` on a multi-thread runtime can decode
 several bodies at once; each is still charged before it is parsed.
 
+Error messages never quote more than a short excerpt of a request value: at
+most 64 characters of its Python repr followed by `…` (`response_format`, the
+method of a 501), or, as upstream, the first 80 characters of its JSON text
+(`tool_choice`); control characters appear escaped in both. Template and
+tokenizer errors are cut to 500 characters. An error response is therefore a
+few hundred bytes whatever the request held, and a client that never reads a
+response is cut off by `idle_timeout`, which also bounds a write that makes no
+progress, and the connection's permit is returned.
+
 Default bind is 127.0.0.1:8765 and the default `max_tokens` is 32768.
 
 **Closing a connection.** Whenever the server ends a connection after a

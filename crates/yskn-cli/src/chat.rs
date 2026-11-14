@@ -158,9 +158,12 @@ impl ChatRunner {
         })
     }
     pub fn prepare_checked(&self, p: &ChatParams) -> Result<(Vec<u32>, bool)> {
+        // A template or tokenizer error may quote request text: capped at the
+        // 500 characters upstream keeps of a generation error.
         let rejected = |e: yskn_text::Error| {
             Error::request(format!(
-                "the chat template does not accept these messages: {e}"
+                "the chat template does not accept these messages: {}",
+                e.to_string().chars().take(500).collect::<String>()
             ))
         };
         let capacity = self.engine.context_capacity();

@@ -1535,3 +1535,56 @@ async fn a_stream_that_is_not_read_frees_the_engine() {
     drop(s);
     h.stop().await;
 }
+// Review finding: an error message quoted the request value in full, so a
+// client could make the server build and hold a response several times its
+// body outside the budget. Error responses stay small whatever was sent.
+#[tokio::test]
+async fn error_responses_quote_a_short_excerpt_of_the_request() {
+    let h = Harness::start(Config::default()).await;
+    let long = "\u{7f}".repeat(1 << 20);
+    let r = h.chat(json!({"response_format":{"type":long}})).await;
+    assert_eq!(r.status, 400, "{}", &r.text[..r.text.len().min(200)]);
+    assert!(r.text.len() < 512, "{} bytes", r.text.len());
+    let method = "X".repeat(16 * 1024);
+    let r = raw(
+        h.addr,
+        &format!(
+            "{method} /health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            h.addr
+        ),
+    )
+    .await;
+    assert!(r.starts_with("HTTP/1.1 501"), "{}", &r[..r.len().min(200)]);
+    assert!(r.len() < 1024, "{} bytes", r.len());
+    assert_eq!(h.control.observation().calls, 0);
+    h.stop().await;
+}
+// A client that sends a request and never reads the response cannot hold the
+// connection: the idle deadline also bounds a write that makes no progress.
+// The answer is endless and the backpressure deadline far away, so only the
+// idle deadline can end it.
+#[tokio::test]
+async fn a_response_that_is_not_read_is_bounded_by_the_idle_deadline() {
+    let mut cfg = Config::default();
+    cfg.limits.max_connections = 1;
+    cfg.limits.idle_timeout = Duration::from_millis(300);
+    cfg.limits.stream_timeout = Duration::from_secs(3600);
+    let h = Harness::start_with_capacity(cfg, 4_000_000).await;
+    h.control.push(Script {
+        ids: ids("unread "),
+        loop_from: Some(0),
+    });
+    let b = json!({"messages":user(),"stream":true,"max_tokens":2_000_000,"enable_thinking":false,"loop_guard":false});
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut s = socket.connect(h.addr).await.unwrap();
+    s.write_all(raw_post(&h, &b).as_bytes()).await.unwrap();
+    // `s` holds the only permit: a served request proves it was dropped.
+    until_a_connection_is_free(&h).await;
+    h.script("</think>next");
+    let r = h.chat(json!({"max_tokens":20})).await;
+    assert_eq!(r.json()["choices"][0]["message"]["content"], "next");
+    assert_eq!(h.control.observation().stops, 1);
+    drop(s);
+    h.stop().await;
+}

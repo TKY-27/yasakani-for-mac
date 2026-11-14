@@ -103,6 +103,32 @@ pub fn truthy(v: &Value) -> bool {
         Value::Object(o) => !o.is_empty(),
     }
 }
+/// Characters of a request value an error message may quote.
+pub const EXCERPT: usize = 64;
+/// `text` cut to [`EXCERPT`] characters, with an ellipsis if it was longer.
+pub fn excerpt(text: &str) -> String {
+    let mut out: String = text.chars().take(EXCERPT).collect();
+    if out.len() < text.len() {
+        out.push('…');
+    }
+    out
+}
+/// `v` with every string and key cut to `n` characters and every list and
+/// object to `n` entries, so quoting a huge value costs no more than its
+/// excerpt. Its repr or JSON text is longer than `n` exactly when `v`'s is.
+fn shortened(v: &Value, n: usize) -> Value {
+    let cut = |s: &str| s.chars().take(n).collect::<String>();
+    match v {
+        Value::String(s) => Value::String(cut(s)),
+        Value::Array(a) => a.iter().take(n).map(|v| shortened(v, n)).collect(),
+        Value::Object(m) => m
+            .iter()
+            .take(n)
+            .map(|(k, v)| (cut(k), shortened(v, n)))
+            .collect(),
+        v => v.clone(),
+    }
+}
 fn py_string(v: &Value) -> String {
     if let Value::String(s) = v {
         s.clone()
@@ -395,7 +421,8 @@ pub fn parse_chat_request(body: &Value, cfg: &RequestDefaults) -> Result<ChatPar
         _ => {
             return Err(Error::request(format!(
                 "tool_choice {} is not supported; use \"auto\" or \"none\"",
-                yskn_text::json_dumps(&body["tool_choice"], true)
+                // As upstream: the first 80 characters of the JSON text.
+                yskn_text::json_dumps(&shortened(&body["tool_choice"], 80), true)
                     .chars()
                     .take(80)
                     .collect::<String>()
@@ -416,7 +443,7 @@ pub fn parse_chat_request(body: &Value, cfg: &RequestDefaults) -> Result<ChatPar
     if rf.is_object() && !rf["type"].is_null() && rf["type"] != "text" {
         return Err(Error::request(format!(
             "response_format {} is not supported",
-            py_repr(&rf["type"])
+            excerpt(&py_repr(&shortened(&rf["type"], EXCERPT)))
         )));
     }
     let messages = clean_messages(&body["messages"])?;
