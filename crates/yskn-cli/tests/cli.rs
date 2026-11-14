@@ -58,7 +58,7 @@ fn info() {
     assert!(text(&r).contains("deterministic demo"));
     let r = run(&["info"], "");
     assert!(!r.status.success());
-    assert!(text(&r).contains("real engine is not connected"));
+    assert!(text(&r).contains("--model-dir is required for the real engine"));
     let r = run(
         &[
             "info",
@@ -112,7 +112,7 @@ fn chat_ends_on_end_of_input() {
 fn bad_inputs() {
     let r = run(&["chat"], "");
     assert!(!r.status.success());
-    assert!(text(&r).contains("--engine stub"));
+    assert!(text(&r).contains("--model-dir is required for the real engine"));
     let r = run(
         &[
             "serve", "--engine", "stub", "--host", "0.0.0.0", "--port", "0",
@@ -146,11 +146,11 @@ fn bad_inputs() {
     }
 }
 #[test]
-fn recognized_unavailable_commands() {
+fn real_commands_require_a_model_folder() {
     for cmd in ["bench", "selfcheck"] {
         let r = run(&[cmd], "");
         assert!(!r.status.success());
-        assert!(text(&r).contains("not available yet"));
+        assert!(text(&r).contains("--model-dir is required for the real engine"));
     }
 }
 #[test]
