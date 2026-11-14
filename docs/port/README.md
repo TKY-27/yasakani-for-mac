@@ -384,7 +384,7 @@ Without `YSKN_MODEL_DIR`, the real test prints
 `skipped: YSKN_MODEL_DIR is not set` and passes. An unusable set path fails.
 The info example reads headers only, lists every tensor/vector and SHEAD
 array extent, and checks released shape/sign/rotation assumptions. Synthetic
-tests need no artifact files or network. Proofs and scalar resource
-measurements: [DRAFT_REFERENCE_PROOF.md](DRAFT_REFERENCE_PROOF.md).
+tests need no artifact files or network. On the real files one scalar
+`propose` takes about 90 seconds and about 1.6 GB resident.
 The scalar reference intentionally remains slow; no main capture wiring,
 speculation loop, 16-row option or HCAP side policy is included.

@@ -899,8 +899,8 @@ of BF16-expanded main embedding rows. Main weight files are never touched.
 Read-only artifacts resolve DRF-02: 46 eight-bit warp matrices, no output
 rotations, H512/Mulberry32 seed 7/offset 0 everywhere, fc sign length 25,600
 and equal sign prefixes for every matrix. There are 35 BF16 vectors. SHEAD
-is V=248320/H=5120/R=512. Full `draft_info` output, proof tails, real timing
-and RSS are in [DRAFT_REFERENCE_PROOF.md](DRAFT_REFERENCE_PROOF.md).
+is V=248320/H=5120/R=512. `draft_info MODEL_FOLDER` prints these facts.
+One scalar `propose` on the real files took 87 to 99 seconds, 1.6 GB resident.
 No contradictory equation/layout was found in chapter 07 §§1–8 or chapter
 10; docs clarify dense BF16 correction and feature rounding, record the
 artifact facts, and distinguish D15 choices from upstream uncertainty.
