@@ -54,7 +54,12 @@ impl Engine for TestEngine {
         if self.fault == Fault::LaterError && prompt.first() == Some(&13) && n > 1 {
             return Err(yskn::Error::engine("injected later generation error"));
         }
-        let mut result = self.inner.generate(prompt, n, sampling, stops, emit)?;
+        let mut result = if self.fault == Fault::Empty {
+            self.inner
+                .generate(prompt, n, sampling, stops, &mut |_| Ok(true))?
+        } else {
+            self.inner.generate(prompt, n, sampling, stops, emit)?
+        };
         let original = prompt.first() == Some(&1) && n > 1;
         let count = self
             .counts
