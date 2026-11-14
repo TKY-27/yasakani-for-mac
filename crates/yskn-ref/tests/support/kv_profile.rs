@@ -92,6 +92,17 @@ pub fn mixed_profile() -> Vec<u8> {
     profile.bytes()
 }
 
+/// One attention ordinal, two heads: only keys fall back; values keep packed means.
+pub fn int8_keys_packed_values_profile() -> Vec<u8> {
+    let mut profile = Profile::new(1, 2);
+    profile.groups[0].guard = 2;
+    profile.groups[2].basis.push([0.0625; 256]);
+    profile.groups[2].mean = Some([0.03125; 256]);
+    profile.groups[1].mean = Some([0.125; 256]);
+    profile.groups[3].mean = Some(std::array::from_fn(|i| (i as f32 - 128.0) / 1024.0));
+    profile.bytes()
+}
+
 /// One attention ordinal, with both a packed head and a basis/fallback head.
 /// Multi-ordinal indexing remains pinned by the frozen model/KV suites.
 pub fn compact_mixed_profile() -> Vec<u8> {

@@ -497,3 +497,92 @@ fn load_selects_env_kv_and_explicit_constructors_keep_int8_default() {
         );
     }
 }
+
+/// D14: explicit constructors read no Metal option from the environment (binary32,
+/// calibrated share); `Model::load` applies `YSKN_METAL_MAC` and
+/// `YSKN_METAL_CPU_SHARE` on Metal, rejects unknown values, and reads neither on CPU.
+#[test]
+fn metal_options_come_from_the_environment_only_when_loading() {
+    const CHILD: &str = "YSKN_TEST_METAL_FOLDER";
+    const FAILS: &str = "YSKN_TEST_METAL_LOAD_FAILS";
+    if let Some(folder) = std::env::var_os(CHILD) {
+        let engine = || Engine::new(Kernel::fastest(), 2).unwrap();
+        // SAFETY: the parent keeps this fixture immutable until this child exits.
+        let mut explicit =
+            unsafe { Model::with_backend(&folder, engine(), Backend::Metal, 5) }.unwrap();
+        // SAFETY: same immutable fixture contract.
+        let loaded = unsafe { Model::load(&folder) };
+        if std::env::var_os(FAILS).is_some() {
+            assert!(
+                matches!(&loaded, Err(yskn_engine::Error::InvalidInput(message))
+                    if message.contains("YSKN_METAL_")),
+                "{:?}",
+                loaded.err()
+            );
+            return;
+        }
+        let mut loaded = loaded.unwrap();
+        // The environment's mode and share cannot change a bit either.
+        let tokens = [3, 17, 42, 5, 99, 0, 7];
+        explicit.prefill(&tokens).unwrap();
+        loaded.prefill(&tokens).unwrap();
+        same(
+            loaded.row_logits(),
+            explicit.row_logits(),
+            "load vs explicit",
+        );
+        return;
+    }
+    if !metal_device() {
+        return;
+    }
+    let fixture = Fixture::new(&support::synthetic_model(
+        107,
+        &["linear_attention", "full_attention"],
+    ));
+    for (backend, mac, share, fails) in [
+        ("metal", None, None, false),
+        ("metal", Some("integer"), Some("off"), false),
+        ("metal", Some("float"), Some("0.5"), false),
+        ("metal", Some("invalid"), None, true),
+        ("metal", None, Some("invalid"), true),
+        ("metal", None, Some("0.95"), true),
+        ("cpu", Some("invalid"), Some("invalid"), false),
+    ] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "metal_options_come_from_the_environment_only_when_loading",
+            ])
+            .env(CHILD, &fixture.0)
+            .env("YSKN_BACKEND", backend)
+            .env_remove("YSKN_KERNEL")
+            .env_remove("YSKN_KV")
+            .env_remove("YSKN_METAL_MAC")
+            .env_remove("YSKN_METAL_CPU_SHARE")
+            .env_remove(FAILS);
+        for (name, value) in [("YSKN_METAL_MAC", mac), ("YSKN_METAL_CPU_SHARE", share)] {
+            if let Some(value) = value {
+                child.env(name, value);
+            }
+        }
+        if fails {
+            child.env(FAILS, "1");
+        }
+        let output = child.output().unwrap();
+        let context = format!("backend={backend} mac={mac:?} share={share:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{context}: child did not run the test: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.status.success(),
+            "{context}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    println!("ran: Metal options from the environment");
+}

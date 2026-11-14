@@ -10,6 +10,7 @@ constant uint BITS [[function_constant(0)]];    // bits per step, 4..8
 constant uint MC [[function_constant(1)]];      // activation rows in this dispatch, 1..16
 constant bool WARP [[function_constant(2)]];    // FORMAT.md 4.3 layout
 constant bool ALIGNED [[function_constant(3)]]; // stream start is 4-byte aligned
+constant bool FLOAT_MAC [[function_constant(4)]]; // binary32 products and sums (exact, see METAL.md)
 constant uint WORDS = 4 * BITS;                 // 32-bit words per sequence
 
 struct Params {
@@ -30,6 +31,21 @@ static inline uint load_word(device const uchar *codes, uint shift, uint index) 
     return uint(q[0]) | (uint(q[1]) << 8) | (uint(q[2]) << 16) | (uint(q[3]) << 24);
 }
 
+template <typename T>
+static inline void decode(thread T *e, threadgroup const T *lut, thread const uint *wb) {
+    if (BITS == 4) {
+        DECODE_BLOCK4
+    } else if (BITS == 5) {
+        DECODE_BLOCK5
+    } else if (BITS == 6) {
+        DECODE_BLOCK6
+    } else if (BITS == 7) {
+        DECODE_BLOCK7
+    } else {
+        DECODE_BLOCK8
+    }
+}
+
 kernel void weighted_sums(device const uchar *codes [[buffer(0)]],
                           device const ushort *table [[buffer(1)]],      // 4096 byte pairs
                           device const short2 *activation [[buffer(2)]], // MC x cols, widened
@@ -45,12 +61,18 @@ kernel void weighted_sums(device const uchar *codes [[buffer(0)]],
     // 16 KB: the table widened to short2 (low byte = first weight), later the reduction.
     threadgroup long shared_memory[2048];
     threadgroup short2 *lut = (threadgroup short2 *)shared_memory;
+    threadgroup half2 *lut_f = (threadgroup half2 *)shared_memory;
     // The threadgroup is 32 x splits; a scalar threads_per_threadgroup would be only
     // its width, so each entry would be written `splits` times. flat = y * 32 + x.
     const uint threads = size.x * size.y;
     for (uint i = flat; i < 4096; i += threads) {
         const ushort t = table[i];
-        lut[i] = short2(short(as_type<char>(uchar(t & 0xff))), short(as_type<char>(uchar(t >> 8))));
+        const short2 w = short2(short(as_type<char>(uchar(t & 0xff))), short(as_type<char>(uchar(t >> 8))));
+        if (FLOAT_MAC) {
+            lut_f[i] = half2(w); // |w| <= 128 is exact in binary16
+        } else {
+            lut[i] = w;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -64,8 +86,10 @@ kernel void weighted_sums(device const uchar *codes [[buffer(0)]],
     }
     for (uint s = split; live && s < p.sequences; s += splits) {
         int dot[16];
+        float dot_f[16];
         for (uint m = 0; m < MC; ++m) {
             dot[m] = 0;
+            dot_f[m] = 0.0f;
         }
         // A 32-step block spans exactly BITS words, so every block has the same
         // shifts. wb[0] is the previous block's last word (zero before the sequence).
@@ -84,33 +108,41 @@ kernel void weighted_sums(device const uchar *codes [[buffer(0)]],
                 }
                 wb[1 + i] = load_word(codes, p.shift, index);
             }
-            short2 e[32];
-            if (BITS == 4) {
-                DECODE_BLOCK4
-            } else if (BITS == 5) {
-                DECODE_BLOCK5
-            } else if (BITS == 6) {
-                DECODE_BLOCK6
-            } else if (BITS == 7) {
-                DECODE_BLOCK7
-            } else {
-                DECODE_BLOCK8
-            }
             const uint pair0 = s * 128 + block * 32;
-            for (uint m = 0; m < MC; ++m) {
-                device const short2 *a = activation + m * half_cols + pair0;
-                int part = 0;
-                for (uint j = 0; j < 32; ++j) {
-                    const short2 x = a[j];
-                    // |w| <= 127 and |a| <= 128: |w0*a0 + w1*a1| <= 32512 is exact in 16 bits.
-                    part += int(short(e[j].x * x.x + e[j].y * x.y));
+            if (FLOAT_MAC) {
+                half2 e[32];
+                decode(e, lut_f, wb);
+                device const half2 *activation_f = (device const half2 *)activation;
+                for (uint m = 0; m < MC; ++m) {
+                    device const half2 *a = activation_f + m * half_cols + pair0;
+                    float part = 0.0f;
+                    for (uint j = 0; j < 32; ++j) {
+                        const half2 x = a[j];
+                        // Integer operands and partial sums below 2^24: exact (METAL.md).
+                        part = fma(float(e[j].x), float(x.x), part);
+                        part = fma(float(e[j].y), float(x.y), part);
+                    }
+                    dot_f[m] += part;
                 }
-                dot[m] += part;
+            } else {
+                short2 e[32];
+                decode(e, lut, wb);
+                for (uint m = 0; m < MC; ++m) {
+                    device const short2 *a = activation + m * half_cols + pair0;
+                    int part = 0;
+                    for (uint j = 0; j < 32; ++j) {
+                        const short2 x = a[j];
+                        // |w| <= 127 and |a| <= 128: |w0*a0 + w1*a1| <= 32512 is exact in 16 bits.
+                        part += int(short(e[j].x * x.x + e[j].y * x.y));
+                    }
+                    dot[m] += part;
+                }
             }
         }
         // Integer distributivity: scaling each sequence's dot separately is exact.
         for (uint m = 0; m < MC; ++m) {
-            total[m] += long(scales[m * groups + s / 2]) * long(dot[m]);
+            const int d = FLOAT_MAC ? int(dot_f[m]) : dot[m];
+            total[m] += long(scales[m * groups + s / 2]) * long(d);
         }
     }
 

@@ -43,8 +43,23 @@ pub struct PassTiming {
     /// Attention row preparation, including KV encoding (also norm/RoPE/gating).
     pub kv_encode: Duration,
     pub recurrence: Duration,
+    /// Optional subset of recurrence: rounded history, convolution, normalization and dense gates.
+    pub recurrence_prepare: Duration,
+    /// Optional sum of dense callback elapsed times (overlaps across rows when M > 1).
+    pub dense_gate_work: Duration,
+    /// Optional nonoverlapping diagnostic subsets of rest().
+    pub normalization: Duration,
+    pub activation_encode: Duration,
+    pub projection_restore: Duration,
+    pub mlp_gate: Duration,
+    pub residual: Duration,
+    detailed: bool,
 }
 impl PassTiming {
+    fn detailed_start(&self) -> Option<Instant> {
+        self.detailed.then(Instant::now)
+    }
+
     pub fn rest(&self) -> Duration {
         self.total
             .saturating_sub(self.kernel + self.attention + self.kv_encode + self.recurrence)
@@ -110,11 +125,13 @@ pub struct Model {
     kv_mode: KvMode,
     logits: Vec<Vec<f32>>,
     timings: Vec<PassTiming>,
+    detailed_timing: bool,
 }
 impl Model {
     /// Default kernel and pool (`YSKN_KERNEL`), backend from `YSKN_BACKEND`
     /// (default Metal when a device exists, CPU otherwise), `YSKN_KV`
-    /// (`int8`, `int8-profile`, `kv5`; default `int8`), 16 rows per pass.
+    /// (`int8`, `int8-profile`, `kv5`; default `int8`), 16 rows per pass, and on
+    /// Metal `YSKN_METAL_MAC` and `YSKN_METAL_CPU_SHARE` ([`Self::configure_metal_from_env`]).
     /// # Safety
     /// All weights files must remain unmodified and untruncated until this model is dropped.
     pub unsafe fn load(path: impl AsRef<Path>) -> Result<Self> {
@@ -127,7 +144,19 @@ impl Model {
             .transpose()?
             .unwrap_or_default();
         // SAFETY: forwarded file-stability contract is required of this method's caller.
-        unsafe { Self::with_options(path, Engine::from_env()?, Backend::from_env()?, 16, mode) }
+        let mut model = unsafe {
+            Self::with_options(path, Engine::from_env()?, Backend::from_env()?, 16, mode)?
+        };
+        model.configure_metal_from_env()?;
+        Ok(model)
+    }
+
+    /// Apply `YSKN_METAL_MAC` (`float` | `integer`) and `YSKN_METAL_CPU_SHARE`
+    /// (`auto` | `off` | 0..=0.9) to the Metal projector, as [`Self::load`] does;
+    /// unknown values are errors. Nothing is read on the CPU backend. Explicit
+    /// constructors use binary32 and the calibrated share (D22).
+    pub fn configure_metal_from_env(&mut self) -> Result<()> {
+        self.engine.configure_metal_from_env()
     }
 
     /// The CPU backend with an explicit kernel/pool and pass width (positive, with
@@ -247,6 +276,7 @@ impl Model {
             kv_mode,
             logits: Vec::new(),
             timings: Vec::new(),
+            detailed_timing: false,
         })
     }
     pub fn dimensions(&self) -> &ModelDimensions {
@@ -277,6 +307,12 @@ impl Model {
     pub fn logits(&self) -> Option<&[f32]> {
         self.logits.last().map(Vec::as_slice)
     }
+    /// Collect diagnostic timing subsets on future passes (off by default).
+    /// Coarse stage times are always collected; disabled subsets remain zero.
+    pub fn set_detailed_timing(&mut self, enabled: bool) {
+        self.detailed_timing = enabled;
+    }
+
     pub fn pass_timings(&self) -> &[PassTiming] {
         &self.timings
     }
@@ -716,6 +752,7 @@ impl Model {
         let mut timing = PassTiming {
             position,
             rows: tokens.len(),
+            detailed: self.detailed_timing,
             ..Default::default()
         };
         let mut hidden = self
@@ -789,6 +826,7 @@ impl Model {
                 &self.weights.final_norm,
                 &self.weights.head,
                 self.weights.dimensions.epsilon,
+                &mut timing,
             )?;
             let [head] =
                 project_normalized(&mut self.engine, [&self.weights.head], &input, &mut timing)?;
@@ -871,6 +909,14 @@ impl Compute {
             engine,
         })
     }
+    /// `MetalEngine::configure_from_env` on the Metal backend; nothing on the CPU.
+    pub(crate) fn configure_metal_from_env(&mut self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = &mut self.metal {
+            return metal.configure_from_env();
+        }
+        Ok(())
+    }
     pub(crate) fn backend(&self) -> Backend {
         #[cfg(target_os = "macos")]
         if self.metal.is_some() {
@@ -896,8 +942,9 @@ impl Compute {
     ) -> Result<Vec<T>> {
         self.engine.map_range(range, function)
     }
-    /// Each matrix's M×N sums for one shared input: one Metal command buffer,
-    /// or one CPU kernel call per matrix.
+    /// Each matrix's M×N sums for one shared input: one Metal command buffer
+    /// (with the CPU kernel computing its calibrated share of the rows meanwhile,
+    /// D22), or one CPU kernel call per matrix.
     pub(crate) fn weighted_sums(
         &mut self,
         matrices: &[&Matrix],
@@ -906,7 +953,7 @@ impl Compute {
     ) -> Result<Vec<Vec<i64>>> {
         #[cfg(target_os = "macos")]
         if let Some(metal) = &mut self.metal {
-            return metal.weighted_sums_shared(matrices, activation, scales);
+            return metal.weighted_sums_split(&mut self.engine, matrices, activation, scales);
         }
         matrices
             .iter()
@@ -921,10 +968,16 @@ fn normalize(
     norm: &[f32],
     linear: &Linear,
     epsilon: f32,
+    timing: &mut PassTiming,
 ) -> Result<Vec<NormalizedInput>> {
-    engine.map_range(0..rows.len(), |i| {
+    let start = timing.detailed_start();
+    let output = engine.map_range(0..rows.len(), |i| {
         prepare_normalization(&rows[i], norm, linear.input_signs(), epsilon)
-    })
+    })?;
+    if let Some(start) = start {
+        timing.normalization += start.elapsed();
+    }
+    Ok(output)
 }
 /// Projections that share one normalized input (and its first matrix's signs).
 fn project_normalized<const N: usize>(
@@ -957,6 +1010,7 @@ fn project<const N: usize>(
     let start = Instant::now();
     let sums = engine.weighted_sums(&matrices, &activation, &scales)?;
     timing.kernel += start.elapsed();
+    let start = timing.detailed_start();
     let m = inputs.len();
     let mut rows = engine
         .map_range(0..N * m, |index| {
@@ -976,6 +1030,9 @@ fn project<const N: usize>(
             )
         })?
         .into_iter();
+    if let Some(start) = start {
+        timing.projection_restore += start.elapsed();
+    }
     Ok(std::array::from_fn(|_| rows.by_ref().take(m).collect()))
 }
 fn project_rows(
@@ -984,9 +1041,13 @@ fn project_rows(
     rows: &[Vec<f32>],
     timing: &mut PassTiming,
 ) -> Result<Vec<Vec<f32>>> {
+    let start = timing.detailed_start();
     let prepared = engine.map_range(0..rows.len(), |i| {
         quantize_activation(&rows[i], linear.input_signs())
     })?;
+    if let Some(start) = start {
+        timing.activation_encode += start.elapsed();
+    }
     let inputs: Vec<_> = prepared.iter().map(|p| (p, None)).collect();
     let [projected] = project(engine, [linear], &inputs, timing)?;
     Ok(projected)
@@ -1005,7 +1066,11 @@ fn recurrence(
     z: &[Vec<f32>],
     input: &[NormalizedInput],
     cache: Option<&mut [GatedDeltaNetRow]>,
+    timing: &mut PassTiming,
 ) -> Result<Vec<Vec<f32>>> {
+    let prepare_start = timing.detailed_start();
+    let detailed = timing.detailed;
+    let gate_nanos = std::sync::atomic::AtomicU64::new(0);
     let rounded: Vec<_> = qkv.iter().map(|row| round_projection(row)).collect();
     let rows = {
         let taps: Vec<&[f32]> = state
@@ -1013,16 +1078,66 @@ fn recurrence(
             .chain(rounded.iter().map(Vec::as_slice))
             .collect();
         let width = taps.len() - rounded.len();
-        engine.map_range(0..qkv.len(), |i| {
-            layer.prepare(
-                &taps[i..i + width],
-                &qkv[i],
-                &z[i],
-                &input[i].weighted_hidden_bf16,
-                input[i].inverse_rms,
-            )
-        })?
+        if crate::cpu_stages::enabled() && qkv.len() == 1 {
+            vec![
+                layer.prepare_with_math::<crate::cpu_stages::math::FastMath>(
+                    &taps[..width],
+                    &qkv[0],
+                    &z[0],
+                    &input[0].weighted_hidden_bf16,
+                    input[0].inverse_rms,
+                    |weights, hidden, rms| {
+                        let start = detailed.then(Instant::now);
+                        let gates = engine.map_range(0..weights.len() / hidden.len(), |head| {
+                            crate::cpu_stages::recurrence::dense_gate(
+                                &weights[head * hidden.len()..(head + 1) * hidden.len()],
+                                hidden,
+                                rms,
+                            )
+                        });
+                        if let Some(start) = start {
+                            gate_nanos.fetch_add(
+                                start.elapsed().as_nanos() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        gates
+                    },
+                )?,
+            ]
+        } else {
+            engine.map_range(0..qkv.len(), |i| {
+                layer.prepare_with_math::<crate::cpu_stages::math::FastMath>(
+                    &taps[i..i + width],
+                    &qkv[i],
+                    &z[i],
+                    &input[i].weighted_hidden_bf16,
+                    input[i].inverse_rms,
+                    |weights, hidden, rms| {
+                        let start = detailed.then(Instant::now);
+                        let gates = weights
+                            .chunks_exact(hidden.len())
+                            .map(|weight| {
+                                crate::cpu_stages::recurrence::dense_gate(weight, hidden, rms)
+                            })
+                            .collect();
+                        if let Some(start) = start {
+                            gate_nanos.fetch_add(
+                                start.elapsed().as_nanos() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        gates
+                    },
+                )
+            })?
+        }
     };
+    if let Some(start) = prepare_start {
+        timing.recurrence_prepare += start.elapsed();
+        timing.dense_gate_work +=
+            Duration::from_nanos(gate_nanos.load(std::sync::atomic::Ordering::Relaxed));
+    }
     if let Some(cache) = cache {
         for (slot, row) in cache.iter_mut().zip(&rows) {
             slot.copy_from(row);
@@ -1090,11 +1205,12 @@ fn attention_pass(
             let sides = engine.map_range(0..q.len() * sides_per_row, |index| {
                 let row = index / sides_per_row;
                 let side = index % 2;
-                attention.prepare_cache_side(
+                attention.prepare_cache_side_with_search(
                     position + row,
                     index % sides_per_row / 2,
                     side,
                     if side == 0 { &k[row] } else { &v[row] },
+                    crate::cpu_stages::kv_codec::search_chain,
                 )
             })?;
             let queries = engine.map_range(0..q.len(), |i| {
@@ -1130,15 +1246,8 @@ fn attention_pass(
         attention.append_prepared(state, position + i, p)?;
     }
     let heads = attention.query_heads();
-    let outputs = engine.map_range(0..q.len() * heads, |i| {
-        crate::cpu_stages::attention::output_head(
-            attention,
-            state,
-            position + i / heads,
-            &prepared[i / heads],
-            i % heads,
-        )
-    })?;
+    let outputs =
+        crate::cpu_stages::attention::output_rows(engine, attention, state, position, &prepared)?;
     let gated: Vec<_> = outputs
         .chunks(heads)
         .map(|heads| heads.iter().flatten().copied().collect())
@@ -1162,7 +1271,14 @@ fn forward(
         Branch::Attention(l) => &l.query_gate,
         Branch::Recurrent(l) => &l.query_key_value,
     };
-    let input = normalize(engine, hidden, &layer.input_norm, input_projection, epsilon)?;
+    let input = normalize(
+        engine,
+        hidden,
+        &layer.input_norm,
+        input_projection,
+        epsilon,
+        timing,
+    )?;
     let projected = match (&layer.branch, state) {
         (Branch::Recurrent(l), LayerState::Recurrent(state)) => {
             let [qkv, z] =
@@ -1177,6 +1293,7 @@ fn forward(
                 &z,
                 &input,
                 cache,
+                timing,
             )?;
             timing.recurrence += start.elapsed();
             project_rows(engine, &l.output, &gated, timing)?
@@ -1189,18 +1306,32 @@ fn forward(
         }
         _ => return Err(Error::InvalidModel("layer/state types differ".into())),
     };
+    let start = timing.detailed_start();
     let hidden = engine.map_range(0..hidden.len(), |i| residual_add(&hidden[i], &projected[i]))?;
+    if let Some(start) = start {
+        timing.residual += start.elapsed();
+    }
     let input = normalize(
         engine,
         &hidden,
         &layer.post_attention_norm,
         &layer.gate,
         epsilon,
+        timing,
     )?;
     let [gate, up] = project_normalized(engine, [&layer.gate, &layer.up], &input, timing)?;
+    let start = timing.detailed_start();
     let product = engine.map_range(0..hidden.len(), |i| gated_product(&gate[i], &up[i]))?;
+    if let Some(start) = start {
+        timing.mlp_gate += start.elapsed();
+    }
     let down = project_rows(engine, &layer.down, &product, timing)?;
-    engine.map_range(0..hidden.len(), |i| residual_add(&hidden[i], &down[i]))
+    let start = timing.detailed_start();
+    let result = engine.map_range(0..hidden.len(), |i| residual_add(&hidden[i], &down[i]))?;
+    if let Some(start) = start {
+        timing.residual += start.elapsed();
+    }
+    Ok(result)
 }
 
 impl yskn_ref::quality::ScoringModel for Model {
@@ -1289,6 +1420,179 @@ mod session_tests {
     use super::*;
     use crate::Kernel;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn dense_gate_errors_check_all_partials_then_results_then_next_projection() {
+        use yskn_ref::gated_deltanet::{GatedDeltaNetDimensions, GatedDeltaNetWeights};
+        for threads in [1, 4] {
+            let mut engine = Compute::new(
+                Engine::new(Kernel::Portable, threads).unwrap(),
+                Backend::Cpu,
+            )
+            .unwrap();
+            for rows in [1, 2] {
+                for (partial_in_a, expected) in [
+                    (true, "DeltaNet dense gate partial"),
+                    (false, "DeltaNet dense gates"),
+                ] {
+                    let mut a = vec![0.0; 1024];
+                    let mut b = vec![0.0; 1024];
+                    a[0] = f32::from_bits(0x7f00_0000);
+                    if partial_in_a {
+                        a[513] = f32::from_bits(0x7f00_0000);
+                    } else {
+                        b[513] = f32::from_bits(0x7f00_0000);
+                    }
+                    let layer = GatedDeltaNet::new(
+                        GatedDeltaNetDimensions {
+                            hidden_width: 512,
+                            query_key_heads: 1,
+                            value_heads: 2,
+                            head_dim: 128,
+                            convolution_width: 4,
+                        },
+                        GatedDeltaNetWeights {
+                            projection_a: a,
+                            projection_b: b,
+                            convolution_weight: vec![0.0; 2048],
+                            log_decay_weight: vec![0.0; 2],
+                            time_bias: vec![0.0; 2],
+                            normalization_weight: vec![1.0; 128],
+                        },
+                        1e-6,
+                    )
+                    .unwrap();
+                    let input: Vec<_> = (0..rows)
+                        .map(|_| {
+                            let mut hidden = vec![0.0; 512];
+                            hidden[..2].copy_from_slice(&[1.0, 4.0]);
+                            NormalizedInput {
+                                prepared: quantize_activation(&hidden, &[1; 512]).unwrap(),
+                                inverse_rms: 4.0,
+                                weighted_hidden_bf16: hidden,
+                            }
+                        })
+                        .collect();
+                    let result = recurrence(
+                        &mut engine,
+                        &layer,
+                        &mut layer.new_state().unwrap(),
+                        None,
+                        &vec![vec![0.0; 512]; rows],
+                        &vec![vec![0.0; 256]; rows],
+                        &input,
+                        None,
+                        &mut PassTiming::default(),
+                    );
+                    assert!(
+                        matches!(result, Err(Error::NonFinite(context)) if context == expected),
+                        "threads={threads} rows={rows} partial_in_a={partial_in_a}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dense_gate_errors_follow_scalar_row_order_with_different_failures() {
+        use yskn_ref::gated_deltanet::{GatedDeltaNetDimensions, GatedDeltaNetWeights};
+        let mut a = vec![0.0; 1024];
+        a[0] = f32::from_bits(0x7f00_0000);
+        a[513] = f32::from_bits(0x7f00_0000);
+        let layer = GatedDeltaNet::new(
+            GatedDeltaNetDimensions {
+                hidden_width: 512,
+                query_key_heads: 1,
+                value_heads: 2,
+                head_dim: 128,
+                convolution_width: 4,
+            },
+            GatedDeltaNetWeights {
+                projection_a: a,
+                projection_b: vec![0.0; 1024],
+                convolution_weight: vec![0.0; 2048],
+                log_decay_weight: vec![0.0; 2],
+                time_bias: vec![0.0; 2],
+                normalization_weight: vec![1.0; 128],
+            },
+            1e-6,
+        )
+        .unwrap();
+        let mut input: Vec<_> = [[1.0, 0.0], [0.0, 4.0]]
+            .into_iter()
+            .map(|first_two| {
+                let mut hidden = vec![0.0; 512];
+                hidden[..2].copy_from_slice(&first_two);
+                NormalizedInput {
+                    prepared: quantize_activation(&hidden, &[1; 512]).unwrap(),
+                    inverse_rms: 4.0,
+                    weighted_hidden_bf16: hidden,
+                }
+            })
+            .collect();
+        let qkv = vec![vec![0.0; 512]; 2];
+        let z = vec![vec![0.0; 256]; 2];
+        // Prove each distinct error with the scalar reference before comparing passes.
+        for (row, expected) in input
+            .iter()
+            .zip(["DeltaNet dense gates", "DeltaNet dense gate partial"])
+        {
+            let error = layer
+                .step(
+                    &mut layer.new_state().unwrap(),
+                    &qkv[0],
+                    &z[0],
+                    &row.weighted_hidden_bf16,
+                    row.inverse_rms,
+                )
+                .unwrap_err();
+            assert!(matches!(error, Error::NonFinite(context) if context == expected));
+        }
+        for reversed in [false, true] {
+            if reversed {
+                input.reverse();
+            }
+            for threads in [1, 4] {
+                let mut engine = Compute::new(
+                    Engine::new(Kernel::Portable, threads).unwrap(),
+                    Backend::Cpu,
+                )
+                .unwrap();
+                let mut reference_state = layer.new_state().unwrap();
+                let expected = input
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| {
+                        layer.step(
+                            &mut reference_state,
+                            &qkv[i],
+                            &z[i],
+                            &row.weighted_hidden_bf16,
+                            row.inverse_rms,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap_err();
+                let actual = recurrence(
+                    &mut engine,
+                    &layer,
+                    &mut layer.new_state().unwrap(),
+                    None,
+                    &qkv,
+                    &z,
+                    &input,
+                    None,
+                    &mut PassTiming::default(),
+                )
+                .unwrap_err();
+                assert_eq!(
+                    actual.to_string(),
+                    expected.to_string(),
+                    "threads={threads} reversed={reversed}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn attention_pass_errors_follow_scalar_row_and_stage_order() {
@@ -1389,6 +1693,63 @@ mod session_tests {
         );
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    #[test]
+    fn detailed_timing_is_opt_in_and_preserves_coarse_times_and_bits() {
+        let path = fixture_path();
+        for rows in [1, 2] {
+            // SAFETY: the synthetic fixture stays immutable until the model is dropped.
+            let mut model = unsafe {
+                Model::with_engine(&path, Engine::new(Kernel::Portable, 2).unwrap(), rows)
+            }
+            .unwrap();
+            assert!(!model.detailed_timing);
+            let mut expected = None;
+            for detailed in [false, true, false] {
+                model.reset().unwrap();
+                model.set_detailed_timing(detailed);
+                model.prefill(&[1, 2]).unwrap();
+                let actual = (
+                    model.state_digest(),
+                    model
+                        .row_logits()
+                        .iter()
+                        .map(|row| row.iter().map(|v| v.to_bits()).collect::<Vec<_>>())
+                        .collect::<Vec<_>>(),
+                );
+                if let Some(expected) = &expected {
+                    assert_eq!(&actual, expected);
+                } else {
+                    expected = Some(actual);
+                }
+                assert!(!model.pass_timings().is_empty());
+                for timing in model.pass_timings() {
+                    for coarse in [
+                        timing.total,
+                        timing.kernel,
+                        timing.recurrence,
+                        timing.attention,
+                        timing.kv_encode,
+                        timing.rest(),
+                    ] {
+                        assert!(!coarse.is_zero());
+                    }
+                    for subset in [
+                        timing.recurrence_prepare,
+                        timing.dense_gate_work,
+                        timing.normalization,
+                        timing.activation_encode,
+                        timing.projection_restore,
+                        timing.mlp_gate,
+                        timing.residual,
+                    ] {
+                        assert_eq!(!subset.is_zero(), detailed);
+                    }
+                }
+            }
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

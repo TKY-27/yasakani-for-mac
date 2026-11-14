@@ -1,7 +1,10 @@
-//! `bench_metal MODEL.yskn [--m 1,2,4,8,16] [--passes 7] [--splits N]`
+//! `bench_metal MODEL.yskn [--m 1,2,4,8,16] [--passes 7] [--splits N] [--shares 0,0.1]`
 //!
 //! Verifies Metal against the CPU kernel on four real tensors, then times full
-//! passes (every body matrix and the head) in three submission modes.
+//! passes (every body matrix and the head) in three submission modes. With
+//! `--shares`, it instead times engine-like passes (one call per group of
+//! consecutive same-layer, same-width matrices, as `Model` groups them) for
+//! each fixed CPU share of the rows (`weighted_sums_split`, 0 = GPU only).
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -26,7 +29,8 @@ mod macos {
 
     fn usage() -> Error {
         Error::InvalidInput(
-            "usage: bench_metal MODEL.yskn [--m 1,2,4,8,16] [--passes 7] [--splits N]".into(),
+            "usage: bench_metal MODEL.yskn [--m 1,2,4,8,16] [--passes 7] [--splits N] [--shares 0,0.1]"
+                .into(),
         )
     }
 
@@ -128,12 +132,72 @@ mod macos {
         Ok(())
     }
 
+    /// Engine-like passes: one `weighted_sums_split` call per group of consecutive
+    /// matrices of one layer with the same input width.
+    fn split_passes(
+        metal: &mut MetalEngine,
+        matrices: &[Matrix],
+        batches: &[usize],
+        shares: &[f64],
+        passes: usize,
+    ) -> Result<()> {
+        let layers = layer_groups(matrices);
+        let mut groups: Vec<Range<usize>> = Vec::new();
+        for layer in layers {
+            for index in layer.clone() {
+                match groups.last_mut() {
+                    Some(last)
+                        if last.end == index
+                            && last.start >= layer.start
+                            && matrices[last.start].descriptor().cols
+                                == matrices[index].descriptor().cols =>
+                    {
+                        last.end = index + 1
+                    }
+                    _ => groups.push(index..index + 1),
+                }
+            }
+        }
+        let mut cpu = Engine::from_env()?;
+        println!(
+            "split: groups={} cpu={} x{}",
+            groups.len(),
+            cpu.kernel().name(),
+            cpu.threads()
+        );
+        println!("M share min_ms median_ms");
+        for &m in batches {
+            let inputs: Vec<_> = groups
+                .iter()
+                .enumerate()
+                .map(|(i, g)| activations(matrices[g.start].descriptor().cols, m, 300 + i as u64))
+                .collect();
+            for &share in shares {
+                metal.set_cpu_share(Some(share))?;
+                let mut pass = || -> Result<f64> {
+                    let start = Instant::now();
+                    for (group, (a, s)) in groups.iter().zip(&inputs) {
+                        let refs: Vec<&Matrix> = matrices[group.clone()].iter().collect();
+                        black_box(metal.weighted_sums_split(&mut cpu, &refs, a, s)?);
+                    }
+                    Ok(milliseconds(start))
+                };
+                pass()?;
+                let times = (0..passes).map(|_| pass()).collect::<Result<Vec<_>>>()?;
+                let (median, min) = stats(times);
+                println!("{m} {share} {min:.3} {median:.3}");
+            }
+        }
+        metal.set_cpu_share(None)
+    }
+
     pub fn main() -> Result<()> {
         let mut args = std::env::args().skip(1);
         let path = PathBuf::from(args.next().ok_or_else(usage)?);
         let mut batches = vec![1, 2, 4, 8, 16];
         let mut passes = 7;
         let mut splits = None;
+        let mut shares: Option<Vec<f64>> = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--m" => {
@@ -149,21 +213,37 @@ mod macos {
                 }
                 "--passes" => passes = number(args.next())?.max(1),
                 "--splits" => splits = Some(number(args.next())?),
+                "--shares" => {
+                    shares = Some(
+                        args.next()
+                            .ok_or_else(usage)?
+                            .split(',')
+                            .map(|v| v.parse::<f64>().map_err(|_| usage()))
+                            .collect::<Result<_>>()?,
+                    )
+                }
                 _ => return Err(usage()),
             }
         }
         let mut metal = MetalEngine::new()?
             .ok_or_else(|| Error::InvalidInput("no Metal device in this process".into()))?;
+        // YSKN_METAL_MAC and YSKN_METAL_CPU_SHARE apply here as in Model::load.
+        metal.configure_from_env()?;
         if let Some(splits) = splits {
             metal.set_splits(splits)?;
         }
         println!(
-            "device={} maxBufferLength={} threadgroup={}x{}={} threads",
+            "device={} maxBufferLength={} threadgroup={}x{}={} threads mac={}",
             metal.device_name(),
             metal.max_buffer_length(),
             32,
             metal.splits(),
-            metal.threads_per_threadgroup()
+            metal.threads_per_threadgroup(),
+            if metal.float_mac() {
+                "float"
+            } else {
+                "integer"
+            }
         );
         // SAFETY: this read-only benchmark requires the file to stay unchanged until exit.
         let model = unsafe { MappedModel::open(&path)? };
@@ -204,6 +284,9 @@ mod macos {
             round_trips[100], round_trips[0]
         );
 
+        if let Some(shares) = shares {
+            return split_passes(&mut metal, &matrices, &batches, &shares, passes);
+        }
         println!(
             "M a_median_ms a_min_ms a_gpu_median_ms b_median_ms b_min_ms c_median_ms c_min_ms GB/s_a_median"
         );

@@ -195,7 +195,7 @@ fn randomized_partial_commits_and_discards_match_reference_kv5_every_backend() {
 fn failed_numeric_pass_preserves_committed_state_and_future_rows() {
     let mut bytes = support::synthetic_model_with_dense_embeddings(
         167,
-        &["linear_attention", "full_attention"],
+        &["linear_attention", "full_attention", "full_attention"],
     );
     let descriptor = Container::from_bytes(bytes.clone())
         .unwrap()
@@ -211,31 +211,33 @@ fn failed_numeric_pass_preserves_committed_state_and_future_rows() {
     }
     let fixture = Fixture::new(&bytes);
     for backend in backends() {
-        let mut engine = fixture.engine(backend, KvMode::Int8);
-        let mut reference = fixture.reference(KvMode::Int8);
-        engine.prefill(&[1, 2]).unwrap();
-        reference.prefill(&[1, 2]).unwrap();
-        let digest = engine.state_digest();
-        let logits = bits(engine.row_logits());
-        assert!(matches!(
-            engine.run_provisional(&[4, 100]),
-            Err(yskn_engine::Error::NonFinite(_))
-        ));
-        assert!(reference.run_provisional(&[4, 100]).is_err());
-        assert_eq!(engine.state_digest(), digest);
-        assert_eq!(bits(engine.row_logits()), logits);
-        assert!(!engine.has_provisional_pass());
-        assert!(
-            engine
-                .prefill(&[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 100])
-                .is_err()
-        );
-        assert_eq!(engine.state_digest(), digest);
-        assert_eq!(bits(engine.row_logits()), logits);
-        engine.prefill(&[4, 5]).unwrap();
-        reference.prefill(&[4, 5]).unwrap();
-        assert_eq!(bits(engine.row_logits()), bits(reference.row_logits()));
-        assert_eq!(engine.state_digest(), reference.state_digest());
+        for mode in [KvMode::Int8, KvMode::Int8Profile, KvMode::Kv5] {
+            let mut engine = fixture.engine(backend, mode);
+            let mut reference = fixture.reference(mode);
+            engine.prefill(&[1, 2]).unwrap();
+            reference.prefill(&[1, 2]).unwrap();
+            let digest = engine.state_digest();
+            let logits = bits(engine.row_logits());
+            let actual_error = engine.run_provisional(&[4, 100, 5]).unwrap_err();
+            let expected_error = reference.run_provisional(&[4, 100, 5]).unwrap_err();
+            assert!(matches!(actual_error, yskn_engine::Error::NonFinite(_)));
+            assert_eq!(actual_error.to_string(), expected_error.to_string());
+            assert_eq!(engine.state_digest(), reference.state_digest());
+            assert_eq!(engine.state_digest(), digest);
+            assert_eq!(bits(engine.row_logits()), logits);
+            assert!(!engine.has_provisional_pass());
+            assert!(
+                engine
+                    .prefill(&[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 100])
+                    .is_err()
+            );
+            assert_eq!(engine.state_digest(), digest);
+            assert_eq!(bits(engine.row_logits()), logits);
+            engine.prefill(&[4, 5]).unwrap();
+            reference.prefill(&[4, 5]).unwrap();
+            assert_eq!(bits(engine.row_logits()), bits(reference.row_logits()));
+            assert_eq!(engine.state_digest(), reference.state_digest());
+        }
     }
 }
 
