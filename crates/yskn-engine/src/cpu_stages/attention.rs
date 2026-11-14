@@ -2,7 +2,7 @@
 use crate::Result;
 use yskn_ref::{
     Error,
-    attention::{Attention, AttentionOperands, AttentionState, CacheToken, PreparedRow},
+    attention::{Attention, AttentionOperands, AttentionState, PreparedRow},
     kv_codec::CacheRow,
     portable_math::{bfloat, exp, exp2},
 };
@@ -86,7 +86,14 @@ fn attend_head(operands: AttentionOperands<'_>) -> Result<Vec<f32>> {
             numerator: vec![0.0; 256],
         };
         for (tile_start, visible) in plan.tiles {
-            prefix_tile(&mut split, query, kv_head, prefix, tile_start, visible)?;
+            prefix_tile(&mut split, query, tile_start, visible, |position, side| {
+                let row = if side == 0 {
+                    prefix[position].key(kv_head)
+                } else {
+                    prefix[position].value(kv_head)
+                };
+                (row.bases(), row.scale())
+            })?;
         }
         if plan.include_self {
             add_self(
@@ -143,21 +150,21 @@ fn attend_head(operands: AttentionOperands<'_>) -> Result<Vec<f32>> {
 fn prefix_tile(
     split: &mut AttentionSplit,
     query: &[f32],
-    kv_head: usize,
-    prefix: &[CacheToken],
     tile_start: usize,
     visible: std::ops::Range<usize>,
+    row: impl Fn(usize, usize) -> ([f32; 256], f32),
 ) -> Result<()> {
     let mut scores = [f32::NEG_INFINITY; 32];
     for first in (visible.start..visible.end).step_by(4) {
         let count = (visible.end - first).min(4);
         let mut bases = [[0.0; 256]; 4];
+        let mut scales = [0.0; 4];
         for lane in 0..count {
-            bases[lane] = prefix[first + lane].key(kv_head).bases();
+            (bases[lane], scales[lane]) = row(first + lane, 0);
         }
         let dots = dots4(query, &bases);
         for lane in 0..count {
-            let score = dots[lane] * (prefix[first + lane].key(kv_head).scale() * 0.0625);
+            let score = dots[lane] * (scales[lane] * 0.0625);
             finite(&[score], "attention prefix score")?;
             scores[first + lane - tile_start] = score;
         }
@@ -197,9 +204,9 @@ fn prefix_tile(
     }
     // Only visible rows are read. Each channel still consumes ascending tile keys.
     for position in visible {
-        let value = prefix[position].value(kv_head);
-        let weight = bfloat(probabilities[position - tile_start] * value.scale());
-        add_scaled(&mut split.numerator, &value.bases(), weight);
+        let (bases, scale) = row(position, 1);
+        let weight = bfloat(probabilities[position - tile_start] * scale);
+        add_scaled(&mut split.numerator, &bases, weight);
     }
     finite(&[split.denominator], "attention prefix denominator")?;
     finite(&split.numerator, "attention prefix numerator")
@@ -441,6 +448,55 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn masked_prefix_slots_preserve_negative_zero_on_vector_path() {
+        if !super::super::neon_available() {
+            return;
+        }
+        // A split can begin or end inside an absolute 32-slot tile.
+        for visible in [35..64, 32..38] {
+            for poisoned in [false, true] {
+                // Key/value operands are read lazily, just as they are from CacheToken.
+                let mut rows = vec![([127.0; 256], 0.125); 128];
+                for position in 0..64 {
+                    if visible.contains(&position) {
+                        rows[2 * position] = ([0.0; 256], 0.25);
+                        rows[2 * position + 1] = ([-127.0; 256], f32::from_bits(32));
+                    } else if poisoned {
+                        rows[2 * position] = ([-128.0; 256], f32::NAN);
+                        rows[2 * position + 1] = ([127.0; 256], f32::NAN);
+                    }
+                }
+                // Future padding need not even exist; masked scales must never be read.
+                for rows in [&rows[..], &rows[..2 * visible.end]] {
+                    let mut split = AttentionSplit {
+                        maximum: 0.0,
+                        denominator: 0.0,
+                        numerator: vec![-0.0; 256],
+                    };
+                    prefix_tile(
+                        &mut split,
+                        &[0.0; 256],
+                        32,
+                        visible.clone(),
+                        |position, side| rows[2 * position + side],
+                    )
+                    .unwrap();
+                    assert_eq!(split.maximum.to_bits(), 0.0_f32.to_bits());
+                    assert_eq!(
+                        split.denominator.to_bits(),
+                        (visible.len() as f32).to_bits()
+                    );
+                    assert_eq!(
+                        bits(&split.numerator),
+                        vec![(-0.0_f32).to_bits(); 256],
+                        "visible={visible:?} poisoned={poisoned}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn score_lanes_preserve_the_full_ascending_chain_for_extreme_int8_and_signed_zero() {
         if !super::super::neon_available() {
