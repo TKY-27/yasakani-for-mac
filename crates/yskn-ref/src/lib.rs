@@ -4,6 +4,7 @@
 pub mod attention;
 pub mod compressed_linear;
 pub mod draft;
+mod draft_depth;
 pub mod draft_head;
 mod draft_proposer;
 pub mod gated_deltanet;
