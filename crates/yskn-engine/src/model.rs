@@ -159,6 +159,31 @@ impl Model {
         self.engine.configure_metal_from_env()
     }
 
+    /// Explicit Metal arithmetic and CPU share (D22); nothing on the CPU backend.
+    /// Reads no environment variable; neither choice changes a bit.
+    pub fn set_metal_options(&mut self, options: MetalOptions) {
+        self.engine.set_metal_options(options);
+    }
+
+    /// Run the exact CPU fast paths (`Auto`, when NEON is detected) or only the
+    /// reference stages (D20), overriding the process-wide `YSKN_CPU_STAGES`
+    /// default. Bits are identical either way. Not while a provisional pass is
+    /// pending, whose working state was prepared for the previous choice.
+    pub fn set_cpu_stages(&mut self, stages: crate::CpuStages) -> Result<()> {
+        if self.pending {
+            return Err(Error::InvalidInput(
+                "CPU stages cannot change during a provisional pass".into(),
+            ));
+        }
+        self.engine.cpu_stages = stages.fast();
+        Ok(())
+    }
+
+    /// Whether the exact CPU fast paths run.
+    pub fn cpu_stages(&self) -> bool {
+        self.engine.cpu_stages
+    }
+
     /// The CPU backend with an explicit kernel/pool and pass width (positive, with
     /// no implicit upper clamp). The process-wide CPU-stage diagnostic override still applies.
     /// # Safety
@@ -541,7 +566,7 @@ impl Model {
             if let (LayerState::Recurrent(work), LayerState::Recurrent(committed)) =
                 (work, committed)
             {
-                if crate::cpu_stages::enabled() {
+                if self.engine.cpu_stages {
                     work.copy_history_from(committed);
                 } else {
                     work.copy_from(committed);
@@ -692,7 +717,7 @@ impl Model {
                     if let (Branch::Recurrent(layer), LayerState::Recurrent(state)) =
                         (&layer.branch, state)
                     {
-                        let source = if crate::cpu_stages::enabled() {
+                        let source = if self.engine.cpu_stages {
                             if let LayerState::Recurrent(source) = source {
                                 Some(source)
                             } else {
@@ -781,7 +806,7 @@ impl Model {
                 Branch::Attention(_) => (&mut self.states[i], None),
                 Branch::Recurrent(_) => (
                     &mut self.working[i],
-                    if crate::cpu_stages::enabled() && position == self.position {
+                    if self.engine.cpu_stages && position == self.position {
                         if let LayerState::Recurrent(source) = &self.states[i] {
                             Some(source)
                         } else {
@@ -883,9 +908,78 @@ impl std::str::FromStr for Backend {
     }
 }
 
+/// The CPU kernel's share of each Metal projection's rows, computed while the
+/// GPU computes the rest (D22). The sums are exact whatever the share.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CpuShare {
+    /// The calibrated table, but only on the machine it was measured on (an
+    /// Apple M5 with 10 CPU workers); off on every other machine (D23).
+    Auto,
+    Off,
+    /// One fraction in (0, 0.9] for every row count, e.g. from `bench_metal --shares`.
+    Fixed(f64),
+}
+impl CpuShare {
+    /// Largest accepted fixed share.
+    pub const MAX: f64 = 0.9;
+    pub fn name(self) -> String {
+        match self {
+            Self::Auto => "auto".into(),
+            Self::Off => "off".into(),
+            Self::Fixed(share) => share.to_string(),
+        }
+    }
+    /// A fraction in 0..=0.9; 0 is [`Self::Off`].
+    pub fn fixed(share: f64) -> Result<Self> {
+        if share == 0.0 {
+            Ok(Self::Off)
+        } else if (0.0..=Self::MAX).contains(&share) {
+            Ok(Self::Fixed(share))
+        } else {
+            Err(Error::InvalidInput(
+                "the CPU share must be within 0..=0.9".into(),
+            ))
+        }
+    }
+}
+impl std::str::FromStr for CpuShare {
+    type Err = Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "off" => Ok(Self::Off),
+            _ => value
+                .parse::<f64>()
+                .ok()
+                .and_then(|share| Self::fixed(share).ok())
+                .ok_or_else(|| {
+                    Error::InvalidInput("the CPU share must be auto, off or 0..=0.9".into())
+                }),
+        }
+    }
+}
+
+/// Exact Metal kernel choices (D22): binary32 or integer multiply-accumulate
+/// and the CPU share. Neither changes a bit; both only change speed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MetalOptions {
+    pub float_mac: bool,
+    pub cpu_share: CpuShare,
+}
+impl Default for MetalOptions {
+    fn default() -> Self {
+        Self {
+            float_mac: true,
+            cpu_share: CpuShare::Auto,
+        }
+    }
+}
+
 /// The CPU pool (all row/head work and the CPU kernel) plus the selected projector.
 pub(crate) struct Compute {
     engine: Engine,
+    /// Whether the exact CPU fast paths run (D20); process default `YSKN_CPU_STAGES`.
+    pub(crate) cpu_stages: bool,
     #[cfg(target_os = "macos")]
     metal: Option<MetalEngine>,
 }
@@ -906,8 +1000,18 @@ impl Compute {
                         .ok_or_else(|| Error::InvalidInput("no Metal device".into()))?,
                 ),
             },
+            cpu_stages: crate::cpu_stages::enabled(),
             engine,
         })
+    }
+    /// Apply explicit Metal options; nothing on the CPU backend.
+    pub(crate) fn set_metal_options(&mut self, options: MetalOptions) {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = &mut self.metal {
+            metal.set_options(options);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = options;
     }
     /// `MetalEngine::configure_from_env` on the Metal backend; nothing on the CPU.
     pub(crate) fn configure_metal_from_env(&mut self) -> Result<()> {
@@ -1078,7 +1182,7 @@ fn recurrence(
             .chain(rounded.iter().map(Vec::as_slice))
             .collect();
         let width = taps.len() - rounded.len();
-        if crate::cpu_stages::enabled() && qkv.len() == 1 {
+        if engine.cpu_stages && qkv.len() == 1 {
             vec![
                 layer.prepare_with_math::<crate::cpu_stages::math::FastMath>(
                     &taps[..width],
@@ -1199,7 +1303,7 @@ fn attention_pass(
 ) -> Result<Vec<Vec<f32>>> {
     let position = timing.position;
     let start = Instant::now();
-    let prepared = if crate::cpu_stages::enabled() {
+    let prepared = if engine.cpu_stages {
         let parallel = (|| {
             let sides_per_row = attention.kv_heads() * 2;
             let sides = engine.map_range(0..q.len() * sides_per_row, |index| {

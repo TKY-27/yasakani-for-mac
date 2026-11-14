@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Engine, Error, Matrix, Result};
+use crate::{CpuShare, Engine, Error, Matrix, MetalOptions, Result};
 use objc2::{rc::Retained, rc::autoreleasepool, runtime::ProtocolObject};
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
@@ -72,6 +72,8 @@ fn shader_source() -> String {
 const MAX_ROWS_PER_DISPATCH: usize = 16;
 /// Output rows per SIMD group (one row per lane).
 const ROW_TILE: usize = 32;
+/// The shader's threadgroup array: the 4,096-entry widened table, then the reduction.
+const THREADGROUP_BYTES: usize = 16_384;
 /// With |dot| <= 512 * 127 * 128 per group and |scale| <= 2^31, 516 groups cannot
 /// overflow i64. Bounding the group count makes the reference's checked overflow
 /// error unreachable, so the unchecked GPU sum is identical.
@@ -82,32 +84,21 @@ type Buffer = ProtocolObject<dyn MTLBuffer>;
 type Pipeline = ProtocolObject<dyn MTLComputePipelineState>;
 type CommandBuffer = ProtocolObject<dyn MTLCommandBuffer>;
 
-/// Largest accepted CPU share of a matrix's rows.
-const MAX_CPU_SHARE: f64 = 0.9;
-
-#[derive(Clone, Copy)]
-enum CpuShare {
-    Off,
-    Fixed(f64),
-    Calibrated,
-}
-
-fn parse_share(share: f64) -> Result<CpuShare> {
-    if share == 0.0 {
-        Ok(CpuShare::Off)
-    } else if (0.0..=MAX_CPU_SHARE).contains(&share) {
-        Ok(CpuShare::Fixed(share))
-    } else {
-        Err(invalid("the CPU share must be within 0..=0.9"))
-    }
-}
-
 /// CPU fraction of each matrix's rows at M = 1, 2, 4, 8 and 16 (linear in between,
 /// constant above 16), from `bench_metal --shares` on the real model on the
 /// 4P+6E M5 with 10 CPU workers (D22). Each value is somewhat below the measured
 /// optimum: a CPU that is slower than calibrated (other load) costs far more
 /// than one that is faster.
 const CPU_SHARE: [(usize, f64); 5] = [(1, 0.08), (2, 0.08), (4, 0.09), (8, 0.12), (16, 0.15)];
+/// The Metal device and CPU worker count `CPU_SHARE` was measured with. On any
+/// other machine `CpuShare::Auto` is off: a CPU slower than calibrated makes the
+/// GPU wait (D22), and no other chip was measured (D23).
+const CALIBRATED_DEVICE: &str = "Apple M5";
+const CALIBRATED_THREADS: usize = 10;
+
+fn share_table_applies(device: &str, cpu_threads: usize) -> bool {
+    device == CALIBRATED_DEVICE && cpu_threads == CALIBRATED_THREADS
+}
 
 fn calibrated_cpu_share(m: usize) -> f64 {
     let m = m.clamp(1, 16);
@@ -137,16 +128,12 @@ type CpuRows<'a> = dyn FnMut(&[(&Matrix, std::ops::Range<usize>)]) -> Result<Vec
 /// `YSKN_METAL_CPU_SHARE`: unset or `auto` = calibrated table, `off` = GPU only,
 /// or a fixed fraction in 0..=0.9 for every M.
 fn cpu_share_from_env() -> Result<CpuShare> {
-    match std::env::var("YSKN_METAL_CPU_SHARE").as_deref() {
-        Err(std::env::VarError::NotPresent) | Ok("auto") => Ok(CpuShare::Calibrated),
-        Ok("off") => Ok(CpuShare::Off),
-        Ok(value) => value
-            .parse::<f64>()
-            .ok()
-            .and_then(|share| parse_share(share).ok())
-            .ok_or_else(|| invalid("YSKN_METAL_CPU_SHARE must be auto, off or 0..=0.9")),
-        Err(_) => Err(invalid("YSKN_METAL_CPU_SHARE must be auto, off or 0..=0.9")),
+    match std::env::var("YSKN_METAL_CPU_SHARE") {
+        Err(std::env::VarError::NotPresent) => Some(CpuShare::Auto),
+        Ok(value) => value.parse().ok(),
+        Err(_) => None,
     }
+    .ok_or_else(|| invalid("YSKN_METAL_CPU_SHARE must be auto, off or 0..=0.9"))
 }
 
 fn metal_error(context: &str, detail: impl std::fmt::Display) -> Error {
@@ -161,10 +148,13 @@ fn invalid(message: &str) -> Error {
     Error::InvalidInput(message.into())
 }
 
-/// A no-copy GPU view of one complete read-only file mapping.
+/// A no-copy GPU view of the page-aligned bytes `start..start + length` of a
+/// read-only file mapping (the whole mapping when it fits `maxBufferLength`).
 struct CodeBuffer {
     // Declared first so the Metal buffer is released before the mapping it wraps.
     buffer: Retained<Buffer>,
+    start: usize,
+    length: usize,
     _mapping_owner: Matrix,
 }
 
@@ -437,13 +427,19 @@ fn float_mac_from_env() -> Result<bool> {
 /// Every file mapping wrapped for the GPU stays mapped until the engine is dropped.
 pub struct MetalEngine {
     device: Retained<Device>,
+    name: String,
+    /// The device's `maxBufferLength`, or a smaller test limit.
+    max_buffer_length: usize,
+    /// A test limit on threads per threadgroup below each pipeline's own.
+    max_threads: Option<usize>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: HashMap<PipelineKey, Retained<Pipeline>>,
     empty: Retained<Pipeline>,
     // Keyed by mapping address. The engine keeps every mapping it has wrapped alive
     // until it is dropped, so an address (and a table key) cannot be reused meanwhile.
-    mappings: HashMap<usize, Rc<CodeBuffer>>,
+    // One buffer per mapping, or several when it exceeds `max_buffer_length`.
+    mappings: HashMap<usize, Vec<Rc<CodeBuffer>>>,
     /// Signed-byte tables keyed by (mapping address, lookup-table offset): the
     /// quantized table depends only on the f16 table at that offset, while tensors
     /// may share a code stream but not a table.
@@ -460,11 +456,34 @@ pub struct MetalEngine {
 
 impl MetalEngine {
     /// `Ok(None)` when this process has no Metal device. Binary32 arithmetic and
-    /// the calibrated CPU share; reads no environment variable (D14).
+    /// the calibrated CPU share; reads no environment variable (D14). An error
+    /// when the shader does not compile or the device lacks what the kernel
+    /// needs (SIMD width 32, 16 KB of threadgroup memory; D23).
     pub fn new() -> Result<Option<Self>> {
+        Self::with_limits(None, None)
+    }
+
+    /// As [`Self::new`], but with limits below the device's, so tests can force a
+    /// small device: `max_buffer_length` for the no-copy code buffers (a larger
+    /// mapping is wrapped in several), `max_threads_per_threadgroup` for the
+    /// kernel's threadgroups (fewer SIMD groups split each tile).
+    pub fn with_limits(
+        max_buffer_length: Option<usize>,
+        max_threads_per_threadgroup: Option<usize>,
+    ) -> Result<Option<Self>> {
         let Some(device) = MTLCreateSystemDefaultDevice() else {
             return Ok(None);
         };
+        let name = device.name().to_string();
+        let memory = device.maxThreadgroupMemoryLength();
+        if memory < THREADGROUP_BYTES {
+            return Err(metal_error(
+                "device",
+                format!(
+                    "{name} offers {memory} bytes of threadgroup memory; the kernel needs {THREADGROUP_BYTES}"
+                ),
+            ));
+        }
         let queue = device
             .newCommandQueue()
             .ok_or_else(|| metal_error("queue", "newCommandQueue returned nil"))?;
@@ -484,7 +503,19 @@ impl MetalEngine {
         let empty = device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| ns_error("pipeline", &e))?;
+        // The shader maps one SIMD lane to one output row of a 32-row tile.
+        let width = empty.threadExecutionWidth();
+        if width != ROW_TILE {
+            return Err(metal_error(
+                "device",
+                format!("{name} has SIMD width {width}; the kernel needs {ROW_TILE}"),
+            ));
+        }
+        let device_limit = device.maxBufferLength();
         Ok(Some(Self {
+            max_buffer_length: max_buffer_length.map_or(device_limit, |n| n.min(device_limit)),
+            max_threads: max_threads_per_threadgroup,
+            name,
             device,
             queue,
             library,
@@ -496,7 +527,7 @@ impl MetalEngine {
             // at 16; 1-2 and 16-32 are slower.
             splits: 4,
             float_mac: true,
-            cpu_share: CpuShare::Calibrated,
+            cpu_share: CpuShare::Auto,
             scratch_activation: None,
             scratch_scales: None,
             scratch_outputs: Vec::new(),
@@ -509,11 +540,43 @@ impl MetalEngine {
     }
 
     pub fn device_name(&self) -> String {
-        self.device.name().to_string()
+        self.name.clone()
     }
 
+    /// The largest no-copy code buffer (the device's `maxBufferLength` unless a
+    /// test limit is smaller).
     pub fn max_buffer_length(&self) -> usize {
-        self.device.maxBufferLength()
+        self.max_buffer_length
+    }
+
+    /// The device's recommended GPU working-set size in bytes (reported, not enforced).
+    pub fn recommended_working_set(&self) -> u64 {
+        self.device.recommendedMaxWorkingSetSize()
+    }
+
+    /// No-copy code buffers created so far (one per mapping that fits
+    /// `maxBufferLength`, more for larger ones).
+    pub fn code_buffers(&self) -> usize {
+        self.mappings.values().map(Vec::len).sum()
+    }
+
+    /// Whether `CpuShare::Auto` uses the calibrated table for a CPU pool of
+    /// `cpu_threads` workers: only on the machine it was measured on (D22, D23).
+    pub fn share_table_applies(&self, cpu_threads: usize) -> bool {
+        share_table_applies(&self.name, cpu_threads)
+    }
+
+    pub fn options(&self) -> MetalOptions {
+        MetalOptions {
+            float_mac: self.float_mac,
+            cpu_share: self.cpu_share,
+        }
+    }
+
+    /// Arithmetic and CPU share for calls made afterwards; neither changes a bit.
+    pub fn set_options(&mut self, options: MetalOptions) {
+        self.float_mac = options.float_mac;
+        self.cpu_share = options.cpu_share;
     }
 
     /// SIMD groups per threadgroup that split one 32-row tile's sequences
@@ -552,6 +615,8 @@ impl MetalEngine {
         self.float_mac = float_mac;
     }
 
+    /// Requested threads per threadgroup; a call uses fewer when the device or
+    /// pipeline allows fewer, or the matrix has fewer sequences than splits.
     pub fn threads_per_threadgroup(&self) -> usize {
         ROW_TILE * self.splits
     }
@@ -589,10 +654,19 @@ impl MetalEngine {
         Ok(pipeline)
     }
 
+    /// A no-copy buffer holding `matrix`'s code stream from its 4-byte-aligned
+    /// start: the whole mapping when it fits `max_buffer_length`, otherwise a
+    /// window of the mapping starting at the stream's page. Nothing is copied.
     fn code_buffer(&mut self, matrix: &Matrix) -> Result<Rc<CodeBuffer>> {
         let mapping = matrix.mapping();
         let address = mapping.as_ptr() as usize;
-        if let Some(buffer) = self.mappings.get(&address) {
+        let range = matrix.code_range();
+        let (first, end) = (range.start & !3, range.end);
+        if let Some(buffer) = self.mappings.get(&address).and_then(|buffers| {
+            buffers
+                .iter()
+                .find(|b| b.start <= first && end <= b.start + b.length)
+        }) {
             return Ok(Rc::clone(buffer));
         }
         // SAFETY: getpagesize has no preconditions.
@@ -601,28 +675,36 @@ impl MetalEngine {
         if page == 0 || !address.is_multiple_of(page) {
             return Err(metal_error("no-copy buffer", "mapping is not page-aligned"));
         }
-        let length = mapping
+        let mapped = mapping
             .len()
             .checked_next_multiple_of(page)
-            .filter(|&length| length > 0)
+            .filter(|&length| length > 0 && end <= mapping.len())
             .ok_or_else(|| metal_error("no-copy buffer", "invalid mapping length"))?;
-        if length > self.max_buffer_length() {
+        let limit = self.max_buffer_length / page * page;
+        let start = if mapped <= limit {
+            0
+        } else {
+            first / page * page
+        };
+        let length = (mapped - start).min(limit);
+        if end > start + length {
             return Err(metal_error(
                 "no-copy buffer",
                 format!(
-                    "mapping of {length} bytes exceeds maxBufferLength {}",
-                    self.max_buffer_length()
+                    "a code stream of {} bytes does not fit maxBufferLength {}",
+                    range.len(),
+                    self.max_buffer_length
                 ),
             ));
         }
-        let pointer = NonNull::new(mapping.as_ptr().cast_mut().cast::<c_void>())
+        let pointer = NonNull::new(mapping[start..].as_ptr().cast_mut().cast::<c_void>())
             .ok_or_else(|| metal_error("no-copy buffer", "null mapping"))?;
-        // SAFETY: `pointer` is the page-aligned start of a live read-only mapping;
-        // `length` only rounds its size up to the end of the last mapped page, which
-        // the VM maps as a whole (bytes past EOF read as zero). The returned
-        // CodeBuffer owns a Matrix clone, which keeps the mapping alive until after
-        // the Metal buffer is released, so no deallocator is needed. Shaders only
-        // read through this buffer.
+        // SAFETY: `pointer` is page-aligned (a page-aligned mapping plus a multiple
+        // of the page size) inside a live read-only mapping, and `length` ends at
+        // or before the end of the mapping's last page, which the VM maps as a
+        // whole (bytes past EOF read as zero). The returned CodeBuffer owns a
+        // Matrix clone, which keeps the mapping alive until after the Metal buffer
+        // is released, so no deallocator is needed. Shaders only read through it.
         let buffer = unsafe {
             self.device
                 .newBufferWithBytesNoCopy_length_options_deallocator(
@@ -640,9 +722,14 @@ impl MetalEngine {
         })?;
         let buffer = Rc::new(CodeBuffer {
             buffer,
+            start,
+            length,
             _mapping_owner: matrix.clone(),
         });
-        self.mappings.insert(address, Rc::clone(&buffer));
+        self.mappings
+            .entry(address)
+            .or_default()
+            .push(Rc::clone(&buffer));
         Ok(buffer)
     }
 
@@ -734,16 +821,19 @@ impl MetalEngine {
         }
         // Bind at a 4-byte boundary; an unaligned stream uses byte loads from `shift`.
         let aligned = range.start.is_multiple_of(4);
-        let code_offset = range.start & !3;
+        let codes = self.code_buffer(matrix)?;
+        // The buffer starts at or before this boundary and contains the stream.
+        let code_offset = (range.start & !3) - codes.start;
         let params = Params {
             rows: n as u32,
             physical_rows: physical_rows as u32,
             sequences: sequences as u32,
             cols: cols as u32,
-            shift: (range.start - code_offset) as u32,
+            shift: (range.start & 3) as u32,
         };
-        let codes = self.code_buffer(matrix)?;
         let mut dispatches = Vec::new();
+        // Idle SIMD groups would only add barrier work for short rows.
+        let mut splits = self.splits.min(sequences);
         for first_input in (0..inputs).step_by(MAX_ROWS_PER_DISPATCH) {
             let rows = (inputs - first_input).min(MAX_ROWS_PER_DISPATCH);
             let pipeline = self.pipeline(PipelineKey {
@@ -753,16 +843,20 @@ impl MetalEngine {
                 aligned,
                 float_mac: self.float_mac,
             })?;
-            if pipeline.maxTotalThreadsPerThreadgroup() < self.threads_per_threadgroup() {
+            // A device or pipeline allowing fewer threads than 32 x splits gets
+            // fewer SIMD groups per tile: the sums are exact for any split count.
+            let limit = self
+                .max_threads
+                .map_or(pipeline.maxTotalThreadsPerThreadgroup(), |n| {
+                    n.min(pipeline.maxTotalThreadsPerThreadgroup())
+                });
+            if limit < ROW_TILE {
                 return Err(metal_error(
                     "pipeline",
-                    format!(
-                        "supports {} threads per threadgroup, {} requested",
-                        pipeline.maxTotalThreadsPerThreadgroup(),
-                        self.threads_per_threadgroup()
-                    ),
+                    format!("supports {limit} threads per threadgroup, at least {ROW_TILE} needed"),
                 ));
             }
+            splits = splits.min(limit / ROW_TILE);
             dispatches.push(Dispatch {
                 pipeline,
                 first_input,
@@ -786,8 +880,7 @@ impl MetalEngine {
             inputs,
             groups,
             code_bytes: (n * sequences * bits * 16) as u64,
-            // Idle SIMD groups would only add barrier work for short rows.
-            splits: self.splits.min(sequences),
+            splits,
             float_mac: self.float_mac,
             dispatches,
         })
@@ -829,35 +922,43 @@ impl MetalEngine {
         activation: &[i8],
         scales: &[i32],
     ) -> Result<Vec<Vec<i64>>> {
+        let threads = cpu.threads();
         self.shared(
-            Some(&mut |parts| cpu.weighted_sums_rows(parts, activation, scales)),
+            Some((
+                &mut |parts| cpu.weighted_sums_rows(parts, activation, scales),
+                threads,
+            )),
             matrices,
             activation,
             scales,
         )
     }
 
-    /// The CPU's fraction of each matrix's rows for M activation rows (0 = GPU only).
-    pub fn cpu_share(&self, m: usize) -> f64 {
+    /// The CPU's fraction of each matrix's rows for M activation rows and a CPU
+    /// pool of `cpu_threads` workers (0 = GPU only). `CpuShare::Auto` is the
+    /// calibrated table where [`Self::share_table_applies`], else 0.
+    pub fn cpu_share(&self, m: usize, cpu_threads: usize) -> f64 {
         match self.cpu_share {
             CpuShare::Off => 0.0,
             CpuShare::Fixed(share) => share,
-            CpuShare::Calibrated => calibrated_cpu_share(m),
+            CpuShare::Auto if self.share_table_applies(cpu_threads) => calibrated_cpu_share(m),
+            CpuShare::Auto => 0.0,
         }
     }
 
-    /// Override the CPU share for all M (`None` restores the calibrated table).
+    /// Override the CPU share for all M (`None` restores `CpuShare::Auto`).
     pub fn set_cpu_share(&mut self, share: Option<f64>) -> Result<()> {
         self.cpu_share = match share {
-            None => CpuShare::Calibrated,
-            Some(share) => parse_share(share)?,
+            None => CpuShare::Auto,
+            Some(share) => CpuShare::fixed(share)?,
         };
         Ok(())
     }
 
+    /// `cpu` is the CPU part and the CPU pool's worker count.
     fn shared(
         &mut self,
-        cpu: Option<&mut CpuRows>,
+        mut cpu: Option<(&mut CpuRows, usize)>,
         matrices: &[&Matrix],
         activation: &[i8],
         scales: &[i32],
@@ -868,10 +969,9 @@ impl MetalEngine {
                 let d = matrix.descriptor();
                 let n = d.physical_rows;
                 let m = activation.len() / d.cols.max(1);
-                let cpu_rows = if cpu.is_some() {
-                    cpu_rows(self.cpu_share(m), n)
-                } else {
-                    0
+                let cpu_rows = match &cpu {
+                    Some((_, threads)) => cpu_rows(self.cpu_share(m, *threads), n),
+                    None => 0,
                 };
                 (n - cpu_rows, n)
             })
@@ -917,8 +1017,8 @@ impl MetalEngine {
             }
         })?;
         // The CPU rows run while the GPU works; wait for the GPU even if they fail.
-        let cpu_sums = match cpu {
-            Some(cpu) if split.iter().any(|&(gpu_rows, n)| gpu_rows < n) => {
+        let cpu_sums = match cpu.as_mut() {
+            Some((cpu, _)) if split.iter().any(|&(gpu_rows, n)| gpu_rows < n) => {
                 let parts: Vec<_> = matrices
                     .iter()
                     .zip(&split)
@@ -1023,15 +1123,33 @@ mod tests {
     use crate::{Kernel, MappedModel};
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    /// The calibrated share table is for the machine it was measured on only;
+    /// another chip, or the M5 with another CPU worker count, runs GPU-only.
+    #[test]
+    fn share_table_applies_only_to_the_calibrated_machine() {
+        assert!(share_table_applies("Apple M5", 10));
+        for (device, threads) in [
+            ("Apple M5", 1),
+            ("Apple M5", 4),
+            ("Apple M5", 16),
+            ("Apple M4", 10),
+            ("Apple M5 Max", 10),
+            ("Apple M1", 8),
+            ("Apple Paravirtual device", 10),
+        ] {
+            assert!(!share_table_applies(device, threads), "{device} {threads}");
+        }
+    }
+
     #[test]
     fn cpu_rows_are_whole_tiles_and_leave_the_gpu_a_tile() {
         // Below 64 rows the GPU's minimum tile leaves no whole tile for the CPU.
         for n in [1, 11, 31, 32, 33, 40, 63] {
-            assert_eq!(cpu_rows(MAX_CPU_SHARE, n), 0, "n={n}");
+            assert_eq!(cpu_rows(CpuShare::MAX, n), 0, "n={n}");
         }
-        assert_eq!(cpu_rows(MAX_CPU_SHARE, 64), 32);
-        assert_eq!(cpu_rows(MAX_CPU_SHARE, 75), 32);
-        assert_eq!(cpu_rows(MAX_CPU_SHARE, 104), 64);
+        assert_eq!(cpu_rows(CpuShare::MAX, 64), 32);
+        assert_eq!(cpu_rows(CpuShare::MAX, 75), 32);
+        assert_eq!(cpu_rows(CpuShare::MAX, 104), 64);
         assert_eq!(cpu_rows(0.3, 75), 0);
         assert_eq!(cpu_rows(0.3, 320), 96);
         assert_eq!(cpu_rows(0.0, 5120), 0);
@@ -1079,7 +1197,7 @@ mod tests {
                 Err(invalid("expected CPU part error"))
             };
             let result = catch_unwind(AssertUnwindSafe(|| {
-                engine.shared(Some(&mut failing), &refs, &activation, &scales)
+                engine.shared(Some((&mut failing, 4)), &refs, &activation, &scales)
             }));
             match result {
                 Err(_) => assert!(panics),
@@ -1110,7 +1228,7 @@ mod tests {
             // Fewer than 64 rows leave the CPU nothing, so a CPU part is never called.
             let expected = cpu.weighted_sums(&small, &activation, &scales).unwrap();
             let sums = engine
-                .shared(Some(&mut failing), &[&small], &activation, &scales)
+                .shared(Some((&mut failing, 4)), &[&small], &activation, &scales)
                 .unwrap();
             assert_sums(&sums[0], &expected, "small matrix without CPU rows");
         }

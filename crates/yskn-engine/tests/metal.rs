@@ -6,10 +6,16 @@ fn metal_matches_scalar_reference() {
 
 #[cfg(target_os = "macos")]
 mod fixture;
+// Shared writer retains yskn-ref's Rust 1.85 syntax.
+#[cfg(target_os = "macos")]
+#[allow(dead_code, clippy::manual_is_multiple_of)]
+#[path = "../../yskn-ref/tests/support/mod.rs"]
+mod support;
 
 #[cfg(target_os = "macos")]
 mod macos {
     use super::fixture::{DATA_OFFSET, TempFile, assert_sums, change_header, random, synthetic};
+    use super::support;
     use serde_json::json;
     use yskn_engine::MetalEngine;
     use yskn_engine::{Engine, Kernel, MappedModel};
@@ -337,20 +343,130 @@ mod macos {
         assert!(engine.set_cpu_share(Some(0.95)).is_err());
         assert!(engine.set_cpu_share(Some(-0.1)).is_err());
         engine.set_cpu_share(Some(0.5)).unwrap();
-        assert_eq!(engine.cpu_share(1), 0.5);
+        assert_eq!(engine.cpu_share(1, 3), 0.5);
         engine.set_cpu_share(Some(0.0)).unwrap();
-        assert_eq!(engine.cpu_share(16), 0.0);
+        assert_eq!(engine.cpu_share(16, 10), 0.0);
         engine.set_cpu_share(None).unwrap();
+        // Auto is the calibrated table only on the measured machine (Apple M5,
+        // 10 CPU workers) and off everywhere else (D23).
+        assert_eq!(engine.cpu_share(16, 4), 0.0);
         let calibrated: Vec<_> = [1, 2, 3, 4, 8, 12, 16, 40]
-            .map(|m| engine.cpu_share(m))
+            .map(|m| engine.cpu_share(m, 10))
             .to_vec();
-        let table = [0.08, 0.08, 0.085, 0.09, 0.12, 0.135, 0.15, 0.15];
+        let table = if engine.share_table_applies(10) {
+            [0.08, 0.08, 0.085, 0.09, 0.12, 0.135, 0.15, 0.15]
+        } else {
+            [0.0; 8]
+        };
         assert!(
             calibrated
                 .iter()
                 .zip(table)
                 .all(|(a, b)| (a - b).abs() < 1e-12)
         );
+    }
+
+    /// Every compressed matrix of a synthetic model file, through the no-copy
+    /// code buffers of an engine whose buffer limit is forced below the file
+    /// size, so the mapping is wrapped in several buffers: the sums equal the
+    /// CPU kernel's, and a limit below one code stream is a clear error.
+    #[test]
+    fn mapping_larger_than_the_buffer_limit_is_wrapped_in_several_buffers() {
+        if engine().is_none() {
+            return;
+        }
+        let file = TempFile::new(&support::synthetic_model(
+            107,
+            &["linear_attention", "full_attention", "linear_attention"],
+        ));
+        // SAFETY: the private file is never modified and outlives all mapping owners.
+        let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+        let matrices: Vec<_> = model
+            .header()
+            .tensors
+            .iter()
+            .filter(|t| t.role != yskn_format::Role::Embedding)
+            .map(|t| model.matrix(&t.name).unwrap())
+            .collect();
+        assert!(matrices.len() > 4);
+        let page = yskn_engine::Machine::detect().page_size.unwrap() as usize;
+        let longest = matrices.iter().map(|m| m.code_range().len()).max().unwrap();
+        let limit = longest.next_multiple_of(page) + page;
+        let file_length = std::fs::metadata(&file.0).unwrap().len() as usize;
+        assert!(limit < file_length, "limit {limit}, file {file_length}");
+        let mut cpu = Engine::new(Kernel::fastest(), 2).unwrap();
+        let mut small = MetalEngine::with_limits(Some(limit), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(small.max_buffer_length(), limit);
+        let mut seed = 0x6b0f_fe75_0000_0003;
+        for (index, matrix) in matrices.iter().enumerate() {
+            let k = matrix.descriptor().cols;
+            let m = 3;
+            let activation: Vec<i8> = (0..m * k).map(|_| random(&mut seed) as i8).collect();
+            let scales: Vec<i32> = (0..m * k / 512).map(|_| random(&mut seed) as i32).collect();
+            let expected = cpu.weighted_sums(matrix, &activation, &scales).unwrap();
+            let sums = small.weighted_sums(matrix, &activation, &scales).unwrap();
+            assert_sums(&sums, &expected, &format!("matrix {index}"));
+            let split = small
+                .weighted_sums_split(&mut cpu, &[matrix], &activation, &scales)
+                .unwrap();
+            assert_sums(&split[0], &expected, &format!("split matrix {index}"));
+        }
+        assert!(small.code_buffers() > 1, "{} buffers", small.code_buffers());
+        let mut tiny = MetalEngine::with_limits(Some(page), None).unwrap().unwrap();
+        let matrix = matrices
+            .iter()
+            .find(|m| m.code_range().len() > page)
+            .unwrap();
+        let k = matrix.descriptor().cols;
+        let error = tiny
+            .weighted_sums(matrix, &vec![1; k], &vec![1; k / 512])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not fit maxBufferLength"), "{error}");
+    }
+
+    /// A device limit below the default threadgroup (32 x 4 threads) gets fewer
+    /// SIMD groups per tile, with the same sums; below one SIMD group is an error.
+    #[test]
+    fn threadgroup_limit_below_the_default_chooses_fewer_simd_groups() {
+        if engine().is_none() {
+            return;
+        }
+        let bytes = synthetic(6, "warp", 65, 96, 5120, false);
+        let file = TempFile::new(&bytes);
+        // SAFETY: the private file is never modified and outlives all mapping owners.
+        let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+        let matrix = model.matrix("linear").unwrap();
+        let mut seed = 0x2210_00aa_0000_0005;
+        let activation: Vec<i8> = (0..17 * 5120).map(|_| random(&mut seed) as i8).collect();
+        let scales: Vec<i32> = (0..17 * 10).map(|_| random(&mut seed) as i32).collect();
+        let expected = Engine::new(Kernel::fastest(), 2)
+            .unwrap()
+            .weighted_sums(&matrix, &activation, &scales)
+            .unwrap();
+        for limit in [127, 96, 64, 32] {
+            let mut engine = MetalEngine::with_limits(None, Some(limit))
+                .unwrap()
+                .unwrap();
+            assert_eq!(engine.threads_per_threadgroup(), 128);
+            for float_mac in [false, true] {
+                engine.set_float_mac(float_mac);
+                let sums = engine.weighted_sums(&matrix, &activation, &scales).unwrap();
+                assert_sums(
+                    &sums,
+                    &expected,
+                    &format!("limit {limit} float={float_mac}"),
+                );
+            }
+        }
+        let mut engine = MetalEngine::with_limits(None, Some(31)).unwrap().unwrap();
+        let error = engine
+            .weighted_sums(&matrix, &activation, &scales)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("threads per threadgroup"), "{error}");
     }
 
     #[test]
@@ -386,19 +502,9 @@ mod macos {
                     let expected = reference_sums(&reference, &activation, &scales, 64);
                     for splits in [1, 3, 8, 20, 32] {
                         engine.set_splits(splits).unwrap();
-                        let result = match engine.weighted_sums(&matrix, &activation, &scales) {
-                            Ok(result) => result,
-                            // Some devices cap a threadgroup below 32 x splits (CI's
-                            // paravirtual GPU allows 448 threads); the default of 4 must work.
-                            Err(error)
-                                if splits > 8
-                                    && error.to_string().contains("threads per threadgroup") =>
-                            {
-                                eprintln!("skipped: splits={splits}: {error}");
-                                continue;
-                            }
-                            Err(error) => panic!("splits={splits}: {error}"),
-                        };
+                        // A device allowing fewer than 32 x splits threads (CI's
+                        // paravirtual GPU allows 448) runs fewer SIMD groups.
+                        let result = engine.weighted_sums(&matrix, &activation, &scales).unwrap();
                         assert_sums(
                             &result,
                             &expected,

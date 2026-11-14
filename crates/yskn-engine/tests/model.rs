@@ -586,3 +586,34 @@ fn metal_options_come_from_the_environment_only_when_loading() {
     }
     println!("ran: Metal options from the environment");
 }
+
+/// D23: the explicit per-model CPU-stage choice (the product's `--cpu-stages`)
+/// overrides the process default without an environment variable; both
+/// choices give the scalar reference's bits, also through a provisional pass
+/// and partial commit, and the choice cannot change while a pass is pending.
+#[test]
+fn explicit_cpu_stage_choice_overrides_the_process_default_with_identical_bits() {
+    let fixture = Fixture::new(&support::synthetic_model(
+        107,
+        &["linear_attention", "full_attention"],
+    ));
+    let tokens = [3, 17, 42, 5, 99, 0, 7, 64, 11];
+    let mut reference = yskn_ref::Model::load_folder(&fixture.0).unwrap();
+    reference.prefill(&tokens).unwrap();
+    for stages in [yskn_engine::CpuStages::Reference, yskn_engine::CpuStages::Auto] {
+        let mut model = fixture.model(Kernel::fastest(), 3, 4);
+        model.set_cpu_stages(stages).unwrap();
+        assert_eq!(model.cpu_stages(), stages.fast(), "{stages:?}");
+        model.prefill(&tokens[..5]).unwrap();
+        model.run_provisional(&tokens[5..]).unwrap();
+        assert!(model.set_cpu_stages(stages).is_err(), "{stages:?}");
+        model.commit(2).unwrap();
+        model.prefill(&tokens[7..]).unwrap();
+        same(
+            &model.row_logits()[model.row_logits().len() - 1..],
+            &reference.row_logits()[reference.row_logits().len() - 1..],
+            &format!("{stages:?}"),
+        );
+        assert_eq!(model.state_digest(), reference.state_digest(), "{stages:?}");
+    }
+}
