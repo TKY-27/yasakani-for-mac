@@ -158,12 +158,17 @@ mod macos {
             metal.set_splits(splits)?;
         }
         println!(
-            "device={} maxBufferLength={} threadgroup={}x{}={} threads",
+            "device={} maxBufferLength={} threadgroup={}x{}={} threads mac={}",
             metal.device_name(),
             metal.max_buffer_length(),
             32,
             metal.splits(),
-            metal.threads_per_threadgroup()
+            metal.threads_per_threadgroup(),
+            if metal.float_mac() {
+                "float"
+            } else {
+                "integer"
+            }
         );
         // SAFETY: this read-only benchmark requires the file to stay unchanged until exit.
         let model = unsafe { MappedModel::open(&path)? };

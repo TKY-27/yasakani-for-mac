@@ -44,15 +44,30 @@ which includes uploading inputs and reading back outputs.
   thread loads `bits` words plus the carried previous word. It decodes 32
   `short2` weight pairs into registers. Then it runs a compact loop over the
   M activation rows.
-- **Activations.** The CPU widens them to i16 (`short2` per column pair,
-  row-major M×K) on upload. All lanes of a SIMD group read the same address
+- **Activations.** The CPU widens them to i16 (binary16 in float mode;
+  `short2`/`half2` per column pair, row-major M×K) on upload. All lanes of a SIMD group read the same address
   (broadcast).
-- **Arithmetic.** Integer only (compile option `MTLMathMode::Safe` as well).
-  Per pair: `short(w0*a0 + w1*a1)` is exact (|w| ≤ 127, |a| ≤ 128 → ≤ 32,512).
-  It accumulates to i32 per sequence (≤ 4.2 M), then
-  `long(scale) * long(dot)` in i64 on the GPU. The CPU rejects K/512 > 512,
-  which makes i64 overflow impossible, so the reference's checked-overflow
-  error can never be the expected result.
+- **Arithmetic.** Two exact multiply-accumulate modes (function constant
+  `FLOAT_MAC`, `YSKN_METAL_MAC=float|integer`, default float since D21), both
+  compiled with `MTLMathMode::Safe`:
+  - *integer*: per pair `short(w0*a0 + w1*a1)` is exact (|w| ≤ 127,
+    |a| ≤ 128 → ≤ 32,512), accumulated to i32 per sequence (≤ 4.2 M);
+  - *float* (D21): the table is widened to `half2` and the activations are
+    uploaded as binary16 (every integer of magnitude ≤ 2048 is exact in
+    binary16, so both conversions are exact). Each pair runs two binary32
+    `fma(float(w), float(a), part)`. Every operand is an integer with
+    |w|, |a| ≤ 128, so every product is an integer ≤ 2^14 and every partial
+    sum of one 256-weight sequence, in whatever order it is formed, is an
+    integer of magnitude ≤ 256 · 2^14 = 2^22 < 2^24. All such integers are
+    binary32 values, and an addition, multiplication or fused multiply-add
+    whose exact result is representable returns that result. So every step
+    is exact, independently of evaluation order and fusion, and
+    `int(dot)` converts the exact sequence sum before any sum could exceed
+    the bound.
+
+  Then `long(scale) * long(dot)` in i64 on the GPU. The CPU rejects
+  K/512 > 512, which makes i64 overflow impossible, so the reference's
+  checked-overflow error can never be the expected result.
 - **Specialisation.** Function constants: bits (4..8), activation rows per
   dispatch MC (1..16; M > 16 is split into dispatches of 16), layout,
   4-byte alignment of the stream (unaligned streams use byte loads).

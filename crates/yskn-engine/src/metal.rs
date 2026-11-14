@@ -27,6 +27,21 @@ unsafe extern "C" {
 
 const SOURCE: &str = include_str!("linear.metal");
 
+/// Upload encodings of every i8 value, indexed by its byte: i16 bits, and binary16
+/// bits for the float kernel (|value| <= 128 is exact in binary16).
+static WIDE: [u16; 256] = {
+    let mut codes = [0; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        codes[byte] = byte as u8 as i8 as i16 as u16;
+        byte += 1;
+    }
+    codes
+};
+static HALF: std::sync::LazyLock<[u16; 256]> = std::sync::LazyLock::new(|| {
+    std::array::from_fn(|byte| yskn_format::f32_to_f16(f32::from(byte as u8 as i8)))
+});
+
 /// FORMAT.md §4.2 for one 32-step block of a `bits`-bit code. 32 steps use exactly
 /// `bits` words, so all four blocks of a sequence share these constant shifts.
 /// `wb[0]` is the previous block's last word, `wb[1..=bits]` this block's words:
@@ -101,6 +116,7 @@ struct PipelineKey {
     rows_per_dispatch: u32,
     warp: bool,
     aligned: bool,
+    float_mac: bool,
 }
 
 struct Dispatch {
@@ -118,10 +134,12 @@ struct Plan {
     groups: usize,
     code_bytes: u64,
     splits: usize,
+    float_mac: bool,
     dispatches: Vec<Dispatch>,
 }
 
-/// Widen the activation rows to i16 and copy the integer scales into shared buffers.
+/// Widen the activation rows to i16 (binary16 for the float kernel) and copy the
+/// integer scales into shared buffers.
 ///
 /// # Safety
 /// No GPU work and no other CPU reference may access either buffer's contents
@@ -131,6 +149,7 @@ unsafe fn upload(
     scales_buffer: &Buffer,
     activation: &[i8],
     scales: &[i32],
+    float_mac: bool,
 ) -> Result<()> {
     if activation_buffer.length() < activation.len() * 2
         || scales_buffer.length() < scales.len() * 4
@@ -142,11 +161,12 @@ unsafe fn upload(
     // access, so the mutable slice is not aliased.
     unsafe {
         let wide = std::slice::from_raw_parts_mut(
-            activation_buffer.contents().as_ptr().cast::<i16>(),
+            activation_buffer.contents().as_ptr().cast::<u16>(),
             activation.len(),
         );
+        let codes: &[u16; 256] = if float_mac { &HALF } else { &WIDE };
         for (wide, &value) in wide.iter_mut().zip(activation) {
-            *wide = i16::from(value);
+            *wide = codes[value as u8 as usize];
         }
         std::ptr::copy_nonoverlapping(
             scales.as_ptr(),
@@ -221,7 +241,15 @@ impl Job {
         }
         // SAFETY: the job's private buffers are borrowed exclusively here, and `run`
         // waits for completion, so no GPU work reads them now.
-        unsafe { upload(&self.activation, &self.scales, activation, scales) }
+        unsafe {
+            upload(
+                &self.activation,
+                &self.scales,
+                activation,
+                scales,
+                self.plan.float_mac,
+            )
+        }
     }
 
     /// Bytes of compressed code this job reads (once per pass, independent of M).
@@ -289,7 +317,16 @@ impl Plan {
     }
 }
 
-/// Integer compressed-linear kernel on the system default Metal device.
+/// `YSKN_METAL_MAC`: `float` (default) or `integer` multiply-accumulate.
+fn float_mac_from_env() -> Result<bool> {
+    match std::env::var("YSKN_METAL_MAC").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("float") => Ok(true),
+        Ok("integer") => Ok(false),
+        _ => Err(invalid("YSKN_METAL_MAC must be float or integer")),
+    }
+}
+
+/// Exact compressed-linear kernel on the system default Metal device.
 ///
 /// Every file mapping wrapped for the GPU stays mapped until the engine is dropped.
 pub struct MetalEngine {
@@ -306,6 +343,7 @@ pub struct MetalEngine {
     /// may share a code stream but not a table.
     tables: HashMap<(usize, u64), Retained<Buffer>>,
     splits: usize,
+    float_mac: bool,
     /// Reusable input and per-matrix output buffers of `weighted_sums_shared`,
     /// grown on demand and never shrunk.
     scratch_activation: Option<Retained<Buffer>>,
@@ -348,6 +386,7 @@ impl MetalEngine {
             // Measured on the M5 (DESIGN.md): 4 beats 8 by 3-4% for M <= 8 and ties
             // at 16; 1-2 and 16-32 are slower.
             splits: 4,
+            float_mac: float_mac_from_env()?,
             scratch_activation: None,
             scratch_scales: None,
             scratch_outputs: Vec::new(),
@@ -383,6 +422,16 @@ impl MetalEngine {
         Ok(())
     }
 
+    /// Whether jobs created afterwards multiply in binary32 (exact, METAL.md) rather
+    /// than in 16/32-bit integers. Default from `YSKN_METAL_MAC` (`float` | `integer`).
+    pub fn float_mac(&self) -> bool {
+        self.float_mac
+    }
+
+    pub fn set_float_mac(&mut self, float_mac: bool) {
+        self.float_mac = float_mac;
+    }
+
     pub fn threads_per_threadgroup(&self) -> usize {
         ROW_TILE * self.splits
     }
@@ -392,7 +441,7 @@ impl MetalEngine {
             return Ok(pipeline.clone());
         }
         let values = MTLFunctionConstantValues::new();
-        let constants: [(NonNull<c_void>, MTLDataType); 4] = [
+        let constants: [(NonNull<c_void>, MTLDataType); 5] = [
             (NonNull::from(&key.bits).cast(), MTLDataType::UInt),
             (
                 NonNull::from(&key.rows_per_dispatch).cast(),
@@ -400,6 +449,7 @@ impl MetalEngine {
             ),
             (NonNull::from(&key.warp).cast(), MTLDataType::Bool),
             (NonNull::from(&key.aligned).cast(), MTLDataType::Bool),
+            (NonNull::from(&key.float_mac).cast(), MTLDataType::Bool),
         ];
         for (index, (value, kind)) in constants.into_iter().enumerate() {
             // SAFETY: each pointer refers to a live u32 (UInt) or bool (Bool, one
@@ -581,6 +631,7 @@ impl MetalEngine {
                 rows_per_dispatch: rows as u32,
                 warp: d.layout == Layout::Warp,
                 aligned,
+                float_mac: self.float_mac,
             })?;
             if pipeline.maxTotalThreadsPerThreadgroup() < self.threads_per_threadgroup() {
                 return Err(metal_error(
@@ -617,6 +668,7 @@ impl MetalEngine {
             code_bytes: (n * sequences * bits * 16) as u64,
             // Idle SIMD groups would only add barrier work for short rows.
             splits: self.splits.min(sequences),
+            float_mac: self.float_mac,
             dispatches,
         })
     }
@@ -668,7 +720,15 @@ impl MetalEngine {
         // SAFETY: the scratch buffers are distinct objects owned by this engine,
         // which is borrowed mutably here, and every submission waits for
         // completion, so no GPU work or other reference touches them meanwhile.
-        unsafe { upload(&activation_buffer, &scales_buffer, activation, scales) }?;
+        unsafe {
+            upload(
+                &activation_buffer,
+                &scales_buffer,
+                activation,
+                scales,
+                self.float_mac,
+            )
+        }?;
         self.submit(|encoder| {
             for (plan, output) in plans.iter().zip(&outputs) {
                 plan.encode(encoder, &activation_buffer, &scales_buffer, output);

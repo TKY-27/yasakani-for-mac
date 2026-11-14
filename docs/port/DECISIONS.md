@@ -1670,3 +1670,57 @@ matrix copies are gone; (4) profile software half conversion and residual/MLP
 allocation/dispatch. No SIMD-within-score reduction or additional persistent
 cache bytes are proposed as an unapproved shortcut.
 
+
+## D21 — Second round on the compressed-linear kernel (brief 07d)
+
+Every change keeps the kernel's result identical, as signed 64-bit integers,
+to the CPU kernel (D10) for every input. Each has a forced-off environment
+switch and a test that compares it on and off. Design notes, rejected
+variants and limits are in `crates/yskn-engine/METAL.md` ("Round 2").
+Real-model numbers come from a shared machine (other workers' builds and
+GPU jobs ran at the same time; `uptime` load given with each run), so only
+differences larger than the observed spread are claimed. The orchestrator
+repeats the final numbers on a quiet machine.
+
+### 1. Exact binary32 multiply-accumulate (`YSKN_METAL_MAC=float|integer`)
+
+The Metal kernel's per-pair arithmetic now runs in binary32 by default: the
+decoded weights are `half2` (table widened once per threadgroup), the
+activations are uploaded as binary16, and each pair is two
+`fma(float(w), float(a), part)`. Exactness: every operand is an integer of
+magnitude ≤ 128 (weights are quantized to ±127, activations are i8), exact
+in binary16 and binary32; every product is an integer ≤ 2^14 and every
+partial sum within one 256-weight sequence, in any order, is an integer of
+magnitude ≤ 2^22 < 2^24. Every such value is a binary32 number, and an
+add, multiply or fused multiply-add whose exact result is representable
+returns it, so no step rounds, whatever order or fusion the compiler
+chooses (`MTLMathMode::Safe` anyway). The sequence sum is converted to
+`int` (exact) and scaled in i64 as before. `integer` keeps the previous
+16/32-bit integer path.
+
+Tests (`tests/metal.rs`): the randomized layouts × bits × shapes × M test
+now runs in both modes against the scalar reference; a new test sets every
+table entry to ±1.0 (all weights ±127, all +127 or random signs) with
+activation rows of all −128 / all +127 / random ±extremes and scales
+`i32::MAX` / `i32::MIN`, at K = 512 and at the maximum K = 262,144
+(512 groups, 1,024 sequences), every bit width and both layouts, M = 1, 5,
+16 and 17, and compares both modes with the CPU kernel; with all +127 it
+asserts that the largest sum equals the analytic bound
+512 · 127 · 128 · 2^31 per group (99.2 % of the i64 range at 512 groups).
+A deliberately inexact variant (each fma rounded through binary16) fails
+four of the five Metal tests.
+
+Real model, kernel alone,
+`YSKN_METAL_MAC=$MAC cargo run --release -p yskn-engine --example bench_metal -- $HOME/models/qwen38-speed/qwen38_27b_speed.yskn --m 1,4,16 --passes 5`,
+run back to back (load 11.1 then 9.4), ms per pass, minimum of five passes
+(GPU time: median):
+
+| M | integer | float | change |
+|---:|---:|---:|---:|
+| 1 | 100.7 (GPU 97.8) | 98.9 (GPU 97.6) | none (memory-bound) |
+| 4 | 181.3 (GPU 176.6) | 153.8 (GPU 148.1) | −15 % |
+| 16 | 638.2 (GPU 620.5) | 492.0 (GPU 477.1) | −23 % |
+
+The cost per added row falls from about 35.8 to 26.2 ms (M = 1 → 16).
+Synthetic file (D12's 8-layer file), GPU time at M = 16: 54.1–55.2 ms
+integer, 41.6–44.0 ms float over four runs.

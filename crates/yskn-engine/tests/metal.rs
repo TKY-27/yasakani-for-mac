@@ -11,8 +11,8 @@ mod fixture;
 mod macos {
     use super::fixture::{DATA_OFFSET, TempFile, assert_sums, change_header, random, synthetic};
     use serde_json::json;
-    use yskn_engine::MappedModel;
     use yskn_engine::MetalEngine;
+    use yskn_engine::{Engine, Kernel, MappedModel};
     use yskn_format::Container;
     use yskn_ref::compressed_linear::CompressedLinear;
 
@@ -117,54 +117,159 @@ mod macos {
                             .iter()
                             .all(|&s| s == 0)
                     );
-                    let mut jobs = Vec::new();
-                    for m in [1, 2, 3, 8, 16, 17, 40] {
-                        let context =
-                            format!("{layout} bits={bits} K={cols} N={rows}/{physical_rows} M={m}");
-                        let result = engine
-                            .weighted_sums(&matrix, &activation[..m * cols], &scales[..m * groups])
-                            .unwrap();
-                        assert_sums(&result, &expected[..m * physical_rows], &context);
-                        jobs.push(
-                            engine
-                                .job(
+                    for float_mac in [false, true] {
+                        engine.set_float_mac(float_mac);
+                        let mut jobs = Vec::new();
+                        for m in [1, 2, 3, 8, 16, 17, 40] {
+                            let context = format!(
+                                "{layout} bits={bits} K={cols} N={rows}/{physical_rows} M={m} float={float_mac}"
+                            );
+                            let result = engine
+                                .weighted_sums(
                                     &matrix,
                                     &activation[..m * cols],
                                     &scales[..m * groups],
-                                    physical_rows,
                                 )
-                                .unwrap(),
-                        );
-                        if m == 3 {
-                            for n in [1, rows, physical_rows - 1] {
-                                let prefix: Vec<_> = (0..m)
-                                    .flat_map(|i| {
-                                        expected[i * physical_rows..i * physical_rows + n]
-                                            .iter()
-                                            .copied()
-                                    })
-                                    .collect();
-                                let result = engine
-                                    .weighted_sums_prefix(
+                                .unwrap();
+                            assert_sums(&result, &expected[..m * physical_rows], &context);
+                            jobs.push(
+                                engine
+                                    .job(
                                         &matrix,
                                         &activation[..m * cols],
                                         &scales[..m * groups],
-                                        n,
+                                        physical_rows,
                                     )
-                                    .unwrap();
-                                assert_sums(&result, &prefix, &format!("{context} prefix={n}"));
+                                    .unwrap(),
+                            );
+                            if m == 3 {
+                                for n in [1, rows, physical_rows - 1] {
+                                    let prefix: Vec<_> = (0..m)
+                                        .flat_map(|i| {
+                                            expected[i * physical_rows..i * physical_rows + n]
+                                                .iter()
+                                                .copied()
+                                        })
+                                        .collect();
+                                    let result = engine
+                                        .weighted_sums_prefix(
+                                            &matrix,
+                                            &activation[..m * cols],
+                                            &scales[..m * groups],
+                                            n,
+                                        )
+                                        .unwrap();
+                                    assert_sums(&result, &prefix, &format!("{context} prefix={n}"));
+                                }
                             }
                         }
+                        // All M variants again, encoded into one command buffer.
+                        engine.run(&mut jobs).unwrap();
+                        for job in &jobs {
+                            let m = job.output().len() / physical_rows;
+                            assert_sums(
+                                &job.output(),
+                                &expected[..m * physical_rows],
+                                &format!(
+                                    "batched {layout} bits={bits} K={cols} M={m} float={float_mac}"
+                                ),
+                            );
+                        }
                     }
-                    // All M variants again, encoded into one command buffer.
-                    engine.run(&mut jobs).unwrap();
-                    for job in &jobs {
-                        let m = job.output().len() / physical_rows;
-                        assert_sums(
-                            &job.output(),
-                            &expected[..m * physical_rows],
-                            &format!("batched {layout} bits={bits} K={cols} M={m}"),
-                        );
+                }
+            }
+        }
+    }
+
+    /// All weights ±127 with activations at -128/+127 and |scales| up to 2^31, at one
+    /// group and at the maximum of 512 groups (1024 sequences): the largest partial
+    /// sums either kernel can see. Both multiply-accumulate modes must equal the
+    /// CPU kernel.
+    #[test]
+    fn extreme_values_at_maximum_sequence_counts_match_cpu_kernel() {
+        let Some(mut engine) = engine() else { return };
+        let mut cpu = Engine::new(Kernel::fastest(), 4).unwrap();
+        let mut seed = 0x0e57_7a11_c0de_0127_u64;
+        for bits in 4..=8 {
+            for layout in ["row", "warp"] {
+                for (cols, signs) in [(512, false), (512, true), (262_144, false), (262_144, true)]
+                {
+                    let mut bytes = synthetic(bits, layout, 32, 32, cols, false);
+                    let header_length =
+                        u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+                    let header: serde_json::Value =
+                        serde_json::from_slice(&bytes[32..32 + header_length]).unwrap();
+                    let table = header["tensors"][0]["lut_off"].as_u64().unwrap() as usize;
+                    // Each entry ±1.0: every weight quantizes to ±127 (all +127 unless `signs`).
+                    for pair in bytes[table..table + 16_384].as_chunks_mut::<2>().0 {
+                        let negative = signs && !random(&mut seed).is_multiple_of(2);
+                        *pair = yskn_format::f32_to_f16(if negative { -1.0 } else { 1.0 })
+                            .to_le_bytes();
+                    }
+                    let file = TempFile::new(&bytes);
+                    // SAFETY: the private file is never modified and outlives all mapping owners.
+                    let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+                    let matrix = model.matrix("linear").unwrap();
+                    let groups = cols / 512;
+                    let m = 17;
+                    let activation: Vec<i8> = (0..m)
+                        .flat_map(|row| {
+                            let mut seed = seed ^ row as u64;
+                            (0..cols).map(move |c| match row {
+                                0 | 1 => -128,
+                                2 => 127,
+                                3 => {
+                                    if c % 2 == 0 {
+                                        -128
+                                    } else {
+                                        127
+                                    }
+                                }
+                                4..=9 => {
+                                    if random(&mut seed).is_multiple_of(2) {
+                                        -128
+                                    } else {
+                                        127
+                                    }
+                                }
+                                _ => random(&mut seed) as i8,
+                            })
+                        })
+                        .collect();
+                    let scales: Vec<i32> = (0..m)
+                        .flat_map(|row| {
+                            let mut seed = seed ^ (row as u64) << 32;
+                            (0..groups).map(move |_| match row {
+                                0 | 2 => i32::MAX,
+                                1 | 3 => i32::MIN,
+                                _ => random(&mut seed) as i32,
+                            })
+                        })
+                        .collect();
+                    seed = seed.wrapping_add(1);
+                    let expected = cpu.weighted_sums(&matrix, &activation, &scales).unwrap();
+                    // All +127: row 1 reaches the bound 512 * 127 * 128 * 2^31 per group
+                    // (99.2 % of the i64 limit at 512 groups).
+                    let largest = expected.iter().map(|s| s.unsigned_abs()).max().unwrap();
+                    assert!(signs || largest == (groups as u64 * 512 * 127 * 128) << 31);
+                    for float_mac in [false, true] {
+                        engine.set_float_mac(float_mac);
+                        for rows in [1, 5, 16, 17] {
+                            let result = engine
+                                .weighted_sums(
+                                    &matrix,
+                                    &activation[..rows * cols],
+                                    &scales[..rows * groups],
+                                )
+                                .unwrap();
+                            assert_sums(
+                                &result,
+                                &expected[..rows * 32],
+                                &format!(
+                                    "{layout} bits={bits} K={cols} signs={signs} M={rows} float={float_mac}"
+                                ),
+                            );
+                        }
                     }
                 }
             }
