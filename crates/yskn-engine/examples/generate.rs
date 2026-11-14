@@ -1,7 +1,6 @@
 //! Token-ID generation with the shared lossless speculation loop.
 use std::error::Error as StdError;
-use yskn_engine::{Backend, Engine, Error, KvMode, LogitRows, Model};
-use yskn_ref::draft::Draft as NeuralDraft;
+use yskn_engine::{Backend, Engine, Error, FastDraft, KvMode, LogitRows, Model};
 use yskn_ref::draft_head::DraftChoice;
 use yskn_ref::model::{CaptureOptions, CapturedRow};
 use yskn_ref::quality::parse_kv_mode;
@@ -27,8 +26,8 @@ fn token_ids(value: &str) -> Result<Vec<u32>, Error> {
 enum Draft {
     None(NoProposer),
     Ngram(NgramProposer),
-    Neural(Box<DraftProposer>),
-    Both(Box<CombinedProposer>),
+    Neural(Box<DraftProposer<FastDraft>>),
+    Both(Box<CombinedProposer<FastDraft>>),
 }
 impl Proposer for Draft {
     fn propose(&mut self, history: &[u32], last: u32, max: usize) -> Vec<u32> {
@@ -77,7 +76,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
     if path == "--help" || path == "-h" {
         println!("Usage: {USAGE}");
         println!(
-            "Neural drafting uses the scalar reference and can take about 90 seconds per proposal on the real model."
+            "Neural drafting uses the fast draft (yskn_engine::FastDraft), bit-identical to the scalar reference; YSKN_BACKEND/YSKN_KERNEL select its projections as for the main model."
         );
         return Ok(());
     }
@@ -123,9 +122,15 @@ fn main() -> Result<(), Box<dyn StdError>> {
         _ => {
             // The example's seeded main sampler uses version 3, the only coupled source mode.
             let choice = seed.map_or(DraftChoice::Greedy, DraftChoice::sampled);
-            let neural = DraftProposer::new(NeuralDraft::load(&path)?, k, choice)?;
+            // SAFETY: callers must keep the read-only draft files unchanged until exit.
+            let fast = unsafe { FastDraft::load(&path)? };
+            eprintln!(
+                "fast neural draft: backend={} device={}",
+                fast.backend().name(),
+                fast.device()
+            );
+            let neural = DraftProposer::new(fast, k, choice)?;
             capture = Some(neural.capture_options());
-            eprintln!("scalar neural draft: real-model proposals can take about 90 seconds each");
             if draft == "both" {
                 Draft::Both(Box::new(CombinedProposer::new(
                     NgramProposer::new(n, k)?,

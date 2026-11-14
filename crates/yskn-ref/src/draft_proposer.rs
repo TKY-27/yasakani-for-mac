@@ -1,5 +1,5 @@
 //! Main/draft connection. Captures are committed inputs; the frontier is absent.
-use crate::draft::{BLOCK_ROWS, ContextFeatures, Draft, DraftSnapshot};
+use crate::draft::{BLOCK_ROWS, BlockDraft, Draft, DraftSnapshot};
 use crate::draft_head::DraftChoice;
 use crate::model::{CaptureOptions, CapturedRow};
 use crate::speculation::{CheckpointVerifier, GenerationError, NgramProposer, Proposer, Verifier};
@@ -21,15 +21,17 @@ pub struct SessionSnapshot<T> {
     proposer: DraftProposerSnapshot,
 }
 
-pub struct DraftProposer {
-    draft: Draft,
+/// Generic over the draft implementation: the scalar reference by default, or a
+/// fast draft that reproduces it bit for bit.
+pub struct DraftProposer<D: BlockDraft = Draft> {
+    draft: D,
     k: usize,
     choice: DraftChoice,
     context_identity: Option<std::sync::Arc<()>>,
     owner: Rc<()>,
 }
-impl DraftProposer {
-    pub fn new(draft: Draft, k: usize, choice: DraftChoice) -> Result<Self> {
+impl<D: BlockDraft> DraftProposer<D> {
+    pub fn new(draft: D, k: usize, choice: DraftChoice) -> Result<Self> {
         if !(1..BLOCK_ROWS).contains(&k) {
             return Err(Error::InvalidInput("draft K must be in 1..8".into()));
         }
@@ -47,7 +49,7 @@ impl DraftProposer {
             max_rows: self.draft.dimensions().window,
         }
     }
-    pub fn draft(&self) -> &Draft {
+    pub fn draft(&self) -> &D {
         &self.draft
     }
     /// Absolute positions currently retained in the draft ring (end excluded).
@@ -159,11 +161,18 @@ impl DraftProposer {
             }
             self.draft.reset_at(first);
         }
-        for row in rows {
-            if row.position >= self.draft.position() {
-                self.push(row)?;
-            }
-        }
+        // Keep rows at or after the position the ring will have reached when each
+        // is pushed, as a row-by-row loop would; already-inserted rows are skipped.
+        let mut next = self.draft.position();
+        let rows: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                let keep = row.position >= next;
+                next += usize::from(keep);
+                keep
+            })
+            .collect();
+        self.push(&rows)?;
         if self.draft.position() != verifier.position() {
             return Err(Error::InvalidInput(
                 "draft context has missing committed rows".into(),
@@ -172,16 +181,21 @@ impl DraftProposer {
         drop(verifier.take_captured_rows());
         Ok(())
     }
-    fn push(&mut self, row: &CapturedRow) -> Result<()> {
-        self.draft.push_context(
-            row.position,
-            ContextFeatures {
-                values: &row.values,
-            },
-        )
+    /// Push maximal runs of consecutive positions as batches. A run that does not
+    /// start at the draft position fails exactly as a single-row push would.
+    fn push(&mut self, rows: &[&CapturedRow]) -> Result<()> {
+        let mut start = 0;
+        for end in 1..=rows.len() {
+            if end == rows.len() || rows[end].position != rows[end - 1].position + 1 {
+                let values: Vec<_> = rows[start..end].iter().map(|r| &r.values[..]).collect();
+                self.draft.push_rows(rows[start].position, &values)?;
+                start = end;
+            }
+        }
+        Ok(())
     }
 }
-impl Proposer for DraftProposer {
+impl<D: BlockDraft> Proposer for DraftProposer<D> {
     /// Neural proposals need the verifier's embeddings; use `propose_with`.
     fn propose(&mut self, _history: &[u32], _last: u32, _max: usize) -> Vec<u32> {
         Vec::new()
@@ -203,10 +217,7 @@ impl Proposer for DraftProposer {
             // A bounded hand-over may cover a whole ring after a wide commit.
             self.draft.reset_at(rows[0].position);
         }
-        for row in rows {
-            self.push(row)?;
-        }
-        Ok(())
+        self.push(&rows.iter().collect::<Vec<_>>())
     }
     fn propose_with<V: Verifier>(
         &mut self,
@@ -221,7 +232,7 @@ impl Proposer for DraftProposer {
         }
         Ok(self
             .draft
-            .propose(last, |token| verifier.embedding(token), self.choice)?
+            .propose(last, &mut |token| verifier.embedding(token), self.choice)?
             .tokens
             .into_iter()
             .take(self.k.min(max))
@@ -236,20 +247,20 @@ pub enum ProposalOrder {
 }
 
 /// First nonempty proposal wins. No adaptive upstream cost/source policy.
-pub struct CombinedProposer {
+pub struct CombinedProposer<D: BlockDraft = Draft> {
     ngram: NgramProposer,
-    draft: DraftProposer,
+    draft: DraftProposer<D>,
     order: ProposalOrder,
 }
-impl CombinedProposer {
-    pub fn new(ngram: NgramProposer, draft: DraftProposer, order: ProposalOrder) -> Self {
+impl<D: BlockDraft> CombinedProposer<D> {
+    pub fn new(ngram: NgramProposer, draft: DraftProposer<D>, order: ProposalOrder) -> Self {
         Self {
             ngram,
             draft,
             order,
         }
     }
-    pub fn draft(&self) -> &DraftProposer {
+    pub fn draft(&self) -> &DraftProposer<D> {
         &self.draft
     }
     pub fn reset(&mut self) {
@@ -275,7 +286,7 @@ impl CombinedProposer {
         self.draft.restore(snapshot)
     }
 }
-impl Proposer for CombinedProposer {
+impl<D: BlockDraft> Proposer for CombinedProposer<D> {
     fn propose(&mut self, history: &[u32], last: u32, max: usize) -> Vec<u32> {
         self.ngram.propose(history, last, max)
     }

@@ -1,7 +1,7 @@
-//! Teacher-forced agreement and provisional-verification acceptance diagnostics; the neural draft is scalar.
+//! Teacher-forced agreement and provisional-verification acceptance diagnostics; the neural
+//! draft is the fast draft (D18), bit-identical to the scalar reference.
 use std::error::Error as StdError;
-use yskn_engine::{Backend, Engine, Error, KvMode, LogitRows, Model};
-use yskn_ref::draft::Draft;
+use yskn_engine::{Backend, Engine, Error, FastDraft, KvMode, LogitRows, Model};
 use yskn_ref::draft_head::DraftChoice;
 use yskn_ref::output_head_sampler::greedy;
 use yskn_ref::quality::{TokenWindows, parse_kv_mode};
@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
             "Valid input positions: first_scored_position..=min(last_scored_position, n_ctx - K - 1); each verified probe needs K+1 rows."
         );
         println!(
-            "Scalar neural drafting can take about 90 seconds per proposal on the real model. Run only a handful of positions."
+            "Neural proposals use the fast draft; its projections run on the same backend as the main model."
         );
         println!(
             "Prints teacher-forced agreement and verified acceptance separately. Depth d measures P(leading prefix >= d); missing guesses count as misses. Both uses ngram-first fallback."
@@ -131,7 +131,16 @@ fn main() -> Result<(), Box<dyn StdError>> {
         return Err(invalid("requested positions and K exceed the scored window context").into());
     }
     let backend = backend.map_or_else(Backend::from_env, Ok)?;
-    let mut neural = DraftProposer::new(Draft::load(&folder)?, k, DraftChoice::Greedy)?;
+    // SAFETY: this read-only diagnostic requires stable draft files until exit.
+    let draft = unsafe {
+        FastDraft::with_options(
+            &folder,
+            Engine::from_env()?,
+            backend,
+            yskn_ref::draft::DraftOptions::default(),
+        )?
+    };
+    let mut neural = DraftProposer::new(draft, k, DraftChoice::Greedy)?;
     let mut ngram = NgramProposer::new(3, k)?;
     // SAFETY: this read-only diagnostic requires stable weights until exit.
     let mut model =
@@ -150,7 +159,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
         }
     }
     eprintln!(
-        "backend={} device={} kv={} positions_per_window={positions} k={k}; scalar neural draft may take about 90 seconds per proposal",
+        "backend={} device={} kv={} positions_per_window={positions} k={k}; fast neural draft",
         model.backend().name(),
         model.device(),
         mode.name(),
