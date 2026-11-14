@@ -85,71 +85,101 @@ fn random(state: &mut u64) -> usize {
     *state as usize
 }
 fn mixed() -> Fixture {
-    Fixture::new(&support::synthetic_model(
+    let fixture = Fixture::new(&support::synthetic_model(
         163,
-        &["linear_attention", "full_attention", "full_attention"],
-    ))
+        &["linear_attention", "full_attention"],
+    ));
+    fs::write(
+        fixture.0.join("kvq_u5.bin"),
+        support::kv_profile::compact_mixed_profile(),
+    )
+    .unwrap();
+    fixture
+}
+
+fn check_partial_commits(mode: KvMode) {
+    let fixture = mixed();
+    for backend in backends() {
+        let mut engine = fixture.engine(backend, mode);
+        let mut reference = fixture.reference(mode);
+        engine.prefill(&[8, 21, 5]).unwrap();
+        reference.prefill(&[8, 21, 5]).unwrap();
+        let mut seed = 0x4567_89ab_cdef_u64;
+        let mut widths = [false; 10];
+        let mut accepted_lengths = [false; 10];
+        for pass in 0..23 {
+            let width = if pass < 9 {
+                pass + 1
+            } else if pass < 19 {
+                9
+            } else {
+                1 + random(&mut seed) % 9
+            };
+            let accepted = if pass < 9 {
+                width
+            } else if pass < 19 {
+                pass - 9
+            } else {
+                random(&mut seed) % (width + 1)
+            };
+            widths[width] = true;
+            accepted_lengths[accepted] = true;
+            let tokens: Vec<_> = (0..width)
+                .map(|_| (random(&mut seed) % 128) as u32)
+                .collect();
+            engine.run_provisional(&tokens).unwrap();
+            reference.run_provisional(&tokens).unwrap();
+            assert_eq!(
+                bits(engine.row_logits()),
+                bits(reference.row_logits()),
+                "{backend:?} {mode:?} pass {pass}"
+            );
+            assert!(engine.run_provisional(&[1]).is_err());
+            assert!(engine.commit(width + 1).is_err());
+            engine.commit(accepted).unwrap();
+            reference.commit(accepted).unwrap();
+            assert_eq!(engine.position(), reference.position());
+            assert_eq!(
+                engine.state_digest(),
+                reference.state_digest(),
+                "{backend:?} {mode:?} pass {pass} accepted {accepted}"
+            );
+            // A future row checks actual cache/recurrence semantics in addition to the digest.
+            engine.run_provisional(&[17]).unwrap();
+            reference.run_provisional(&[17]).unwrap();
+            assert_eq!(bits(engine.row_logits()), bits(reference.row_logits()));
+            engine.discard_provisional();
+            reference.discard_provisional();
+            let digest = engine.state_digest();
+            let logits = bits(engine.row_logits());
+            assert!(engine.run_provisional(&[1, 128]).is_err());
+            assert!(engine.run_provisional(&[]).is_err());
+            assert_eq!(engine.state_digest(), digest);
+            assert_eq!(bits(engine.row_logits()), logits);
+            assert!(!engine.has_provisional_pass());
+        }
+        assert!(widths[1..].iter().all(|&seen| seen));
+        assert!(accepted_lengths.iter().all(|&seen| seen));
+        assert!(
+            engine.position() > 64,
+            "committed context crosses two attention tiles"
+        );
+    }
 }
 
 #[test]
-fn randomized_partial_commits_and_discards_match_reference_in_every_kv_backend() {
-    let fixture = mixed();
-    for backend in backends() {
-        for mode in [KvMode::Int8, KvMode::Int8Profile, KvMode::Kv5] {
-            let mut engine = fixture.engine(backend, mode);
-            let mut reference = fixture.reference(mode);
-            engine.prefill(&[8, 21, 5]).unwrap();
-            reference.prefill(&[8, 21, 5]).unwrap();
-            let mut seed = 0x4567_89ab_cdef_u64;
-            for pass in 0..40 {
-                let width = if pass < 9 {
-                    pass + 1
-                } else {
-                    1 + random(&mut seed) % 9
-                };
-                let accepted = if pass % 10 == 0 {
-                    0
-                } else if pass % 10 == 1 {
-                    width
-                } else {
-                    random(&mut seed) % (width + 1)
-                };
-                let tokens: Vec<_> = (0..width)
-                    .map(|_| (random(&mut seed) % 128) as u32)
-                    .collect();
-                engine.run_provisional(&tokens).unwrap();
-                reference.run_provisional(&tokens).unwrap();
-                assert_eq!(
-                    bits(engine.row_logits()),
-                    bits(reference.row_logits()),
-                    "{backend:?} {mode:?} pass {pass}"
-                );
-                assert!(engine.run_provisional(&[1]).is_err());
-                assert!(engine.commit(width + 1).is_err());
-                engine.commit(accepted).unwrap();
-                reference.commit(accepted).unwrap();
-                assert_eq!(engine.position(), reference.position());
-                assert_eq!(
-                    engine.state_digest(),
-                    reference.state_digest(),
-                    "{backend:?} {mode:?} pass {pass} accepted {accepted}"
-                );
-                // A future row checks actual cache/recurrence semantics in addition to the digest.
-                engine.run_provisional(&[17]).unwrap();
-                reference.run_provisional(&[17]).unwrap();
-                assert_eq!(bits(engine.row_logits()), bits(reference.row_logits()));
-                engine.discard_provisional();
-                reference.discard_provisional();
-                let digest = engine.state_digest();
-                let logits = bits(engine.row_logits());
-                assert!(engine.run_provisional(&[1, 128]).is_err());
-                assert!(engine.run_provisional(&[]).is_err());
-                assert_eq!(engine.state_digest(), digest);
-                assert_eq!(bits(engine.row_logits()), logits);
-                assert!(!engine.has_provisional_pass());
-            }
-        }
-    }
+fn randomized_partial_commits_and_discards_match_reference_int8_every_backend() {
+    check_partial_commits(KvMode::Int8);
+}
+
+#[test]
+fn randomized_partial_commits_and_discards_match_reference_int8_profile_every_backend() {
+    check_partial_commits(KvMode::Int8Profile);
+}
+
+#[test]
+fn randomized_partial_commits_and_discards_match_reference_kv5_every_backend() {
+    check_partial_commits(KvMode::Kv5);
 }
 
 #[test]
@@ -203,10 +233,13 @@ fn failed_numeric_pass_preserves_committed_state_and_future_rows() {
 #[test]
 fn snapshots_restore_prefix_without_growing_persistent_storage_and_reject_misuse() {
     let fixture = mixed();
-    for backend in backends() {
-        for mode in [KvMode::Int8, KvMode::Int8Profile, KvMode::Kv5] {
+    for mode in [KvMode::Int8, KvMode::Int8Profile, KvMode::Kv5] {
+        let mut reference = fixture.reference(mode);
+        reference.prefill(&[1, 2, 3, 8, 9, 10]).unwrap();
+        let expected_digest = reference.state_digest();
+        let expected = bits(reference.row_logits())[3..].to_vec();
+        for backend in backends() {
             let mut engine = fixture.engine(backend, mode);
-            let mut reference = fixture.reference(mode);
             let empty = engine.snapshot().unwrap();
             engine.prefill(&[1, 2, 3]).unwrap();
             let prefix = engine.snapshot().unwrap();
@@ -231,10 +264,8 @@ fn snapshots_restore_prefix_without_growing_persistent_storage_and_reject_misuse
                 engine.prefill(&[11, 12]).unwrap();
                 engine.restore(&prefix).unwrap();
                 engine.prefill(&[8, 9, 10]).unwrap();
-                reference.reset().unwrap();
-                reference.prefill(&[1, 2, 3, 8, 9, 10]).unwrap();
-                assert_eq!(engine.state_digest(), reference.state_digest());
-                assert_eq!(bits(engine.row_logits()), bits(reference.row_logits())[3..]);
+                assert_eq!(engine.state_digest(), expected_digest);
+                assert_eq!(bits(engine.row_logits()), expected);
                 engine.restore(&prefix).unwrap();
                 assert_eq!(engine.session_memory(), memory);
             }
@@ -376,153 +407,172 @@ where
     result
 }
 
-#[test]
-fn synthetic_model_generation_is_lossless_repeatable_for_every_proposer_and_sampler() {
+fn check_generation(sampler: Sampler) {
     let fixture = Fixture::new(&support::synthetic_model(
         173,
         &["linear_attention", "full_attention"],
     ));
     let prompt = [1, 2, 3, 1, 2, 3, 1];
-    let samplers = [
-        Sampler::Greedy,
-        Sampler::Sampled(SamplingParameters {
-            seed: 17,
-            ..SamplingParameters::default()
-        }),
-        Sampler::Sampled(SamplingParameters {
-            seed: 0xabcdef,
-            ..SamplingParameters::default()
-        }),
-    ];
     let mut reference = fixture.reference(KvMode::Int8);
     reference.prefill(&prompt[..prompt.len() - 1]).unwrap();
     let reference_start = reference.snapshot().unwrap();
-    for backend in backends() {
-        let mut engine = fixture.engine(backend, KvMode::Int8);
-        engine.prefill(&prompt[..prompt.len() - 1]).unwrap();
-        let engine_start = engine.snapshot().unwrap();
-        for sampler in &samplers {
+    let baseline = run_generation(
+        &mut reference,
+        &sampler,
+        &mut Draft::None(NoProposer),
+        &prompt,
+        0,
+        64,
+        &[],
+        None,
+    );
+    let baseline_digest = reference.state_digest();
+    assert_eq!(baseline.tokens.len(), 8);
+    let mut expected = Vec::new();
+    for k in [1, 2, 3, 7] {
+        for kind in 0..6 {
+            // NoProposer always returns zero guesses, independent of the K cap.
+            if kind == 0 {
+                expected.push((k, kind, baseline.clone(), baseline_digest));
+                continue;
+            }
             reference.restore(&reference_start).unwrap();
-            let baseline = run_generation(
+            let result = run_generation(
                 &mut reference,
-                sampler,
-                &mut Draft::None(NoProposer),
+                &sampler,
+                &mut draft(kind, &baseline.tokens, prompt.len() - 1, k),
                 &prompt,
-                0,
+                k,
                 64,
                 &[],
                 None,
             );
-            let baseline_digest = reference.state_digest();
-            assert_eq!(baseline.tokens.len(), 8);
-            for k in [1, 2, 3, 7] {
-                for kind in 0..6 {
-                    let mut previous_stats = None;
-                    for _ in 0..2 {
-                        reference.restore(&reference_start).unwrap();
-                        engine.restore(&engine_start).unwrap();
-                        let actual_ref = run_generation(
-                            &mut reference,
-                            sampler,
-                            &mut draft(kind, &baseline.tokens, prompt.len() - 1, k),
-                            &prompt,
-                            k,
-                            64,
-                            &[],
-                            None,
-                        );
-                        let actual_engine = run_generation(
-                            &mut engine,
-                            sampler,
-                            &mut draft(kind, &baseline.tokens, prompt.len() - 1, k),
-                            &prompt,
-                            k,
-                            64,
-                            &[],
-                            None,
-                        );
-                        assert_eq!(
-                            actual_ref.tokens, baseline.tokens,
-                            "reference kind={kind} k={k}"
-                        );
-                        assert_eq!(
-                            actual_engine.tokens, baseline.tokens,
-                            "{backend:?} kind={kind} k={k}"
-                        );
-                        assert_eq!(reference.state_digest(), baseline_digest);
-                        assert_eq!(engine.state_digest(), baseline_digest);
-                        assert_eq!(
-                            actual_engine.statistics.tokens_confirmed_per_pass,
-                            actual_ref.statistics.tokens_confirmed_per_pass
-                        );
-                        if let Some(previous) = previous_stats {
-                            assert_eq!(
-                                actual_engine.statistics.tokens_confirmed_per_pass,
-                                previous
-                            );
-                        }
-                        previous_stats =
-                            Some(actual_engine.statistics.tokens_confirmed_per_pass.clone());
-                        if kind == 1 {
-                            assert_eq!(
-                                actual_engine.statistics.guesses_offered,
-                                actual_engine.statistics.guesses_accepted
-                            );
-                            assert!(actual_engine.statistics.passes < 8);
-                        }
-                        if kind == 2 {
-                            assert_eq!(actual_engine.statistics.guesses_accepted, 0);
-                        }
-                        if kind == 5 {
-                            assert!(actual_engine.statistics.guesses_offered > 0);
-                        }
-                    }
+            expected.push((k, kind, result, reference.state_digest()));
+        }
+    }
+    let mut stops = Vec::new();
+    for (capacity, eos, cancel, reason) in [
+        (prompt.len() + 2, vec![], None, StopReason::ContextCapacity),
+        (64, vec![], Some(3), StopReason::Cancelled),
+        (
+            64,
+            vec![baseline.tokens[3]],
+            None,
+            StopReason::EndOfSequence,
+        ),
+    ] {
+        reference.restore(&reference_start).unwrap();
+        let result = run_generation(
+            &mut reference,
+            &sampler,
+            &mut Draft::None(NoProposer),
+            &prompt,
+            0,
+            capacity,
+            &eos,
+            cancel,
+        );
+        stops.push((
+            capacity,
+            eos,
+            cancel,
+            reason,
+            result,
+            reference.state_digest(),
+        ));
+    }
+    for backend in backends() {
+        let mut engine = fixture.engine(backend, KvMode::Int8);
+        engine.prefill(&prompt[..prompt.len() - 1]).unwrap();
+        let engine_start = engine.snapshot().unwrap();
+        for &(k, kind, ref actual_ref, reference_digest) in &expected {
+            let mut previous_stats = None;
+            for _ in 0..2 {
+                engine.restore(&engine_start).unwrap();
+                let actual_engine = run_generation(
+                    &mut engine,
+                    &sampler,
+                    &mut draft(kind, &baseline.tokens, prompt.len() - 1, k),
+                    &prompt,
+                    k,
+                    64,
+                    &[],
+                    None,
+                );
+                assert_eq!(
+                    actual_ref.tokens, baseline.tokens,
+                    "reference kind={kind} k={k}"
+                );
+                assert_eq!(
+                    actual_engine.tokens, baseline.tokens,
+                    "{backend:?} kind={kind} k={k}"
+                );
+                assert_eq!(reference_digest, baseline_digest);
+                assert_eq!(engine.state_digest(), baseline_digest);
+                assert_eq!(
+                    actual_engine.statistics.tokens_confirmed_per_pass,
+                    actual_ref.statistics.tokens_confirmed_per_pass
+                );
+                if let Some(previous) = previous_stats {
+                    assert_eq!(actual_engine.statistics.tokens_confirmed_per_pass, previous);
+                }
+                previous_stats = Some(actual_engine.statistics.tokens_confirmed_per_pass.clone());
+                if kind == 1 {
+                    assert_eq!(
+                        actual_engine.statistics.guesses_offered,
+                        actual_engine.statistics.guesses_accepted
+                    );
+                    assert!(actual_engine.statistics.passes < 8);
+                }
+                if kind == 2 {
+                    assert_eq!(actual_engine.statistics.guesses_accepted, 0);
+                }
+                if kind == 5 {
+                    assert!(actual_engine.statistics.guesses_offered > 0);
                 }
             }
-            // Stop boundaries must retain exactly the same committed model state.
-            for (capacity, eos, cancel, expected_reason) in [
-                (prompt.len() + 2, vec![], None, StopReason::ContextCapacity),
-                (64, vec![], Some(3), StopReason::Cancelled),
-                (
-                    64,
-                    vec![baseline.tokens[3]],
-                    None,
-                    StopReason::EndOfSequence,
-                ),
-            ] {
-                reference.restore(&reference_start).unwrap();
-                let expected = run_generation(
-                    &mut reference,
-                    sampler,
-                    &mut Draft::None(NoProposer),
-                    &prompt,
-                    0,
-                    capacity,
-                    &eos,
-                    cancel,
-                );
-                let digest = reference.state_digest();
-                for k in [1, 2, 3, 7] {
-                    for kind in [1, 4] {
-                        engine.restore(&engine_start).unwrap();
-                        let actual = run_generation(
-                            &mut engine,
-                            sampler,
-                            &mut draft(kind, &baseline.tokens, prompt.len() - 1, k),
-                            &prompt,
-                            k,
-                            capacity,
-                            &eos,
-                            cancel,
-                        );
-                        assert_eq!(actual.tokens, expected.tokens);
-                        assert_eq!(actual.stop_reason, expected_reason);
-                        assert_eq!(engine.state_digest(), digest);
-                    }
+        }
+        // Every stop boundary retains the scalar no-draft committed state.
+        for (capacity, eos, cancel, expected_reason, expected, digest) in &stops {
+            for k in [1, 2, 3, 7] {
+                for kind in [1, 4] {
+                    engine.restore(&engine_start).unwrap();
+                    let actual = run_generation(
+                        &mut engine,
+                        &sampler,
+                        &mut draft(kind, &baseline.tokens, prompt.len() - 1, k),
+                        &prompt,
+                        k,
+                        *capacity,
+                        eos,
+                        *cancel,
+                    );
+                    assert_eq!(actual.tokens, expected.tokens);
+                    assert_eq!(actual.stop_reason, *expected_reason);
+                    assert_eq!(engine.state_digest(), *digest);
                 }
             }
         }
     }
+}
+
+#[test]
+fn greedy_generation_is_lossless_repeatable_for_every_proposer() {
+    check_generation(Sampler::Greedy);
+}
+#[test]
+fn seed17_generation_is_lossless_repeatable_for_every_proposer() {
+    check_generation(Sampler::Sampled(SamplingParameters {
+        seed: 17,
+        ..SamplingParameters::default()
+    }));
+}
+#[test]
+fn seedabcdef_generation_is_lossless_repeatable_for_every_proposer() {
+    check_generation(Sampler::Sampled(SamplingParameters {
+        seed: 0xabcdef,
+        ..SamplingParameters::default()
+    }));
 }
 
 #[test]
@@ -560,7 +610,11 @@ fn capture_bits(rows: &[yskn_ref::model::CapturedRow]) -> Vec<(usize, Vec<u32>)>
 #[test]
 fn residual_capture_matches_reference_across_widths_kv_backends_and_session_operations() {
     use yskn_ref::model::CaptureOptions;
-    let fixture = mixed();
+    // Capture slots 0 and 2 require the original three-layer fixture.
+    let fixture = Fixture::new(&support::synthetic_model(
+        163,
+        &["linear_attention", "full_attention", "full_attention"],
+    ));
     let options = CaptureOptions {
         layers: vec![0, 2],
         max_rows: 5,
