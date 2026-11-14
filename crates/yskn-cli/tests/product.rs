@@ -554,11 +554,8 @@ mod sockets {
     use hyper_util::rt::TokioIo;
     use std::{
         net::SocketAddr,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
-        time::Duration,
+        sync::{Arc, Mutex, mpsc},
+        time::{Duration, Instant},
     };
     use tokio::{io::AsyncWriteExt, net::TcpStream, sync::oneshot};
     use yskn::{
@@ -577,8 +574,52 @@ mod sockets {
     }
     #[derive(Default)]
     struct Observation {
-        prefill: AtomicUsize,
+        gate: Mutex<Option<PrefillGate>>,
         cancelled: Mutex<Vec<Cancelled>>,
+    }
+    struct PrefillGate {
+        reached: oneshot::Sender<()>,
+        disconnected: mpsc::Receiver<()>,
+    }
+    impl Observation {
+        fn pausing_prefill() -> (Arc<Self>, oneshot::Receiver<()>, mpsc::SyncSender<()>) {
+            let (reached, boundary) = oneshot::channel();
+            let (disconnected, resume) = mpsc::sync_channel(1);
+            let observation = Arc::new(Self {
+                gate: Mutex::new(Some(PrefillGate {
+                    reached,
+                    disconnected: resume,
+                })),
+                ..Default::default()
+            });
+            (observation, boundary, disconnected)
+        }
+    }
+    impl PrefillGate {
+        fn wait_for_disconnect(
+            self,
+            ids: &[u32],
+            cb: &mut dyn FnMut(&[u32]) -> yskn::Result<bool>,
+        ) -> yskn::Result<bool> {
+            self.reached
+                .send(())
+                .expect("test left before prefill boundary");
+            self.disconnected
+                .recv_timeout(PATIENCE)
+                .expect("client was not disconnected");
+            // Closing the client and Hyper dropping its response body happen
+            // on different threads. Poll cancellation at this same boundary
+            // until the real callback observes it; never advance another row.
+            let deadline = Instant::now() + PATIENCE;
+            while cb(ids)? {
+                assert!(
+                    Instant::now() < deadline,
+                    "disconnect did not cancel prefill"
+                );
+                std::thread::yield_now();
+            }
+            Ok(false)
+        }
     }
     struct Observed {
         inner: RealEngine,
@@ -603,7 +644,12 @@ mod sockets {
             let result = self.inner.generate(p, n, s, stop, &mut |ids| {
                 if ids.is_empty() {
                     prefill_callbacks += 1;
-                    self.observation.prefill.fetch_add(1, Ordering::Release);
+                    if prefill_callbacks == 2 {
+                        let gate = self.observation.gate.lock().unwrap().take();
+                        if let Some(gate) = gate {
+                            return gate.wait_for_disconnect(ids, cb);
+                        }
+                    }
                 }
                 cb(ids)
             })?;
@@ -685,6 +731,46 @@ mod sockets {
         (addr, tx, task)
     }
     #[tokio::test]
+    async fn observed_prefill_gate_holds_real_engine_until_disconnect_then_cancels() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (observation, boundary, disconnected) = Observation::pausing_prefill();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let worker_observation = observation.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let folder = Folder::new();
+            let mut engine = Observed {
+                inner: folder.engine(DraftMode::None),
+                observation: worker_observation,
+            };
+            engine
+                .generate(&[1; 12], 2, &greedy(), None, &mut |_| {
+                    Ok(!signal.load(Ordering::Acquire))
+                })
+                .unwrap()
+        });
+        tokio::time::timeout(PATIENCE, boundary)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !worker.is_finished(),
+            "engine crossed the held prefill boundary"
+        );
+        assert!(observation.cancelled.lock().unwrap().is_empty());
+        cancelled.store(true, Ordering::Release);
+        disconnected.send(()).unwrap();
+        let result = tokio::time::timeout(PATIENCE, worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.finish, Finish::Cancelled);
+        assert!(result.ids.is_empty());
+        let calls = observation.cancelled.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].prefill_callbacks, 2);
+    }
+    #[tokio::test]
     async fn real_socket_streaming_and_nonstreaming_use_scalar_tokens_and_exact_usage() {
         let folder = Folder::new();
         let formatter = yskn_text::ChatFormatter::load(&folder.0).unwrap();
@@ -752,21 +838,18 @@ mod sockets {
     #[tokio::test]
     async fn real_socket_disconnect_during_prefill_cancels_and_releases_engine_for_next_chat() {
         let folder = Folder::new();
-        let observation = Arc::new(Observation::default());
+        let (observation, boundary, disconnected) = Observation::pausing_prefill();
         let (addr, shutdown, task) = start(&folder, observation.clone()).await;
         let long_messages = json!([{"role":"user","content":"1 ".repeat(256)}]);
         let body=json!({"messages":long_messages,"stream":true,"max_tokens":4,"temperature":0,"enable_thinking":false}).to_string();
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(format!("POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
-        let deadline = tokio::time::Instant::now() + PATIENCE;
-        while observation.prefill.load(Ordering::Acquire) < 2 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "prefill did not start"
-            );
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        tokio::time::timeout(PATIENCE, boundary)
+            .await
+            .expect("prefill did not reach the held boundary")
+            .expect("engine left before prefill boundary");
         drop(client);
+        disconnected.send(()).unwrap();
         let messages = json!([{"role":"user","content":"2"}]);
         let (status, text) = request(
             addr,
@@ -786,10 +869,7 @@ mod sockets {
         // Width-1 prefill calls back once before and once after each of the
         // prompt.len() - 1 rows; cancellation must land strictly inside.
         assert_eq!(cancelled.ids, 0, "cancelled after prefill: {cancelled:?}");
-        assert!(
-            (2..long_prompt.len()).contains(&cancelled.prefill_callbacks),
-            "disconnect was not observed between prefill passes: {cancelled:?}"
-        );
+        assert_eq!(cancelled.prefill_callbacks, 2, "{cancelled:?}");
         // The released engine answers the next chat exactly as a fresh one.
         let prompt = formatter
             .prompt(&messages, None, &json!({"enable_thinking":false}))
