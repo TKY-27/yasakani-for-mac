@@ -1,0 +1,18 @@
+{# Synthetic byte tokenizer/template for the explicit stub engine, never a model substitute. #}
+{% if tools %}<|im_start|>system
+{{ tools|tojson }}<|im_end|>
+{% endif %}
+{% for m in messages %}<|im_start|>{{ m.role }}
+{% if m.content is string %}{{ m.content }}{% else %}{% for p in m.content %}{{ p.text }}{% endfor %}{% endif %}
+{% if m.tool_calls %}{% for c in m.tool_calls %}<tool_call>
+<function={{ c.function.name }}>
+{% for key, value in c.function.arguments.items() %}<parameter={{ key }}>
+{% if value is string %}{{ value }}{% else %}{{ value|tojson }}{% endif %}{{ '\n' }}</parameter>
+{% endfor %}</function>
+</tool_call>{% endfor %}{% endif %}
+{% if m.role == 'tool' %}<tool_response>
+{{ m.content }}
+</tool_response>{% endif %}<|im_end|>
+{% endfor %}<|im_start|>assistant
+{% if enable_thinking is not defined or enable_thinking %}<think>
+{% endif %}

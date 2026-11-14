@@ -454,6 +454,39 @@ The info example reads headers only, lists every tensor/vector and SHEAD
 array extent, and checks released shape/sign/rotation assumptions. Synthetic
 tests need no artifact files or network. On the real files one scalar
 `propose` takes about 90 seconds and about 1.6 GB resident.
+The scalar reference intentionally remains slow; no main capture wiring,
+speculation loop, 16-row option or HCAP side policy is included.
+
+## Rust product layer (`yskn`, Brief 06d)
+
+`crates/yskn-cli` implements plain terminal chat and the OpenAI-compatible
+HTTP/1 API over a synchronous, object-safe engine trait with no Send bound.
+The server builds/owns its runner on a dedicated thread and serializes jobs
+through a bounded channel. Text formatting/decoding/tool parsing reuse
+`yskn-text`; additive `ChatFormatter::from_json`, `Clone` and `json_dumps`
+allow embedded synthetic assets and Python-compatible tool argument strings.
+File loading delegates to the same initialization and retains its checks.
+
+Use `cargo run -p yskn -- chat --engine stub`, `serve --engine stub`, or
+`info --engine stub`. The stub is explicitly deterministic demo output;
+real generation is not connected, and omitting `--engine stub` fails clearly.
+`bench` and `selfcheck` report `not available yet`. No model weights, Python,
+DLL or CUDA are used. The optional model directory is text-only.
+
+The API ports request cleaning, thinking/effort/budget controls, stop-string
+holdback, loop-guard bridge continuation, tool calling, finish reasons and
+usage. Loopback Host/Origin/Fetch checks, optional constant-time digest key
+comparison, and security response headers follow the upstream product.
+Non-local binds without a key are refused. Additional bounded body/header/
+connection/event resources and deadlines protect the Hyper transport.
+
+Synthetic chat/service tests and real ephemeral TCP tests are ordinary Cargo
+tests. Real-socket tests must fail visibly if the environment denies bind;
+service tests do not establish transport verification. Full commands, security
+limits, the engine contract and deliberate Python/Windows differences are in
+[the CLI README](../../crates/yskn-cli/README.md); each ported test names its
+upstream case in a comment.
+
 The scalar reference intentionally remains slow. D17 adds main capture wiring
 and the shared speculation loop; 16-row blocks and HCAP side policy remain
 outside the port.

@@ -3,6 +3,7 @@ use minijinja::{
     value::{Kwargs, Rest, StringInput, ValueOrKwargs, from_args},
 };
 use serde_json::Value;
+use std::fmt;
 
 pub(crate) fn error(e: Error) -> crate::Error {
     crate::error(
@@ -67,6 +68,28 @@ pub(crate) fn environment() -> Environment<'static> {
     env
 }
 
+/// Python-compatible JSON spelling for protocol-embedded argument strings.
+pub fn json_dumps(value: &Value, ensure_ascii: bool) -> String {
+    let mut out = String::new();
+    // Writing into a String cannot fail.
+    let _ = write_json(value, ensure_ascii, &mut out);
+    out
+}
+
+/// [`json_dumps`]'s text written into `out` piece by piece, without an
+/// intermediate copy of the value. An error from `out` stops the writing
+/// there, so a sink that keeps only a prefix pays only for the prefix.
+pub fn write_json(value: &Value, ensure_ascii: bool, out: &mut dyn fmt::Write) -> fmt::Result {
+    JsonFormat {
+        ensure_ascii,
+        indent: None,
+        item_sep: ", ".into(),
+        key_sep: ": ".into(),
+        sort_keys: false,
+    }
+    .write(value, 0, out)
+}
+
 fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidOperation, message.into())
 }
@@ -128,7 +151,11 @@ fn tojson(value: JValue, args: Rest<ValueOrKwargs>) -> Result<String, Error> {
         key_sep,
         sort_keys,
     };
-    Ok(format.render(&value, 0))
+    let mut out = String::new();
+    format
+        .write(&value, 0, &mut out)
+        .map_err(|e| invalid(e.to_string()))?;
+    Ok(out)
 }
 
 struct JsonFormat {
@@ -139,71 +166,82 @@ struct JsonFormat {
     sort_keys: bool,
 }
 
+type Entries<'a> = Box<dyn Iterator<Item = (Option<&'a String>, &'a Value)> + 'a>;
+
 impl JsonFormat {
-    fn quoted(&self, text: &str) -> String {
-        // serde_json's escaping agrees with json.dumps except ensure_ascii.
-        let encoded = Value::String(text.into()).to_string();
-        if !self.ensure_ascii {
-            return encoded;
-        }
-        let mut result = String::new();
-        for c in encoded.chars() {
-            if c < '\u{7f}' {
-                result.push(c);
-            } else {
-                for unit in c.encode_utf16(&mut [0; 2]) {
-                    result.push_str(&format!("\\u{unit:04x}"));
+    /// json.dumps' string escaping: serde_json's (`\"`, `\\`, the short
+    /// escapes and `\u00XX` for other controls), plus `\uXXXX` UTF-16 units
+    /// for everything from DEL up with `ensure_ascii`.
+    fn write_quoted(&self, text: &str, out: &mut dyn fmt::Write) -> fmt::Result {
+        out.write_char('"')?;
+        let mut plain = 0;
+        for (i, c) in text.char_indices() {
+            if !(matches!(c, '"' | '\\') || c < ' ' || (self.ensure_ascii && c >= '\u{7f}')) {
+                continue;
+            }
+            // Unescaped runs are written whole, not character by character.
+            out.write_str(&text[plain..i])?;
+            plain = i + c.len_utf8();
+            match c {
+                '"' => out.write_str("\\\"")?,
+                '\\' => out.write_str("\\\\")?,
+                '\u{8}' => out.write_str("\\b")?,
+                '\u{c}' => out.write_str("\\f")?,
+                '\n' => out.write_str("\\n")?,
+                '\r' => out.write_str("\\r")?,
+                '\t' => out.write_str("\\t")?,
+                c => {
+                    for unit in c.encode_utf16(&mut [0; 2]) {
+                        write!(out, "\\u{unit:04x}")?;
+                    }
                 }
             }
         }
-        result
+        out.write_str(&text[plain..])?;
+        out.write_char('"')
     }
 
-    fn render(&self, value: &Value, depth: usize) -> String {
-        let (open, close, items): (&str, &str, Vec<String>) = match value {
-            Value::Array(values) => (
-                "[",
-                "]",
-                values.iter().map(|v| self.render(v, depth + 1)).collect(),
-            ),
-            Value::Object(values) => {
-                let mut entries: Vec<_> = values.iter().collect();
-                if self.sort_keys {
-                    entries.sort_by_key(|(k, _)| *k);
-                }
+    fn write(&self, value: &Value, depth: usize, out: &mut dyn fmt::Write) -> fmt::Result {
+        let (open, close, entries): (char, char, Entries<'_>) = match value {
+            Value::Array(values) => ('[', ']', Box::new(values.iter().map(|v| (None, v)))),
+            Value::Object(values) if self.sort_keys => {
+                let mut sorted: Vec<_> = values.iter().collect();
+                sorted.sort_by_key(|(k, _)| *k);
                 (
-                    "{",
-                    "}",
-                    entries
-                        .into_iter()
-                        .map(|(k, v)| {
-                            format!(
-                                "{}{}{}",
-                                self.quoted(k),
-                                self.key_sep,
-                                self.render(v, depth + 1)
-                            )
-                        })
-                        .collect(),
+                    '{',
+                    '}',
+                    Box::new(sorted.into_iter().map(|(k, v)| (Some(k), v))),
                 )
             }
-            Value::String(s) => return self.quoted(s),
-            Value::Number(n) if n.is_f64() => return python_float(&n.to_string()),
-            _ => return value.to_string(),
+            Value::Object(values) => ('{', '}', Box::new(values.iter().map(|(k, v)| (Some(k), v)))),
+            Value::String(s) => return self.write_quoted(s, out),
+            Value::Number(n) if n.is_f64() => return out.write_str(&python_float(&n.to_string())),
+            _ => return write!(out, "{value}"),
         };
-        if items.is_empty() {
-            return format!("{open}{close}");
+        let prefix = self
+            .indent
+            .as_ref()
+            .map(|indent| format!("\n{}", indent.repeat(depth + 1)));
+        out.write_char(open)?;
+        let mut empty = true;
+        for (key, v) in entries {
+            if !empty {
+                out.write_str(&self.item_sep)?;
+            }
+            empty = false;
+            if let Some(prefix) = &prefix {
+                out.write_str(prefix)?;
+            }
+            if let Some(key) = key {
+                self.write_quoted(key, out)?;
+                out.write_str(&self.key_sep)?;
+            }
+            self.write(v, depth + 1, out)?;
         }
-        if let Some(indent) = &self.indent {
-            let prefix = format!("\n{}", indent.repeat(depth + 1));
-            format!(
-                "{open}{prefix}{}\n{}{close}",
-                items.join(&format!("{}{prefix}", self.item_sep)),
-                indent.repeat(depth)
-            )
-        } else {
-            format!("{open}{}{close}", items.join(&self.item_sep))
+        if let Some(indent) = self.indent.as_ref().filter(|_| !empty) {
+            write!(out, "\n{}", indent.repeat(depth))?;
         }
+        out.write_char(close)
     }
 }
 
@@ -290,6 +328,34 @@ mod tests {
                 .unwrap(),
             "[1e-07, 1e+20, -0.0, 1000000000000000.0, 1e-05, 0.0001]"
         );
+    }
+
+    #[test]
+    fn json_text_is_streamed_and_stops_with_its_sink() {
+        // String escaping agrees with serde_json's, which agrees with json.dumps.
+        let all: String = ('\0'..='\u{3ff}').chain(['\u{2028}', '😀']).collect();
+        assert_eq!(json_dumps(&json!(all), false), json!(all).to_string());
+        assert_eq!(
+            json_dumps(&json!(["\"\\\u{7f}é😀"]), true),
+            "[\"\\\"\\\\\\u007f\\u00e9\\ud83d\\ude00\"]"
+        );
+        assert_eq!(
+            environment()
+                .render_str("{{ {'a': [], 'b': {}, 'c': [1]}|tojson(indent=2) }}", ())
+                .unwrap(),
+            "{\n  \"a\": [],\n  \"b\": {},\n  \"c\": [\n    1\n  ]\n}"
+        );
+        // A sink's error ends the writing: the rest of the value is not visited.
+        struct Writes(usize);
+        impl fmt::Write for Writes {
+            fn write_str(&mut self, _: &str) -> fmt::Result {
+                self.0 += 1;
+                if self.0 == 5 { Err(fmt::Error) } else { Ok(()) }
+            }
+        }
+        let mut sink = Writes(0);
+        assert!(write_json(&json!(vec![vec!["ab"; 1000]; 1000]), false, &mut sink).is_err());
+        assert_eq!(sink.0, 5);
     }
 
     #[test]
