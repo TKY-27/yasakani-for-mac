@@ -8,10 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 use yskn_ref::{
-    ModelDimensions,
+    KvMode, ModelDimensions,
     compressed_linear::{PreparedActivation, quantize_activation, restore_projection},
     gated_deltanet::{GatedDeltaNet, GatedDeltaNetState, round_projection},
-    model::{Branch, Layer, LayerState, Weights, load_weights, model_location},
+    model::{Branch, Layer, LayerState, Weights, load_weights_with_kv, model_location_with_kv},
     residual_norm_mlp::{NormalizedInput, gated_product, prepare_normalization, residual_add},
 };
 
@@ -27,18 +27,21 @@ impl Linear {
 
 /// Wall times cover nonoverlapping stages of a complete layer-major pass.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct PassTiming {
     pub position: usize,
     pub rows: usize,
     pub total: Duration,
     pub kernel: Duration,
     pub attention: Duration,
+    /// Attention row preparation, including KV encoding (also norm/RoPE/gating).
+    pub kv_encode: Duration,
     pub recurrence: Duration,
 }
 impl PassTiming {
     pub fn rest(&self) -> Duration {
         self.total
-            .saturating_sub(self.kernel + self.attention + self.recurrence)
+            .saturating_sub(self.kernel + self.attention + self.kv_encode + self.recurrence)
     }
 }
 
@@ -49,17 +52,27 @@ pub struct Model {
     position: usize,
     context_capacity: usize,
     rows_per_pass: usize,
+    kv_mode: KvMode,
     logits: Vec<Vec<f32>>,
     timings: Vec<PassTiming>,
 }
 impl Model {
     /// Default kernel and pool (`YSKN_KERNEL`), backend from `YSKN_BACKEND`
-    /// (default Metal when a device exists, CPU otherwise), 16 rows per pass.
+    /// (default Metal when a device exists, CPU otherwise), `YSKN_KV`
+    /// (`int8`, `int8-profile`, `kv5`; default `int8`), 16 rows per pass.
     /// # Safety
     /// All weights files must remain unmodified and untruncated until this model is dropped.
     pub unsafe fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let mode = std::env::var_os("YSKN_KV")
+            .map(|value| {
+                yskn_ref::quality::parse_kv_mode(&value).map_err(|_| {
+                    Error::InvalidInput("YSKN_KV expects int8|int8-profile|kv5".into())
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
         // SAFETY: forwarded file-stability contract is required of this method's caller.
-        unsafe { Self::with_backend(path, Engine::from_env()?, Backend::from_env()?, 16) }
+        unsafe { Self::with_options(path, Engine::from_env()?, Backend::from_env()?, 16, mode) }
     }
 
     /// The CPU backend with an explicit kernel/pool and pass width (positive, with
@@ -86,16 +99,33 @@ impl Model {
         backend: Backend,
         rows_per_pass: usize,
     ) -> Result<Self> {
+        // SAFETY: forwarded file-stability contract is required of this method's caller.
+        unsafe { Self::with_options(path, engine, backend, rows_per_pass, KvMode::Int8) }
+    }
+
+    /// Explicit backend, pool, pass width and KV mode. Never reads the environment.
+    /// Profile modes require a model folder containing the manifest's KVQP profile.
+    /// # Safety
+    /// All weights files must remain unmodified and untruncated until this model is dropped.
+    pub unsafe fn with_options(
+        path: impl AsRef<Path>,
+        engine: Engine,
+        backend: Backend,
+        rows_per_pass: usize,
+        kv_mode: KvMode,
+    ) -> Result<Self> {
         if rows_per_pass == 0 {
             return Err(Error::InvalidInput("rows_per_pass must be positive".into()));
         }
         let engine = Compute::new(engine, backend)?;
-        let (path, context_capacity) = model_location(path.as_ref())?;
+        let (path, context_capacity, profile) = model_location_with_kv(path.as_ref(), kv_mode)?;
         // SAFETY: caller establishes file stability through model drop. Every weight view
         // shares this mapping, so none can outlive that external-file contract.
         let mapping = unsafe { MappedModel::open(path)? };
-        let weights = load_weights(
+        let weights = load_weights_with_kv(
             &mut mapping.reader()?,
+            kv_mode,
+            profile,
             |_, name, rows, cols, output_rotation| {
                 let matrix = mapping.matrix(name)?;
                 let d = matrix.descriptor();
@@ -130,6 +160,7 @@ impl Model {
             position: 0,
             context_capacity,
             rows_per_pass,
+            kv_mode,
             logits: Vec::new(),
             timings: Vec::new(),
         })
@@ -145,6 +176,9 @@ impl Model {
     }
     pub fn rows_per_pass(&self) -> usize {
         self.rows_per_pass
+    }
+    pub fn kv_mode(&self) -> KvMode {
+        self.kv_mode
     }
     pub fn backend(&self) -> Backend {
         self.engine.backend()
@@ -508,6 +542,8 @@ fn forward(
             let prepared = engine.map_range(0..hidden.len(), |i| {
                 l.attention.prepare_row(position + i, &q[i], &k[i], &v[i])
             })?;
+            timing.kv_encode += start.elapsed();
+            let start = Instant::now();
             for (i, p) in prepared.iter().enumerate() {
                 l.attention.append_prepared(state, position + i, p)?;
             }

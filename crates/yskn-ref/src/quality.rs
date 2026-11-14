@@ -1,5 +1,7 @@
 //! Shared chapter-06 window definition, ordered loss accumulation and reporting.
-use crate::{Error, Result, output_head_sampler::negative_log_likelihood, portable_math::exp_d};
+use crate::{
+    Error, KvMode, Result, output_head_sampler::negative_log_likelihood, portable_math::exp_d,
+};
 use serde::{Deserialize, Serialize};
 use std::{fs, ops::Range, path::Path, time::Instant};
 
@@ -87,6 +89,30 @@ impl Score {
         fs::write(path, serde_json::to_vec_pretty(self)?)?;
         Ok(())
     }
+}
+
+/// Shared CLI spelling for scalar and mapped quality runners.
+pub fn parse_kv_mode(value: &std::ffi::OsStr) -> Result<KvMode> {
+    match value.to_str() {
+        Some("int8") => Ok(KvMode::Int8),
+        Some("int8-profile") => Ok(KvMode::Int8Profile),
+        Some("kv5") => Ok(KvMode::Kv5),
+        _ => Err(Error::InvalidInput(
+            "--kv expects int8|int8-profile|kv5".into(),
+        )),
+    }
+}
+
+/// Pass the selected mode to a backend loader, then use the common scoring contract.
+pub fn score_with_kv<M: ScoringModel>(
+    mode: KvMode,
+    load: impl FnOnce(KvMode) -> Result<M>,
+    windows: &TokenWindows,
+    range: Range<usize>,
+    rows_per_pass: usize,
+    after_pass: impl FnMut(&M),
+) -> Result<Score> {
+    score(&mut load(mode)?, windows, range, rows_per_pass, after_pass)
 }
 
 /// `after_pass` observes timing without participating in any numerical operation.

@@ -1,6 +1,10 @@
-//! Scalar int8 attention from [chapter 04](../../../docs/spec/04_ATTENTION.md).
+//! Scalar selectable-cache attention from [chapter 04](../../../docs/spec/04_ATTENTION.md).
+
+use std::sync::Arc;
 
 use crate::gated_deltanet::xor_sum32;
+use crate::kv_codec::{CacheRow, Int8Row, encode_packed, requantize_int8};
+use crate::kv_profile::KvProfile;
 use crate::portable_math::{bfloat, exp, exp2, rsqrt, sigmoid, sincos};
 use crate::{Error, Result};
 
@@ -41,6 +45,26 @@ const FREQUENCY_BITS: [u32; 32] = [
 const LOG2_E: f32 = std::f32::consts::LOG2_E;
 const EMPTY_MAXIMUM: f32 = -1.0e30;
 
+/// Cache arithmetic contract; plain Int8 remains the loader default (D13).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvMode {
+    #[default]
+    Int8,
+    Int8Profile,
+    Kv5,
+}
+
+impl KvMode {
+    /// Stable spelling used by command-line options and result files.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Int8 => "int8",
+            Self::Int8Profile => "int8-profile",
+            Self::Kv5 => "kv5",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttentionDimensions {
     pub query_heads: usize,
@@ -57,18 +81,15 @@ pub struct Attention {
     epsilon: f32,
     query_width: usize,
     kv_width: usize,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct Int8CacheRow {
-    integers: Vec<i8>,
-    scale: f32,
+    kv_mode: KvMode,
+    kv_profile: Option<Arc<KvProfile>>,
+    attention_ordinal: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct CacheToken {
-    keys: Vec<Int8CacheRow>,
-    values: Vec<Int8CacheRow>,
+    keys: Vec<CacheRow>,
+    values: Vec<CacheRow>,
 }
 
 /// Only the visible causal prefix is retained; a model pass owns its provisional copy.
@@ -187,7 +208,101 @@ impl Attention {
             epsilon,
             query_width,
             kv_width,
+            kv_mode: KvMode::Int8,
+            kv_profile: None,
+            attention_ordinal: 0,
         })
+    }
+
+    /// Configure before creating sequence state. Arc keeps engine stage calls shareable.
+    pub fn with_kv(
+        mut self,
+        mode: KvMode,
+        profile: Option<Arc<KvProfile>>,
+        attention_ordinal: usize,
+    ) -> Result<Self> {
+        if mode != KvMode::Int8 {
+            let profile = profile.as_ref().ok_or_else(|| {
+                Error::InvalidModel("profile KV mode requires a KVQP profile".into())
+            })?;
+            if profile.kv_heads() != self.dimensions.kv_heads
+                || attention_ordinal >= profile.attention_layers()
+            {
+                return Err(Error::InvalidModel(
+                    "attention/profile dimensions differ".into(),
+                ));
+            }
+        }
+        self.kv_mode = mode;
+        self.kv_profile = if mode == KvMode::Int8 { None } else { profile };
+        self.attention_ordinal = attention_ordinal;
+        Ok(self)
+    }
+
+    fn group_index(&self, head: usize, side: usize) -> usize {
+        // src/kvq_atxpk.hpp:65-68; ordinal counts attention layers only.
+        (self.attention_ordinal * self.dimensions.kv_heads + head) * 2 + side
+    }
+
+    fn encode_row(
+        &self,
+        head: usize,
+        side: usize,
+        position: usize,
+        row: &[f32],
+    ) -> Result<CacheRow> {
+        if self.kv_mode == KvMode::Int8 {
+            return encode_int8(row);
+        }
+        let profile = self.kv_profile.as_ref().expect("validated KV profile");
+        let group = self.group_index(head, side);
+        let row = row.try_into().expect("256-channel cache row");
+        // src/kvq_fast.cuh:78,189,218-234: guard uses the absolute cache position.
+        match self.kv_mode {
+            KvMode::Int8 => unreachable!(),
+            KvMode::Int8Profile => Ok(CacheRow::Int8(requantize_int8(
+                profile, group, position, row,
+            )?)),
+            KvMode::Kv5 => encode_packed(profile, group, position, row),
+        }
+    }
+
+    fn base(&self, row: &CacheRow, head: usize, side: usize, channel: usize) -> Result<f32> {
+        match row {
+            CacheRow::Int8(row) => Ok(f32::from(row.integers()[channel])),
+            CacheRow::Packed(_) => {
+                let profile = self.kv_profile.as_ref().ok_or_else(|| {
+                    Error::InvalidInput("packed attention row requires a profile".into())
+                })?;
+                // BF16 table, no key mean: src/kvq_atxpk.hpp:42-45;
+                // src/q35_atxpk3.cuh:343-380,427-430,454 (pk4:287-325,369-372,396).
+                if side == 0 {
+                    row.key_base(profile, self.group_index(head, side), channel)
+                } else {
+                    row.value_base(profile, self.group_index(head, side), channel)
+                }
+            }
+        }
+    }
+
+    fn add_value_mean(
+        &self,
+        split: &mut AttentionSplit,
+        head: usize,
+        row: &CacheRow,
+    ) -> Result<()> {
+        if matches!(row, CacheRow::Packed(_)) {
+            let profile = self.kv_profile.as_ref().expect("validated KV profile");
+            for (channel, numerator) in split.numerator.iter_mut().enumerate() {
+                let mean = row.value_mean(profile, self.group_index(head, 1), channel)?;
+                // After self; denominator is FP32 including self, not BF16 weight sums.
+                // src/q35_atxpk3.cuh:443-475; src/q35_atxpk4.cuh:385-417.
+                *numerator += split.denominator * mean;
+            }
+            finite(&split.numerator, "attention split value mean")?;
+        }
+        // Int8 fallback already restored mean/basis (src/kvq_fast.cuh:214-218,234).
+        Ok(())
     }
 
     pub fn new_state(&self) -> Result<AttentionState> {
@@ -366,9 +481,9 @@ impl Attention {
                 .collect();
             let normalized_key = self.normalize_head(&key, &self.key_norm)?;
             let rotated_key = rotate_cache(&self.rope(&normalized_key, position)?);
-            keys.push(encode_int8(&rotated_key)?);
+            keys.push(self.encode_row(head, 0, position, &rotated_key)?);
             // Values receive neither head normalization nor RoPE.
-            values.push(encode_int8(&rotate_cache(&value))?);
+            values.push(self.encode_row(head, 1, position, &rotate_cache(&value))?);
         }
         finite(&queries, "attention rounded rotated query")?;
         finite(&gates, "attention rounded gate")?;
@@ -456,8 +571,10 @@ impl Attention {
                     query,
                     &current.keys[kv_head],
                     &current.values[kv_head],
+                    kv_head,
                 )?;
             }
+            self.add_value_mean(&mut split, kv_head, &current.values[kv_head])?;
             splits.push(split);
         }
         splits.resize_with(padded_count, || AttentionSplit {
@@ -519,11 +636,16 @@ impl Attention {
                 let mut accumulator = 0.0;
                 for chunk in 0..self.dimensions.head_dim / 16 {
                     // D3: provisional mma16 order is ascending scalar multiply then add.
-                    for channel in chunk * 16..(chunk + 1) * 16 {
-                        accumulator += query[channel] * f32::from(key.integers[channel]);
+                    for (offset, &query_value) in
+                        query[chunk * 16..(chunk + 1) * 16].iter().enumerate()
+                    {
+                        accumulator +=
+                            query_value * self.base(key, kv_head, 0, chunk * 16 + offset)?;
                     }
                 }
-                *score = accumulator * (key.scale * 0.0625);
+                // Shipping QK8=false: no table-int8 scale, only the packed row scale.
+                // src/q35_atxpk3.cuh:379; src/q35_atxpk4.cuh:325.
+                *score = accumulator * (key.scale() * 0.0625);
                 finite(&[*score], "attention prefix score")?;
             }
         }
@@ -564,13 +686,14 @@ impl Attention {
         for (tile_index, weight) in value_weights.iter_mut().enumerate() {
             let position = tile_start + tile_index;
             if visible.contains(&position) {
-                let value_scale = prefix[position].values[kv_head].scale;
-                // Prefix probability times the row scale rounds to BF16 before the value dot.
+                let value_scale = prefix[position].values[kv_head].scale();
+                // Round probability * scale, not the value: src/q35_atxpk3.cuh:405-406;
+                // src/q35_atxpk4.cuh:348-349; src/q35_atxpk.cu:55-56.
                 *weight = bfloat(probabilities[tile_index] * value_scale);
             }
         }
         for half in 0..2 {
-            for channel in 0..self.dimensions.head_dim {
+            for (channel, numerator) in split.numerator.iter_mut().enumerate() {
                 // D3: each mma16 consumes its 16 keys in ascending scalar order.
                 for (offset, &value_weight) in
                     value_weights[half * 16..(half + 1) * 16].iter().enumerate()
@@ -578,8 +701,9 @@ impl Attention {
                     let position = tile_start + half * 16 + offset;
                     // D9 skips masked operations entirely, including zero-valued products.
                     if visible.contains(&position) {
-                        let value = f32::from(prefix[position].values[kv_head].integers[channel]);
-                        split.numerator[channel] += value_weight * value;
+                        let value =
+                            self.base(&prefix[position].values[kv_head], kv_head, 1, channel)?;
+                        *numerator += value_weight * value;
                     }
                 }
             }
@@ -592,8 +716,9 @@ impl Attention {
         &self,
         split: &mut AttentionSplit,
         query: &[f32],
-        key: &Int8CacheRow,
-        value: &Int8CacheRow,
+        key: &CacheRow,
+        value: &CacheRow,
+        kv_head: usize,
     ) -> Result<()> {
         let mut partial = [0.0; 4];
         for (lane, sum) in partial.iter_mut().enumerate() {
@@ -601,11 +726,11 @@ impl Attention {
                 // Self has its own interleaved FP32 order; it is not the prefix mma16.
                 for offset in [2 * lane, 2 * lane + 1, 8 + 2 * lane, 9 + 2 * lane] {
                     let channel = 16 * chunk + offset;
-                    *sum += query[channel] * f32::from(key.integers[channel]);
+                    *sum += query[channel] * self.base(key, kv_head, 0, channel)?;
                 }
             }
         }
-        let score = xor_sum4(partial) * (key.scale * 0.0625);
+        let score = xor_sum4(partial) * (key.scale() * 0.0625);
         finite(&[score], "attention self score")?;
         let new_maximum = split.maximum.max(score);
         let rescale_argument = (split.maximum - new_maximum) * LOG2_E;
@@ -619,10 +744,12 @@ impl Attention {
         let probability = exp2(probability_argument);
         split.maximum = new_maximum;
         split.denominator = split.denominator * rescale + probability;
-        // No BF16 rounding is permitted for the separate self value weight.
-        let value_weight = probability * value.scale;
+        // FP32 self weight and own encoded row: src/q35_atxpk3.cuh:421-458;
+        // src/q35_atxpk4.cuh:363-400. Packed self still uses the BF16 table base.
+        let value_weight = probability * value.scale();
         for (channel, numerator) in split.numerator.iter_mut().enumerate() {
-            *numerator = *numerator * rescale + value_weight * f32::from(value.integers[channel]);
+            *numerator =
+                *numerator * rescale + value_weight * self.base(value, kv_head, 1, channel)?;
         }
         finite(&[split.denominator], "attention self denominator")?;
         finite(&split.numerator, "attention self numerator")
@@ -679,7 +806,7 @@ fn inverse_rotate_cache(values: &[f32]) -> Vec<f32> {
     rotated
 }
 
-fn encode_int8(values: &[f32]) -> Result<Int8CacheRow> {
+fn encode_int8(values: &[f32]) -> Result<CacheRow> {
     finite(values, "attention cache input")?;
     let maximum = values.iter().map(|value| value.abs()).fold(0.0, f32::max);
     let scale = maximum / 127.0;
@@ -694,7 +821,7 @@ fn encode_int8(values: &[f32]) -> Result<Int8CacheRow> {
             }
         })
         .collect();
-    Ok(Int8CacheRow { integers, scale })
+    Ok(CacheRow::Int8(Int8Row { integers, scale }))
 }
 
 fn xor_sum4(mut partial: [f32; 4]) -> f32 {
@@ -715,6 +842,14 @@ fn finite(values: &[f32], context: &'static str) -> Result<()> {
         Err(Error::NonFinite(context))
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/kv_profile.rs"]
+mod synthetic_kv_profile;
+
+#[cfg(test)]
+#[path = "attention_kv_tests.rs"]
+mod kv_tests;
 
 #[cfg(test)]
 mod tests {
@@ -878,7 +1013,7 @@ mod tests {
         let rows: Vec<CacheToken> = (0..76)
             .map(|position| CacheToken {
                 keys: vec![
-                    Int8CacheRow {
+                    CacheRow::Int8(Int8Row {
                         integers: (0..256)
                             .map(
                                 |channel| (((position * 13 + channel * 7) % 255) as i16 - 127)
@@ -886,11 +1021,11 @@ mod tests {
                             )
                             .collect(),
                         scale: (position % 7 + 1) as f32 * 0.0078125,
-                    };
+                    });
                     2
                 ],
                 values: vec![
-                    Int8CacheRow {
+                    CacheRow::Int8(Int8Row {
                         integers: (0..256)
                             .map(
                                 |channel| (((position * 19 + (channel % 16) * 11) % 255) as i16
@@ -898,7 +1033,7 @@ mod tests {
                             )
                             .collect(),
                         scale: (position % 11 + 1) as f32 * 0.015625,
-                    };
+                    });
                     2
                 ],
             })
@@ -936,10 +1071,16 @@ mod tests {
 
     #[test]
     fn int8_encoding_handles_zero_and_halfway_ties() {
-        let zero = encode_int8(&[0.0; 256]).unwrap();
+        let CacheRow::Int8(zero) = encode_int8(&[0.0; 256]).unwrap() else {
+            panic!("int8");
+        };
         assert_eq!(zero.scale.to_bits(), 0.0_f32.to_bits());
         assert!(zero.integers.iter().all(|&value| value == 0));
-        let encoded = encode_int8(&[127.0, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5]).unwrap();
+        let CacheRow::Int8(encoded) =
+            encode_int8(&[127.0, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5]).unwrap()
+        else {
+            panic!("int8");
+        };
         assert_eq!(encoded.scale, 1.0);
         assert_eq!(encoded.integers, [127, 0, 2, 2, 0, -2, -2]);
     }
@@ -1016,17 +1157,17 @@ mod tests {
         let mut prefix = vec![
             CacheToken {
                 keys: vec![
-                    Int8CacheRow {
+                    CacheRow::Int8(Int8Row {
                         integers: vec![2; 256],
                         scale: 0.25
-                    };
+                    });
                     2
                 ],
                 values: vec![
-                    Int8CacheRow {
+                    CacheRow::Int8(Int8Row {
                         integers: vec![-3; 256],
                         scale: 0.125
-                    };
+                    });
                     2
                 ],
             };
@@ -1059,8 +1200,10 @@ mod tests {
         for (position, token) in prefix.iter_mut().enumerate() {
             if !visible.contains(&position) {
                 for row in token.keys.iter_mut().chain(&mut token.values) {
-                    row.scale = f32::NAN;
-                    row.integers.fill(-127);
+                    if let CacheRow::Int8(row) = row {
+                        row.scale = f32::NAN;
+                        row.integers.fill(-127);
+                    }
                 }
             }
         }
@@ -1071,9 +1214,13 @@ mod tests {
 
         // Substituting +0 operands for masked slots would erase these negative zeros.
         for token in &mut prefix[visible.clone()] {
-            token.keys[0].integers.fill(0);
-            token.values[0].scale = f32::from_bits(32);
-            token.values[0].integers.fill(-127);
+            if let CacheRow::Int8(row) = &mut token.keys[0] {
+                row.integers.fill(0);
+            }
+            if let CacheRow::Int8(row) = &mut token.values[0] {
+                row.scale = f32::from_bits(32);
+                row.integers.fill(-127);
+            }
         }
         let mut split = AttentionSplit {
             maximum: 0.0,

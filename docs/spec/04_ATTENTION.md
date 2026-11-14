@@ -106,13 +106,21 @@ After rotation, query coordinates are rounded to BF16 and saved as `query_bf16[r
 
 ## Runtime cache representations
 
+The scalar reference's `KvMode::Int8` is the historical plain-int8 baseline,
+not the upstream published “int8” quality configuration. `Int8Profile`
+selects that initial-int8/profile/final-int8 path; `Kv5` packs eligible sides
+and uses `Int8Profile` elsewhere. Existing scalar loaders still default to
+plain `Int8` and require a profile only for explicit profile modes (D13).
+Upstream runs profile selection with packed capacity both on and off:
+`src/engine35.cpp:688-704`, `src/kvq_fast.cuh:189-234`.
+
 The cache row index is `kv_head * max_context + physical_position`. Key and value use separate payload and scale arrays. The table describes storage for one 256-element row of one key/value head; these are runtime arrays, not `.yskn` tensor records. `.yskn` is already specified in [../FORMAT.md](../FORMAT.md). Sources: `src/q35_kernels.cu:39-39`, `src/engine35.cpp:248-254`.
 
 | Representation | Payload / side data per row | Numeric interpretation and reachability | Evidence |
 |---|---|---|---|
 | FP16 | 256 binary16 values, 512 bytes | `f16` of the prepared key/value; available in an alternative build/configuration | `src/q35_kernels.cu:607-608`, `src/q35_kernels.cu:1035-1035`, `src/q35_kernels.cu:1059-1059` |
 | BF16 | 256 BF16 values, 512 bytes | `bf` of the prepared key/value when both 16-bit-cache flags select BF16; alternate configuration | `src/q35_kernels.cu:607-608`; `src/engine35.cpp:356-356` |
-| Int8 | 256 signed bytes plus one FP32 scale, 260 bytes | signed integer times its row scale | `src/kvx_codec.cuh:50-69`; `src/engine35.cpp:250-251` |
+| Int8 | 256 signed bytes plus one FP32 scale, 260 bytes | Signed integer times its row scale; shipping mode 3 stores profile-requantized int8, including when packed capacity is disabled | `src/kvx_codec.cuh:50-69`; `src/engine35.cpp:250-251` |
 | Packed 5-bit trellis | 160 payload bytes plus one FP32 scale, 164 bytes | 256 5-bit fields, four 64-element chains, codebook and mean from the profile | `src/kvq_fast.cuh:220-231`; `src/q35_atxpk.cu:69-74`; `src/engine35.cpp:249-251` |
 | Packed 4-bit trellis | 128 payload bytes plus one FP32 scale, 132 bytes | Same procedure with four field bits, supported according to the profile | `src/kvq_atxpk.hpp:73-83`; `src/kvq_fast.cuh:220-231` |
 
@@ -284,7 +292,7 @@ for chain in 0..3:
         decoded_state[64*chain+i] = state
 ```
 
-For attention, build `attention_codebook[state] = bf(mul(mul(float32(ci[state]),1/256),gain))`. The packed payload selects these BF16 values; key/value row scales remain separate. A key mean is not added to the query/key score. A packed value mean is added later as `partial_denominator * mean[channel]` to each partial numerator. This exactly describes the source, including the asymmetry between key and value means. Sources: `src/kvq_atxpk.hpp:39-54`, `src/q35_atxpk3.cuh:343-380`, `src/q35_atxpk3.cuh:463-468`, `src/q35_atxpk4.cuh:405-410`.
+For attention, build `attention_codebook[state] = bf(mul(mul(float32(ci[state]),1/256),gain))`. The packed payload selects these BF16 values; key/value row scales remain separate. A key mean is not added to the query/key score. A packed value mean is added later as `partial_denominator * mean[channel]` to each partial numerator, after self and before split output; that FP32 denominator includes self and uses the original probabilities, not BF16-rounded/scaled value weights. This exactly describes the source, including the asymmetry between key and value means. Sources: `src/kvq_atxpk.hpp:39-54`, `src/q35_atxpk3.cuh:343-380,443-475`, `src/q35_atxpk4.cuh:385-417`.
 
 For an unpackable side, mode 0 still performs profile quantization, restores the optional basis contributions in order and then the mean, and quantizes the result a second time with `encode_int8`. Mode 1 instead uses residual scale `max(abs(residual))/7` (zero replaced by one), nearest-even integer rounding clamped to `[-7,7]`, then restores basis/mean and performs that second int8 encoding. Before a group's guard position, or for a missing group, profile alteration is bypassed but the selector still sends the dequantized row through the final int8 store. Sources: `src/kvq_fast.cuh:187-218`, `src/kvq_fast.cuh:233-234`.
 
@@ -336,7 +344,7 @@ and entirely skipped masked value operations (no zero operands).
 
 For this section define `Kbase[position,channel]` and `Vbase[position,channel]` as the BF16 codebook values selected by a packed row, or the exact signed-int8 integer values widened to BF16 for an int8 row. `Kscale`/`Vscale` are the corresponding FP32 row scales. Keep them separate; rounding `Kbase*Kscale` or `Vbase*Vscale` to BF16 before attention would change this path. Sources: `src/q35_atxpk.cu:55-66`, `src/q35_atxpk3.cuh:343-380`, `src/q35_atxpk3.cuh:402-406`, `src/q35_atx.cu:57-61`, `src/q35_atx.cu:478-520`.
 
-The query/key prefix dot product visits sixteen consecutive 16-channel chunks. For a valid key in the current tile, its scalar schedule is below; invalid keys are assigned negative infinity after the score calculation. Source fixes this chunk order, while `mma16` remains the explicitly identified uncertainty ATT-01. Sources: `src/q35_atxpk3.cuh:343-380`, `src/q35_atxpk4.cuh:287-326`, `src/q35_atx.cu:478-497`.
+The query/key prefix dot product visits sixteen consecutive 16-channel chunks. For a valid key in the current tile, its scalar schedule is below; invalid keys are assigned negative infinity after the score calculation. Source fixes this chunk order, while `mma16` remains the explicitly identified uncertainty ATT-01. For packed keys the shipping `QK8=false` expression is `dot * (1.f * (Kscale * 0.0625f))`, numerically `dot * (Kscale * 0.0625f)` for finite scales: there is no extra codebook-int8 scale and no key-mean term (`src/q35_atxpk3.cuh:379`, `src/q35_atxpk4.cuh:325`). Sources: `src/q35_atxpk3.cuh:343-380`, `src/q35_atxpk4.cuh:287-326`, `src/q35_atx.cu:478-497`.
 
 ```text
 score_accumulator = 0
@@ -402,7 +410,7 @@ for offset in [1,2]:
 self_score = mul(partial[0],mul(Kscale[self_slot],0.0625))
 ```
 
-Unlike prefix probabilities, self probability subtracts the new maximum before multiplying by `LOG2E`. Unlike the prefix value weights, the self probability times its value scale remains FP32, without BF16 rounding. These are source-defined numeric differences between prefix and self, regardless of pass row count. Sources: `src/q35_atxpk3.cuh:443-458`, `src/q35_atxpk4.cuh:383-400`, `src/q35_atx.cu:551-567`.
+Unlike prefix probabilities, self probability subtracts the new maximum before multiplying by `LOG2E`. Unlike the prefix value weights, the self probability times its value scale remains FP32, without BF16 rounding. This does not undo the BF16 rounding of the packed self key/value codebook base (`src/q35_atxpk.cu:66`, `src/q35_atxpk3.cuh:427-430,454`, `src/q35_atxpk4.cuh:369-372,396`). These are source-defined numeric differences between prefix and self, regardless of pass row count. Sources: `src/q35_atxpk3.cuh:443-458`, `src/q35_atxpk4.cuh:383-400`, `src/q35_atx.cu:551-567`.
 
 ```text
 new_maximum = max(maximum,self_score)
@@ -415,7 +423,7 @@ for channel in 0..255:
     numerator[channel] = add(mul(numerator[channel],rescale),mul(self_value_weight,Vbase[self_slot,channel]))
 ```
 
-For packed values, finish each split by `numerator[channel] = add(numerator[channel],mul(denominator,value_mean[channel]))`. Missing means are zero in the constructed records. Store this split's maximum, denominator, and 256-element FP32 numerator. Sources: `src/kvq_atxpk.hpp:31-54`, `src/q35_atxpk3.cuh:463-475`, `src/q35_atxpk4.cuh:405-417`.
+For packed values, finish each split by `numerator[channel] = add(numerator[channel],mul(denominator,value_mean[channel]))`. The denominator includes the self probability and is independent of BF16 value-weight rounding. Missing means are zero in the constructed records. Int8 fallback rows already contain restored basis/mean and receive no extra mean term (`src/kvq_fast.cuh:214-218,234`). Store this split's maximum, denominator, and 256-element FP32 numerator. Sources: `src/kvq_atxpk.hpp:31-54`, `src/q35_atxpk3.cuh:463-475`, `src/q35_atxpk4.cuh:405-417`.
 
 ## Split combination, inverse rotation, and output gate
 

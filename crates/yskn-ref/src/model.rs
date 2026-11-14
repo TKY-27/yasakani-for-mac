@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{Read, Seek};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use serde_json::Value;
 use yskn_format::{Container, VectorType};
@@ -13,9 +14,10 @@ use crate::compressed_linear::{CompressedLinear, Embedding, EmbeddingTensor, qua
 use crate::gated_deltanet::{
     GatedDeltaNet, GatedDeltaNetDimensions, GatedDeltaNetState, GatedDeltaNetWeights,
 };
+use crate::kv_profile::KvProfile;
 use crate::output_head_sampler::output_head;
 use crate::residual_norm_mlp::{gated_product, prepare_normalization, residual_add};
-use crate::{Error, Result, require_finite};
+use crate::{Error, KvMode, Result, require_finite};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelDimensions {
@@ -252,20 +254,33 @@ impl Model {
     /// `folder` may also be a plain `.yskn` weights path (any non-directory):
     /// that file is loaded directly with the default context capacity of 262,144.
     pub fn load_folder(folder: impl AsRef<Path>) -> Result<Self> {
-        let (path, capacity) = model_location(folder.as_ref())?;
-        let mut model = Self::load(path)?;
+        Self::load_folder_with(folder, KvMode::Int8)
+    }
+
+    /// Profile modes require files.kv_profile (default kvq_u5.bin) inside the folder.
+    pub fn load_folder_with(folder: impl AsRef<Path>, mode: KvMode) -> Result<Self> {
+        let (path, capacity, profile) = model_location_with_kv(folder.as_ref(), mode)?;
+        let mut model = Self::from_container_with_kv(Container::open(path)?, mode, profile)?;
         model.context_capacity = capacity;
         Ok(model)
     }
 
-    pub fn from_container<R: Read + Seek>(mut container: Container<R>) -> Result<Self> {
+    pub fn from_container<R: Read + Seek>(container: Container<R>) -> Result<Self> {
+        Self::from_container_with_kv(container, KvMode::Int8, None)
+    }
+
+    pub fn from_container_with_kv<R: Read + Seek>(
+        mut container: Container<R>,
+        mode: KvMode,
+        profile: Option<Arc<KvProfile>>,
+    ) -> Result<Self> {
         let Weights {
             dimensions,
             embeddings,
             layers,
             final_norm,
             head,
-        } = load_weights(&mut container, load_linear, |c, name| {
+        } = load_weights_with_kv(&mut container, mode, profile, load_linear, |c, name| {
             Ok(c.load_tensor(name)?)
         })?;
         let layer_states = layers.iter().map(Layer::new_state).collect::<Result<_>>()?;
@@ -453,6 +468,17 @@ impl Model {
 /// Shared architecture validation/loading; backends choose storage for each tensor.
 pub fn load_weights<R: Read + Seek, L, T: EmbeddingTensor>(
     container: &mut Container<R>,
+    linear: impl FnMut(&mut Container<R>, &str, usize, usize, bool) -> Result<L>,
+    tensor: impl FnMut(&mut Container<R>, &str) -> Result<T>,
+) -> Result<Weights<L, T>> {
+    load_weights_with_kv(container, KvMode::Int8, None, linear, tensor)
+}
+
+/// Backend-independent loader; the profile is shared by immutable attention layers.
+pub fn load_weights_with_kv<R: Read + Seek, L, T: EmbeddingTensor>(
+    container: &mut Container<R>,
+    mode: KvMode,
+    profile: Option<Arc<KvProfile>>,
     mut linear: impl FnMut(&mut Container<R>, &str, usize, usize, bool) -> Result<L>,
     mut tensor: impl FnMut(&mut Container<R>, &str) -> Result<T>,
 ) -> Result<Weights<L, T>> {
@@ -469,6 +495,19 @@ pub fn load_weights<R: Read + Seek, L, T: EmbeddingTensor>(
         return Err(Error::InvalidModel(
             "layer_types must contain one string per layer".into(),
         ));
+    }
+    if mode != KvMode::Int8 {
+        profile
+            .as_ref()
+            .ok_or_else(|| Error::InvalidModel("profile KV mode requires a KVQP profile".into()))?
+            .check_dimensions(
+                layer_types
+                    .iter()
+                    .filter(|kind| kind.as_str() == Some("full_attention"))
+                    .count(),
+                dimensions.kv_heads,
+                dimensions.attention_head_width,
+            )?;
     }
     let embeddings = if container
         .header()
@@ -494,6 +533,7 @@ pub fn load_weights<R: Read + Seek, L, T: EmbeddingTensor>(
     };
 
     let mut layers = Vec::new();
+    let mut attention_ordinal = 0;
     for (index, kind) in layer_types.iter().enumerate() {
         let prefix = format!("layers.{index}");
         let branch = if kind.as_str() == Some("full_attention") {
@@ -517,7 +557,9 @@ pub fn load_weights<R: Read + Seek, L, T: EmbeddingTensor>(
                     dimensions.attention_head_width,
                 )?,
                 dimensions.epsilon,
-            )?;
+            )?
+            .with_kv(mode, profile.clone(), attention_ordinal)?;
+            attention_ordinal += 1;
             Branch::Attention(Box::new(AttentionLayer {
                 query_gate: linear(
                     container,
@@ -789,8 +831,23 @@ fn rotary_width_from_header(header: &Value) -> Result<usize> {
 
 /// Resolve a folder manifest (or a direct weights path) without opening model weights.
 pub fn model_location(folder: &Path) -> Result<(PathBuf, usize)> {
+    let (path, capacity, _) = model_location_with_kv(folder, KvMode::Int8)?;
+    Ok((path, capacity))
+}
+
+/// Resolve weights/capacity and load only the optional profile, never weight payloads.
+/// Mapped backends can reuse this with load_weights_with_kv.
+pub fn model_location_with_kv(
+    folder: &Path,
+    mode: KvMode,
+) -> Result<(PathBuf, usize, Option<Arc<KvProfile>>)> {
     if !folder.is_dir() {
-        return Ok((folder.to_path_buf(), 262_144));
+        if mode != KvMode::Int8 {
+            return Err(Error::InvalidModel(
+                "profile KV mode requires a model folder or an explicit profile".into(),
+            ));
+        }
+        return Ok((folder.to_path_buf(), 262_144, None));
     }
     let manifest_path = folder.join("yasakani.json");
     let manifest: Value = match fs::read(manifest_path) {
@@ -798,19 +855,7 @@ pub fn model_location(folder: &Path) -> Result<(PathBuf, usize)> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Null,
         Err(error) => return Err(error.into()),
     };
-    let filename = match manifest.pointer("/files/weights") {
-        Some(Value::String(filename)) => filename.as_str(),
-        None => "qwen38_27b_e3x.yskn",
-        _ => return Err(Error::InvalidModel("files.weights must be a string".into())),
-    };
-    if Path::new(filename)
-        .components()
-        .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
-    {
-        return Err(Error::InvalidModel(
-            "files.weights must be relative to the model folder".into(),
-        ));
-    }
+    let weights = manifest_file(folder, &manifest, "weights", "qwen38_27b_e3x.yskn")?;
     let mut context_capacity = 262_144;
     if let Some(capacity) = manifest.get("max_ctx") {
         let capacity = capacity
@@ -825,7 +870,38 @@ pub fn model_location(folder: &Path) -> Result<(PathBuf, usize)> {
             .map(|rounded| rounded / 64 * 64)
             .ok_or_else(|| Error::InvalidModel("rounded context capacity overflows".into()))?;
     }
-    Ok((folder.join(filename), context_capacity))
+    let profile = if mode == KvMode::Int8 {
+        None
+    } else {
+        let path = manifest_file(folder, &manifest, "kv_profile", "kvq_u5.bin")?;
+        Some(Arc::new(KvProfile::parse(&fs::read(path)?)?))
+    };
+    Ok((weights, context_capacity, profile))
+}
+
+fn manifest_file(folder: &Path, manifest: &Value, key: &str, default: &str) -> Result<PathBuf> {
+    let filename = match manifest.get("files").and_then(|files| files.get(key)) {
+        Some(Value::String(filename)) => filename.as_str(),
+        None => default,
+        _ => return Err(Error::InvalidModel(format!("files.{key} must be a string"))),
+    };
+    if filename.is_empty()
+        || Path::new(filename)
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(Error::InvalidModel(format!(
+            "files.{key} must be relative to the model folder"
+        )));
+    }
+    let path = folder.join(filename);
+    // Apply the same containment rule to both files, including existing symlink targets.
+    if path.exists() && !fs::canonicalize(&path)?.starts_with(fs::canonicalize(folder)?) {
+        return Err(Error::InvalidModel(format!(
+            "files.{key} must stay inside the model folder"
+        )));
+    }
+    Ok(path)
 }
 
 #[cfg(test)]

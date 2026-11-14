@@ -6,8 +6,8 @@ use crate::{Result, require_finite};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Int8Row {
-    integers: Vec<i8>,
-    scale: f32,
+    pub(crate) integers: Vec<i8>,
+    pub(crate) scale: f32,
 }
 impl Int8Row {
     pub fn integers(&self) -> &[i8] {

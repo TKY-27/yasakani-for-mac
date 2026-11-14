@@ -1,11 +1,14 @@
-//! `dump_logits MODEL_FOLDER WINDOWS.json ROWS OUT.json`
+//! `dump_logits MODEL_FOLDER WINDOWS.json ROWS OUT.json [--kv int8|int8-profile|kv5]`
 //!
 //! Runs the scalar reference on the first ROWS tokens of window 0 and writes
-//! `{"tokens": [...], "logits_bits": [[u32; vocabulary]; ROWS]}` for
+//! `{"kv_mode": "int8", "tokens": [...], "logits_bits": [[u32; vocabulary]; ROWS]}` for
 //! `yskn-engine`'s `verify_model --reference`. Loads all weights onto the heap.
 #![forbid(unsafe_code)]
 use std::{fs::File, io::BufWriter, process::ExitCode, time::Instant};
-use yskn_ref::{Error, Model, Result, quality::TokenWindows};
+use yskn_ref::{
+    Error, KvMode, Model, Result,
+    quality::{TokenWindows, parse_kv_mode},
+};
 
 fn main() -> ExitCode {
     match run() {
@@ -19,11 +22,15 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
-    let [folder, windows, rows, out] = arguments.as_slice() else {
-        return Err(Error::InvalidInput(
-            "usage: dump_logits MODEL_FOLDER WINDOWS.json ROWS OUT.json".into(),
-        ));
+    let (folder, windows, rows, out, mode) = match arguments.as_slice() {
+        [folder, windows, rows, out] => (folder, windows, rows, out, KvMode::Int8),
+        [folder, windows, rows, out, option, mode] if option == "--kv" =>
+            (folder, windows, rows, out, parse_kv_mode(mode)?),
+        _ => return Err(Error::InvalidInput(
+            "usage: dump_logits MODEL_FOLDER WINDOWS.json ROWS OUT.json [--kv int8|int8-profile|kv5]".into(),
+        )),
     };
+    eprintln!("kv_mode={}", mode.name());
     let windows = TokenWindows::load(windows)?;
     let rows: usize = rows
         .to_str()
@@ -32,7 +39,7 @@ fn run() -> Result<()> {
         .ok_or_else(|| Error::InvalidInput("ROWS must be a positive token count".into()))?;
     let tokens = &windows.windows[0].ids[..rows];
     let start = Instant::now();
-    let mut model = Model::load_folder(folder)?;
+    let mut model = Model::load_folder_with(folder, mode)?;
     eprintln!("loaded in {:.1} s", start.elapsed().as_secs_f64());
     model.prefill(tokens)?;
     eprintln!("{rows} rows in {:.1} s", start.elapsed().as_secs_f64());
@@ -43,7 +50,7 @@ fn run() -> Result<()> {
         .collect();
     serde_json::to_writer(
         BufWriter::new(File::create_new(out)?),
-        &serde_json::json!({ "tokens": tokens, "logits_bits": logits_bits }),
+        &serde_json::json!({ "kv_mode": mode.name(), "tokens": tokens, "logits_bits": logits_bits }),
     )?;
     Ok(())
 }

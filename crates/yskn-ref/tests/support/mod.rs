@@ -1,5 +1,8 @@
 //! Small seeded containers written directly from docs/FORMAT.md and spec/01.
 
+#[allow(dead_code)]
+pub mod kv_profile;
+
 use serde_json::{Value, json};
 use yskn_format::{f32_to_bf16, f32_to_f16};
 
