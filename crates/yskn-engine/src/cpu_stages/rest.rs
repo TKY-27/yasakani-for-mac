@@ -46,7 +46,8 @@ pub(crate) fn restore_projection(
 fn hadamard512(values: &mut [f32; 512]) {
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: runtime NEON dispatch; values has exactly 512 elements.
+        // SAFETY: quantize_activation/restore_projection check enabled() (runtime
+        // NEON detection); direct tests check neon_available(). The array has 512 elements.
         unsafe {
             hadamard_neon(values);
         }
@@ -61,15 +62,16 @@ unsafe fn hadamard_neon(values: &mut [f32; 512]) {
     // SAFETY: each initial chunk holds four floats. Later paired vectors lie within
     // a 2*stride block of the 512-element array; both operands load before either store.
     unsafe {
+        let values_ptr = values.as_mut_ptr();
         for i in (0..512).step_by(4) {
-            let v = vld1q_f32(values.as_ptr().add(i));
+            let v = vld1q_f32(values_ptr.add(i));
             let even = vuzp1q_f32(v, v);
             let odd = vuzp2q_f32(v, v);
             let first = vzip1q_f32(vaddq_f32(even, odd), vsubq_f32(even, odd));
             let lo = vget_low_f32(first);
             let hi = vget_high_f32(first);
             vst1q_f32(
-                values.as_mut_ptr().add(i),
+                values_ptr.add(i),
                 vcombine_f32(vadd_f32(lo, hi), vsub_f32(lo, hi)),
             );
         }
@@ -77,13 +79,10 @@ unsafe fn hadamard_neon(values: &mut [f32; 512]) {
         while stride < 512 {
             for base in (0..512).step_by(stride * 2) {
                 for off in (0..stride).step_by(4) {
-                    let lo = vld1q_f32(values.as_ptr().add(base + off));
-                    let hi = vld1q_f32(values.as_ptr().add(base + off + stride));
-                    vst1q_f32(values.as_mut_ptr().add(base + off), vaddq_f32(lo, hi));
-                    vst1q_f32(
-                        values.as_mut_ptr().add(base + off + stride),
-                        vsubq_f32(lo, hi),
-                    );
+                    let lo = vld1q_f32(values_ptr.add(base + off));
+                    let hi = vld1q_f32(values_ptr.add(base + off + stride));
+                    vst1q_f32(values_ptr.add(base + off), vaddq_f32(lo, hi));
+                    vst1q_f32(values_ptr.add(base + off + stride), vsubq_f32(lo, hi));
                 }
             }
             stride *= 2;
@@ -94,7 +93,8 @@ unsafe fn hadamard_neon(values: &mut [f32; 512]) {
 fn adjusted4(hidden: [f32; 4], weight: [f32; 4]) -> [f32; 4] {
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: runtime NEON dispatch and four-element arrays.
+        // SAFETY: prepare_normalization checks enabled() (runtime NEON detection)
+        // before calling; both arrays have four elements.
         unsafe { adjusted_neon(hidden, weight) }
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -258,7 +258,8 @@ pub(crate) fn gated_product(gate_projection: &[f32], up_projection: &[f32]) -> R
 fn rounded_binary4(a: [f32; 4], b: [f32; 4], multiply: bool) -> [f32; 4] {
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: runtime NEON dispatch, all operands are four-element arrays.
+        // SAFETY: residual_add/gated_product check enabled() (runtime NEON detection)
+        // before calling; both arrays have four elements.
         unsafe { rounded_binary_neon(a, b, multiply) }
     }
     #[cfg(not(target_arch = "aarch64"))]

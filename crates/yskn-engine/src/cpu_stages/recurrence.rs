@@ -43,7 +43,9 @@ unsafe fn core(
     // SAFETY: callers validate all extents; j steps by four through 128 columns,
     // and k visits 128 rows. Loads/stores use those exact bounds. No fused operations.
     unsafe {
-        let old = source.map_or(state.as_ptr(), |s| s.as_ptr());
+        // All state accesses derive from one exclusive pointer, including in-place reads.
+        let state_ptr = state.as_mut_ptr();
+        let old = source.map_or(state_ptr.cast_const(), |s| s.as_ptr());
         for j in (0..128).step_by(4) {
             let mut parts = [vdupq_n_f32(0.0); 4];
             for (group, part) in parts.iter_mut().enumerate() {
@@ -51,7 +53,7 @@ unsafe fn core(
                     let k = group * 32 + offset;
                     let index = k * 128 + j;
                     let decayed = vmulq_n_f32(vld1q_f32(old.add(index)), decay);
-                    vst1q_f32(state.as_mut_ptr().add(index), decayed);
+                    vst1q_f32(state_ptr.add(index), decayed);
                     *part = vaddq_f32(*part, vmulq_n_f32(decayed, key[k]));
                 }
             }
@@ -73,10 +75,10 @@ unsafe fn core(
                     let k = group * 32 + offset;
                     let index = k * 128 + j;
                     let updated = vaddq_f32(
-                        vld1q_f32(state.as_ptr().add(index)),
+                        vld1q_f32(state_ptr.add(index)),
                         vmulq_n_f32(correction, key[k]),
                     );
-                    vst1q_f32(state.as_mut_ptr().add(index), updated);
+                    vst1q_f32(state_ptr.add(index), updated);
                     *part = vaddq_f32(*part, vmulq_n_f32(updated, query[k]));
                 }
             }

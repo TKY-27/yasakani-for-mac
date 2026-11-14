@@ -282,7 +282,8 @@ fn dots4(query: &[f32], bases: &[[f32; 256]; 4]) -> [f32; 4] {
     assert_eq!(query.len(), 256);
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: this module is dispatched only after runtime NEON detection;
+        // SAFETY: output_head checks enabled() (runtime NEON detection); direct kernel
+        // tests check neon_available() before calling.
         // query and every base row have exactly 256 channels.
         unsafe { dots4_neon(query, bases) }
     }
@@ -325,7 +326,8 @@ fn add_scaled(output: &mut [f32], bases: &[f32], weight: f32) {
     assert_eq!(bases.len(), 256);
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: runtime NEON dispatch; checked 256-element arrays, four-element chunks.
+        // SAFETY: output_head checks enabled() (runtime NEON detection); direct kernel
+        // tests check neon_available(). Both checked slices have 256 elements.
         unsafe {
             add_scaled_neon(output, bases, weight);
         }
@@ -341,12 +343,13 @@ unsafe fn add_scaled_neon(output: &mut [f32], bases: &[f32], weight: f32) {
     use std::arch::aarch64::*;
     // SAFETY: both slices contain 256 elements; each load/store covers i..i+4.
     unsafe {
+        let output_ptr = output.as_mut_ptr();
         for i in (0..256).step_by(4) {
             let sum = vaddq_f32(
-                vld1q_f32(output.as_ptr().add(i)),
+                vld1q_f32(output_ptr.add(i)),
                 vmulq_n_f32(vld1q_f32(bases.as_ptr().add(i)), weight),
             );
-            vst1q_f32(output.as_mut_ptr().add(i), sum);
+            vst1q_f32(output_ptr.add(i), sum);
         }
     }
 }

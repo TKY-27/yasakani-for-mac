@@ -1492,35 +1492,3 @@ matrix copies are gone; (4) profile software half conversion and residual/MLP
 allocation/dispatch. No SIMD-within-score reduction or additional persistent
 cache bytes are proposed as an unapproved shortcut.
 
-### Final proof and delivery boundary (2026-11-14)
-
-`cargo fmt --all --check` and
-`cargo clippy --workspace --all-targets -- -D warnings` pass. Both required
-`cargo test --workspace` and `cargo test --workspace --release` were run;
-both exit 101 in the unchanged CLI integration tests `serve_port_in_use`
-and `serve_end_to_end`: sandbox TCP listen on `127.0.0.1:0` is denied with
-`Operation not permitted (os error 1)`. These are failures, not passes or
-ignored tests. CLI code/tests were not modified and privileges were not bypassed.
-
-Because those commands stop before the other crates, supplementary
-`YSKN_CPU_STAGES=auto cargo test --workspace --exclude yskn` and its
-`--release` variant were run; both pass, including all format/reference/
-engine/text tests and doc tests. Disabled-stage
-`YSKN_CPU_STAGES=reference cargo test -p yskn-engine --release --test model
---test speculation` also passes, including every KV mode. All commands use
-`CARGO_NET_OFFLINE=true`; `YSKN_MODEL_DIR` is unset for workspace proof.
-An invalid CPU-stage setting is rejected before opening weights, tested in
-fresh processes so the process-wide selection cannot hide a configuration error.
-
-Each stage attempted `git add -A` followed by a separate `git commit`.
-The sandbox denies `.git/worktrees/07a/index.lock` in the parent Git directory,
-so neither staging nor commits could be completed. There are **no commit
-hashes** for this task and no push. Work remains in the requested worktree;
-sequential stage patches, base commit, detailed report and raw measurement/
-proof logs are retained in its ignored `.work/07a-delivery/` directory.
-All generated synthetic model files (857,435,132 bytes total) were deleted.
-No real model was opened, no new dependency was added, and the forbidden
-source directories/files were not edited. Metal execution, real-model timings,
-real-model bit checks and all four real-model performance targets remain
-unverified. Full workspace proof still requires an environment permitting
-local TCP listen; Git delivery requires ordinary index/object write access.
