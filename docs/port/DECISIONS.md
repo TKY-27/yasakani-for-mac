@@ -1436,3 +1436,145 @@ acceptance, which `draft_acceptance` can now measure at this speed.
 No other heavy process ran at 14:18, but this task's own builds and runs had
 just ended; the orchestrator's quiet-machine re-measurement supersedes these
 numbers.
+
+## D19 — Real engine behind the product commands
+
+The default `yskn` engine loads the published model folder. `--engine stub`
+remains an explicit deterministic development fixture. The public
+`RealEngineConfig` holds the same settings used by terminal/server factories:
+cache `Kv5`, n-gram drafting with K=3, context 32,768, prefill width 16,
+normal engine backend selection and normal CPU-worker defaults. None/neural/
+fixed n-gram-first combined drafting are selectable. K remains a plain option;
+there is no new adaptive policy. Neural modes use D17's scalar draft. The
+server creates the model on its existing dedicated engine thread, retaining
+the non-`Send` engine contract and every existing request/security limit.
+Mapped model files must remain unchanged through process exit; command help,
+startup and info make that contract visible.
+
+### Sampling and stopping
+
+`python/yasakani/engine.py:25-42,165-176` defines the mapping: mode 3 maps to
+reference `SamplingVersion::Gumbel`; temperature <=0 selects greedy, and
+otherwise temperature/top-p/min-p are multiplied by 1000 and rounded with
+Python's nearest-even rule before the integer native call. Rust performs the
+same nearest-even conversion and constructs reference parameters from those
+thousandths. A positive temperature rounding to zero consequently becomes
+greedy. top-k outside 1..20 becomes 20, then is bounded by the actual vocabulary
+for synthetic models. The native signed-int setter narrows seeds to the low
+32 bits, reinterpreted unsigned. Token-keyed noise uses absolute prediction
+positions, retaining reference-loop losslessness across proposal settings.
+Draft Gumbel selection uses that same effective seed and its independent D17
+temperature/candidate policy.
+
+Upstream `python/yasakani/chat.py:20-21,36-41` hardcodes the published
+`generation_config.json` values 1.0/0.95/20/0.0. The product reads those four
+fields from the optional folder file, with those same fallbacks, so a published
+folder can supply its actual request defaults. Per-request validation remains
+unchanged; explicit values override defaults. `RequestDefaults` carries the
+sampling defaults for HTTP and terminal parsing.
+
+`python/yasakani/runtime.py:20-21,54-59` names EOS 248046/248044 and snapshot
+marker 248045. `engine.py:190-212` makes `None` ignore EOS; an explicit stop-ID
+slice instead controls stops. Selfcheck uses the two EOS IDs; fixed-length
+bench ignores them. The existing chat layer continues to own request EOS,
+stop-string, loop-guard and thinking-budget behavior.
+
+### Prompt reuse and bounded work
+
+Reuse follows `docs/spec/08_SPECULATION.md` section 2,
+`src/specx.cpp:94-126` and `src/engine35.cpp:1244-1266,1550-1583`. A nonempty
+committed prefix strictly shorter than the new prompt takes live mode 1;
+otherwise a strict saved prefix restores mode 2; otherwise mode 0 resets.
+Equal prompts do not satisfy either strict-prefix branch. The new suffix's
+last marker determines the snapshot cut immediately after 248045; without
+one, the cut is before the final prompt token. One replaceable joint
+main/draft checkpoint retains the recurrent state, prefix and D17 draft ring;
+attention remains in the main owner and is truncated on restore. Prompt reuse
+reports cached token count and mode, without accumulating request snapshots.
+
+Prefill is divided into configurable passes and checks the callback between
+passes. Only the final requested prompt row needs logits. Captured committed
+prompt rows feed the draft ring as in D17. Generation uses the shared lossless
+reference loop and reports verification passes/rows, guesses offered/accepted,
+prefill time and generation time. Callback cancellation/errors retain the
+existing synchronous engine contract.
+
+### Startup memory estimate
+
+Metadata inspection reads container headers/file sizes, manifest and required
+KV/draft profiles, without mapping main weights or running inference. Context
+is checked against the manifest's unrounded `max_ctx`. The cache allocation
+uses the next power-of-two context capacity to account for vector growth.
+Before load, compare the following conservative estimate with physical memory
+(`sysctl -n hw.memsize` on macOS, falling back to Foundation's
+`NSProcessInfo.physicalMemory` through a fixed `/usr/bin/osascript` program
+when sandboxed sysctl cannot report it); fail with needed/physical byte counts and
+suggest lowering `--ctx`, choosing `--kv int8`, or `--draft ngram/none`:
+
+```text
+W = max(prefill_width, K+1)
+subtotal = weights_file + draft_files + recurrent + cache + snapshot + working
+margin   = ceil(0.15 * subtotal) + 1 GiB
+needed   = subtotal + margin
+snapshot = recurrent + 4*context + 4*vocabulary + draft_ring
+working  = recurrent + W*replay_row + expanded_dense_vectors
+         + 256*W*(hidden+ffn) + draft_ring + draft_captures
+         + 8*context + 4*W*vocabulary
+```
+
+Draft files count twice the draft container plus the reduced-head file to
+cover owned scalar codes/expanded data. D17 ring and capture dimensions are
+header-derived and appear in both working/checkpoint owners as appropriate.
+The margin covers process/allocator/OS overhead and unitemized tables/scratch;
+this is a startup fit estimate, not measured peak RSS or free-memory admission.
+No settings are changed. A physically fitting model may still encounter memory
+pressure from other processes.
+
+For the published architecture from `docs/spec/01_MODEL_ARCHITECTURE.md`, model
+file 10,311,344,128 bytes, context 32,768, W=16, n-gram K=3:
+recurrent = 156,893,184; replay = 94,666,752; dense vectors = 104,953,856;
+snapshot = 158,017,536; working = 464,943,104 bytes. D13's actual Rust row
+representation costs 37,632 bytes/token in either int8 mode and 89,600 in
+real-profile Kv5. Kv5 retains derived BF16 bases and currently allocates more
+than int8; the compact theoretical packed reader is not implemented.
+
+| Cache | Cache bytes | Subtotal bytes | Margin bytes | Needed bytes (GiB) |
+|---|---:|---:|---:|---:|
+| int8 | 1,233,125,376 | 12,324,323,328 | 2,922,390,324 | 15,246,713,652 (14.199609) |
+| int8-profile | 1,233,125,376 | 12,324,323,328 | 2,922,390,324 | 15,246,713,652 (14.199609) |
+| kv5, real profile | 2,936,012,800 | 14,027,210,752 | 3,177,823,437 | 17,205,034,189 (16.023437) |
+
+These figures are derived from the documented architecture/profile, without
+opening the real model during this brief. `yskn info` computes the same formula
+from the actual chosen folder/configuration and is authoritative for that run.
+
+### Selfcheck and benchmark evidence
+
+Selfcheck follows `python/yasakani/cli.py:400-471`: the three fixed cases,
+exact template options, greedy output, little-endian int32 SHA-256, prompt
+and output counts/hashes and twelve-token head. It prints one result per case
+and exits nonzero for any mismatch. A stored mismatch reports a zero-based
+index and both IDs. Published records contain no IDs past the first twelve,
+so a later first-difference index/expected ID cannot be recovered from SHA-256;
+that diagnostic explicitly reports the limitation. An optional full `ids`
+array supports exact later diagnostics without changing the upstream fields.
+
+Bench reuses prose/code/proof text from `python/yasakani/cli.py:339-344` and
+adds a fixed neutral CSV-to-JSON prompt. Each run resets the session, uses
+greedy decoding, ignores EOS and requires exactly `--n` output tokens to fit
+with the prompt plus the unchanged 64-token reserve. Repeated draft and K
+settings compare their Cartesian product. Printed metrics are also written by
+`--json OUT`, including the loaded backend/device, cache, context, threads,
+model file size/name and proposal settings. Prefill rate counts only prompt rows
+processed before the final pending row; the latter is timed in the shared
+loop's first verification pass. Logical code bytes count body/head
+compressed streams once per main pass, plus actual neural proposal code reads
+normalised by main passes. Per neural proposal the model is draft compressed
+body streams plus `7 * (vocabulary*rank + shortlist*hidden)` int8 head reads:
+the seven output positions each score the approximate head and only the
+shortlisted rescore rows (default shortlist 512). It does not count the full
+rescore matrix, whose other rows are untouched. Embedding row reads, vectors, lookup tables, scales,
+cache and recurrent traffic are excluded; it is not a hardware DRAM counter.
+Neither synthetic tests nor these accounting definitions establish released
+model throughput. The real-model selfcheck/bench/chat/server commands remain
+for the orchestrator; this brief never opens the in-use model.
