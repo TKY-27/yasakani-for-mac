@@ -31,6 +31,10 @@ pub struct DraftProposer<D: BlockDraft = Draft> {
     owner: Rc<()>,
 }
 impl<D: BlockDraft> DraftProposer<D> {
+    /// Update request-local coupling without invalidating the retained ring/checkpoint.
+    pub fn set_choice(&mut self, choice: DraftChoice) {
+        self.choice = choice;
+    }
     pub fn new(draft: D, k: usize, choice: DraftChoice) -> Result<Self> {
         if !(1..BLOCK_ROWS).contains(&k) {
             return Err(Error::InvalidInput("draft K must be in 1..8".into()));
@@ -253,6 +257,10 @@ pub struct CombinedProposer<D: BlockDraft = Draft> {
     order: ProposalOrder,
 }
 impl<D: BlockDraft> CombinedProposer<D> {
+    /// Update request-local neural coupling while preserving the joint session.
+    pub fn set_choice(&mut self, choice: DraftChoice) {
+        self.draft.set_choice(choice);
+    }
     pub fn new(ngram: NgramProposer, draft: DraftProposer<D>, order: ProposalOrder) -> Self {
         Self {
             ngram,

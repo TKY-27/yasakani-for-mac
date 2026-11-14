@@ -467,11 +467,30 @@ through a bounded channel. Text formatting/decoding/tool parsing reuse
 allow embedded synthetic assets and Python-compatible tool argument strings.
 File loading delegates to the same initialization and retains its checks.
 
-Use `cargo run -p yskn -- chat --engine stub`, `serve --engine stub`, or
-`info --engine stub`. The stub is explicitly deterministic demo output;
-real generation is not connected, and omitting `--engine stub` fails clearly.
-`bench` and `selfcheck` report `not available yet`. No model weights, Python,
-DLL or CUDA are used. The optional model directory is text-only.
+`yskn chat`, `serve`, `bench`, `selfcheck` and `info` now select the real engine
+with `--model-dir MODEL` (or `YASAKANI_MODEL_DIR`). Defaults are `--kv kv5`,
+`--ctx 32768`, `--draft ngram`, `--k 3`, cancellable `--prefill-width 16`;
+`--backend cpu|metal` follows normal engine selection when omitted, and
+`--threads N` controls workers. `--engine stub` keeps the deterministic demo.
+The real model is created and remains on the owning terminal/server thread.
+Files must remain unchanged while mapped. Startup checks a conservative memory
+estimate against physical memory before loading; `info` reports its breakdown.
+Request sampling defaults load `generation_config.json`; missing fields retain
+upstream's defaults. D19 records sampling/reuse/memory decisions.
+
+```sh
+cargo run --release -p yskn -- info --model-dir MODEL
+cargo run --release -p yskn -- selfcheck --model-dir MODEL
+cargo run --release -p yskn -- bench --model-dir MODEL --draft none --draft ngram --k 3 --json bench.json
+printf 'Say hello.\n/exit\n' | cargo run --release -p yskn -- chat --model-dir MODEL --no-think --temperature 0 --max-tokens 48
+cargo run --release -p yskn -- serve --model-dir MODEL
+```
+
+Selfcheck uses the three upstream fixed cases and folder `selfcheck.json`.
+Bench covers prose, code, structured output and thinking; repeated `--draft`
+and `--k` compare their Cartesian product. Its logical bytes/pass counts code
+streams, not physical DRAM transactions. Neural modes retain the scalar draft
+and may be slow. Full options and diagnostic boundaries are in the CLI README.
 
 The API ports request cleaning, thinking/effort/budget controls, stop-string
 holdback, loop-guard bridge continuation, tool calling, finish reasons and

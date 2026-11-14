@@ -382,12 +382,20 @@ pub struct RequestDefaults {
     pub max_tokens: usize,
     pub max_tokens_cap: Option<usize>,
     pub thinking_budget: usize,
+    pub sampling: crate::engine::Sampling,
 }
 impl Default for RequestDefaults {
     fn default() -> Self {
         Self {
             max_tokens: 32768,
             max_tokens_cap: None,
+            sampling: crate::engine::Sampling {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+                min_p: 0.0,
+                seed: 0,
+            },
             thinking_budget: std::env::var("YASAKANI_THINKING_BUDGET")
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())
@@ -586,14 +594,35 @@ pub fn parse_chat_request(body: &Value, cfg: &RequestDefaults) -> Result<ChatPar
     Ok(ChatParams {
         messages,
         max_tokens,
-        temperature: num(body, "temperature", 1.0, false, Some(0.0), Some(2.0))?,
-        top_p: num(body, "top_p", 0.95, false, Some(1e-6), Some(1.0))?,
+        temperature: num(
+            body,
+            "temperature",
+            cfg.sampling.temperature,
+            false,
+            Some(0.0),
+            Some(2.0),
+        )?,
+        top_p: num(
+            body,
+            "top_p",
+            cfg.sampling.top_p,
+            false,
+            Some(1e-6),
+            Some(1.0),
+        )?,
         top_k: if body["top_k"].is_null() {
-            20
+            cfg.sampling.top_k
         } else {
             integer(&body["top_k"], "top_k", None)?
         },
-        min_p: num(body, "min_p", 0.0, false, Some(0.0), Some(1.0))?,
+        min_p: num(
+            body,
+            "min_p",
+            cfg.sampling.min_p,
+            false,
+            Some(0.0),
+            Some(1.0),
+        )?,
         seed: if body["seed"].is_null() {
             None
         } else {
