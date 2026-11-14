@@ -92,7 +92,7 @@ struct CacheToken {
     values: Vec<CacheRow>,
 }
 
-/// Only the visible causal prefix is retained; a model pass owns its provisional copy.
+/// Causal cache rows. Engines may append provisionally and roll back by truncation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AttentionState {
     dimensions: AttentionDimensions,
@@ -100,6 +100,59 @@ pub struct AttentionState {
 }
 
 impl AttentionState {
+    /// Remove a provisional suffix without copying or reallocating the prefix.
+    pub fn truncate(&mut self, len: usize) -> Result<()> {
+        if len > self.rows.len() {
+            return Err(Error::InvalidInput(
+                "cannot extend an attention cache by truncation".into(),
+            ));
+        }
+        self.rows.truncate(len);
+        Ok(())
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.rows.capacity()
+    }
+
+    /// Diagnostic FNV-1a over every stored code and scale, independent of allocation.
+    pub fn update_digest(&self, digest: &mut u64) {
+        self.update_prefix_digest(digest, self.rows.len());
+    }
+
+    /// Digest only the committed prefix while later rows are provisional.
+    pub fn update_prefix_digest(&self, digest: &mut u64, len: usize) {
+        assert!(len <= self.rows.len());
+        fn bytes(digest: &mut u64, values: &[u8]) {
+            for &byte in values {
+                *digest = (*digest ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            }
+        }
+        bytes(digest, &(len as u64).to_le_bytes());
+        for token in &self.rows[..len] {
+            for side in [&token.keys, &token.values] {
+                bytes(digest, &(side.len() as u64).to_le_bytes());
+                for row in side {
+                    bytes(digest, &row.scale().to_bits().to_le_bytes());
+                    match row {
+                        CacheRow::Int8(row) => {
+                            bytes(digest, &[0]);
+                            for &value in row.integers() {
+                                bytes(digest, &[value as u8]);
+                            }
+                        }
+                        CacheRow::Packed(row) => {
+                            bytes(digest, &[row.bits()]);
+                            for value in row.words() {
+                                bytes(digest, &value.to_le_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.rows.len()
     }
@@ -844,8 +897,7 @@ fn finite(values: &[f32], context: &'static str) -> Result<()> {
 }
 
 #[cfg(test)]
-#[path = "../tests/support/kv_profile.rs"]
-mod synthetic_kv_profile;
+use crate::test_support::kv_profile as synthetic_kv_profile;
 
 #[cfg(test)]
 #[path = "attention_kv_tests.rs"]

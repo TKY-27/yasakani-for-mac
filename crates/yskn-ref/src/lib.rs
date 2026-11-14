@@ -13,11 +13,17 @@ pub mod output_head_sampler;
 pub mod portable_math;
 pub mod quality;
 pub mod residual_norm_mlp;
+pub mod speculation;
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
 
 use std::fmt;
 
 pub use attention::KvMode;
-pub use model::{Model, ModelDimensions};
+pub use model::{Model, ModelDimensions, Snapshot};
 pub use output_head_sampler::{Sampler, SamplingParameters, SamplingVersion};
 
 pub type Result<T> = std::result::Result<T, Error>;
