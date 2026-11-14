@@ -1,6 +1,6 @@
-use crate::kv_codec::requantize_int8;
 use super::synthetic_kv_profile::{Profile, mixed_profile};
 use super::*;
+use crate::kv_codec::requantize_int8;
 
 fn layer(profile: Profile) -> Attention {
     configured(Arc::new(KvProfile::parse(&profile.bytes()).unwrap()), 0)

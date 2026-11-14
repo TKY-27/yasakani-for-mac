@@ -1724,3 +1724,40 @@ target/release/examples/bench_model "$HOME/models/qwen38-speed" \
 
 Kernel timing varies on the shared host; total-time improvement is not claimed
 from this pair. KV preparation minimum improves 3.44x.
+
+#### Task 2: dense gates and recurrence profile
+
+NEON deinterleaves four adjacent eight-element partitions. Each lane still
+visits `8*p + 1024*chunk + e` in ascending chunk/e order, with separate
+multiply and add. The scalar hook retains the exact XOR and four-group fold,
+finite checks and BF16 boundary. Partial final blocks use the scalar path.
+Single-row passes dispatch the independent gate outputs on the existing pool;
+multi-row passes parallelize rows and use SIMD within each row. No nested
+pool dispatch is used. The forced-off path invokes the original scalar
+partition body through the same preparation hook.
+
+Focused tests compare arbitrary widths, partial chunks, 5120-wide random
+inputs, signed zero, subnormals, BF16 ties, nonfinite and overflowing inputs
+against `dense_gate`, in addition to the existing recurrent-state comparisons.
+`bench_model` now exposes `recurrence_prepare` (a subset of recurrence) and
+`dense_gate_work` (elapsed callback time summed across rows, hence overlapping
+for M>1). These are diagnostic subsets and are not subtracted twice from rest.
+
+The same real-model five-pass command gives, after task 2, minimum/median ms:
+
+| Stage | After task 2 |
+|---|---:|
+| total | 977.476 / 981.700 |
+| kernel | 922.520 / 929.170 |
+| recurrence | 16.158 / 16.636 |
+| recurrence_prepare | 7.408 / 7.684 |
+| dense_gate_work | 3.726 / 3.929 |
+| attention | 1.427 / 1.536 |
+| kv_encode | 3.628 / 3.727 |
+| rest | 28.443 / 30.371 |
+
+Recurrence improves from task 1's 41.204 ms minimum to 16.158 ms (2.55x).
+Kernel variation again dominates total time. Preparation outside dense gates
+is about 3.7 ms; recurrence/update/output/checks about 8.8 ms. Task 3 therefore
+addresses wide elementwise math and checks in preparation and recurrent output,
+plus the still-large rest stage, rather than further changing ordered reductions.

@@ -43,6 +43,10 @@ pub struct PassTiming {
     /// Attention row preparation, including KV encoding (also norm/RoPE/gating).
     pub kv_encode: Duration,
     pub recurrence: Duration,
+    /// Subset of recurrence: rounded history, convolution, normalization and dense gates.
+    pub recurrence_prepare: Duration,
+    /// Sum of dense callback elapsed times (overlaps across rows when M > 1).
+    pub dense_gate_work: Duration,
 }
 impl PassTiming {
     pub fn rest(&self) -> Duration {
@@ -1005,7 +1009,10 @@ fn recurrence(
     z: &[Vec<f32>],
     input: &[NormalizedInput],
     cache: Option<&mut [GatedDeltaNetRow]>,
+    timing: &mut PassTiming,
 ) -> Result<Vec<Vec<f32>>> {
+    let prepare_start = Instant::now();
+    let gate_nanos = std::sync::atomic::AtomicU64::new(0);
     let rounded: Vec<_> = qkv.iter().map(|row| round_projection(row)).collect();
     let rows = {
         let taps: Vec<&[f32]> = state
@@ -1013,16 +1020,58 @@ fn recurrence(
             .chain(rounded.iter().map(Vec::as_slice))
             .collect();
         let width = taps.len() - rounded.len();
-        engine.map_range(0..qkv.len(), |i| {
-            layer.prepare(
-                &taps[i..i + width],
-                &qkv[i],
-                &z[i],
-                &input[i].weighted_hidden_bf16,
-                input[i].inverse_rms,
-            )
-        })?
+        if crate::cpu_stages::enabled() && qkv.len() == 1 {
+            vec![layer.prepare_with_gates(
+                &taps[..width],
+                &qkv[0],
+                &z[0],
+                &input[0].weighted_hidden_bf16,
+                input[0].inverse_rms,
+                |weights, hidden, rms| {
+                    let start = Instant::now();
+                    let gates = engine.map_range(0..weights.len() / hidden.len(), |head| {
+                        crate::cpu_stages::recurrence::dense_gate(
+                            &weights[head * hidden.len()..(head + 1) * hidden.len()],
+                            hidden,
+                            rms,
+                        )
+                    });
+                    gate_nanos.fetch_add(
+                        start.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    gates
+                },
+            )?]
+        } else {
+            engine.map_range(0..qkv.len(), |i| {
+                layer.prepare_with_gates(
+                    &taps[i..i + width],
+                    &qkv[i],
+                    &z[i],
+                    &input[i].weighted_hidden_bf16,
+                    input[i].inverse_rms,
+                    |weights, hidden, rms| {
+                        let start = Instant::now();
+                        let gates = weights
+                            .chunks_exact(hidden.len())
+                            .map(|weight| {
+                                crate::cpu_stages::recurrence::dense_gate(weight, hidden, rms)
+                            })
+                            .collect();
+                        gate_nanos.fetch_add(
+                            start.elapsed().as_nanos() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        gates
+                    },
+                )
+            })?
+        }
     };
+    timing.recurrence_prepare += prepare_start.elapsed();
+    timing.dense_gate_work +=
+        Duration::from_nanos(gate_nanos.load(std::sync::atomic::Ordering::Relaxed));
     if let Some(cache) = cache {
         for (slot, row) in cache.iter_mut().zip(&rows) {
             slot.copy_from(row);
@@ -1178,6 +1227,7 @@ fn forward(
                 &z,
                 &input,
                 cache,
+                timing,
             )?;
             timing.recurrence += start.elapsed();
             project_rows(engine, &l.output, &gated, timing)?

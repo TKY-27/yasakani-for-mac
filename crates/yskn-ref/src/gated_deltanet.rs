@@ -298,6 +298,26 @@ impl GatedDeltaNet {
         weighted_hidden_bf16: &[f32],
         inverse_rms: f32,
     ) -> Result<GatedDeltaNetRow> {
+        self.prepare_with_gates(
+            history,
+            projected_qkv,
+            projected_z,
+            weighted_hidden_bf16,
+            inverse_rms,
+            |weights, hidden, rms| self.dense_gates(weights, hidden, rms),
+        )
+    }
+
+    /// Shared preparation with independent dense-output work supplied by the engine.
+    pub fn prepare_with_gates(
+        &self,
+        history: &[&[f32]],
+        projected_qkv: &[f32],
+        projected_z: &[f32],
+        weighted_hidden_bf16: &[f32],
+        inverse_rms: f32,
+        mut dense: impl FnMut(&[f32], &[f32], f32) -> Result<Vec<f32>>,
+    ) -> Result<GatedDeltaNetRow> {
         if history.len() != self.dimensions.convolution_width - 1
             || history
                 .iter()
@@ -362,16 +382,23 @@ impl GatedDeltaNet {
         finite(&query, "DeltaNet query")?;
         finite(&key, "DeltaNet key")?;
 
-        let gates_a = self.dense_gates(
+        let gates_a = dense(
             &self.weights.projection_a,
             weighted_hidden_bf16,
             inverse_rms,
         )?;
-        let gates_b = self.dense_gates(
+        let gates_b = dense(
             &self.weights.projection_b,
             weighted_hidden_bf16,
             inverse_rms,
         )?;
+        if gates_a.len() != self.dimensions.value_heads
+            || gates_b.len() != self.dimensions.value_heads
+        {
+            return Err(dimension_mismatch());
+        }
+        finite(&gates_a, "DeltaNet dense gates")?;
+        finite(&gates_b, "DeltaNet dense gates")?;
         Ok(GatedDeltaNetRow {
             projected,
             z,
@@ -532,28 +559,47 @@ impl GatedDeltaNet {
         for (head, gate) in gates.iter_mut().enumerate() {
             let weight = &weights
                 [head * self.dimensions.hidden_width..(head + 1) * self.dimensions.hidden_width];
-            let mut partial = [0.0; 128];
-            for (partition, partial_sum) in partial.iter_mut().enumerate() {
-                // Keep the chapter's partition and chunk order as hidden width varies.
-                // Empty partitions contribute zero; every real input is visited once.
-                for chunk in 0..self.dimensions.hidden_width.div_ceil(1024) {
-                    for element in 0..8 {
-                        let index = 8 * partition + 1024 * chunk + element;
-                        if index < self.dimensions.hidden_width {
-                            *partial_sum += weight[index] * weighted_hidden_bf16[index];
-                        }
-                    }
-                }
-            }
-            finite(&partial, "DeltaNet dense gate partial")?;
-            let grouped =
-                std::array::from_fn(|group| xor_sum32(&partial[group * 32..(group + 1) * 32]));
-            // The dense projection is BF16 only after the deferred inverse RMS.
-            *gate = bfloat(sum4(grouped) * inverse_rms);
+            *gate = dense_gate(weight, weighted_hidden_bf16, inverse_rms)?;
         }
         finite(&gates, "DeltaNet dense gates")?;
         Ok(gates)
     }
+}
+
+/// One dense output, retaining the scalar partition and XOR reduction order.
+pub fn dense_gate(weight: &[f32], hidden: &[f32], inverse_rms: f32) -> Result<f32> {
+    dense_gate_with_partials(weight, hidden, inverse_rms, |weight, hidden| {
+        let mut partial = [0.0; 128];
+        for (partition, sum) in partial.iter_mut().enumerate() {
+            for chunk in 0..hidden.len().div_ceil(1024) {
+                for element in 0..8 {
+                    let index = 8 * partition + 1024 * chunk + element;
+                    if index < hidden.len() {
+                        *sum += weight[index] * hidden[index];
+                    }
+                }
+            }
+        }
+        partial
+    })
+}
+
+/// Independent partial accumulators; the reference owns validation and reduction.
+pub fn dense_gate_with_partials(
+    weight: &[f32],
+    hidden: &[f32],
+    inverse_rms: f32,
+    partials: impl FnOnce(&[f32], &[f32]) -> [f32; 128],
+) -> Result<f32> {
+    if weight.len() != hidden.len() {
+        return Err(dimension_mismatch());
+    }
+    let partial = partials(weight, hidden);
+    finite(&partial, "DeltaNet dense gate partial")?;
+    let grouped = std::array::from_fn(|group| xor_sum32(&partial[group * 32..(group + 1) * 32]));
+    let gate = bfloat(sum4(grouped) * inverse_rms);
+    finite(&[gate], "DeltaNet dense gates")?;
+    Ok(gate)
 }
 
 pub(crate) fn xor_sum32(values: &[f32]) -> f32 {

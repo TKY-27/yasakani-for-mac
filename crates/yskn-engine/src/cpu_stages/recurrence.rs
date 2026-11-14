@@ -94,10 +94,110 @@ unsafe fn core(
     Ok(output)
 }
 
+pub(crate) fn dense_gate(weight: &[f32], hidden: &[f32], inverse_rms: f32) -> Result<f32> {
+    #[cfg(target_arch = "aarch64")]
+    if super::enabled() && hidden.len().is_multiple_of(32) {
+        return yskn_ref::gated_deltanet::dense_gate_with_partials(
+            weight,
+            hidden,
+            inverse_rms,
+            |weight, hidden| {
+                // SAFETY: runtime NEON, matching lengths validated by the shared hook;
+                // complete groups of four eight-element partitions.
+                unsafe { dense_partials(weight, hidden) }
+            },
+        );
+    }
+    yskn_ref::gated_deltanet::dense_gate(weight, hidden, inverse_rms)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dense_partials(weight: &[f32], hidden: &[f32]) -> [f32; 128] {
+    use std::arch::aarch64::*;
+    let mut partial = [0.0; 128];
+    // SAFETY: each active 32-element block is complete; four output partials
+    // are disjoint and each retains ascending chunk then element order.
+    unsafe {
+        for p in (0..128).step_by(4) {
+            let mut sum = vdupq_n_f32(0.0);
+            for chunk in 0..hidden.len().div_ceil(1024) {
+                let index = p * 8 + chunk * 1024;
+                if index >= hidden.len() {
+                    continue;
+                }
+                let wa = vld4q_f32(weight.as_ptr().add(index));
+                let wb = vld4q_f32(weight.as_ptr().add(index + 16));
+                let ha = vld4q_f32(hidden.as_ptr().add(index));
+                let hb = vld4q_f32(hidden.as_ptr().add(index + 16));
+                for (a, b, c, d) in [
+                    (wa.0, wb.0, ha.0, hb.0),
+                    (wa.1, wb.1, ha.1, hb.1),
+                    (wa.2, wb.2, ha.2, hb.2),
+                    (wa.3, wb.3, ha.3, hb.3),
+                ] {
+                    sum = vaddq_f32(sum, vmulq_f32(vuzp1q_f32(a, b), vuzp1q_f32(c, d)));
+                }
+                for (a, b, c, d) in [
+                    (wa.0, wb.0, ha.0, hb.0),
+                    (wa.1, wb.1, ha.1, hb.1),
+                    (wa.2, wb.2, ha.2, hb.2),
+                    (wa.3, wb.3, ha.3, hb.3),
+                ] {
+                    sum = vaddq_f32(sum, vmulq_f32(vuzp2q_f32(a, b), vuzp2q_f32(c, d)));
+                }
+            }
+            vst1q_f32(partial.as_mut_ptr().add(p), sum);
+        }
+    }
+    partial
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use yskn_ref::gated_deltanet::{GatedDeltaNetDimensions, GatedDeltaNetWeights};
+    #[test]
+    fn dense_partitions_keep_chunk_element_and_xor_orders() {
+        let mut seed = 1729u32;
+        let mut sample = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            match seed % 16 {
+                0 => -0.0,
+                1 => f32::from_bits(1),
+                2 => f32::from_bits(0x80000001),
+                3 => f32::from_bits(0x3f808000),
+                _ => seed as i32 as f32 / i32::MAX as f32,
+            }
+        };
+        for width in [0, 1, 31, 32, 128, 512, 1024, 1056, 5120, 5136, 6144] {
+            for _ in 0..16 {
+                let w: Vec<_> = (0..width).map(|_| sample()).collect();
+                let h: Vec<_> = (0..width).map(|_| sample()).collect();
+                let rms = sample();
+                assert_eq!(
+                    dense_gate(&w, &h, rms).unwrap().to_bits(),
+                    yskn_ref::gated_deltanet::dense_gate(&w, &h, rms)
+                        .unwrap()
+                        .to_bits()
+                );
+            }
+        }
+        for value in [f32::MAX, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let w = vec![value; 5120];
+            let h = vec![2.0; 5120];
+            assert_eq!(
+                dense_gate(&w, &h, 1.0).unwrap_err().to_string(),
+                yskn_ref::gated_deltanet::dense_gate(&w, &h, 1.0)
+                    .unwrap_err()
+                    .to_string()
+            );
+        }
+        assert!(dense_gate(&[0.0], &[0.0; 32], 1.0).is_err());
+    }
+
     #[test]
     fn independent_value_lanes_and_out_of_place_state_equal_scalar_bits() {
         let dimensions = GatedDeltaNetDimensions {

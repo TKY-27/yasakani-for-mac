@@ -91,10 +91,12 @@ fn main() -> Result<()> {
     };
     println!("rows_per_pass={rows} passes={passes} context={context:?} stage min_s median_s");
     type Stage = fn(&PassTiming) -> Duration;
-    let stages: [(&str, Stage); 6] = [
+    let stages: [(&str, Stage); 8] = [
         ("total", |t| t.total),
         ("kernel", |t| t.kernel),
         ("recurrence", |t| t.recurrence),
+        ("recurrence_prepare", |t| t.recurrence_prepare),
+        ("dense_gate_work", |t| t.dense_gate_work),
         ("attention", |t| t.attention),
         ("kv_encode", |t| t.kv_encode),
         ("rest", PassTiming::rest),
