@@ -235,8 +235,6 @@ pub(super) fn bench(args: &Args) -> Result<()> {
                 "tokens_confirmed_per_pass":divide(generated.ids.len() as f64, passes as f64),
                 "tokens_per_s":divide(generated.ids.len() as f64 * 1000.0, generated.gen_ms),
                 "guesses_offered":generated.guesses_offered, "guesses_accepted":generated.guesses_accepted,
-                "neural_guesses_offered":generated.neural_guesses_offered,
-                "ngram_guesses_offered":generated.ngram_guesses_offered,
                 "main_code_bytes_per_pass":main_bytes, "draft_code_bytes_per_proposal":proposal_bytes,
                 "draft_code_bytes_per_update":update_bytes,
                 "neural_proposals":generated.draft_proposals, "draft_updates":generated.draft_updates,
