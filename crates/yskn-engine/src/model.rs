@@ -11,7 +11,10 @@ use yskn_ref::{
     KvMode, ModelDimensions,
     compressed_linear::{PreparedActivation, quantize_activation, restore_projection},
     gated_deltanet::{GatedDeltaNet, GatedDeltaNetRow, GatedDeltaNetState, round_projection},
-    model::{Branch, Layer, LayerState, Weights, load_weights_with_kv, model_location_with_kv},
+    model::{
+        Branch, CaptureOptions, CapturedRow, Layer, LayerState, Weights, load_weights_with_kv,
+        model_location_with_kv,
+    },
     residual_norm_mlp::{NormalizedInput, gated_product, prepare_normalization, residual_add},
 };
 
@@ -60,11 +63,20 @@ pub struct Snapshot {
     tokens: Vec<u32>,
     recurrence: Vec<Option<GatedDeltaNetState>>,
     committed_logits: Option<Vec<f32>>,
+    captures: Vec<CapturedRow>,
+    capture_options: CaptureOptions,
+}
+
+impl Snapshot {
+    pub fn capture_bytes(&self) -> usize {
+        yskn_ref::model::capture_allocated_bytes(&self.captures, self.captures.capacity())
+    }
 }
 
 /// Persistent storage only; transient projection/attention work is not included.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionMemory {
+    pub capture_bytes: usize,
     pub recurrent_state_bytes: usize,
     pub replay_bytes: usize,
     pub replay_capacity_rows: usize,
@@ -81,6 +93,11 @@ pub struct Model {
     replay: Vec<Vec<GatedDeltaNetRow>>,
     pending_tokens: Vec<u32>,
     pending: bool,
+    working_complete: bool,
+    context_identity: Arc<()>,
+    capture_options: CaptureOptions,
+    captures: Vec<CapturedRow>,
+    pending_captures: Vec<CapturedRow>,
     committed_logits: Option<Vec<f32>>,
     tokens: Vec<u32>,
     owner: Arc<()>,
@@ -208,6 +225,11 @@ impl Model {
             replay,
             pending_tokens: Vec::with_capacity(rows_per_pass),
             pending: false,
+            working_complete: false,
+            context_identity: Arc::new(()),
+            capture_options: CaptureOptions::default(),
+            captures: Vec::new(),
+            pending_captures: Vec::new(),
             committed_logits: None,
             tokens: Vec::new(),
             owner: Arc::new(()),
@@ -262,8 +284,54 @@ impl Model {
         self.pending
     }
 
+    /// Configure observation before any input has been committed.
+    pub fn set_capture(&mut self, options: CaptureOptions) -> Result<()> {
+        self.require_no_pending_pass()?;
+        if self.position != 0 {
+            return Err(Error::InvalidInput(
+                "capture must be configured before prefill".into(),
+            ));
+        }
+        options.validate(self.weights.layers.len())?;
+        self.capture_options = options;
+        self.captures.clear();
+        self.pending_captures.clear();
+        Ok(())
+    }
+    pub fn capture_options(&self) -> &CaptureOptions {
+        &self.capture_options
+    }
+    pub fn context_identity(&self) -> Arc<()> {
+        Arc::clone(&self.context_identity)
+    }
+    pub fn take_captured_rows(&mut self) -> Vec<CapturedRow> {
+        std::mem::take(&mut self.captures)
+    }
+    pub fn captured_rows(&self) -> &[CapturedRow] {
+        &self.captures
+    }
+    pub fn provisional_captures(&self) -> &[CapturedRow] {
+        &self.pending_captures
+    }
+    pub fn embedding(&self, token: u32) -> Result<Vec<f32>> {
+        self.weights.embeddings.row(token)
+    }
+    fn retain_captures(&mut self, rows: Vec<CapturedRow>) {
+        let excess =
+            (self.captures.len() + rows.len()).saturating_sub(self.capture_options.max_rows);
+        self.captures.drain(..excess.min(self.captures.len()));
+        self.captures.extend(rows);
+    }
+
     pub fn session_memory(&self) -> SessionMemory {
         SessionMemory {
+            capture_bytes: yskn_ref::model::capture_allocated_bytes(
+                &self.captures,
+                self.captures.capacity(),
+            ) + yskn_ref::model::capture_allocated_bytes(
+                &self.pending_captures,
+                self.pending_captures.capacity(),
+            ),
             recurrent_state_bytes: self
                 .states
                 .iter()
@@ -328,12 +396,16 @@ impl Model {
             .collect::<Result<_>>()?;
         self.position = 0;
         self.pending = false;
+        self.working_complete = false;
+        self.captures.clear();
+        self.pending_captures.clear();
         self.pending_tokens.clear();
         self.tokens.clear();
         self.committed_logits = None;
         self.logits.clear();
         self.timings.clear();
         self.owner = Arc::new(());
+        self.context_identity = Arc::new(());
         Ok(())
     }
 
@@ -352,6 +424,8 @@ impl Model {
                 })
                 .collect(),
             committed_logits: self.committed_logits.clone(),
+            captures: self.captures.clone(),
+            capture_options: self.capture_options.clone(),
         })
     }
 
@@ -365,6 +439,21 @@ impl Model {
                 "snapshot is not a retained prefix of this session".into(),
             ));
         }
+        if snapshot.capture_options != self.capture_options {
+            return Err(Error::InvalidInput(
+                "snapshot capture configuration changed".into(),
+            ));
+        }
+        // Validate every cache before publishing any part of the checkpoint.
+        for state in &self.states {
+            if let LayerState::Attention(state) = state
+                && state.len() < snapshot.position
+            {
+                return Err(Error::InvalidInput(
+                    "snapshot attention prefix is unavailable".into(),
+                ));
+            }
+        }
         for (state, saved) in self.states.iter_mut().zip(&snapshot.recurrence) {
             match (state, saved) {
                 (LayerState::Attention(state), None) => state.truncate(snapshot.position)?,
@@ -372,6 +461,8 @@ impl Model {
                 _ => unreachable!("snapshot belongs to the same model"),
             }
         }
+        self.context_identity = Arc::new(());
+        self.captures.clone_from(&snapshot.captures);
         self.position = snapshot.position;
         self.tokens.truncate(snapshot.position);
         self.committed_logits.clone_from(&snapshot.committed_logits);
@@ -454,6 +545,7 @@ impl Model {
         let result = (|| {
             let mut logits = Vec::new();
             let mut timings = Vec::new();
+            let mut captures = Vec::new();
             for (pass, chunk) in tokens.chunks(self.rows_per_pass).enumerate() {
                 let position = self.position + pass * self.rows_per_pass;
                 let rows = match requested {
@@ -462,14 +554,24 @@ impl Model {
                     }
                     rows => rows,
                 };
-                let (head, timing) = self.compute_pass(chunk, position, rows, false)?;
+                let (head, timing, captured) = self.compute_pass(
+                    chunk,
+                    position,
+                    rows,
+                    false,
+                    (self.position + tokens.len()).saturating_sub(self.capture_options.max_rows),
+                )?;
+                captures.extend(captured);
+                let excess = captures.len().saturating_sub(self.capture_options.max_rows);
+                captures.drain(..excess);
                 logits.extend(head);
                 timings.push(timing);
             }
-            Ok::<_, Error>((logits, timings))
+            Ok::<_, Error>((logits, timings, captures))
         })();
         match result {
-            Ok((logits, timings)) => {
+            Ok((logits, timings, captures)) => {
+                self.retain_captures(captures);
                 self.publish_recurrence();
                 self.position += tokens.len();
                 self.tokens.extend_from_slice(tokens);
@@ -496,8 +598,10 @@ impl Model {
         }
         self.validate_tokens(tokens)?;
         self.prepare_working();
-        match self.compute_pass(tokens, self.position, LogitRows::All, true) {
-            Ok((logits, timing)) => {
+        match self.compute_pass(tokens, self.position, LogitRows::All, true, 0) {
+            Ok((logits, timing, captures)) => {
+                self.pending_captures = captures;
+                self.working_complete = true;
                 self.pending_tokens.clear();
                 self.pending_tokens.extend_from_slice(tokens);
                 self.pending = true;
@@ -524,7 +628,8 @@ impl Model {
             self.discard_provisional();
             return Ok(());
         }
-        if k < self.pending_tokens.len() {
+        if k < self.pending_tokens.len() || !self.working_complete {
+            self.working_complete = false;
             self.prepare_working();
             let result = self
                 .weights
@@ -540,11 +645,14 @@ impl Model {
                     }
                     Ok::<_, Error>(())
                 });
-            if let Err(error) = result {
-                self.discard_provisional();
-                return Err(error);
-            }
+            result?;
         }
+        let accepted = self
+            .pending_captures
+            .drain(..k.min(self.pending_captures.len()))
+            .collect::<Vec<_>>();
+        self.retain_captures(accepted);
+        self.pending_captures.clear();
         self.publish_recurrence();
         self.position += k;
         self.tokens.extend_from_slice(&self.pending_tokens[..k]);
@@ -560,6 +668,7 @@ impl Model {
         if self.pending {
             self.truncate_attention(self.position);
             self.pending_tokens.clear();
+            self.pending_captures.clear();
             self.pending = false;
             self.logits = self.committed_logits.iter().cloned().collect();
         }
@@ -571,7 +680,8 @@ impl Model {
         position: usize,
         requested: LogitRows,
         cache_replay: bool,
-    ) -> Result<(Vec<Vec<f32>>, PassTiming)> {
+        capture_from: usize,
+    ) -> Result<(Vec<Vec<f32>>, PassTiming, Vec<CapturedRow>)> {
         let start = Instant::now();
         let mut timing = PassTiming {
             position,
@@ -581,6 +691,24 @@ impl Model {
         let mut hidden = self
             .engine
             .map_range(0..tokens.len(), |i| self.weights.embeddings.row(tokens[i]))?;
+        let capture_start = if cache_replay {
+            0
+        } else {
+            tokens.len().saturating_sub(self.capture_options.max_rows)
+        }
+        .max(capture_from.saturating_sub(position).min(tokens.len()));
+        let mut captures = if self.capture_options.layers.is_empty() {
+            Vec::new()
+        } else {
+            (capture_start..tokens.len())
+                .map(|row| CapturedRow {
+                    position: position + row,
+                    values: Vec::with_capacity(
+                        self.capture_options.layers.len() * self.weights.dimensions.hidden_width,
+                    ),
+                })
+                .collect::<Vec<_>>()
+        };
         for (i, layer) in self.weights.layers.iter().enumerate() {
             let state = match layer.branch {
                 Branch::Attention(_) => &mut self.states[i],
@@ -599,6 +727,11 @@ impl Model {
                     None
                 },
             )?;
+            if self.capture_options.layers.binary_search(&i).is_ok() {
+                for (capture, row) in captures.iter_mut().zip(&hidden[capture_start..]) {
+                    capture.values.extend_from_slice(row);
+                }
+            }
         }
         let selected = match requested {
             LogitRows::All => hidden.as_slice(),
@@ -620,7 +753,7 @@ impl Model {
             head
         };
         timing.total = start.elapsed();
-        Ok((head, timing))
+        Ok((head, timing, captures))
     }
 }
 
@@ -956,6 +1089,16 @@ impl yskn_ref::quality::ScoringModel for Model {
 
 impl yskn_ref::speculation::Verifier for Model {
     type Error = Error;
+    fn context_identity(&self) -> Option<Arc<()>> {
+        Some(self.context_identity())
+    }
+    fn take_captured_rows(&mut self) -> Vec<CapturedRow> {
+        self.take_captured_rows()
+    }
+
+    fn dimensions(&self) -> Option<&ModelDimensions> {
+        Some(self.dimensions())
+    }
     fn position(&self) -> usize {
         self.position()
     }
@@ -977,7 +1120,153 @@ impl yskn_ref::speculation::Verifier for Model {
     fn commit(&mut self, rows: usize) -> Result<()> {
         self.commit(rows)
     }
+    fn capture_options(&self) -> Option<&CaptureOptions> {
+        Some(self.capture_options())
+    }
+    fn captured_rows(&self) -> &[CapturedRow] {
+        self.captured_rows()
+    }
+    fn provisional_captures(&self) -> &[CapturedRow] {
+        self.provisional_captures()
+    }
+    fn embedding(&self, token: u32) -> yskn_ref::Result<Vec<f32>> {
+        self.embedding(token)
+            .map_err(|error| yskn_ref::Error::InvalidInput(error.to_string()))
+    }
     fn discard(&mut self) {
         self.discard_provisional();
+    }
+}
+
+impl yskn_ref::speculation::CheckpointVerifier for Model {
+    type Snapshot = Snapshot;
+    fn snapshot(&self) -> Result<Snapshot> {
+        self.snapshot()
+    }
+    fn restore(&mut self, snapshot: &Snapshot) -> Result<()> {
+        self.restore(snapshot)
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code, clippy::manual_is_multiple_of)]
+#[path = "../../yskn-ref/tests/support/mod.rs"]
+mod session_test_support;
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::Kernel;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn fixture_path() -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "yskn-rollback-{}-{}.yskn",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let bytes = super::session_test_support::synthetic_model(
+            187,
+            &["full_attention", "linear_attention"],
+        );
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn failed_later_layer_truncates_already_appended_attention() {
+        let path = fixture_path();
+        let mut reference = yskn_ref::Model::load(&path).unwrap();
+        // SAFETY: this test never modifies the backing file while the mapping is alive.
+        let mut engine =
+            unsafe { Model::with_engine(&path, Engine::new(Kernel::Portable, 2).unwrap(), 4) }
+                .unwrap();
+        engine
+            .set_capture(CaptureOptions {
+                layers: vec![0, 1],
+                max_rows: 3,
+            })
+            .unwrap();
+        engine.prefill(&[1, 2]).unwrap();
+        reference.prefill(&[1, 2]).unwrap();
+        let digest = engine.state_digest();
+        let logits = engine.row_logits().to_vec();
+        let captures = engine.captured_rows().to_vec();
+        // Owned norm data can be poisoned without mutating any mapped weight bytes.
+        // Layer zero has appended both attention rows before layer one reads this.
+        let saved = engine.weights.layers[1].input_norm[0];
+        engine.weights.layers[1].input_norm[0] = f32::NAN;
+        assert!(matches!(
+            engine.run_provisional(&[3, 4]),
+            Err(Error::NonFinite(_))
+        ));
+        engine.weights.layers[1].input_norm[0] = saved;
+        assert_eq!(engine.state_digest(), digest);
+        assert_eq!(engine.row_logits(), logits);
+        assert!(!engine.has_provisional_pass());
+        assert_eq!(engine.captured_rows(), captures);
+        assert!(engine.provisional_captures().is_empty());
+        // The digest only includes the committed prefix: a successful probe is
+        // essential to detect an untruncated, otherwise invisible cache suffix.
+        engine.run_provisional(&[5, 6]).unwrap();
+        reference.run_provisional(&[5, 6]).unwrap();
+        assert_eq!(engine.row_logits(), reference.row_logits());
+        engine.commit(2).unwrap();
+        reference.commit(2).unwrap();
+        assert_eq!(engine.state_digest(), reference.state_digest());
+        drop(engine);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_partial_replay_retains_pending_pass_and_full_retry_replays_correctly() {
+        use yskn_ref::gated_deltanet::{GatedDeltaNetDimensions, GatedDeltaNetWeights};
+        let path = fixture_path();
+        let mut reference = yskn_ref::Model::load(&path).unwrap();
+        // SAFETY: backing file remains immutable until model drop.
+        let mut engine =
+            unsafe { Model::with_engine(&path, Engine::new(Kernel::Portable, 2).unwrap(), 4) }
+                .unwrap();
+        engine.prefill(&[1, 2]).unwrap();
+        reference.prefill(&[1, 2]).unwrap();
+        engine.run_provisional(&[3, 4, 5]).unwrap();
+        reference.run_provisional(&[3, 4, 5]).unwrap();
+        let digest = engine.state_digest();
+        let logits = engine.row_logits().to_vec();
+        // An incompatible cached row forces the recurrence replay error path.
+        // The actual row is restored before retrying the still-pending pass.
+        let other = GatedDeltaNet::new(
+            GatedDeltaNetDimensions {
+                hidden_width: 512,
+                query_key_heads: 1,
+                value_heads: 1,
+                head_dim: 128,
+                convolution_width: 4,
+            },
+            GatedDeltaNetWeights {
+                projection_a: vec![0.0; 512],
+                projection_b: vec![0.0; 512],
+                convolution_weight: vec![0.0; 384 * 4],
+                log_decay_weight: vec![0.0],
+                time_bias: vec![0.0],
+                normalization_weight: vec![1.0; 128],
+            },
+            1e-6,
+        )
+        .unwrap();
+        let saved = std::mem::replace(&mut engine.replay[1][0], other.new_row().unwrap());
+        assert!(engine.commit(1).is_err());
+        assert!(engine.has_provisional_pass());
+        assert_eq!(engine.state_digest(), digest);
+        assert_eq!(engine.row_logits(), logits);
+        assert!(engine.snapshot().is_err());
+        engine.replay[1][0] = saved;
+        engine.commit(3).unwrap();
+        reference.commit(3).unwrap();
+        assert_eq!(engine.state_digest(), reference.state_digest());
+        assert_eq!(engine.row_logits(), reference.row_logits());
+        drop(engine);
+        std::fs::remove_file(path).unwrap();
     }
 }

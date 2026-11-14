@@ -254,6 +254,44 @@ pub struct Weights<L = CompressedLinear, T = yskn_format::Tensor> {
     pub head: L,
 }
 
+/// Optional post-MLP residual taps. Empty layers disable observation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CaptureOptions {
+    pub layers: Vec<usize>,
+    /// Maximum committed rows retained, normally the draft ring capacity.
+    pub max_rows: usize,
+}
+impl CaptureOptions {
+    pub fn validate(&self, layer_count: usize) -> Result<()> {
+        if !self.layers.is_empty()
+            && (self.max_rows == 0
+                || self.layers.iter().any(|&layer| layer >= layer_count)
+                || self.layers.windows(2).any(|pair| pair[0] >= pair[1]))
+        {
+            return Err(Error::InvalidInput(
+                "invalid capture layers or row capacity".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One absolute input position, in [capture_slot, hidden_channel] order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapturedRow {
+    pub position: usize,
+    pub values: Vec<f32>,
+}
+
+/// Allocated capture storage, including row descriptors and FP32 payloads.
+pub fn capture_allocated_bytes(rows: &[CapturedRow], capacity: usize) -> usize {
+    capacity * std::mem::size_of::<CapturedRow>()
+        + rows
+            .iter()
+            .map(|row| row.values.capacity() * 4)
+            .sum::<usize>()
+}
+
 /// An owned committed checkpoint. Attention rows stay in the originating session.
 ///
 /// A checkpoint can only restore its own session, before reset, while its exact
@@ -264,6 +302,14 @@ pub struct Snapshot {
     tokens: Vec<u32>,
     recurrent_states: Vec<Option<GatedDeltaNetState>>,
     committed_logits: Option<Vec<f32>>,
+    capture_options: CaptureOptions,
+    captures: Vec<CapturedRow>,
+}
+
+impl Snapshot {
+    pub fn capture_bytes(&self) -> usize {
+        capture_allocated_bytes(&self.captures, self.captures.capacity())
+    }
 }
 
 /// A single sequence. Immutable weights are shared only through a single-threaded Rc.
@@ -277,7 +323,13 @@ pub struct Model {
     pending_tokens: Option<Vec<u32>>,
     committed_tokens: Vec<u32>,
     session: Rc<()>,
+    context_identity: Arc<()>,
+    capture_options: CaptureOptions,
+    captures: Vec<CapturedRow>,
+    provisional_captures: Vec<CapturedRow>,
 }
+
+type ComputedRows = (Vec<LayerState>, Vec<Vec<f32>>, Vec<CapturedRow>);
 
 impl Model {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
@@ -336,6 +388,10 @@ impl Model {
             pending_tokens: None,
             committed_tokens: Vec::new(),
             session: Rc::new(()),
+            context_identity: Arc::new(()),
+            capture_options: CaptureOptions::default(),
+            captures: Vec::new(),
+            provisional_captures: Vec::new(),
         })
     }
 
@@ -358,6 +414,52 @@ impl Model {
         self.pending_tokens.is_some()
     }
 
+    /// Configure before consuming any rows; changing taps mid-prefix loses context.
+    pub fn set_capture(&mut self, options: CaptureOptions) -> Result<()> {
+        self.require_no_pending_pass()?;
+        options.validate(self.dimensions().layer_count)?;
+        if self.position != 0 {
+            return Err(Error::InvalidInput(
+                "configure capture before prefill".into(),
+            ));
+        }
+        self.capture_options = options;
+        self.captures.clear();
+        Ok(())
+    }
+    pub fn capture_options(&self) -> &CaptureOptions {
+        &self.capture_options
+    }
+    pub fn context_identity(&self) -> Arc<()> {
+        Arc::clone(&self.context_identity)
+    }
+    /// Move undelivered rows to the consumer; snapshots now omit delivered rows.
+    pub fn take_captured_rows(&mut self) -> Vec<CapturedRow> {
+        std::mem::take(&mut self.captures)
+    }
+    pub fn capture_bytes(&self) -> usize {
+        capture_allocated_bytes(&self.captures, self.captures.capacity())
+            + capture_allocated_bytes(
+                &self.provisional_captures,
+                self.provisional_captures.capacity(),
+            )
+    }
+    pub fn captured_rows(&self) -> &[CapturedRow] {
+        &self.captures
+    }
+    pub fn provisional_captures(&self) -> &[CapturedRow] {
+        &self.provisional_captures
+    }
+    pub fn embedding(&self, token: u32) -> Result<Vec<f32>> {
+        self.weights.embeddings.row(token)
+    }
+    fn retain_captures(&mut self, rows: Vec<CapturedRow>) {
+        let excess =
+            (self.captures.len() + rows.len()).saturating_sub(self.capture_options.max_rows);
+        self.captures.drain(..excess.min(self.captures.len()));
+        self.captures.extend(rows);
+    }
+
     pub fn new_session(&self) -> Result<Self> {
         Ok(Self {
             weights: Rc::clone(&self.weights),
@@ -374,6 +476,10 @@ impl Model {
             pending_tokens: None,
             committed_tokens: Vec::new(),
             session: Rc::new(()),
+            context_identity: Arc::new(()),
+            capture_options: self.capture_options.clone(),
+            captures: Vec::new(),
+            provisional_captures: Vec::new(),
         })
     }
 
@@ -390,7 +496,10 @@ impl Model {
         self.last_pass_logits.clear();
         self.pending_tokens = None;
         self.committed_tokens.clear();
+        self.captures.clear();
+        self.provisional_captures.clear();
         self.session = Rc::new(());
+        self.context_identity = Arc::new(());
         Ok(())
     }
 
@@ -400,12 +509,14 @@ impl Model {
         if tokens.is_empty() {
             return Ok(());
         }
-        let (states, logits) = self.compute_rows(tokens)?;
+        let (states, logits, captures) =
+            self.compute_rows(tokens, self.capture_options.max_rows)?;
         self.layer_states = states;
         self.position += tokens.len();
         self.committed_tokens.extend_from_slice(tokens);
         self.committed_logits = logits.last().cloned();
         self.last_pass_logits = logits;
+        self.retain_captures(captures);
         Ok(())
     }
 
@@ -417,8 +528,9 @@ impl Model {
                 "a provisional pass must contain at least one row".into(),
             ));
         }
-        let (_, logits) = self.compute_rows(tokens)?;
+        let (_, logits, captures) = self.compute_rows(tokens, tokens.len())?;
         self.pending_tokens = Some(tokens.to_vec());
+        self.provisional_captures = captures;
         self.last_pass_logits = logits;
         Ok(&self.last_pass_logits)
     }
@@ -440,7 +552,8 @@ impl Model {
         }
         // Replay from the still-committed state. The exact same scalar row path
         // makes commit independent of candidate count and avoids M state snapshots.
-        let (states, logits) = self.compute_rows(&tokens[..accepted_rows])?;
+        let (states, logits, captures) =
+            self.compute_rows(&tokens[..accepted_rows], self.capture_options.max_rows)?;
         self.layer_states = states;
         self.position += accepted_rows;
         self.committed_tokens
@@ -448,11 +561,14 @@ impl Model {
         self.committed_logits = logits.last().cloned();
         self.last_pass_logits = logits;
         self.pending_tokens = None;
+        self.provisional_captures.clear();
+        self.retain_captures(captures);
         Ok(())
     }
 
     pub fn discard_provisional(&mut self) {
         if self.pending_tokens.take().is_some() {
+            self.provisional_captures.clear();
             self.last_pass_logits = self.committed_logits.iter().cloned().collect();
         }
     }
@@ -473,6 +589,8 @@ impl Model {
                 })
                 .collect(),
             committed_logits: self.committed_logits.clone(),
+            capture_options: self.capture_options.clone(),
+            captures: self.captures.clone(),
         })
     }
 
@@ -483,6 +601,11 @@ impl Model {
         if !Rc::ptr_eq(&self.session, &snapshot.session) {
             return Err(Error::InvalidInput(
                 "snapshot belongs to a different session or reset".into(),
+            ));
+        }
+        if snapshot.capture_options != self.capture_options {
+            return Err(Error::InvalidInput(
+                "snapshot capture configuration changed".into(),
             ));
         }
         if snapshot.position > self.position {
@@ -512,6 +635,9 @@ impl Model {
                 _ => unreachable!("checkpoint layer kinds are fixed within a session"),
             }
         }
+        self.context_identity = Arc::new(());
+        self.captures.clone_from(&snapshot.captures);
+        self.provisional_captures.clear();
         self.position = snapshot.position;
         self.committed_tokens.truncate(snapshot.position);
         self.committed_logits.clone_from(&snapshot.committed_logits);
@@ -546,7 +672,7 @@ impl Model {
         }
     }
 
-    fn compute_rows(&self, tokens: &[u32]) -> Result<(Vec<LayerState>, Vec<Vec<f32>>)> {
+    fn compute_rows(&self, tokens: &[u32], capture_limit: usize) -> Result<ComputedRows> {
         let end_position = self
             .position
             .checked_add(tokens.len())
@@ -564,17 +690,29 @@ impl Model {
         }
         let mut states = self.layer_states.clone();
         let mut logits = Vec::with_capacity(tokens.len());
+        let mut captures = Vec::new();
+        let capture_start = tokens.len().saturating_sub(capture_limit);
         // A canonical row traversal defines batch/chunk invariance. Kernel dispatch
         // and upstream one-row precommit shortcuts are not part of this reference.
         for (row, &token) in tokens.iter().enumerate() {
             let mut hidden = self.weights.embeddings.row(token)?;
-            for (layer, state) in self.weights.layers.iter().zip(&mut states) {
+            let mut values = Vec::new();
+            for (index, (layer, state)) in self.weights.layers.iter().zip(&mut states).enumerate() {
                 hidden = layer.forward(
                     &hidden,
                     state,
                     self.position + row,
                     self.weights.dimensions.epsilon,
                 )?;
+                if row >= capture_start && self.capture_options.layers.contains(&index) {
+                    values.extend_from_slice(&hidden);
+                }
+            }
+            if !values.is_empty() {
+                captures.push(CapturedRow {
+                    position: self.position + row,
+                    values,
+                });
             }
             let input = prepare_normalization(
                 &hidden,
@@ -584,7 +722,7 @@ impl Model {
             )?;
             logits.push(output_head(&self.weights.head, &input)?);
         }
-        Ok((states, logits))
+        Ok((states, logits, captures))
     }
 }
 
@@ -1107,5 +1245,175 @@ mod snapshot_capacity_tests {
             model.restore(&saved).unwrap();
             assert_eq!(capacities(&model), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use crate::portable_math::bfloat;
+
+    #[test]
+    fn captured_two_layer_residual_is_independent_post_mlp_bf16_sum() {
+        let mut bytes =
+            crate::test_support::synthetic_model(317, &["full_attention", "full_attention"]);
+        let n = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header: Value = serde_json::from_slice(&bytes[32..32 + n]).unwrap();
+        // Hand-set sizeable MLP scales so both residual boundaries are observable.
+        for tensor in header["tensors"].as_array().unwrap() {
+            if tensor["name"].as_str().unwrap().contains(".mlp.") {
+                let start = tensor["scale_off"].as_u64().unwrap() as usize;
+                let count = tensor["physical_rows"].as_u64().unwrap() as usize;
+                for pair in bytes[start..start + 2 * count].chunks_exact_mut(2) {
+                    pair.copy_from_slice(&yskn_format::f32_to_f16(0.25).to_le_bytes());
+                }
+            }
+        }
+        let mut model = Model::from_container(Container::from_bytes(bytes).unwrap()).unwrap();
+        let weights = Rc::get_mut(&mut model.weights).unwrap();
+        weights.embeddings = Embeddings::Plain {
+            values: (0..128 * 512)
+                .map(|i| bfloat((i % 71) as f32 / 32.0 - 1.0))
+                .collect(),
+            hidden_width: 512,
+        };
+        for layer in &mut weights.layers {
+            layer.input_norm.fill(2.0);
+            layer.post_attention_norm.fill(3.0);
+        }
+        model
+            .set_capture(CaptureOptions {
+                layers: vec![0, 1],
+                max_rows: 4,
+            })
+            .unwrap();
+        let mut hidden = model.embedding(3).unwrap();
+        let mut expected = Vec::new();
+        for layer in &model.weights.layers {
+            let Branch::Attention(branch) = &layer.branch else {
+                unreachable!()
+            };
+            let mut state = branch.attention.new_state().unwrap();
+            let norm = prepare_normalization(
+                &hidden,
+                &layer.input_norm,
+                branch.query_gate.input_signs(),
+                model.dimensions().epsilon,
+            )
+            .unwrap();
+            let q = branch
+                .query_gate
+                .project(&norm.prepared, Some(norm.inverse_rms))
+                .unwrap();
+            let k = branch
+                .key
+                .project(&norm.prepared, Some(norm.inverse_rms))
+                .unwrap();
+            let v = branch
+                .value
+                .project(&norm.prepared, Some(norm.inverse_rms))
+                .unwrap();
+            let output = branch.attention.step(&mut state, 0, &q, &k, &v).unwrap();
+            let prepared = quantize_activation(&output, branch.output.input_signs()).unwrap();
+            let projected = branch.output.project(&prepared, None).unwrap();
+            let old: Vec<_> = hidden
+                .iter()
+                .zip(projected)
+                .map(|(&h, p)| bfloat(h + bfloat(p)))
+                .collect();
+            let norm = prepare_normalization(
+                &old,
+                &layer.post_attention_norm,
+                layer.gate.input_signs(),
+                model.dimensions().epsilon,
+            )
+            .unwrap();
+            let gate = layer
+                .gate
+                .project(&norm.prepared, Some(norm.inverse_rms))
+                .unwrap();
+            let up = layer
+                .up
+                .project(&norm.prepared, Some(norm.inverse_rms))
+                .unwrap();
+            let product = gated_product(&gate, &up).unwrap();
+            let prepared = quantize_activation(&product, layer.down.input_signs()).unwrap();
+            let down = layer.down.project(&prepared, None).unwrap();
+            hidden = old
+                .iter()
+                .zip(down)
+                .map(|(&h, p)| bfloat(h + bfloat(p)))
+                .collect();
+            assert_ne!(hidden, old, "fixture must detect a tap before the MLP add");
+            assert_ne!(hidden, norm.weighted_hidden_bf16);
+            expected.extend_from_slice(&hidden);
+        }
+        model.prefill(&[3]).unwrap();
+        assert_eq!(model.captured_rows()[0].position, 0);
+        assert_eq!(
+            model.captured_rows()[0]
+                .values
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+        assert_ne!(&expected[..512], &expected[512..]);
+    }
+
+    #[test]
+    fn capture_chunks_commit_restore_and_bounded_prefill_observe_without_changing_logits() {
+        let bytes =
+            crate::test_support::synthetic_model(319, &["linear_attention", "full_attention"]);
+        let build =
+            || Model::from_container(Container::from_bytes(bytes.clone()).unwrap()).unwrap();
+        let mut whole = build();
+        let mut single = build();
+        let mut uneven = build();
+        let mut plain = build();
+        for model in [&mut whole, &mut single, &mut uneven] {
+            model
+                .set_capture(CaptureOptions {
+                    layers: vec![0, 1],
+                    max_rows: 16,
+                })
+                .unwrap();
+        }
+        let tokens = [1, 4, 2, 9, 3, 8, 7, 6, 5];
+        whole.prefill(&tokens).unwrap();
+        plain.prefill(&tokens).unwrap();
+        assert_eq!(whole.row_logits(), plain.row_logits());
+        assert_eq!(whole.state_digest(), plain.state_digest());
+        for token in tokens {
+            single.prefill(&[token]).unwrap();
+        }
+        for chunk in [&tokens[..2], &tokens[2..7], &tokens[7..]] {
+            uneven.prefill(chunk).unwrap();
+        }
+        assert_eq!(whole.captured_rows(), single.captured_rows());
+        assert_eq!(whole.captured_rows(), uneven.captured_rows());
+        let snapshot = whole.snapshot().unwrap();
+        whole.run_provisional(&[10, 11, 12]).unwrap();
+        let provisional = whole.provisional_captures().to_vec();
+        assert_eq!(
+            provisional.iter().map(|r| r.position).collect::<Vec<_>>(),
+            [9, 10, 11]
+        );
+        whole.commit(2).unwrap();
+        assert_eq!(&whole.captured_rows()[9..], &provisional[..2]);
+        whole.restore(&snapshot).unwrap();
+        assert_eq!(whole.captured_rows(), single.captured_rows());
+        whole.run_provisional(&[11]).unwrap();
+        whole.discard_provisional();
+        assert!(whole.provisional_captures().is_empty());
+        let mut bounded = build();
+        bounded
+            .set_capture(CaptureOptions {
+                layers: vec![0, 1],
+                max_rows: 3,
+            })
+            .unwrap();
+        bounded.prefill(&tokens).unwrap();
+        assert_eq!(bounded.captured_rows(), &single.captured_rows()[6..]);
     }
 }

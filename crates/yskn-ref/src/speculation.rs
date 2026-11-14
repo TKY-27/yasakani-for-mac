@@ -7,7 +7,12 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use crate::model::{CaptureOptions, CapturedRow, ModelDimensions};
 use crate::{Error, Model, Result, Sampler};
+
+pub use crate::draft_proposer::{
+    CombinedProposer, DraftProposer, DraftProposerSnapshot, ProposalOrder, SessionSnapshot,
+};
 
 /// A causal verifier. Failed passes are atomic; commit retains exactly its first
 /// `rows` input rows, and discard restores the committed prediction.
@@ -23,10 +28,40 @@ pub trait Verifier {
     fn logits(&self) -> Option<&[f32]>;
     fn commit(&mut self, rows: usize) -> std::result::Result<(), Self::Error>;
     fn discard(&mut self);
+    /// Changes on every successful main-only restore/reset. Drafts require it.
+    fn context_identity(&self) -> Option<std::sync::Arc<()>> {
+        None
+    }
+    fn take_captured_rows(&mut self) -> Vec<CapturedRow> {
+        Vec::new()
+    }
+    fn captured_rows(&self) -> &[CapturedRow] {
+        &[]
+    }
+    fn provisional_captures(&self) -> &[CapturedRow] {
+        &[]
+    }
+    fn capture_options(&self) -> Option<&CaptureOptions> {
+        None
+    }
+    fn dimensions(&self) -> Option<&ModelDimensions> {
+        None
+    }
+    fn embedding(&self, _token: u32) -> Result<Vec<f32>> {
+        Err(Error::InvalidInput(
+            "verifier does not expose embeddings".into(),
+        ))
+    }
 }
 
 impl Verifier for Model {
     type Error = Error;
+    fn context_identity(&self) -> Option<std::sync::Arc<()>> {
+        Some(self.context_identity())
+    }
+    fn take_captured_rows(&mut self) -> Vec<CapturedRow> {
+        self.take_captured_rows()
+    }
     fn position(&self) -> usize {
         self.position()
     }
@@ -47,6 +82,37 @@ impl Verifier for Model {
     }
     fn discard(&mut self) {
         self.discard_provisional();
+    }
+    fn captured_rows(&self) -> &[CapturedRow] {
+        self.captured_rows()
+    }
+    fn provisional_captures(&self) -> &[CapturedRow] {
+        self.provisional_captures()
+    }
+    fn capture_options(&self) -> Option<&CaptureOptions> {
+        Some(self.capture_options())
+    }
+    fn dimensions(&self) -> Option<&ModelDimensions> {
+        Some(self.dimensions())
+    }
+    fn embedding(&self, token: u32) -> Result<Vec<f32>> {
+        self.embedding(token)
+    }
+}
+
+/// Verifiers whose owned checkpoints can be saved together with a draft ring.
+pub trait CheckpointVerifier: Verifier {
+    type Snapshot;
+    fn snapshot(&self) -> std::result::Result<Self::Snapshot, Self::Error>;
+    fn restore(&mut self, snapshot: &Self::Snapshot) -> std::result::Result<(), Self::Error>;
+}
+impl CheckpointVerifier for Model {
+    type Snapshot = crate::Snapshot;
+    fn snapshot(&self) -> Result<Self::Snapshot> {
+        self.snapshot()
+    }
+    fn restore(&mut self, snapshot: &Self::Snapshot) -> Result<()> {
+        self.restore(snapshot)
     }
 }
 
@@ -80,6 +146,25 @@ pub trait Proposer {
         last_selected: u32,
         max_guesses: usize,
     ) -> Vec<u32>;
+    /// Observe the retained prompt suffix before generation or a direct proposal.
+    fn synchronize<V: Verifier>(&mut self, _verifier: &mut V) -> Result<()> {
+        Ok(())
+    }
+    /// Called after commit with its undelivered captures.
+    fn observe_committed(&mut self, _rows: &[CapturedRow]) -> Result<()> {
+        Ok(())
+    }
+    /// Fallible, verifier-aware entry point; token-only proposers keep their API.
+    fn propose_with<V: Verifier>(
+        &mut self,
+        verifier: &mut V,
+        history: &[u32],
+        last: u32,
+        max: usize,
+    ) -> Result<Vec<u32>> {
+        self.synchronize(verifier)?;
+        Ok(self.propose(history, last, max))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -199,6 +284,7 @@ pub struct GenerationResult {
 pub enum GenerationError<E> {
     Verifier(E),
     Selector(Error),
+    Proposer(Error),
     InvalidInput(&'static str),
 }
 impl<E: fmt::Display> fmt::Display for GenerationError<E> {
@@ -206,6 +292,7 @@ impl<E: fmt::Display> fmt::Display for GenerationError<E> {
         match self {
             Self::Verifier(error) => write!(f, "verifier: {error}"),
             Self::Selector(error) => write!(f, "selector: {error}"),
+            Self::Proposer(error) => write!(f, "proposer: {error}"),
             Self::InvalidInput(message) => write!(f, "generation: {message}"),
         }
     }
@@ -214,7 +301,7 @@ impl<E: std::error::Error + 'static> std::error::Error for GenerationError<E> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Verifier(error) => Some(error),
-            Self::Selector(error) => Some(error),
+            Self::Selector(error) | Self::Proposer(error) => Some(error),
             Self::InvalidInput(_) => None,
         }
     }
@@ -257,6 +344,10 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
         statistics: GenerationStatistics::default(),
         stop_reason: StopReason::MaxNewTokens,
     };
+    proposer
+        .synchronize(verifier)
+        .map_err(GenerationError::Proposer)?;
+    let mut drafting = true;
     while result.tokens.len() < limits.max_new_tokens {
         let position = verifier.position();
         let room = capacity.saturating_sub(position);
@@ -266,11 +357,42 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
         }
         let remaining = limits.max_new_tokens - result.tokens.len();
         let width = room.min(remaining).min(verifier.max_pass_width());
-        let guesses = proposer.propose(&history, pending, limits.max_draft_tokens.min(width - 1));
-        if guesses.len() > limits.max_draft_tokens.min(width - 1) {
-            return Err(GenerationError::InvalidInput(
-                "proposer exceeded the requested guess limit",
-            ));
+        let mut guesses = if drafting {
+            match proposer.propose_with(
+                verifier,
+                &history,
+                pending,
+                limits.max_draft_tokens.min(width - 1),
+            ) {
+                Ok(guesses) => guesses,
+                Err(error) if result.tokens.is_empty() => {
+                    return Err(GenerationError::Proposer(error));
+                }
+                Err(_) => {
+                    drafting = false;
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let vocabulary = verifier
+            .dimensions()
+            .map(|dimensions| dimensions.vocabulary_size)
+            .or_else(|| verifier.logits().map(<[f32]>::len));
+        let invalid_guesses = if guesses.len() > limits.max_draft_tokens.min(width - 1) {
+            Some("proposer exceeded the requested guess limit")
+        } else if vocabulary.is_some_and(|size| guesses.iter().any(|&id| id as usize >= size)) {
+            Some("proposer returned a token outside the vocabulary")
+        } else {
+            None
+        };
+        if let Some(message) = invalid_guesses {
+            if result.tokens.is_empty() {
+                return Err(GenerationError::InvalidInput(message));
+            }
+            drafting = false;
+            guesses.clear();
         }
         let mut rows = Vec::with_capacity(guesses.len() + 1);
         rows.push(pending);
@@ -326,9 +448,21 @@ pub fn generate<V: Verifier, P: Proposer, S: Selector>(
             }
         }
         let confirmed = result.tokens.len() - before;
+        let captures = verifier.provisional_captures();
+        if !captures.is_empty() && captures.len() < confirmed {
+            verifier.discard();
+            return Err(GenerationError::InvalidInput(
+                "verifier omitted captured rows",
+            ));
+        }
         if let Err(error) = verifier.commit(confirmed) {
             verifier.discard();
             return Err(GenerationError::Verifier(error));
+        }
+        let committed_captures = verifier.take_captured_rows();
+        if drafting && proposer.observe_committed(&committed_captures).is_err() {
+            // A committed output cannot be rolled back or lost to a draft failure.
+            drafting = false;
         }
         result.statistics.tokens_confirmed_per_pass.push(confirmed);
         result.statistics.pass_durations.push(started.elapsed());
@@ -424,6 +558,202 @@ mod tests {
         fn discard(&mut self) {
             self.pending = None;
             self.rows.clear();
+        }
+    }
+
+    #[test]
+    fn observation_failure_keeps_committed_outputs_and_continues_without_drafting() {
+        struct FailsOnObservation {
+            calls: usize,
+        }
+        impl Proposer for FailsOnObservation {
+            fn propose(&mut self, _: &[u32], _: u32, _: usize) -> Vec<u32> {
+                vec![]
+            }
+            fn observe_committed(&mut self, _: &[CapturedRow]) -> Result<()> {
+                self.calls += 1;
+                if self.calls == 2 {
+                    Err(Error::InvalidInput("observation failed".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut expected = SequenceVerifier::new(&[1, 2], 32, 4);
+        let mut actual = expected.clone();
+        let mut limits = GenerationLimits::new(7, 32);
+        limits.max_draft_tokens = 3;
+        let baseline = generate(
+            &mut expected,
+            &mut NoProposer,
+            &mut Greedy,
+            &[1, 2, 3],
+            GenerationLimits::new(7, 32),
+        )
+        .unwrap();
+        let mut proposer = FailsOnObservation { calls: 0 };
+        let generated =
+            generate(&mut actual, &mut proposer, &mut Greedy, &[1, 2, 3], limits).unwrap();
+        assert_eq!(generated.tokens, baseline.tokens);
+        assert_eq!(actual.committed, expected.committed);
+        assert_eq!(actual.last, expected.last);
+        assert_eq!(proposer.calls, 2);
+    }
+
+    struct FailsOnProposal {
+        calls: usize,
+        fail_on: usize,
+    }
+    impl Proposer for FailsOnProposal {
+        fn propose(&mut self, _: &[u32], _: u32, _: usize) -> Vec<u32> {
+            unreachable!()
+        }
+        fn propose_with<V: Verifier>(
+            &mut self,
+            _: &mut V,
+            _: &[u32],
+            _: u32,
+            _: usize,
+        ) -> Result<Vec<u32>> {
+            self.calls += 1;
+            if self.calls == self.fail_on {
+                Err(Error::InvalidInput("proposal failed".into()))
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
+
+    #[test]
+    fn proposal_failure_after_output_disables_drafting_and_matches_k_zero() {
+        let mut expected = SequenceVerifier::new(&[1, 2], 32, 4);
+        let mut actual = expected.clone();
+        let baseline = generate(
+            &mut expected,
+            &mut NoProposer,
+            &mut Greedy,
+            &[1, 2, 3],
+            GenerationLimits::new(7, 32),
+        )
+        .unwrap();
+        let mut proposer = FailsOnProposal {
+            calls: 0,
+            fail_on: 2,
+        };
+        let mut seen = Vec::new();
+        let mut callback = |token| {
+            seen.push(token);
+            true
+        };
+        let mut limits = GenerationLimits::new(7, 32);
+        limits.max_draft_tokens = 3;
+        limits.on_token = Some(&mut callback);
+        let generated =
+            generate(&mut actual, &mut proposer, &mut Greedy, &[1, 2, 3], limits).unwrap();
+        assert_eq!(generated.tokens, baseline.tokens);
+        assert_eq!(seen, baseline.tokens);
+        assert_eq!(generated.stop_reason, baseline.stop_reason);
+        assert_eq!(actual.committed, expected.committed);
+        assert_eq!(actual.last, expected.last);
+        assert!(actual.pending.is_none());
+        assert_eq!(proposer.calls, 2);
+    }
+
+    #[test]
+    fn proposal_failure_before_output_returns_named_error_without_changing_verifier() {
+        let mut main = SequenceVerifier::new(&[1, 2], 32, 4);
+        let before = main.clone();
+        let mut proposer = FailsOnProposal {
+            calls: 0,
+            fail_on: 1,
+        };
+        let mut limits = GenerationLimits::new(7, 32);
+        limits.max_draft_tokens = 3;
+        let error =
+            generate(&mut main, &mut proposer, &mut Greedy, &[1, 2, 3], limits).unwrap_err();
+        assert!(matches!(
+            error,
+            GenerationError::Proposer(Error::InvalidInput(message)) if message == "proposal failed"
+        ));
+        assert_eq!(main.committed, before.committed);
+        assert_eq!(main.last, before.last);
+        assert_eq!(main.rows, before.rows);
+        assert_eq!(main.pending, before.pending);
+    }
+
+    #[test]
+    fn invalid_guesses_before_output_error_and_after_output_fall_back_losslessly() {
+        struct Misbehaving {
+            calls: usize,
+            fail_on: usize,
+            oversized: bool,
+        }
+        impl Proposer for Misbehaving {
+            fn propose(&mut self, _: &[u32], _: u32, max: usize) -> Vec<u32> {
+                self.calls += 1;
+                if self.calls != self.fail_on {
+                    vec![]
+                } else if self.oversized {
+                    vec![0; max + 1]
+                } else {
+                    vec![8] // SequenceVerifier has vocabulary IDs 0..8.
+                }
+            }
+        }
+        for oversized in [false, true] {
+            for fail_on in [1, 2] {
+                let mut expected = SequenceVerifier::new(&[1, 2], 32, 4);
+                let mut actual = expected.clone();
+                let before = actual.clone();
+                let baseline = generate(
+                    &mut expected,
+                    &mut NoProposer,
+                    &mut Greedy,
+                    &[1, 2, 3],
+                    GenerationLimits::new(7, 32),
+                )
+                .unwrap();
+                let mut proposer = Misbehaving {
+                    calls: 0,
+                    fail_on,
+                    oversized,
+                };
+                let mut seen = Vec::new();
+                let mut callback = |token| {
+                    seen.push(token);
+                    true
+                };
+                let mut limits = GenerationLimits::new(7, 32);
+                limits.max_draft_tokens = 3;
+                limits.on_token = Some(&mut callback);
+                let generated =
+                    generate(&mut actual, &mut proposer, &mut Greedy, &[1, 2, 3], limits);
+                if fail_on == 1 {
+                    let expected_error = if oversized {
+                        "proposer exceeded the requested guess limit"
+                    } else {
+                        "proposer returned a token outside the vocabulary"
+                    };
+                    assert!(matches!(
+                        generated,
+                        Err(GenerationError::InvalidInput(message)) if message == expected_error
+                    ));
+                    assert!(seen.is_empty());
+                    assert_eq!(actual.committed, before.committed);
+                    assert_eq!(actual.last, before.last);
+                    assert_eq!(actual.rows, before.rows);
+                    assert_eq!(actual.pending, before.pending);
+                } else {
+                    let generated = generated.unwrap();
+                    assert_eq!(generated.tokens, baseline.tokens);
+                    assert_eq!(seen, baseline.tokens);
+                    assert_eq!(generated.stop_reason, baseline.stop_reason);
+                    assert_eq!(actual.committed, expected.committed);
+                    assert_eq!(actual.last, expected.last);
+                    assert!(actual.pending.is_none());
+                }
+                assert_eq!(proposer.calls, fail_on);
+            }
         }
     }
 
