@@ -102,3 +102,18 @@ pub fn int8_keys_packed_values_profile() -> Vec<u8> {
     profile.groups[3].mean = Some(std::array::from_fn(|i| (i as f32 - 128.0) / 1024.0));
     profile.bytes()
 }
+
+/// One attention ordinal, with both a packed head and a basis/fallback head.
+/// Multi-ordinal indexing remains pinned by the frozen model/KV suites.
+pub fn compact_mixed_profile() -> Vec<u8> {
+    let mut profile = Profile::new(1, 2);
+    profile.groups[0].mean = Some([0.125; 256]);
+    profile.groups[1].guard = 2;
+    profile.groups[2].mean = Some(std::array::from_fn(|i| (i as f32 - 128.0) / 1024.0));
+    profile.groups[3].basis.push([0.0625; 256]);
+    profile.groups[3].mean = Some([0.03125; 256]);
+    let bytes = profile.bytes();
+    let parsed = yskn_ref::kv_profile::KvProfile::parse(&bytes).unwrap();
+    assert!(parsed.packable(0, 0) && !parsed.packable(0, 1));
+    bytes
+}
