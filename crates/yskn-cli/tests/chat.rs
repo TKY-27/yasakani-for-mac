@@ -1100,3 +1100,15 @@ fn terminal_shows_bidirectional_controls_visibly() {
     let emoji = "\u{1f469}\u{200d}\u{1f4bb} \u{2764}\u{fe0f}";
     assert_eq!(yskn::cli::visible(emoji), emoji);
 }
+// Review finding (third round): the Arabic letter mark and the left-to-right
+// and right-to-left marks also change the order a terminal shows text in.
+#[test]
+fn terminal_shows_direction_marks_visibly() {
+    assert_eq!(
+        yskn::cli::visible("a\u{61c}b\u{200e}c\u{200f}d"),
+        "a\\u061cb\\u200ec\\u200fd"
+    );
+    // Neighbouring characters that are not direction marks stay.
+    let kept = "\u{61b}\u{61d}\u{200d}\u{2010}";
+    assert_eq!(yskn::cli::visible(kept), kept);
+}
