@@ -118,10 +118,16 @@ impl StopFilter {
     }
 }
 
+/// Default longest rendered prompt: as the request text limit, twice a full
+/// 262,144-token context of ordinary text, which is under 1 MiB.
+pub const MAX_PROMPT_BYTES: usize = 2 * 1024 * 1024;
 pub struct ChatRunner {
     pub engine: Box<dyn Engine>,
     pub formatter: ChatFormatter,
     pub bridge: Vec<u32>,
+    /// A rendered prompt longer than this is refused before it is tokenized,
+    /// as tokenizing costs time and memory in proportion to it.
+    pub max_prompt_bytes: usize,
     seed: i64,
 }
 fn too_long(message: String) -> Error {
@@ -141,6 +147,7 @@ impl ChatRunner {
             engine,
             formatter,
             bridge,
+            max_prompt_bytes: MAX_PROMPT_BYTES,
             seed: seed0,
         })
     }
@@ -165,9 +172,9 @@ impl ChatRunner {
             ))
         };
         let capacity = self.engine.context_capacity();
-        // Mirrors ChatFormatter::prompt. No size check before tokenization: a
-        // normalizer may delete any amount of text, so only the token count is
-        // a sound reason to refuse. The body and text limits bound the work.
+        // Mirrors ChatFormatter::prompt. The byte limit bounds the cost of
+        // tokenizing, not whether a prompt fits: a normalizer may delete any
+        // amount of text, so only the token count below decides that.
         let mut options = p.template_kwargs.clone();
         if let Some(map) = options.as_object_mut() {
             map.insert("add_generation_prompt".into(), Value::Bool(true));
@@ -177,6 +184,13 @@ impl ChatRunner {
             .render(&p.messages, p.tools.as_ref(), &options)
             .map_err(rejected)?;
         drop(options);
+        if text.len() > self.max_prompt_bytes {
+            return Err(too_long(format!(
+                "the rendered prompt is {} bytes, more than the limit of {} bytes",
+                text.len(),
+                self.max_prompt_bytes
+            )));
+        }
         go_on()?;
         let ids = self.formatter.encode(&text).map_err(rejected)?;
         go_on()?;

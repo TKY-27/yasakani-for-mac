@@ -1146,6 +1146,77 @@ async fn far_too_long_input_is_refused_before_the_engine() {
     assert_eq!(h.control.observation().calls, 0);
     h.stop().await;
 }
+// Review finding (third round): the text limit counted strings and keys but
+// not numbers or template kwargs, so a tool schema of 500,000 numbers (2.5 MB
+// body, 76 bytes of counted text) rendered to 10 MB and was tokenized in full.
+// Everything the template can render from the request is counted now, numbers
+// at the longest spelling of one.
+#[tokio::test]
+async fn the_text_limit_counts_numbers_and_template_kwargs() {
+    let mut cfg = Config::default();
+    cfg.limits.max_text_bytes = 512;
+    let h = Harness::start(cfg).await;
+    let enum_tool = |n: usize| json!([{"type":"function","function":{"name":"f","parameters":{"enum":vec![1e15; n]}}}]);
+    for extra in [
+        json!({"tools":enum_tool(20)}),
+        json!({"chat_template_kwargs":{"custom":"x".repeat(500)}}),
+    ] {
+        let r = h.chat(extra.clone()).await;
+        assert_eq!(r.status, 400, "{extra}: {}", r.text);
+        assert_eq!(
+            error_message(&r),
+            "the request holds more than 512 bytes of text"
+        );
+    }
+    h.script("</think>ok");
+    let r = h.chat(json!({"tools":enum_tool(1),"max_tokens":20})).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(h.control.observation().calls, 1);
+    h.stop().await;
+    // The review's request, with the default limits.
+    let h = Harness::start(Config::default()).await;
+    let numbers = vec!["1e15"; 500_000].join(",");
+    let b = format!(
+        r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{{"type":"function","function":{{"name":"f","parameters":{{"enum":[{numbers}]}}}}}}]}}"#
+    );
+    let r = h.raw_request("POST", "/v1/chat/completions", b, &[]).await;
+    assert_eq!(r.status, 400, "{}", r.text);
+    assert_eq!(
+        error_message(&r),
+        "the request holds more than 2097152 bytes of text"
+    );
+    assert_eq!(h.control.observation().calls, 0);
+    h.stop().await;
+}
+// Review finding (third round): no limit applied to the rendered prompt, which
+// a template makes longer than the request text (here: tags around each of
+// 80,000 short tool-call arguments), and all of it was tokenized before the
+// context check. A rendered prompt over `max_prompt_bytes` is refused before
+// tokenization, naming both sizes.
+#[tokio::test]
+async fn a_rendered_prompt_over_the_limit_is_refused_before_tokenizing() {
+    let h = Harness::start(Config::default()).await;
+    let arguments: Value = (0..80_000)
+        .map(|i| (format!("a{i:05}"), json!("")))
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    let call = json!({"function":{"name":"f","arguments":arguments.to_string()}});
+    let b = json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[call]}]});
+    let r = h
+        .request("POST", "/v1/chat/completions", Some(b), &[])
+        .await;
+    assert_eq!(r.status, 400, "{}", &r.text[..r.text.len().min(300)]);
+    assert_eq!(r.json()["error"]["code"], "context_length_exceeded");
+    let message = error_message(&r);
+    let size: usize = message
+        .strip_prefix("the rendered prompt is ")
+        .and_then(|m| m.strip_suffix(" bytes, more than the limit of 2097152 bytes"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{message}"));
+    assert!(size > 2 * 1024 * 1024, "{size}");
+    assert_eq!(h.control.observation().calls, 0);
+    h.stop().await;
+}
 // All requests together are bounded: one that would push the bytes held by
 // received, queued and running requests past the budget gets 503 with
 // Retry-After, and the budget is returned when a request finishes.

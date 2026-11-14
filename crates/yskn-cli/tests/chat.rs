@@ -963,6 +963,40 @@ fn preparation_stops_between_its_steps() {
     assert_eq!(calls, 3);
     assert_eq!(c.observation().calls, 0);
 }
+// A rendered prompt over `max_prompt_bytes` is refused right after rendering:
+// the step before tokenization is never reached. The limit is inclusive.
+#[test]
+fn a_rendered_prompt_over_the_limit_is_not_tokenized() {
+    use std::cell::Cell;
+    let (mut r, c) = runner();
+    assert_eq!(r.max_prompt_bytes, 2 * 1024 * 1024);
+    let p = ChatParams::new(json!([{"role":"user","content":"x".repeat(1000)}]));
+    let size = r
+        .formatter
+        .render(&p.messages, None, &json!({}))
+        .unwrap()
+        .len();
+    r.max_prompt_bytes = size - 1;
+    let steps = Cell::new(0);
+    let e = r
+        .prepare_interruptible(&p, &|| {
+            steps.set(steps.get() + 1);
+            Ok(())
+        })
+        .unwrap_err();
+    assert_eq!((e.status, e.code), (400, Some("context_length_exceeded")));
+    assert_eq!(
+        e.message,
+        format!(
+            "the rendered prompt is {size} bytes, more than the limit of {} bytes",
+            size - 1
+        )
+    );
+    assert_eq!(steps.get(), 1);
+    r.max_prompt_bytes = size;
+    assert!(r.prepare_checked(&p).is_ok());
+    assert_eq!(c.observation().calls, 0);
+}
 // Review finding: `tools` in chat_template_kwargs reached the template instead
 // of the validated tools, bypassing the tool limit and tool_choice "none".
 // Names the renderer sets itself are refused, naming the key.

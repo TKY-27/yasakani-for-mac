@@ -119,14 +119,15 @@ SHA-256 and reduces all 32 digest bytes without prefix-dependent branches.
 
 | Limit (`Limits` field) | Default | Why this number |
 |---|---:|---|
-| Actual request-body bytes, before JSON parsing (`max_body`) | 8 MiB | Upstream's `MAX_BODY` is 32 MiB. Lowered: by our estimate a full 262,144-token context is about 1 to 2.4 MiB of JSON (3 to 9 bytes per token, ASCII-escaped CJK at the top), so 8 MiB leaves 32 bytes per token. The body size also bounds the engine thread's uncharged work of preparing the prompt (measured below). A client resending megabytes of old `reasoning_content` that the template drops could exceed it where upstream accepted it |
+| Actual request-body bytes, before JSON parsing (`max_body`) | 8 MiB | Upstream's `MAX_BODY` is 32 MiB. Lowered: by our estimate a full 262,144-token context is about 1 to 2.4 MiB of JSON (3 to 9 bytes per token, ASCII-escaped CJK at the top), so 8 MiB leaves 32 bytes per token. A client resending megabytes of old `reasoning_content` that the template drops could exceed it where upstream accepted it |
 | Bytes held by all requests together (`max_pending_bytes`) | 512 MiB | Charged as body bytes arrive; raised before parsing to what decoding can hold at most, 5 x the body bytes + 640 per JSON value (see below); lowered after decoding to the cleaned request's text bytes + 640 per value, which it holds while it waits and generates. Over budget: 503 with `Retry-After: 5`. Must hold one largest request (5 x 8 MiB + 2^19 x 640 = 360 MiB) |
 | JSON values per request, counted before parsing (`max_json_values`) | 524,288 | Bounds the parsed body and its cleaned copy (measured worst case about 590 bytes per value, for tool schemas of one-member objects). Covers 65,536 messages at 4 values each with room for tools; tool-call argument strings count too |
 | Messages (`max_messages`) | 65,536 | Even an empty message renders as 5 template tokens, so more than 262,144 / 5 = 52,429 can never fit |
 | Content parts per message (`max_content_parts`) | 1,024 | Clients send a handful of text parts per message |
 | Tool calls per assistant message (`max_tool_calls`) | 1,024 | Each call renders as at least about 10 tokens of tags; parallel calls come in single digits |
 | Tools (`max_tools`) | 1,024 | OpenAI documents at most 128 functions; 8 times that |
-| Text bytes of the cleaned messages and tools, keys included (`max_text_bytes`) | 2 MiB | Bounds the one step that cannot be interrupted or charged to the budget, tokenizing the prompt on the engine thread (measured at about 230 bytes of memory per byte-level token). A full 262,144-token context of ordinary text is under 1 MiB, so a request beyond 2 MiB could not fit anyway; it also bounds what Python-style `str()` of non-string text parts and parsed tool arguments can add |
+| Text the template can render from the request (`max_text_bytes`): the bytes of every string and key in the cleaned messages, tools and template kwargs, plus 24 bytes for each number, boolean or null (the longest spelling of a number, `-2.2250738585072014e-308`) | 2 MiB | A full 262,144-token context of ordinary text is under 1 MiB, so a request beyond 2 MiB could not fit anyway. Checked once the request is decoded, before it is queued: it also bounds what Python-style `str()` of non-string text parts and parsed tool arguments can add, and what the request holds while it waits |
+| Rendered prompt (`max_prompt_bytes`) | 2 MiB | The same reasoning as the text limit, applied to the template's output, which adds tags and JSON punctuation to the counted text. Checked on the engine thread between rendering and tokenizing, because tokenizing costs time and memory in proportion to the prompt (measured below). Over it: 400 `context_length_exceeded`, naming the rendered size and the limit |
 | Wait for the engine, from queueing until generation starts (`queue_timeout`) | 600 s | The OpenAI Python SDK's default request timeout is 600 s, so a client would give up by then anyway. Exceeded: 503 with `Retry-After: 5`, and the request never reaches the engine |
 | Concurrent connections (`max_connections`, 1..1024) | 64; excess connections are closed unserved | One engine serves one request at a time |
 | Queued engine jobs | 64 (bounded by active HTTP connections) | One per connection |
@@ -154,12 +155,13 @@ tokenizing, and stops there (past the deadline: 503 with `Retry-After`).
 Rendering and tokenizing themselves cannot be interrupted; see below for what
 the longest of them costs.
 
-A prompt is refused with `context_length_exceeded` only by the exact token
-check after tokenization, as upstream. There is no cheaper check on the
-rendered text before it: a tokenizer's normalizer may delete any amount of
-text (`StripAccents` turns 10,000 combining marks and "hi" into a 23-token
-prompt), so no byte count proves a prompt cannot fit. The cost of preparing a
-prompt is bounded by the body and text limits instead (see below).
+Whether a prompt fits is decided only by the exact token check after
+tokenization, as upstream (400 `context_length_exceeded`). The prompt byte
+limit before it bounds the cost of tokenizing, not whether a prompt fits: a
+tokenizer's normalizer may delete any amount of text (`StripAccents` turns
+10,000 combining marks and "hi" into a 23-token prompt), so a rendered prompt
+over 2 MiB is refused even if it would normalize to fit. Upstream tokenizes
+any prompt.
 
 **What a request holds.** While a body is decoded its text exists at most
 twice at once: the raw body and the parsed JSON while parsing (the raw body is
@@ -170,7 +172,7 @@ a raw DEL byte as the four characters `\x7f`. So at its peak a request holds
 at most 5 times its body bytes (`DECODE_FACTOR`), plus the structure of its
 values, which the 640 bytes per value cover; that is what it is charged while
 it is decoded. Afterwards it holds its cleaned text (at most `max_text_bytes`
-for messages and tools, plus template kwargs and stop strings). Measured on
+for messages, tools and template kwargs, plus stop strings). Measured on
 macOS 27.2 on an Apple M5 with the release binary, peak resident memory of the
 whole server while 64 clients each send one request with a 7 MiB string and
 never read the answer (`/usr/bin/time -l`; an idle server is 8 MiB):
@@ -188,19 +190,36 @@ for the text part, where the allocator keeps the freed raw body resident, and
 28 MiB for template kwargs, of which the engine thread's copies for the
 template are the larger part (not charged, see below).
 
-Not covered by the budget: the one request on the engine thread renders and
-tokenizes its prompt, which only the body and text limits bound. With the
+**What is bounded by what.**
+
+- Bytes held, by the budget (`max_pending_bytes`): every request from its
+  first body byte until it leaves the engine thread, as described above.
+- Text counted, by the request limits (`max_text_bytes` and the shape limits
+  in the table): everything the template can render from the request, checked
+  once it is decoded and before it is queued.
+- The rendered prompt, by `max_prompt_bytes`: the template's output, checked
+  on the engine thread after rendering and before tokenizing.
+- Tokens, by the context check after tokenizing: whether the prompt fits.
+
+Not charged to the budget, and done on the engine thread for one request at
+a time: rendering and tokenizing. Tokenizing is proportional to the rendered
+prompt, so the prompt limit bounds it. Measured on the same machine with the
 synthetic byte tokenizer (one token per byte, the most tokens a prompt byte
-can make), a request of 8 MiB of plain text renders an 8.4 million token
-prompt; preparing it took 0.4 to 0.6 s and the server peaked at 1.8 GiB resident
-(about 230 bytes per token, for CJK, emoji or DEL text; ASCII 1.4 GiB). The most tokens per body byte we
-found come from many short tool-call arguments, each rendered with its
-`<parameter=...>` tags: an 8.3 MB body of 250,000 arguments renders 13.5
-million tokens, taking 0.8 to 1.3 s and peaking at 2.5 GiB. These are measurements of
-constructed cases, not a proven bound; other templates add other tags. A
-real tokenizer makes fewer tokens per byte; it has not been measured here.
-Embedders running `Api` on a multi-thread runtime can decode several bodies at
-once; each is still charged before it is parsed.
+can make): preparing a prompt just under the limit makes 2.1 million tokens
+and takes 0.11 s, with a peak of 304 to 308 MiB allocated (about 150 bytes
+per token, alike for ASCII, CJK and emoji text and for tool-call tags;
+counted with an allocator wrapper in a test build); the whole release server
+peaked at 388 MiB resident for ASCII text and 494 MiB for emoji text
+(`/usr/bin/time -l`; idle 8 MiB) and answered in 0.13 s. Rendering happens
+before the prompt check, so its output is bounded only by the counted text
+and how much the template adds to it: the most expansive request we found,
+290,000 empty tool-call arguments (4.6 MB body, 2.0 MB counted text), renders
+9.9 MB in 0.09 s with a peak of 93 MiB allocated, and is then refused without
+being tokenized. These are measurements of constructed cases, not a proven
+bound; other templates add other tags. A real tokenizer makes fewer tokens
+per byte; it has not been measured here. Embedders running `Api` on a
+multi-thread runtime can decode several bodies at once; each is still charged
+before it is parsed.
 
 Error messages never quote more than a short excerpt of a request value: at
 most 64 characters of its Python repr followed by `…` (`response_format`, the
@@ -248,8 +267,9 @@ their decoding. Hyper rejects malformed framing before the handler, using its
 own 400/414/431 responses and closing the connection.
 
 The body limit is 8 MiB instead of upstream's 32 MiB, and the request shape,
-text and global budget limits in the table above have no upstream equivalent;
-upstream parses any body within its limit and tokenizes it in full.
+text, rendered prompt and global budget limits in the table above have no
+upstream equivalent; upstream parses any body within its limit and tokenizes
+its prompt in full.
 
 Duplicate Host/Origin/Sec-Fetch-Site/Authorization headers are rejected to
 avoid intermediary ambiguity; Python reads the first. An empty Sec-Fetch-Site is

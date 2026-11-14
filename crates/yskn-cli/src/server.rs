@@ -62,6 +62,9 @@ pub struct Limits {
     pub max_tool_calls: usize,
     pub max_tools: usize,
     pub max_text_bytes: usize,
+    /// Longest rendered prompt the engine thread tokenizes; a longer one is
+    /// refused (400) between rendering and tokenization.
+    pub max_prompt_bytes: usize,
     pub max_stop_bytes: usize,
     /// Longest wait for the engine, from queueing until generation starts;
     /// exceeded: 503 with Retry-After. Generation itself is bounded by
@@ -92,6 +95,7 @@ impl Default for Limits {
             // Tokenizing costs time and memory in proportion to the text, and a full
             // 262,144-token context of ordinary text is under 1 MiB.
             max_text_bytes: 2 * 1024 * 1024,
+            max_prompt_bytes: crate::chat::MAX_PROMPT_BYTES,
             max_stop_bytes: 1024,
             queue_timeout: Duration::from_secs(600),
             max_connections: 64,
@@ -367,7 +371,10 @@ impl Api {
             .name("yskn-engine".into())
             .spawn(move || {
                 let mut runner = match factory() {
-                    Ok(r) => r,
+                    Ok(mut r) => {
+                        r.max_prompt_bytes = state.cfg.limits.max_prompt_bytes;
+                        r
+                    }
                     Err(e) => {
                         *state
                             .failure
@@ -686,7 +693,10 @@ fn decode(bytes: Vec<u8>, cfg: &Config, charge: &mut Charge) -> Result<Decoded> 
         return Err(busy_error());
     }
     let params = parse_chat_request(&body, &cfg.defaults)?;
-    let text = text_bytes(&params.messages) + params.tools.as_ref().map_or(0, text_bytes);
+    // Everything the template can render from the request.
+    let text = text_bytes(&params.messages)
+        + params.tools.as_ref().map_or(0, text_bytes)
+        + text_bytes(&params.template_kwargs);
     if text > limits.max_text_bytes {
         return Err(Error::request(format!(
             "the request holds more than {} bytes of text",
@@ -699,9 +709,7 @@ fn decode(bytes: Vec<u8>, cfg: &Config, charge: &mut Charge) -> Result<Decoded> 
         params,
     };
     drop(body);
-    let held = text
-        + text_bytes(&decoded.params.template_kwargs)
-        + decoded.params.stop.iter().map(String::len).sum::<usize>();
+    let held = text + decoded.params.stop.iter().map(String::len).sum::<usize>();
     // Normally below the decode estimate; growth past the budget is refused.
     if !charge.resize(held.saturating_add(values.saturating_mul(VALUE_COST))) {
         return Err(busy_error());

@@ -84,13 +84,17 @@ pub fn check_values(values: usize, limits: &Limits) -> Result<()> {
     }
     Ok(())
 }
-/// Bytes of text (strings and object keys) inside a value.
+/// Bytes a template can render for one number, boolean or null: the longest
+/// spelling of a JSON number, as Python's repr of `-2.2250738585072014e-308`.
+pub const SCALAR_BYTES: usize = 24;
+/// Bytes of text inside a value: its strings and object keys, and
+/// [`SCALAR_BYTES`] for each other value that is not a list or an object.
 pub fn text_bytes(v: &Value) -> usize {
     match v {
         Value::String(s) => s.len(),
         Value::Array(a) => a.iter().map(text_bytes).sum(),
         Value::Object(m) => m.iter().map(|(k, v)| k.len() + text_bytes(v)).sum(),
-        _ => 0,
+        _ => SCALAR_BYTES,
     }
 }
 
