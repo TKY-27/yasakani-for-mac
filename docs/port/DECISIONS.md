@@ -741,6 +741,65 @@ absolute position, including guard bypass. The existing public stage
 signatures are unchanged. The profile uses `Arc` so the mapped engine's
 parallel prepared-row/output stages can continue sharing attention.
 
+Brief 05j keeps the packed words, bit width and FP32 scale and decodes each
+packed row once at encoding. Brief 05l stores the 256 derived BF16 bases as
+512 bytes of `u16` bits inline in a boxed `PackedRow`. The packed words retain
+their original `Vec<u32>` representation. There are two heap blocks: the
+packed row (including bases) and the words; bases have no separate allocation.
+Boxing the packed variant keeps int8 cache slots small instead of making every
+fallback carry space for 512 unused bytes. Attention widens each visible row
+exactly once before its key dot or tile value accumulation, with no change to
+binary32 operation order. Masked value slots are `None`; no unread 32 x 256
+scratch array is zeroed per tile. Stored-code/scale digests omit derived bases.
+
+Measured with `std::mem::size_of` on this arm64 host: `Int8Row` is 32 bytes,
+`PackedRow` is 544, and `CacheRow` is 32. An int8 row costs 32 + 256 = 288
+bytes including its enum slot and integer heap. A five-bit packed row costs
+32 + 544 + 160 = 736 bytes including its enum slot and both heaps (704 for
+four-bit words). Before 05l, `PackedRow` and `CacheRow` were each 40 bytes;
+the packed row lived inside the enum slot and owned 160-byte words and a
+1,024-byte decoded-base box, totaling 40 + 160 + 1,024 = 1,224 bytes, not the
+sum of both overlapping struct sizes. Before 05j, the packed representation
+had no derived-base allocation: 40 + 160 = 200 bytes including its enum slot.
+These are requested allocation sizes, not allocator-rounded resident memory.
+
+The real architecture has 16 attention layers, four KV heads and two sides:
+128 rows/token. Each layer also stores one 48-byte `CacheToken` (two vectors)
+per token, adding 768 bytes/token. Current reference costs are:
+
+| Rows | Numeric bytes/row | Row slot + heaps | Numeric bytes/token | Allocated bytes/token including token structs |
+|---|---:|---:|---:|---:|
+| All int8 (`Int8` or `Int8Profile`) | 260 | 288 | 33,280 | 37,632 |
+| All five-bit packed | 676 | 736 | 86,528 | 94,976 |
+| All four-bit packed | 644 | 704 | 82,432 | 90,880 |
+| Real-profile `Kv5`: 116 five-bit packed + 12 int8 fallback | mixed | mixed | 81,536 | 89,600 |
+
+Numeric bytes include scale and, for packed rows, the derived BF16 bases.
+For `p` five-bit packed rows, numeric payload is `33,280 + 416*p` and the
+allocated total is `37,632 + 448*p` bytes/token. The real profile packs all
+16 key sides and 13 value sides, four rows per side: `p = 116`.
+
+| Context tokens | Int8 cache bytes (GiB) | All five-bit packed reference bytes (GiB) | Real-profile Kv5 reference bytes (GiB) |
+|---|---:|---:|---:|
+| 2,048 | 77,070,336 (0.071777) | 194,510,848 (0.181152) | 183,500,800 (0.170898) |
+| 32,768 | 1,233,125,376 (1.148438) | 3,112,173,568 (2.898438) | 2,936,012,800 (2.734375) |
+| 262,144 | 9,865,003,008 (9.187500) | 24,897,388,544 (23.187500) | 23,488,102,400 (21.875000) |
+
+GiB is 2^30 bytes. These totals include row/token structs and requested heap
+sizes at exact token capacity. They exclude allocator overhead, spare vector
+capacity, the fixed state/profile objects, snapshots and provisional prepared
+row copies. A retained full snapshot adds another cache of the same size.
+With the 10.3 GB model, 2,048 and 32,768 tokens fit the 24 GB machine's memory
+budget in `Kv5`: real-profile cache plus model is about 10.48 and 13.24 GB,
+respectively, leaving room for execution and the OS. At 262,144 tokens they
+do not fit: that cache plus model alone is about 33.79 GB (35.20 GB if all
+rows pack). This is reference-representation accounting, not a measured real
+model run. A later reader that consumes packed words directly could need only
+164 numeric bytes per five-bit row (128 + 4 = 132 for four-bit rows), with no
+derived bases. Its all-five-bit payload would be 20,992 bytes/token, or
+22,144 with the real profile's 12 int8 fallbacks; that compact reader is not
+implemented here.
+
 Reads are defined as follows:
 
 - `Int8` and `Int8Profile` consume exact signed-int8 base operands and the
