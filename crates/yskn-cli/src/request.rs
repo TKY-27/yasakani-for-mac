@@ -520,6 +520,16 @@ pub fn parse_chat_request(body: &Value, cfg: &RequestDefaults) -> Result<ChatPar
             .cloned()
             .ok_or_else(|| Error::request("chat_template_kwargs must be an object"))?
     };
+    // Upstream passes these on as keyword arguments too: `tools` reaches the
+    // template whenever the request has no tools of its own (bypassing the
+    // tool limit and tool_choice "none"), the others fail with a TypeError.
+    if let Some(key) = kw.keys().find(|k| {
+        yskn_text::RESERVED_VARIABLES.contains(&k.as_str()) || *k == "add_generation_prompt"
+    }) {
+        return Err(Error::request(format!(
+            "chat_template_kwargs: {key} is set by the server and cannot be given"
+        )));
+    }
     if let Some(t @ ("enabled" | "disabled")) = body["thinking"]["type"].as_str() {
         kw.entry("enable_thinking").or_insert(json!(t == "enabled"));
     }

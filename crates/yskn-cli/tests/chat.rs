@@ -922,3 +922,38 @@ fn preparation_stops_between_its_steps() {
     assert_eq!(calls, 3);
     assert_eq!(c.observation().calls, 0);
 }
+// Review finding: `tools` in chat_template_kwargs reached the template instead
+// of the validated tools, bypassing the tool limit and tool_choice "none".
+// Names the renderer sets itself are refused, naming the key.
+#[test]
+fn template_kwargs_cannot_set_what_the_server_sets() {
+    let cfg = RequestDefaults::default();
+    for key in [
+        "tools",
+        "messages",
+        "add_generation_prompt",
+        "bos_token",
+        "eos_token",
+        "raise_exception",
+    ] {
+        let b = json!({"messages":user(),"tool_choice":"none","chat_template_kwargs":{"enable_thinking":false,(key):tools()}});
+        let e = parse_chat_request(&b, &cfg).unwrap_err();
+        assert_eq!(e.status, 400);
+        assert_eq!(
+            e.message,
+            format!("chat_template_kwargs: {key} is set by the server and cannot be given")
+        );
+    }
+    // The renderer refuses them too, for callers that build ChatParams.
+    let (r, c) = runner();
+    let mut p = ChatParams::new(user());
+    p.template_kwargs = json!({"tools":tools()});
+    let e = r.prepare_checked(&p).unwrap_err();
+    assert_eq!(e.status, 400);
+    assert!(e.message.contains("tools"), "{}", e.message);
+    // Other kwargs still reach the template.
+    p.template_kwargs = json!({"enable_thinking":false,"custom":1});
+    let (ids, thinking) = r.prepare_checked(&p).unwrap();
+    assert!(!thinking && !ids.is_empty());
+    assert_eq!(c.observation().calls, 0);
+}

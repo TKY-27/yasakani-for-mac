@@ -52,7 +52,9 @@ typed at a real terminal (which sends the same SIGINT) is checked by hand only.
   `min_p`, `seed`; limits: `max_tokens`/`max_completion_tokens`, up to four
   `stop` strings. `ignore_eos`, `loop_guard`, `thinking_budget`, `thinking`,
   `enable_thinking`, `reasoning_effort`, `chat_template_kwargs` are supported.
-  Template kwargs have precedence for thinking/effort. `minimal` aliases `low`,
+  Template kwargs have precedence for thinking/effort; they cannot set what
+  the server sets itself (`messages`, `tools`, `add_generation_prompt`,
+  `bos_token`, `eos_token`, `raise_exception`: 400 naming the key). `minimal` aliases `low`,
   `high` aliases `xhigh`. `tools` supports functions with `tool_choice` auto/none.
   `parallel_tool_calls` is accepted as upstream does; calls are returned in order.
 - Images, forced tool choices, legacy functions/function_call, logprobs, n > 1
@@ -257,8 +259,14 @@ Non-finite numbers and integers outside i64 are rejected; Python accepts
 NaN/Infinity and arbitrary precision integers. Integer seeds within i64 do not
 pass through f64, so they keep full precision. Non-object template
 kwargs/stream_options and invalid effort types become 400 instead of Python
-conversion/attribute errors; all template failures become 400. These are
-deliberate validation defect fixes.
+conversion/attribute errors; all template failures become 400. Upstream passes
+every template kwarg on as a keyword argument: a `tools` kwarg reaches the
+template whenever the request has no tools of its own (so it escapes the tool
+limit and `tool_choice: "none"`), `messages`, `add_generation_prompt`,
+`bos_token` and `eos_token` fail with a Python TypeError outside its error
+handling, and `raise_exception` replaces the template's function; here all
+six are a 400, checked again by `ChatFormatter::render` for every caller.
+These are deliberate validation defect fixes.
 
 Windows console code page and coloring, DLL/CUDA/device selection, nvidia-smi
 GPU-memory warnings and CUDA tuning environment changes have no equivalent
