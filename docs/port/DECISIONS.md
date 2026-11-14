@@ -1279,7 +1279,11 @@ then prepares query/gate rows and assembles cache entries in row/head order.
 Each side calls the original codec, preserving every trellis tie, checked
 integer operation, scale candidate order and FP16/BF16 boundary. Additive
 `Attention` stage methods preserve normalization and rotary arithmetic.
-The original `prepare_row` remains the oracle. Randomized comparisons cover
+The original `prepare_row` remains the oracle. If parallel preparation fails,
+the engine replays rows in scalar order before any cache append, returning the
+first scalar stage error. Successful preparation retains independent side tasks
+without replay. Query preparation shares its scalar body; the scalar path keeps
+its final query/gate checks after cache encoding. Randomized comparisons cover
 signed zeros, subnormals, BF16 midpoints, extreme values, guards, mixed packed
 and int8 sides, tile crossings and non-finite errors; cache digests and every
 output bit match. Existing model tests pass in all three modes.
@@ -1454,10 +1458,10 @@ noisy and the gain is modest. Software FP16 conversion, portable nonlinear
 math, scalar reductions, allocations and dispatch remain. The real-model
 10 ms target has not been measured or claimed.
 
-### Orchestrator validation and remaining gains
+### Real-model validation and remaining gains
 
-Run these **serially**, without another model/build/test job. The agent never
-opens the released model. `MODEL_FOLDER` below is supplied by the orchestrator;
+Run these **serially**, without another model/build/test job.
+`MODEL_FOLDER` below denotes the released model;
 CPU-stage choice is independent of Metal projection selection.
 
 ```sh

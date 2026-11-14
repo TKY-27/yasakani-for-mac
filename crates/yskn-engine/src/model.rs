@@ -1068,6 +1068,79 @@ fn replay_recurrence(
         })
         .collect())
 }
+/// Prepare, append and attend a batch of projected rows using the engine pool.
+fn attention_pass(
+    engine: &mut Compute,
+    attention: &yskn_ref::attention::Attention,
+    state: &mut yskn_ref::attention::AttentionState,
+    [q, k, v]: [&[Vec<f32>]; 3],
+    timing: &mut PassTiming,
+) -> Result<Vec<Vec<f32>>> {
+    let position = timing.position;
+    let start = Instant::now();
+    let prepared = if crate::cpu_stages::enabled() {
+        let parallel = (|| {
+            let sides_per_row = attention.kv_heads() * 2;
+            let sides = engine.map_range(0..q.len() * sides_per_row, |index| {
+                let row = index / sides_per_row;
+                let side = index % 2;
+                attention.prepare_cache_side(
+                    position + row,
+                    index % sides_per_row / 2,
+                    side,
+                    if side == 0 { &k[row] } else { &v[row] },
+                )
+            })?;
+            let queries = engine.map_range(0..q.len(), |i| {
+                attention.prepare_queries(position + i, &q[i], &k[i], &v[i])
+            })?;
+            let mut sides = sides.into_iter();
+            queries
+                .into_iter()
+                .map(|query| {
+                    attention.finish_prepared(query, sides.by_ref().take(sides_per_row).collect())
+                })
+                .collect::<Result<Vec<_>>>()
+        })();
+        match parallel {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // On failure, replay in scalar row/stage order before any cache append.
+                // Success retains independent KV-side tasks and never repeats preparation.
+                for i in 0..q.len() {
+                    attention.prepare_row(position + i, &q[i], &k[i], &v[i])?;
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        engine.map_range(0..q.len(), |i| {
+            attention.prepare_row(position + i, &q[i], &k[i], &v[i])
+        })?
+    };
+    timing.kv_encode += start.elapsed();
+    let start = Instant::now();
+    for (i, p) in prepared.iter().enumerate() {
+        attention.append_prepared(state, position + i, p)?;
+    }
+    let heads = attention.query_heads();
+    let outputs = engine.map_range(0..q.len() * heads, |i| {
+        crate::cpu_stages::attention::output_head(
+            attention,
+            state,
+            position + i / heads,
+            &prepared[i / heads],
+            i % heads,
+        )
+    })?;
+    let gated: Vec<_> = outputs
+        .chunks(heads)
+        .map(|heads| heads.iter().flatten().copied().collect())
+        .collect();
+    timing.attention += start.elapsed();
+    Ok(gated)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn forward(
     engine: &mut Compute,
@@ -1079,7 +1152,6 @@ fn forward(
     timing: &mut PassTiming,
     cache: Option<&mut [GatedDeltaNetRow]>,
 ) -> Result<Vec<Vec<f32>>> {
-    let position = timing.position;
     let input_projection = match &layer.branch {
         Branch::Attention(l) => &l.query_gate,
         Branch::Recurrent(l) => &l.query_key_value,
@@ -1106,56 +1178,7 @@ fn forward(
         (Branch::Attention(l), LayerState::Attention(state)) => {
             let [q, k, v] =
                 project_normalized(engine, [&l.query_gate, &l.key, &l.value], &input, timing)?;
-            let start = Instant::now();
-            let prepared = if crate::cpu_stages::enabled() {
-                let sides_per_row = l.attention.kv_heads() * 2;
-                let sides = engine.map_range(0..hidden.len() * sides_per_row, |index| {
-                    let row = index / sides_per_row;
-                    let side = index % 2;
-                    l.attention.prepare_cache_side(
-                        position + row,
-                        index % sides_per_row / 2,
-                        side,
-                        if side == 0 { &k[row] } else { &v[row] },
-                    )
-                })?;
-                let queries = engine.map_range(0..hidden.len(), |i| {
-                    l.attention
-                        .prepare_queries(position + i, &q[i], &k[i], &v[i])
-                })?;
-                let mut sides = sides.into_iter();
-                queries
-                    .into_iter()
-                    .map(|query| {
-                        l.attention
-                            .finish_prepared(query, sides.by_ref().take(sides_per_row).collect())
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            } else {
-                engine.map_range(0..hidden.len(), |i| {
-                    l.attention.prepare_row(position + i, &q[i], &k[i], &v[i])
-                })?
-            };
-            timing.kv_encode += start.elapsed();
-            let start = Instant::now();
-            for (i, p) in prepared.iter().enumerate() {
-                l.attention.append_prepared(state, position + i, p)?;
-            }
-            let heads = l.attention.query_heads();
-            let outputs = engine.map_range(0..hidden.len() * heads, |i| {
-                crate::cpu_stages::attention::output_head(
-                    &l.attention,
-                    state,
-                    position + i / heads,
-                    &prepared[i / heads],
-                    i % heads,
-                )
-            })?;
-            let gated: Vec<_> = outputs
-                .chunks(heads)
-                .map(|heads| heads.iter().flatten().copied().collect())
-                .collect();
-            timing.attention += start.elapsed();
+            let gated = attention_pass(engine, &l.attention, state, [&q, &k, &v], timing)?;
             project_rows(engine, &l.output, &gated, timing)?
         }
         _ => return Err(Error::InvalidModel("layer/state types differ".into())),
@@ -1260,6 +1283,92 @@ mod session_tests {
     use super::*;
     use crate::Kernel;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn attention_pass_errors_follow_scalar_row_and_stage_order() {
+        use yskn_ref::attention::{Attention, AttentionDimensions};
+        let layer = Attention::new(
+            AttentionDimensions {
+                query_heads: 2,
+                kv_heads: 2,
+                head_dim: 256,
+                rotary_dim: 64,
+            },
+            vec![0.0; 256],
+            vec![0.0; 256],
+            1e-6,
+        )
+        .unwrap();
+        for threads in [1, 4] {
+            let mut engine = Compute::new(
+                Engine::new(Kernel::Portable, threads).unwrap(),
+                Backend::Cpu,
+            )
+            .unwrap();
+            // Same-row query before value, earlier query before later value,
+            // earlier value before later query, and final gate check after cache encoding.
+            for (rows, query_row, value_row, bad_gate, expected_context) in [
+                (1, 0, 0, false, "attention head sum of squares"),
+                (2, 0, 1, false, "attention head sum of squares"),
+                (2, 1, 0, false, "attention cache input"),
+                (1, 0, 0, true, "attention cache input"),
+            ] {
+                let mut q = vec![vec![0.25; 1024]; rows];
+                let k = vec![vec![0.25; 512]; rows];
+                let mut v = vec![vec![0.25; 512]; rows];
+                if bad_gate {
+                    q[query_row][256..512].fill(f32::MAX);
+                } else {
+                    q[query_row][..256].fill(1e20);
+                }
+                v[value_row][..256].fill(2e38);
+                let expected = (0..rows)
+                    .map(|i| layer.prepare_row(i, &q[i], &k[i], &v[i]))
+                    .collect::<Result<Vec<_>>>()
+                    .err()
+                    .unwrap();
+                assert!(
+                    matches!(expected, Error::NonFinite(context) if context == expected_context)
+                );
+                let mut state = layer.new_state().unwrap();
+                let before = state.clone();
+                let actual = attention_pass(
+                    &mut engine,
+                    &layer,
+                    &mut state,
+                    [&q, &k, &v],
+                    &mut PassTiming::default(),
+                )
+                .unwrap_err();
+                assert_eq!(
+                    actual.to_string(),
+                    expected.to_string(),
+                    "threads={threads} rows={rows} query={query_row} value={value_row} gate={bad_gate}"
+                );
+                assert_eq!(state, before, "failed preparation appended cache rows");
+                // The same pool/state can still complete the actual attention pass.
+                let q = vec![vec![0.25; 1024]; rows];
+                let v = vec![vec![0.25; 512]; rows];
+                let actual = attention_pass(
+                    &mut engine,
+                    &layer,
+                    &mut state,
+                    [&q, &k, &v],
+                    &mut PassTiming::default(),
+                )
+                .unwrap();
+                let mut reference = layer.new_state().unwrap();
+                for i in 0..rows {
+                    let expected = layer.step(&mut reference, i, &q[i], &k[i], &v[i]).unwrap();
+                    assert_eq!(
+                        actual[i].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                    );
+                }
+                assert_eq!(state, reference);
+            }
+        }
+    }
 
     fn fixture_path() -> std::path::PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
