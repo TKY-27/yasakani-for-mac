@@ -732,6 +732,23 @@ mod tests {
     }
 
     #[test]
+    fn both_sources_and_acceptance_are_required_in_each_selected_sampler() {
+        let rows: Vec<_> = SAMPLERS.iter().map(|sampler| json!({"sampler":sampler,"guesses_offered":8,"guesses_accepted":2,"neural_guesses_offered":5,"ngram_guesses_offered":3})).collect();
+        let mut failures = vec![];
+        speculation_exercised("both-k7-adaptive", &[0, 1, 2, 3], &rows, &mut failures);
+        assert!(failures.is_empty());
+        let mut missing = rows;
+        missing[1]["ngram_guesses_offered"] = json!(0);
+        speculation_exercised("both-k7-adaptive", &[0, 1, 2, 3], &missing, &mut failures);
+        assert_eq!(
+            failures,
+            vec![
+                json!({"kind":"draft source not exercised","configuration":"both-k7-adaptive","sampler":"seed-42","source":"ngram_guesses_offered"})
+            ]
+        );
+    }
+
+    #[test]
     fn two_empty_generations_are_not_a_lossless_pass() {
         for stages in [vec![], vec![0]] {
             let empty = Observation {
