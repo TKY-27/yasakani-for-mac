@@ -2027,3 +2027,70 @@ fn the_keepalive_interval_is_bounded() {
         assert_eq!(cfg.validate().is_ok(), ok, "{ms} ms");
     }
 }
+// Review follow-up: with keep-alives more frequent than the idle deadline,
+// their writes alone would keep a stream alive. Here no keep-alive comes
+// during the silence, so only the stream's hold of the work flag keeps the
+// connection through several idle deadlines.
+#[tokio::test]
+async fn a_silent_stream_survives_without_keepalives_inside_the_idle_deadline() {
+    let mut cfg = quiet_config();
+    cfg.limits.keepalive_interval = Duration::from_secs(3600);
+    let h = Harness::start(cfg).await;
+    h.silence.set(Duration::from_millis(1000), Duration::ZERO);
+    h.script("</think>held by the flag");
+    let r = h
+        .chat(json!({"stream":true,"stream_options":{"include_usage":true}}))
+        .await;
+    assert_eq!(r.status, 200);
+    let (comments, ev) = sse_frames(&r.text);
+    assert_eq!(comments, 0, "{}", r.text);
+    assert_eq!(ev[0]["choices"][0]["delta"], json!({"role":"assistant"}));
+    assert_eq!(pieces(&ev, "content"), "held by the flag");
+    assert_eq!(ev[ev.len() - 2]["choices"][0]["finish_reason"], "stop");
+    assert!(ev.last().unwrap()["usage"].is_object());
+    assert_eq!(h.silence.get().cancelled, 0);
+    h.stop().await;
+}
+// Pins today's behaviour: a client that half-closes its write side after a
+// complete request is treated as gone (Hyper's default, half_close false):
+// the end of its stream ends the connection and cancels the engine, and no
+// complete response is sent. Waiting for the prefill first keeps the request
+// from being dropped earlier, in the queue.
+#[tokio::test]
+async fn a_client_that_half_closes_after_its_request_is_treated_as_gone() {
+    let h = Harness::start(quiet_config()).await;
+    h.silence.set(Duration::from_secs(3600), Duration::ZERO);
+    let silence = h.silence.clone();
+    for (n, stream) in [(1, false), (2, true)] {
+        let mut s = TcpStream::connect(h.addr).await.unwrap();
+        let b = json!({"messages":user(),"stream":stream});
+        s.write_all(raw_post(&h, &b).as_bytes()).await.unwrap();
+        common::until("the silent prefill to start", || {
+            silence.get().prefills == n
+        })
+        .await;
+        s.shutdown().await.unwrap();
+        let mut out = vec![];
+        let read = tokio::time::timeout(common::PATIENCE, s.read_to_end(&mut out))
+            .await
+            .expect("the server kept the half-closed connection");
+        assert!(read.is_ok() || read.is_err_and(|e| e.kind() == ErrorKind::ConnectionReset));
+        let out = String::from_utf8_lossy(&out);
+        if stream {
+            // The headers and the role chunk were sent before the prefill.
+            assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+            assert!(!out.contains("[DONE]"), "{out}");
+        } else {
+            assert_eq!(out, "");
+        }
+        common::until("the engine to see the cancel", || {
+            silence.get().cancelled == n
+        })
+        .await;
+    }
+    h.silence.set(Duration::ZERO, Duration::ZERO);
+    h.script("</think>next");
+    let r = h.chat(json!({"max_tokens":20})).await;
+    assert_eq!(r.json()["choices"][0]["message"]["content"], "next");
+    h.stop().await;
+}
